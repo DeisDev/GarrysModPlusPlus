@@ -2,6 +2,8 @@
 
 #include "capture.h"
 #include "d3d9_vtable.h"
+#include "effects.h"
+#include "frame_trace.h"
 #include "log.h"
 #include "mod.h"
 #include "presenter.h"
@@ -13,6 +15,10 @@
 #include <array>
 #include <atomic>
 #include <mutex>
+
+#include <wrl/client.h>
+
+using Microsoft::WRL::ComPtr;
 
 namespace gmodpp::hooks {
 
@@ -88,7 +94,9 @@ HWND PresentFrame(IDirect3DDevice9* device, HWND requestedWindow)
     }
     Renderer* renderer = GetRenderer();
     renderer->OnPresent();
+    effects::OnPresent();
     watchdog::NotePresent();
+    trace::OnFrameBoundary();
 
     Presenter* presenter = renderer->GetPresenter();
     if (presenter != nullptr && presenter->PresentFrame(device))
@@ -104,17 +112,25 @@ void LogPresentResult(HRESULT hr)
     last = hr;
 }
 
-void BeforeReset()
+void BeforeReset(IDirect3DDevice9* device, D3DPRESENT_PARAMETERS* params)
 {
     GetRenderer()->OnReset();
+    effects::OnBeforeReset();
     if (Presenter* presenter = GetRenderer()->GetPresenter())
         presenter->BeforeReset();
+    ComPtr<IDirect3D9> d3d;
+    D3DDEVICE_CREATION_PARAMETERS creation;
+    if (SUCCEEDED(device->GetDirect3D(&d3d)) && SUCCEEDED(device->GetCreationParameters(&creation)))
+        effects::PrepareDeviceParameters(d3d.Get(), creation.AdapterOrdinal, *params);
 }
 
-void AfterReset(HRESULT hr, const D3DPRESENT_PARAMETERS* params)
+void AfterReset(IDirect3DDevice9* device, HRESULT hr, const D3DPRESENT_PARAMETERS* params)
 {
     log::Info("Reset to {}x{} returned {:#010x}", params->BackBufferWidth, params->BackBufferHeight, static_cast<unsigned>(hr));
-    if (Presenter* presenter = GetRenderer()->GetPresenter(); presenter != nullptr && SUCCEEDED(hr))
+    if (FAILED(hr))
+        return;
+    effects::OnDeviceReady(device, *params);
+    if (Presenter* presenter = GetRenderer()->GetPresenter())
         presenter->AfterReset(*params);
 }
 
@@ -140,9 +156,9 @@ HRESULT STDMETHODCALLTYPE HookReset(IDirect3DDevice9* self, D3DPRESENT_PARAMETER
 {
     if (!IsGameDevice(self))
         return Original<ResetFn>(self, kSlotDeviceReset)(self, params);
-    BeforeReset();
+    BeforeReset(self, params);
     HRESULT hr = Original<ResetFn>(self, kSlotDeviceReset)(self, params);
-    AfterReset(hr, params);
+    AfterReset(self, hr, params);
     return hr;
 }
 
@@ -150,9 +166,9 @@ HRESULT STDMETHODCALLTYPE HookResetEx(IDirect3DDevice9Ex* self, D3DPRESENT_PARAM
 {
     if (!IsGameDevice(self))
         return Original<ResetExFn>(self, kSlotDeviceExResetEx)(self, params, mode);
-    BeforeReset();
+    BeforeReset(self, params);
     HRESULT hr = Original<ResetExFn>(self, kSlotDeviceExResetEx)(self, params, mode);
-    AfterReset(hr, params);
+    AfterReset(self, hr, params);
     return hr;
 }
 
@@ -178,8 +194,17 @@ HRESULT STDMETHODCALLTYPE HookPresentEx(IDirect3DDevice9Ex* self, const RECT* sr
 
 HRESULT STDMETHODCALLTYPE HookSetVertexShaderConstantF(IDirect3DDevice9* self, UINT start, const float* data, UINT count)
 {
-    if (IsGameDevice(self) && data != nullptr)
+    if (IsGameDevice(self) && data != nullptr) {
         GetRenderer()->OnVertexShaderConstants(start, data, count);
+        if (trace::Active()) {
+            std::string values;
+            for (UINT i = 0; i < count && start + i < 20; ++i) {
+                const float* v = data + i * 4;
+                values += std::format(" c{}=({:.4g} {:.4g} {:.4g} {:.4g})", start + i, v[0], v[1], v[2], v[3]);
+            }
+            trace::Line("VSConst c{} x{}{}", start, count, values);
+        }
+    }
     return Original<SetVertexShaderConstantFFn>(self, kSlotDeviceSetVertexShaderConstantF)(self, start, data, count);
 }
 
@@ -193,6 +218,42 @@ HRESULT STDMETHODCALLTYPE HookCreateDepthStencilSurface(IDirect3DDevice9* self, 
     return hr;
 }
 
+#define GMODPP_DEVICE_HOOK(Name, Params, Args, TraceStatement)                                         \
+    using Name##Fn = HRESULT(STDMETHODCALLTYPE*) Params;                                               \
+    HRESULT STDMETHODCALLTYPE Hook##Name Params                                                        \
+    {                                                                                                  \
+        if (trace::Active() && IsGameDevice(self))                                                     \
+            TraceStatement;                                                                            \
+        return Original<Name##Fn>(self, kSlotDevice##Name) Args;                                       \
+    }
+
+GMODPP_DEVICE_HOOK(SetRenderTarget, (IDirect3DDevice9* self, DWORD index, IDirect3DSurface9* surface), (self, index, surface),
+    trace::Line("SetRenderTarget {} {}", index, trace::Describe(surface)))
+GMODPP_DEVICE_HOOK(SetDepthStencilSurface, (IDirect3DDevice9* self, IDirect3DSurface9* surface), (self, surface),
+    trace::Line("SetDepthStencilSurface {}", trace::Describe(surface)))
+GMODPP_DEVICE_HOOK(SetViewport, (IDirect3DDevice9* self, const D3DVIEWPORT9* vp), (self, vp),
+    trace::Line("SetViewport {} {} {}x{} z {}..{}", vp->X, vp->Y, vp->Width, vp->Height, vp->MinZ, vp->MaxZ))
+GMODPP_DEVICE_HOOK(Clear, (IDirect3DDevice9* self, DWORD count, const D3DRECT* rects, DWORD flags, D3DCOLOR color, float z, DWORD stencil),
+    (self, count, rects, flags, color, z, stencil), trace::Line("Clear rects {} flags {:#x} color {:#010x} z {} stencil {}", count, flags, color, z, stencil))
+GMODPP_DEVICE_HOOK(BeginScene, (IDirect3DDevice9* self), (self), trace::Line("BeginScene"))
+GMODPP_DEVICE_HOOK(EndScene, (IDirect3DDevice9* self), (self), trace::Line("EndScene"))
+GMODPP_DEVICE_HOOK(DrawPrimitive, (IDirect3DDevice9* self, D3DPRIMITIVETYPE type, UINT start, UINT count), (self, type, start, count),
+    trace::Draw("DrawPrimitive", count))
+GMODPP_DEVICE_HOOK(DrawIndexedPrimitive, (IDirect3DDevice9* self, D3DPRIMITIVETYPE type, INT baseVertex, UINT minVertex, UINT numVertices, UINT startIndex, UINT count),
+    (self, type, baseVertex, minVertex, numVertices, startIndex, count), trace::Draw("DrawIndexedPrimitive", count))
+GMODPP_DEVICE_HOOK(DrawPrimitiveUP, (IDirect3DDevice9* self, D3DPRIMITIVETYPE type, UINT count, const void* data, UINT stride), (self, type, count, data, stride),
+    trace::Draw("DrawPrimitiveUP", count))
+GMODPP_DEVICE_HOOK(DrawIndexedPrimitiveUP, (IDirect3DDevice9* self, D3DPRIMITIVETYPE type, UINT minVertex, UINT numVertices, UINT count, const void* indices, D3DFORMAT indexFormat, const void* vertices, UINT stride),
+    (self, type, minVertex, numVertices, count, indices, indexFormat, vertices, stride), trace::Draw("DrawIndexedPrimitiveUP", count))
+GMODPP_DEVICE_HOOK(StretchRect, (IDirect3DDevice9* self, IDirect3DSurface9* src, const RECT* srcRect, IDirect3DSurface9* dst, const RECT* dstRect, D3DTEXTUREFILTERTYPE filter),
+    (self, src, srcRect, dst, dstRect, filter), trace::Line("StretchRect {} -> {}", trace::Describe(src), trace::Describe(dst)))
+GMODPP_DEVICE_HOOK(SetVertexShader, (IDirect3DDevice9* self, IDirect3DVertexShader9* shader), (self, shader),
+    trace::Line("SetVertexShader {}", static_cast<void*>(shader)))
+GMODPP_DEVICE_HOOK(SetPixelShader, (IDirect3DDevice9* self, IDirect3DPixelShader9* shader), (self, shader),
+    trace::Line("SetPixelShader {}", static_cast<void*>(shader)))
+
+#undef GMODPP_DEVICE_HOOK
+
 void OnGameDeviceCreated(IDirect3DDevice9* device, HWND focusWindow, const D3DPRESENT_PARAMETERS& params)
 {
     Renderer* renderer = GetRenderer();
@@ -203,6 +264,21 @@ void OnGameDeviceCreated(IDirect3DDevice9* device, HWND focusWindow, const D3DPR
     Patch(device, kSlotDevicePresent, reinterpret_cast<void*>(&HookPresent));
     Patch(device, kSlotDeviceSetVertexShaderConstantF, reinterpret_cast<void*>(&HookSetVertexShaderConstantF));
     Patch(device, kSlotDeviceCreateDepthStencilSurface, reinterpret_cast<void*>(&HookCreateDepthStencilSurface));
+    if (GetOptions().devMode) {
+        Patch(device, kSlotDeviceSetRenderTarget, reinterpret_cast<void*>(&HookSetRenderTarget));
+        Patch(device, kSlotDeviceSetDepthStencilSurface, reinterpret_cast<void*>(&HookSetDepthStencilSurface));
+        Patch(device, kSlotDeviceSetViewport, reinterpret_cast<void*>(&HookSetViewport));
+        Patch(device, kSlotDeviceClear, reinterpret_cast<void*>(&HookClear));
+        Patch(device, kSlotDeviceBeginScene, reinterpret_cast<void*>(&HookBeginScene));
+        Patch(device, kSlotDeviceEndScene, reinterpret_cast<void*>(&HookEndScene));
+        Patch(device, kSlotDeviceDrawPrimitive, reinterpret_cast<void*>(&HookDrawPrimitive));
+        Patch(device, kSlotDeviceDrawIndexedPrimitive, reinterpret_cast<void*>(&HookDrawIndexedPrimitive));
+        Patch(device, kSlotDeviceDrawPrimitiveUP, reinterpret_cast<void*>(&HookDrawPrimitiveUP));
+        Patch(device, kSlotDeviceDrawIndexedPrimitiveUP, reinterpret_cast<void*>(&HookDrawIndexedPrimitiveUP));
+        Patch(device, kSlotDeviceStretchRect, reinterpret_cast<void*>(&HookStretchRect));
+        Patch(device, kSlotDeviceSetVertexShader, reinterpret_cast<void*>(&HookSetVertexShader));
+        Patch(device, kSlotDeviceSetPixelShader, reinterpret_cast<void*>(&HookSetPixelShader));
+    }
 
     IDirect3DDevice9Ex* deviceEx = nullptr;
     if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&deviceEx)))) {
@@ -218,10 +294,14 @@ void OnGameDeviceCreated(IDirect3DDevice9* device, HWND focusWindow, const D3DPR
 HRESULT STDMETHODCALLTYPE HookCreateDevice(IDirect3D9* self, UINT adapter, D3DDEVTYPE type, HWND window, DWORD flags,
     D3DPRESENT_PARAMETERS* params, IDirect3DDevice9** device)
 {
+    const bool fromGame = CalledFromShaderApi(_ReturnAddress());
+    if (fromGame)
+        effects::PrepareDeviceParameters(self, adapter, *params);
     HRESULT hr = Original<CreateDeviceFn>(self, kSlotD3D9CreateDevice)(self, adapter, type, window, flags, params, device);
-    if (SUCCEEDED(hr) && CalledFromShaderApi(_ReturnAddress())) {
+    if (SUCCEEDED(hr) && fromGame) {
         LogDeviceParameters("CreateDevice", window, params);
         OnGameDeviceCreated(*device, window, *params);
+        effects::OnDeviceReady(*device, *params);
     }
     return hr;
 }
@@ -229,10 +309,14 @@ HRESULT STDMETHODCALLTYPE HookCreateDevice(IDirect3D9* self, UINT adapter, D3DDE
 HRESULT STDMETHODCALLTYPE HookCreateDeviceEx(IDirect3D9Ex* self, UINT adapter, D3DDEVTYPE type, HWND window, DWORD flags,
     D3DPRESENT_PARAMETERS* params, D3DDISPLAYMODEEX* mode, IDirect3DDevice9Ex** device)
 {
+    const bool fromGame = CalledFromShaderApi(_ReturnAddress());
+    if (fromGame)
+        effects::PrepareDeviceParameters(self, adapter, *params);
     HRESULT hr = Original<CreateDeviceExFn>(self, kSlotD3D9ExCreateDeviceEx)(self, adapter, type, window, flags, params, mode, device);
-    if (SUCCEEDED(hr) && CalledFromShaderApi(_ReturnAddress())) {
+    if (SUCCEEDED(hr) && fromGame) {
         LogDeviceParameters("CreateDeviceEx", window, params);
         OnGameDeviceCreated(*device, window, *params);
+        effects::OnDeviceReady(*device, *params);
     }
     return hr;
 }

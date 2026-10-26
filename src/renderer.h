@@ -15,7 +15,6 @@ class Presenter;
 struct CameraConstants {
     float eyePos[4] = {};
     float viewProj[4][4] = {};
-    uint32_t viewProjUpdates = 0;
 };
 
 class Renderer {
@@ -28,6 +27,8 @@ public:
 
     bool AttachGameDevice(IDirect3DDevice9* device, HWND focusWindow, const D3DPRESENT_PARAMETERS& params);
     Presenter* GetPresenter() const { return m_presenter.get(); }
+    const CameraConstants& Camera() const { return m_camera; }
+    bool SupportsRaytracing() const { return m_raytracing; }
     void OnVertexShaderConstants(UINT startRegister, const float* data, UINT vector4fCount);
     void OnPresent();
     void OnReset();

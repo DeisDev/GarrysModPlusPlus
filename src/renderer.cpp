@@ -1,4 +1,4 @@
-#include "renderer.h"
+﻿#include "renderer.h"
 
 #include "log.h"
 #include "mod.h"
@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <iterator>
 #include <memory>
 #include <string>
 
@@ -20,7 +21,6 @@ namespace {
 
 constexpr UINT kEyePosRegister = 2;
 constexpr UINT kViewProjRegister = 8;
-constexpr uint64_t kLoggedCameraFrames = 3;
 
 // Never destroyed: releasing D3D objects during DLL_PROCESS_DETACH is unsafe.
 Renderer* g_renderer = nullptr;
@@ -127,8 +127,13 @@ Renderer* Renderer::Create(LUID adapterLuid, const Options& options)
         shaderModel.HighestShaderModel = D3D_SHADER_MODEL_5_1;
     renderer->m_raytracing = options5.RaytracingTier >= D3D12_RAYTRACING_TIER_1_1 && shaderModel.HighestShaderModel >= D3D_SHADER_MODEL_6_5;
 
-    if (options.d3d12Debug)
-        renderer->m_device.As(&renderer->m_infoQueue);
+    if (options.d3d12Debug && SUCCEEDED(renderer->m_device.As(&renderer->m_infoQueue))) {
+        D3D12_MESSAGE_SEVERITY hidden[] = {D3D12_MESSAGE_SEVERITY_INFO, D3D12_MESSAGE_SEVERITY_MESSAGE, D3D12_MESSAGE_SEVERITY_WARNING};
+        D3D12_INFO_QUEUE_FILTER filter = {};
+        filter.DenyList.NumSeverities = static_cast<UINT>(std::size(hidden));
+        filter.DenyList.pSeverityList = hidden;
+        renderer->m_infoQueue->PushStorageFilter(&filter);
+    }
 
     log::Info("D3D12 device on '{}': raytracing tier {:#x}, shader model {:#x}, inline raytracing {}", adapterName,
         static_cast<int>(options5.RaytracingTier), static_cast<int>(shaderModel.HighestShaderModel),
@@ -174,27 +179,15 @@ bool Renderer::AttachGameDevice(IDirect3DDevice9* device, HWND focusWindow, cons
 void Renderer::OnVertexShaderConstants(UINT startRegister, const float* data, UINT vector4fCount)
 {
     CopyRegisters(startRegister, data, vector4fCount, kEyePosRegister, 1, m_camera.eyePos);
-    if (startRegister < kViewProjRegister + 4 && startRegister + vector4fCount > kViewProjRegister) {
+    if (startRegister < kViewProjRegister + 4 && startRegister + vector4fCount > kViewProjRegister)
         CopyRegisters(startRegister, data, vector4fCount, kViewProjRegister, 4, &m_camera.viewProj[0][0]);
-        ++m_camera.viewProjUpdates;
-    }
 }
 
 void Renderer::OnPresent()
 {
     ++m_frame;
-    if (m_frame <= kLoggedCameraFrames) {
-        const auto& m = m_camera.viewProj;
-        log::Info("Frame {}: c8 writes {}, eye ({:.1f} {:.1f} {:.1f}), viewProj rows "
-                  "[{:.3f} {:.3f} {:.3f} {:.3f}] [{:.3f} {:.3f} {:.3f} {:.3f}] [{:.3f} {:.3f} {:.3f} {:.3f}] [{:.3f} {:.3f} {:.3f} {:.3f}]",
-            m_frame, m_camera.viewProjUpdates, m_camera.eyePos[0], m_camera.eyePos[1], m_camera.eyePos[2],
-            m[0][0], m[0][1], m[0][2], m[0][3], m[1][0], m[1][1], m[1][2], m[1][3],
-            m[2][0], m[2][1], m[2][2], m[2][3], m[3][0], m[3][1], m[3][2], m[3][3]);
-    }
-    if (m_frame % 300 == 0)
-        log::Info("Frame {}: eye ({:.1f} {:.1f} {:.1f}), c8 writes {}", m_frame, m_camera.eyePos[0], m_camera.eyePos[1],
-            m_camera.eyePos[2], m_camera.viewProjUpdates);
-    m_camera.viewProjUpdates = 0;
+    if (GetOptions().devMode && m_frame % 300 == 0)
+        log::Info("Frame {}", m_frame);
     DrainDebugMessages();
 }
 
