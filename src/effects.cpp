@@ -504,16 +504,30 @@ void UpdateScene()
         if (g_state.scene.LoadMap(level, world, worldGeometry)) {
             g_state.brushModels = std::move(world.brushModels);
             std::vector<SceneInstance> instances;
-            for (const bsp::StaticProp& prop : world.props) {
-                SceneInstance& instance = instances.emplace_back();
-                instance.model = ModelFor(world.propModels[prop.model]).sceneModel;
-                std::memcpy(instance.transform, prop.transform, sizeof(instance.transform));
+            const auto addProps = [&](const std::vector<bsp::StaticProp>& props, UINT mask) {
+                for (const bsp::StaticProp& prop : props) {
+                    SceneInstance& instance = instances.emplace_back();
+                    instance.model = ModelFor(world.propModels[prop.model]).sceneModel;
+                    instance.mask = mask;
+                    std::memcpy(instance.transform, prop.transform, sizeof(instance.transform));
+                }
+            };
+            addProps(world.props, 0);
+            const size_t worldProps = std::count_if(instances.begin(), instances.end(), [](const SceneInstance& instance) { return instance.model >= 0; });
+            if (!world.skybox.indices.empty()) {
+                TriangleData skyboxTriangles;
+                SceneInstance& skybox = instances.emplace_back();
+                skybox.model = g_state.scene.AddModel(PrepareMesh(world.skybox, skyboxTriangles));
+                skybox.mask = kSkyboxMask;
+                const float identity[3][4] = {{1.0f, 0.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 1.0f, 0.0f}};
+                std::memcpy(skybox.transform, identity, sizeof(skybox.transform));
             }
+            addProps(world.skyboxProps, kSkyboxMask);
             std::erase_if(instances, [](const SceneInstance& instance) { return instance.model < 0; });
-            log::Info("Scene '{}': {} faces, {} displacements, {} skybox faces and {} skybox props skipped, {} world triangles ({} alpha-tested), {} of {} static props, {} lights; "
+            log::Info("Scene '{}': {} faces, {} displacements, {} skybox faces and {} skybox props, {} world triangles ({} alpha-tested), {} of {} static props, {} lights; "
                       "sun {} dir ({:.2f} {:.2f} {:.2f}) color ({:.2f} {:.2f} {:.2f}), sky ({:.2f} {:.2f} {:.2f})",
-                level, world.faceCount, world.displacementCount, world.skyboxFaceCount, world.skyboxPropCount, world.mesh.indices.size() / 3, worldTriangles.alphaTriangles.size(),
-                instances.size(),
+                level, world.faceCount, world.displacementCount, world.skyboxFaceCount, world.skyboxProps.size(), world.mesh.indices.size() / 3, worldTriangles.alphaTriangles.size(),
+                worldProps,
                 world.props.size(), world.lights.size(), world.sun.present ? "present" : "missing", world.sun.direction.x, world.sun.direction.y,
                 world.sun.direction.z, world.sun.color.x, world.sun.color.y, world.sun.color.z, world.sun.ambient.x, world.sun.ambient.y,
                 world.sun.ambient.z);

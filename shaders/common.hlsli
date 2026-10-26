@@ -62,6 +62,8 @@ struct FrameConstants
     uint bspNodesView;
     uint leafClustersView;
     uint clusterCount;
+    // 1 for the first-person viewmodel's run.
+    uint viewmodel;
 };
 
 // Per-pass descriptor indices and parameters.

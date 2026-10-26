@@ -2,7 +2,9 @@
 
 #include <d3d9types.h>
 
+#include <array>
 #include <bit>
+#include <optional>
 #include <cstring>
 
 namespace gmodpp::bytecode {
@@ -119,6 +121,68 @@ bool WritesColorOutput(std::span<const DWORD> code, UINT index)
             writes = true;
     });
     return writes;
+}
+
+bool ModulatesSampleBy2x(std::span<const DWORD> code, UINT index)
+{
+    std::array<std::array<float, 4>, 256> defs = {};
+    std::array<bool, 256> defined = {};
+    // The temporary register texld wrote the sample to, once it has.
+    int sampled = -1;
+    std::optional<bool> result;
+    const auto constantValue = [&](DWORD source, float& value) {
+        const DWORD reg = source & D3DSP_REGNUM_MASK;
+        if (RegisterType(source) != D3DSPR_CONST || reg >= defs.size() || !defined[reg])
+            return false;
+        value = defs[reg][(source >> D3DSP_SWIZZLE_SHIFT) & 3];
+        return true;
+    };
+    ForEachInstruction(code, [&](size_t at, size_t length) {
+        const DWORD opcode = Opcode(code[at]);
+        if (result || opcode == D3DSIO_COMMENT || opcode == D3DSIO_DCL || length == 0)
+            return;
+        if (opcode == D3DSIO_DEF && length == 5) {
+            const DWORD reg = code[at + 1] & D3DSP_REGNUM_MASK;
+            if (reg < defs.size()) {
+                std::memcpy(defs[reg].data(), &code[at + 2], sizeof(float) * 4);
+                defined[reg] = true;
+            }
+            return;
+        }
+        if (sampled < 0) {
+            if (opcode == D3DSIO_TEX && length == 3 && RegisterType(code[at + 3]) == D3DSPR_SAMPLER && (code[at + 3] & D3DSP_REGNUM_MASK) == index &&
+                RegisterType(code[at + 1]) == D3DSPR_TEMP)
+                sampled = static_cast<int>(code[at + 1] & D3DSP_REGNUM_MASK);
+            return;
+        }
+        // Compilers reuse the sample register's unused .w, so only uses of its colour channels count.
+        const DWORD destination = code[at + 1];
+        const DWORD writeMask = (destination & D3DSP_WRITEMASK_ALL) >> 16;
+        const auto readsColor = [&](DWORD source) {
+            if (RegisterType(source) != D3DSPR_TEMP || static_cast<int>(source & D3DSP_REGNUM_MASK) != sampled)
+                return false;
+            for (DWORD k = 0; k < 4; ++k) {
+                if ((writeMask & (1u << k)) && ((source >> (D3DSP_SWIZZLE_SHIFT + 2 * k)) & 3) < 3)
+                    return true;
+            }
+            return false;
+        };
+        bool reads = false;
+        for (size_t k = at + 2; k <= at + length; ++k)
+            reads = reads || readsColor(code[k]);
+        if (!reads) {
+            if (RegisterType(destination) == D3DSPR_TEMP && static_cast<int>(destination & D3DSP_REGNUM_MASK) == sampled && (writeMask & 7) != 0)
+                result = false;
+            return;
+        }
+        float a = 0.0f;
+        float b = 0.0f;
+        float bias = 0.0f;
+        result = opcode == D3DSIO_MAD && length == 4 && constantValue(code[at + 4], bias) && bias == -1.0f &&
+            ((readsColor(code[at + 2]) && constantValue(code[at + 3], b) && b == 2.0f) ||
+                (readsColor(code[at + 3]) && constantValue(code[at + 2], a) && a == 2.0f));
+    });
+    return result.value_or(false);
 }
 
 int ReplaceDefLiteral(std::span<DWORD> code, float from, float to)

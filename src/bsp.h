@@ -99,9 +99,12 @@ struct WorldGeometry {
     uint32_t faceCount = 0;
     uint32_t displacementCount = 0;
     uint32_t skyboxFaceCount = 0;
-    uint32_t skyboxPropCount = 0;
     std::vector<std::string> propModels;
     std::vector<StaticProp> props;
+    // The 3D skybox's own faces and static props: a scaled-down scene elsewhere in the map, kept apart so that
+    // only rays of the skybox view meet it.
+    Mesh skybox;
+    std::vector<StaticProp> skyboxProps;
 };
 
 // Returns false with a reason in `error` when the data is not a supported Source BSP.

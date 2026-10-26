@@ -72,6 +72,7 @@ struct FrameConstants {
     uint32_t bspNodesView;
     uint32_t leafClustersView;
     uint32_t clusterCount;
+    uint32_t viewmodel;
 };
 
 // The game's D3D9 resources one view rendered: its colour target, which keeps what the G-buffer does not

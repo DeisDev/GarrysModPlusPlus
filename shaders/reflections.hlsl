@@ -36,9 +36,12 @@ float3 ReflectedRadiance(float3 origin, float3 direction)
         float3 sky = PreviousColor(mul(g_frame.prevViewProj, float4(direction, 0.0)), 0.0);
         return sky.x >= 0.0 ? sky : g_frame.skyColor;
     }
-    float3 previous = PreviousColor(mul(g_frame.prevViewProj, float4(hit.position, 1.0)), length(hit.position - g_frame.prevEyePosition));
-    if (previous.x >= 0.0)
-        return previous;
+    // Positions in the 3D skybox are in its own scaled-down space, which last frame's main view does not show.
+    if ((g_frame.traceMask & kSkyboxMask) == 0) {
+        float3 previous = PreviousColor(mul(g_frame.prevViewProj, float4(hit.position, 1.0)), length(hit.position - g_frame.prevEyePosition));
+        if (previous.x >= 0.0)
+            return previous;
+    }
     return hit.albedo * (SunIrradiance(hit, hit.position + hit.normal) + g_frame.skyColor);
 }
 

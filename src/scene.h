@@ -20,6 +20,8 @@ constexpr UINT kStaticPropMask = 0x02;
 constexpr UINT kDynamicMask = 0x04;
 // The local player's own body sits around the camera; viewmodel rays leave it out (see Lighting).
 constexpr UINT kLocalPlayerMask = 0x08;
+// The 3D skybox's scaled-down scene, which only the skybox view's rays meet.
+constexpr UINT kSkyboxMask = 0x10;
 
 // Triangles for Scene::AddModel. Alpha-tested triangles come last, from `opaqueTriangles` on; each has an entry
 // in `alphaTriangles` (Scene::PackAlpha), and then the model needs `uvs`.
@@ -95,7 +97,9 @@ public:
     // A model's BLAS geometry: its opaque triangles, then its alpha-tested ones. Returns the number of descs used.
     static UINT GeometryDescs(D3D12_GPU_VIRTUAL_ADDRESS vertices, UINT vertexCount, D3D12_GPU_VIRTUAL_ADDRESS indices, UINT triangles,
         UINT opaqueTriangles, D3D12_RAYTRACING_GEOMETRY_DESC (&descs)[2]);
-    void SetStaticInstances(std::vector<SceneInstance> instances) { m_staticInstances = std::move(instances); }
+    // Static props, and the 3D skybox's geometry with kSkyboxMask; a mask of 0 means kStaticPropMask.
+    void SetStaticInstances(std::vector<SceneInstance> instances);
+    bool HasSkybox() const { return m_hasSkybox; }
     // The engine's dynamic lights for the next RecordFrame.
     void SetDynamicLights(std::span<const engine::DynamicLight> lights) { m_dynamicLights.assign(lights.begin(), lights.end()); }
     void Clear();
@@ -183,6 +187,7 @@ private:
     UINT m_materialsView = DescriptorHeap::kInvalid;
     UINT m_materialCount = 0;
     std::vector<SceneInstance> m_staticInstances;
+    bool m_hasSkybox = false;
     std::vector<engine::DynamicLight> m_dynamicLights;
     std::array<FrameTlas, kFrameSlots> m_frames;
     int m_worldModel = -1;

@@ -8,6 +8,12 @@
 #include <g_gbufferBumpPS.h>
 #include <g_gbufferBumpSelfIllumFresnelPS.h>
 #include <g_gbufferBumpSelfIllumPS.h>
+#include <g_gbufferSkinDetailPS.h>
+#include <g_gbufferSkinDetailSelfIllumFresnelPS.h>
+#include <g_gbufferSkinDetailSelfIllumPS.h>
+#include <g_gbufferSkinNoBumpDetailPS.h>
+#include <g_gbufferSkinNoBumpDetailSelfIllumFresnelPS.h>
+#include <g_gbufferSkinNoBumpDetailSelfIllumPS.h>
 #include <g_gbufferSkinNoBumpPS.h>
 #include <g_gbufferSkinNoBumpSelfIllumFresnelPS.h>
 #include <g_gbufferSkinNoBumpSelfIllumPS.h>
@@ -83,11 +89,13 @@ struct ShaderInfo {
 enum class SelfIllum { None, Mask, Fresnel };
 
 // Indexed by [shader][SelfIllum].
-enum class ReplacedShader { Bump, Skin, SkinNoBump, Count };
+enum class ReplacedShader { Bump, Skin, SkinNoBump, SkinDetail, SkinNoBumpDetail, Count };
 const BYTE* const kReplacementCode[][3] = {
     {g_gbufferBumpPS, g_gbufferBumpSelfIllumPS, g_gbufferBumpSelfIllumFresnelPS},
     {g_gbufferSkinPS, g_gbufferSkinSelfIllumPS, g_gbufferSkinSelfIllumFresnelPS},
     {g_gbufferSkinNoBumpPS, g_gbufferSkinNoBumpSelfIllumPS, g_gbufferSkinNoBumpSelfIllumFresnelPS},
+    {g_gbufferSkinDetailPS, g_gbufferSkinDetailSelfIllumPS, g_gbufferSkinDetailSelfIllumFresnelPS},
+    {g_gbufferSkinNoBumpDetailPS, g_gbufferSkinNoBumpDetailSelfIllumPS, g_gbufferSkinNoBumpDetailSelfIllumFresnelPS},
 };
 using Replacements = std::array<std::array<ComPtr<IDirect3DPixelShader9>, 3>, static_cast<size_t>(ReplacedShader::Count)>;
 
@@ -194,6 +202,8 @@ SelfIllum BumpSelfIllum(const std::vector<bytecode::Constant>& constants)
     // the material is self-illuminated.
     return HasConstant(constants, "DetailSampler") ? SelfIllum::None : SelfIllum::Mask;
 }
+
+constexpr UINT kSkinDetailSampler = 13;
 
 SelfIllum SkinSelfIllum(const std::vector<bytecode::Constant>& constants)
 {
@@ -413,7 +423,13 @@ HRESULT CreatePixelShader(IDirect3DDevice9* device, const DWORD* code, IDirect3D
         substitute = EnsureReplacement(device, ReplacedShader::Bump, selfIllum, create);
     } else if (IsSkinShader(constants)) {
         selfIllum = SkinSelfIllum(constants);
-        substitute = EnsureReplacement(device, HasConstant(constants, "NormalMapSampler") ? ReplacedShader::Skin : ReplacedShader::SkinNoBump, selfIllum, create);
+        const bool normalMap = HasConstant(constants, "NormalMapSampler");
+        // Other detail blend modes are left out: the replacement then shows the base texture alone.
+        const bool detail = HasRegister(constants, "DetailSampler", bytecode::RegisterSet::Sampler, kSkinDetailSampler) &&
+            bytecode::ModulatesSampleBy2x(original, kSkinDetailSampler);
+        const ReplacedShader replaced = detail ? (normalMap ? ReplacedShader::SkinDetail : ReplacedShader::SkinNoBumpDetail)
+                                               : (normalMap ? ReplacedShader::Skin : ReplacedShader::SkinNoBump);
+        substitute = EnsureReplacement(device, replaced, selfIllum, create);
     }
     if (substitute != nullptr) {
         ++g_state.replacedShaders;

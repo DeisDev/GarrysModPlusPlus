@@ -4,7 +4,7 @@
 // self-illumination, plus the light the game's flashlight passes added, written in the encoding the game
 // uses for lit colours. Pixels without
 // G-buffer data keep the game's forward colour.
-// input0: denoised indirect irradiance; input1: raw indirect estimate (debug view); input2: reflections and
+// input0: denoised indirect irradiance, or none for the sky's light; input1: raw indirect estimate (debug view); input2: reflections and
 // self-illumination (shaders/reflections.hlsl), or none; output0: shaded colour, encoded or (outputLinear) linear.
 
 // Source's range fog (CalcRangeFog and BlendPixelFog in common_ps_fxc.h), applied after the tonemap scale.
@@ -139,9 +139,13 @@ void main(uint3 id : SV_DispatchThreadID)
     float3 position = WorldPositionFromDepth(pixel, DepthAt(pixel));
     float sunVisibility;
     uint seed = PixelSeed(pixel, 0x2Du);
-    float3 direct = DirectIrradiance(position, surface.xyz, surface.w, seed, sunVisibility);
-    Texture2D<float4> indirectTexture = ResourceDescriptorHeap[g_pass.input0];
-    float3 indirect = (g_frame.traceMask != 0 ? indirectTexture.Load(int3(pixel, 0)).rgb : g_frame.skyColor) * g_frame.indirectScale;
+    float3 direct = DirectIrradiance(LitPosition(position), surface.xyz, surface.w, seed, sunVisibility);
+    float3 indirect = g_frame.skyColor;
+    if (g_pass.input0 != kNoView) {
+        Texture2D<float4> indirectTexture = ResourceDescriptorHeap[g_pass.input0];
+        indirect = indirectTexture.Load(int3(pixel, 0)).rgb;
+    }
+    indirect *= g_frame.indirectScale;
 
     float3 result;
     switch (g_frame.debugView) {

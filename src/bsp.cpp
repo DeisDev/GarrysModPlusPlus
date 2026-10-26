@@ -681,7 +681,7 @@ bool LoadWorld(std::span<const std::byte> file, WorldGeometry& world, std::strin
 
     world = {};
     // The scaled-down 3D skybox scene is world geometry placed outside the playable space; it must not
-    // occlude sun rays, so faces in the sky camera's area are skipped.
+    // occlude the main view's rays, so faces and props in the sky camera's area are kept apart.
     const std::optional<AreaLocator> areas = MakeAreaLocator(file, header);
     const std::optional<Float3> skyCamera = SkyCameraOrigin(file, header);
     const int skyArea = areas && skyCamera ? areas->AreaAt(*skyCamera) : -1;
@@ -703,6 +703,10 @@ bool LoadWorld(std::span<const std::byte> file, WorldGeometry& world, std::strin
             if (face.side != 0)
                 normal = Scale(normal, -1.0f);
             if (areas->AreaAt(Add(center, normal)) == skyArea) {
+                if (face.dispinfo >= 0 && static_cast<size_t>(face.dispinfo) < lumps.dispinfos.size())
+                    AddDisplacement(world.skybox, lumps, face, lumps.dispinfos[face.dispinfo], polygon);
+                else
+                    AddPolygon(world.skybox, lumps, face, polygon);
                 ++world.skyboxFaceCount;
                 continue;
             }
@@ -733,9 +737,13 @@ bool LoadWorld(std::span<const std::byte> file, WorldGeometry& world, std::strin
     ReadVisibility(file, header, world.visibility);
     ReadStaticProps(file, header, world);
     if (skyArea >= 0) {
-        world.skyboxPropCount = static_cast<uint32_t>(std::erase_if(world.props, [&](const StaticProp& prop) {
+        for (const StaticProp& prop : world.props) {
+            if (areas->AreaAt({prop.transform[0][3], prop.transform[1][3], prop.transform[2][3]}) == skyArea)
+                world.skyboxProps.push_back(prop);
+        }
+        std::erase_if(world.props, [&](const StaticProp& prop) {
             return areas->AreaAt({prop.transform[0][3], prop.transform[1][3], prop.transform[2][3]}) == skyArea;
-        }));
+        });
     }
     if (world.mesh.indices.empty()) {
         error = "the world model has no drawable faces";

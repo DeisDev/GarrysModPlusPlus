@@ -75,7 +75,7 @@ void main(uint3 id : SV_DispatchThreadID)
         return;
     }
     float3 normal = surface.xyz;
-    float3 position = WorldPositionFromDepth(pixel, DepthAt(pixel));
+    float3 position = LitPosition(WorldPositionFromDepth(pixel, DepthAt(pixel)));
     uint seed = PixelSeed(id.xy, 0x51u);
     float3 origin = position + normal * (g_frame.normalBias * (1.0 + surface.w * 0.002));
     uint samples = max(g_pass.step, 1u);

@@ -386,6 +386,7 @@ void Scene::Clear()
     m_textures.clear();
     m_materialCount = 0;
     m_staticInstances.clear();
+    m_hasSkybox = false;
     m_worldModel = -1;
     m_name.clear();
     m_sun = {};
@@ -563,6 +564,12 @@ bool Scene::EnsureFrameCapacity(FrameTlas& frame, UINT count)
     return true;
 }
 
+void Scene::SetStaticInstances(std::vector<SceneInstance> instances)
+{
+    m_staticInstances = std::move(instances);
+    m_hasSkybox = std::any_of(m_staticInstances.begin(), m_staticInstances.end(), [](const SceneInstance& instance) { return instance.mask == kSkyboxMask; });
+}
+
 SceneFrame Scene::RecordFrame(ID3D12GraphicsCommandList4* list, UINT slot, std::span<const SceneInstance> dynamic)
 {
     FrameTlas& frame = m_frames[slot % kFrameSlots];
@@ -594,7 +601,7 @@ SceneFrame Scene::RecordFrame(ID3D12GraphicsCommandList4* list, UINT slot, std::
     world.model = m_worldModel;
     write(world, nullptr, kWorldMask);
     for (const SceneInstance& instance : m_staticInstances)
-        write(instance, instance.transform, kStaticPropMask);
+        write(instance, instance.transform, instance.mask != 0 ? instance.mask : kStaticPropMask);
     for (const SceneInstance& instance : dynamic)
         write(instance, instance.transform, instance.mask != 0 ? instance.mask : kDynamicMask);
 

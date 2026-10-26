@@ -4,7 +4,8 @@
 // the self-illuminated colour, which the lighting pass adds unlit. All colours are linear.
 //
 // SELFILLUM selects the original shader's self-illumination: 0 none, 1 base alpha mask, 2 base alpha or
-// mask texture (skin), 3 base alpha times a fresnel term.
+// mask texture (skin), 3 base alpha times a fresnel term. SKIN_DETAIL applies a skin detail texture in
+// $detailblendmode 0 (base times detail times 2).
 
 #ifndef SELFILLUM
 #define SELFILLUM 0
@@ -24,6 +25,7 @@ float4 g_SkinSelfIllumScaleBiasExpBrightness : register(c3);
 float4 g_SkinEnvMapFresnel : register(c10);
 float4 g_ShaderControls : register(c27);
 sampler SkinSelfIllumMaskSampler : register(s14);
+sampler SkinDetailSampler : register(s13);
 
 struct GBufferOutput
 {
@@ -88,6 +90,10 @@ struct SkinInput
 GBufferOutput SkinMain(SkinInput i)
 {
     float4 base = tex2D(BaseTextureSampler, i.baseTexCoord.xy);
+#if SKIN_DETAIL
+    // TextureCombine's TCOMBINE_RGB_EQUALS_BASE_x_DETAILx2; c0.w is the detail blend factor.
+    base.rgb *= lerp(1.0, 2.0 * tex2D(SkinDetailSampler, i.baseTexCoord.zw).rgb, g_SkinSelfIllumTint.w);
+#endif
 #if SKIN_NORMAL_MAP
     float3 tangentNormal = lerp(tex2D(NormalSampler, i.baseTexCoord.xy).xyz * 2.0 - 1.0, float3(0.0, 0.0, 1.0), g_ShaderControls.x);
 #else

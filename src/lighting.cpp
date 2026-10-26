@@ -446,7 +446,9 @@ bool Lighting::FillConstants(FrameConstants& constants, const Scene& scene, cons
     constants.bspNodesView = lists.nodesView;
     constants.leafClustersView = lists.leafClustersView;
     constants.clusterCount = lists.clusterCount;
-    if (inputs.kind == gbuffer::ViewKind::Main) {
+    constants.viewmodel = inputs.kind == gbuffer::ViewKind::Viewmodel ? 1u : 0u;
+    // The skybox view shares the main view's orientation, so it finds last frame's sky (reflections.hlsl).
+    if (inputs.kind != gbuffer::ViewKind::Viewmodel) {
         constants.historyValid = m_historyValid && inputs.frame - m_lastMainFrame <= 2 ? 1u : 0u;
         std::memcpy(constants.prevViewProj, m_prevViewProj, sizeof(constants.prevViewProj));
         std::memcpy(constants.prevEyePosition, m_prevEye, sizeof(constants.prevEyePosition));
@@ -724,8 +726,10 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
         statistics.projectedLights = constants.projectorCount;
         statistics.sceneInstances = static_cast<uint32_t>(1 + m_frameInstances.size());
     }
-    if (inputs.kind == gbuffer::ViewKind::Skybox || frame.tlas == 0)
+    if (frame.tlas == 0 || (inputs.kind == gbuffer::ViewKind::Skybox && !scene.HasSkybox()))
         constants.traceMask = 0;
+    else if (inputs.kind == gbuffer::ViewKind::Skybox)
+        constants.traceMask = kSkyboxMask;
     else
         constants.traceMask = inputs.kind == gbuffer::ViewKind::Viewmodel ? kViewmodelTraceMask : kTraceMask;
 
@@ -775,10 +779,17 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     Use(m_surface[current], read);
     Use(m_surface[previous], read);
     Texture* indirect = &m_giFiltered[0];
-    if (constants.traceMask != 0 && !main) {
+    // Untraced views and the distant 3D skybox (traced for reflections and sun shadows only) take the sky's
+    // light as their indirect light.
+    if (constants.traceMask == 0 || inputs.kind == gbuffer::ViewKind::Skybox) {
+        indirect = nullptr;
+        mark();
+        mark();
+        mark();
+    } else if (constants.traceMask != 0 && !main) {
         Use(m_giFiltered[0], read);
         Use(m_giRaw, write);
-        Dispatch(Pass::GiTrace, {m_giFiltered[0].srv, 0, 0, m_giRaw.uav, 0, kViewmodelIndirectSamples});
+        Dispatch(Pass::GiTrace, {kInvalidView, 0, 0, m_giRaw.uav, 0, kViewmodelIndirectSamples});
         mark();
         mark();
         Texture* source = &m_giRaw;
@@ -819,10 +830,6 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
         }
         indirect = source;
         mark();
-    } else {
-        mark();
-        mark();
-        mark();
     }
     UINT reflections = kInvalidView;
     if (constants.traceMask != 0) {
@@ -839,10 +846,11 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
         reflections = m_reflections.srv;
     }
     mark();
-    Use(*indirect, read);
+    if (indirect != nullptr)
+        Use(*indirect, read);
     Use(m_giRaw, read);
     Use(m_lit[current], write);
-    Dispatch(Pass::Lighting, {indirect->srv, m_giRaw.srv, reflections, m_lit[current].uav});
+    Dispatch(Pass::Lighting, {indirect != nullptr ? indirect->srv : kInvalidView, m_giRaw.srv, reflections, m_lit[current].uav});
     mark();
     // The 3D skybox is drawn before the main view, which covers it again, so only the main view is resolved.
     Texture* output = &m_lit[current];

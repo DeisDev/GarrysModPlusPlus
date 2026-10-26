@@ -124,6 +124,22 @@ bool TraceHit(float3 origin, float3 direction, float tMax, uint mask, out HitInf
     return true;
 }
 
+// Where lighting of a G-buffer position is evaluated. The viewmodel is drawn with its own projection and depth
+// range, so next to a wall its surface lies inside or behind world geometry; it is lit from the last point
+// the eye can see on the way to it instead.
+float3 LitPosition(float3 position)
+{
+    if (g_frame.viewmodel == 0)
+        return position;
+    float3 toPosition = position - g_frame.eyePosition;
+    float distance = length(toPosition);
+    float3 direction = toPosition / max(distance, 1e-4);
+    HitInfo hit;
+    if (!TraceHit(g_frame.eyePosition, direction, distance, g_frame.traceMask, hit))
+        return position;
+    return g_frame.eyePosition + direction * max(hit.t - 2.0, 0.0);
+}
+
 // Face normal (facing the ray origin) and albedo of a hit triangle.
 HitSurface SurfaceOf(HitInfo hit, float3 origin, float3 direction)
 {
@@ -312,6 +328,8 @@ static const float kAttachedLightClearance = 48.0;
 
 // kLocalPlayerMask in src/scene.h.
 static const uint kLocalPlayerMask = 0x08;
+// kSkyboxMask in src/scene.h.
+static const uint kSkyboxMask = 0x10;
 
 float ShadowRayLength(bool attachedLight, float distance)
 {

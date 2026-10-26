@@ -27,6 +27,10 @@ size_t TokenCount(const DWORD* code);
 // True when the shader writes the given colour output register (oCn).
 bool WritesColorOutput(std::span<const DWORD> code, UINT index);
 
+// True when the first use of the colour of the shader's sample of sampler `index` remaps it as
+// sample * 2 - 1 with `def` constants, as TextureCombine's TCOMBINE_RGB_EQUALS_BASE_x_DETAILx2 compiles.
+bool ModulatesSampleBy2x(std::span<const DWORD> code, UINT index);
+
 // Replaces every `def` literal equal to `from` with `to`; returns how many were replaced.
 int ReplaceDefLiteral(std::span<DWORD> code, float from, float to);
 
