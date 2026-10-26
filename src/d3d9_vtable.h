@@ -23,6 +23,11 @@ extern const int kSlotDeviceDrawIndexedPrimitiveUP;
 extern const int kSlotDeviceStretchRect;
 extern const int kSlotDeviceSetVertexShader;
 extern const int kSlotDeviceSetPixelShader;
+extern const int kSlotDeviceCreatePixelShader;
+extern const int kSlotDeviceSetPixelShaderConstantF;
+extern const int kSlotDeviceSetRenderState;
+extern const int kSlotDeviceCreateVertexShader;
+extern const int kSlotDeviceSetTexture;
 extern const int kSlotDeviceExPresentEx;
 extern const int kSlotDeviceExResetEx;
 

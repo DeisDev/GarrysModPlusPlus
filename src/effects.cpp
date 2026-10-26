@@ -4,26 +4,26 @@
 #include "client_hooks.h"
 #include "engine_interfaces.h"
 #include "entities.h"
+#include "gbuffer.h"
+#include "lighting.h"
 #include "log.h"
 #include "mod.h"
 #include "renderer.h"
 #include "scene.h"
+#include "settings.h"
 #include "skinned_casters.h"
 #include "studio_model.h"
-#include "sun_shadows.h"
 
-#include <g_compositePS.h>
-#include <g_compositeVS.h>
-
-#include <d3d9on12.h>
 #include <wrl/client.h>
 
-#include <array>
+#include <algorithm>
+#include <charconv>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <memory>
-#include <span>
+#include <numeric>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -34,137 +34,59 @@ namespace gmodpp::effects {
 
 namespace {
 
-constexpr UINT kFrameCount = 3;
-constexpr UINT kDescriptorsPerFrame = 16;
-constexpr UINT kDescriptorsPerEffect = 3;
 constexpr UINT kMapPollInterval = 30;
 constexpr int kMaxBones = 256;
-constexpr UINT kConstantsStride = D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT;
-static_assert(sizeof(FrameConstants) <= kConstantsStride);
+constexpr bsp::Float3 kDefaultReflectivity = {0.5f, 0.5f, 0.5f};
+constexpr float kDefaultAlphaReference = 0.5f;
+// Alpha and mask textures are read from a mip no larger than this; shadows and reflections need no more detail.
+constexpr uint32_t kSceneTextureSize = 256;
+constexpr uint32_t kOpaqueTriangle = 0xFFFFFFFF;
 const D3DFORMAT kIntzFormat = static_cast<D3DFORMAT>(MAKEFOURCC('I', 'N', 'T', 'Z'));
+
+constexpr uint32_t kJitterSamples = 8;
+constexpr uint32_t kRayReconstructionPhases = 32;
+// The local player's held weapon is drawn as a world model right next to the camera; in first person it would
+// shadow the viewmodel and cast a floating shadow, so weapon world models this close to the eye are left out.
+constexpr float kHeldWeaponDistance = 96.0f;
 
 unsigned Hex(HRESULT hr) { return static_cast<unsigned>(hr); }
 
-bool Invert(const float m[4][4], float out[4][4])
+float Halton(uint32_t index, uint32_t base)
 {
-    const float* a = &m[0][0];
-    float inv[16];
-    inv[0] = a[5] * a[10] * a[15] - a[5] * a[11] * a[14] - a[9] * a[6] * a[15] + a[9] * a[7] * a[14] + a[13] * a[6] * a[11] - a[13] * a[7] * a[10];
-    inv[4] = -a[4] * a[10] * a[15] + a[4] * a[11] * a[14] + a[8] * a[6] * a[15] - a[8] * a[7] * a[14] - a[12] * a[6] * a[11] + a[12] * a[7] * a[10];
-    inv[8] = a[4] * a[9] * a[15] - a[4] * a[11] * a[13] - a[8] * a[5] * a[15] + a[8] * a[7] * a[13] + a[12] * a[5] * a[11] - a[12] * a[7] * a[9];
-    inv[12] = -a[4] * a[9] * a[14] + a[4] * a[10] * a[13] + a[8] * a[5] * a[14] - a[8] * a[6] * a[13] - a[12] * a[5] * a[10] + a[12] * a[6] * a[9];
-    inv[1] = -a[1] * a[10] * a[15] + a[1] * a[11] * a[14] + a[9] * a[2] * a[15] - a[9] * a[3] * a[14] - a[13] * a[2] * a[11] + a[13] * a[3] * a[10];
-    inv[5] = a[0] * a[10] * a[15] - a[0] * a[11] * a[14] - a[8] * a[2] * a[15] + a[8] * a[3] * a[14] + a[12] * a[2] * a[11] - a[12] * a[3] * a[10];
-    inv[9] = -a[0] * a[9] * a[15] + a[0] * a[11] * a[13] + a[8] * a[1] * a[15] - a[8] * a[3] * a[13] - a[12] * a[1] * a[11] + a[12] * a[3] * a[9];
-    inv[13] = a[0] * a[9] * a[14] - a[0] * a[10] * a[13] - a[8] * a[1] * a[14] + a[8] * a[2] * a[13] + a[12] * a[1] * a[10] - a[12] * a[2] * a[9];
-    inv[2] = a[1] * a[6] * a[15] - a[1] * a[7] * a[14] - a[5] * a[2] * a[15] + a[5] * a[3] * a[14] + a[13] * a[2] * a[7] - a[13] * a[3] * a[6];
-    inv[6] = -a[0] * a[6] * a[15] + a[0] * a[7] * a[14] + a[4] * a[2] * a[15] - a[4] * a[3] * a[14] - a[12] * a[2] * a[7] + a[12] * a[3] * a[6];
-    inv[10] = a[0] * a[5] * a[15] - a[0] * a[7] * a[13] - a[4] * a[1] * a[15] + a[4] * a[3] * a[13] + a[12] * a[1] * a[7] - a[12] * a[3] * a[5];
-    inv[14] = -a[0] * a[5] * a[14] + a[0] * a[6] * a[13] + a[4] * a[1] * a[14] - a[4] * a[2] * a[13] - a[12] * a[1] * a[6] + a[12] * a[2] * a[5];
-    inv[3] = -a[1] * a[6] * a[11] + a[1] * a[7] * a[10] + a[5] * a[2] * a[11] - a[5] * a[3] * a[10] - a[9] * a[2] * a[7] + a[9] * a[3] * a[6];
-    inv[7] = a[0] * a[6] * a[11] - a[0] * a[7] * a[10] - a[4] * a[2] * a[11] + a[4] * a[3] * a[10] + a[8] * a[2] * a[7] - a[8] * a[3] * a[6];
-    inv[11] = -a[0] * a[5] * a[11] + a[0] * a[7] * a[9] + a[4] * a[1] * a[11] - a[4] * a[3] * a[9] - a[8] * a[1] * a[7] + a[8] * a[3] * a[5];
-    inv[15] = a[0] * a[5] * a[10] - a[0] * a[6] * a[9] - a[4] * a[1] * a[10] + a[4] * a[2] * a[9] + a[8] * a[1] * a[6] - a[8] * a[2] * a[5];
-    float det = a[0] * inv[0] + a[1] * inv[4] + a[2] * inv[8] + a[3] * inv[12];
-    if (std::fabs(det) < 1e-20f)
-        return false;
-    for (int i = 0; i < 16; ++i)
-        (&out[0][0])[i] = inv[i] / det;
-    return true;
+    float result = 0.0f;
+    float fraction = 1.0f / static_cast<float>(base);
+    for (; index > 0; index /= base, fraction /= static_cast<float>(base))
+        result += fraction * static_cast<float>(index % base);
+    return result;
 }
-
-float Luminance(const bsp::Float3& c) { return 0.2126f * c.x + 0.7152f * c.y + 0.0722f * c.z; }
-
-D3D12_RESOURCE_BARRIER Transition(ID3D12Resource* resource, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after)
-{
-    D3D12_RESOURCE_BARRIER barrier = {};
-    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    barrier.Transition.pResource = resource;
-    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    barrier.Transition.StateBefore = before;
-    barrier.Transition.StateAfter = after;
-    return barrier;
-}
-
-DXGI_FORMAT ColorViewFormat(DXGI_FORMAT format)
-{
-    switch (format) {
-    case DXGI_FORMAT_B8G8R8A8_TYPELESS: return DXGI_FORMAT_B8G8R8A8_UNORM;
-    case DXGI_FORMAT_B8G8R8X8_TYPELESS: return DXGI_FORMAT_B8G8R8X8_UNORM;
-    case DXGI_FORMAT_R8G8B8A8_TYPELESS: return DXGI_FORMAT_R8G8B8A8_UNORM;
-    default: return format;
-    }
-}
-
-DXGI_FORMAT DepthViewFormat(DXGI_FORMAT format)
-{
-    switch (format) {
-    case DXGI_FORMAT_R24G8_TYPELESS:
-    case DXGI_FORMAT_D24_UNORM_S8_UINT: return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
-    case DXGI_FORMAT_R32G8X24_TYPELESS:
-    case DXGI_FORMAT_D32_FLOAT_S8X24_UINT: return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
-    case DXGI_FORMAT_R32_TYPELESS:
-    case DXGI_FORMAT_D32_FLOAT: return DXGI_FORMAT_R32_FLOAT;
-    case DXGI_FORMAT_R16_TYPELESS:
-    case DXGI_FORMAT_D16_UNORM: return DXGI_FORMAT_R16_UNORM;
-    default: return DXGI_FORMAT_UNKNOWN;
-    }
-}
-
-class EffectSystem {
-public:
-    bool Initialize(Renderer& renderer, IDirect3DDevice9* device);
-    void Run(IDirect3DSurface9* color, IDirect3DTexture9* depth, Scene& scene, std::span<const SceneInstance> dynamic,
-        const std::vector<SkinnedEntity>& skinned);
-    SkinnedCasters& Skinned() { return m_skinned; }
-    void WaitForGpu();
-
-private:
-    bool EnsureTargets(UINT width, UINT height);
-    ComPtr<ID3D12Resource> CreateTexture(UINT width, UINT height, DXGI_FORMAT format, D3D12_RESOURCE_FLAGS flags, D3D12_RESOURCE_STATES state);
-    D3D12_CPU_DESCRIPTOR_HANDLE Cpu(UINT index) const;
-    D3D12_GPU_DESCRIPTOR_HANDLE Gpu(UINT index) const;
-    void FillConstants(FrameConstants& constants, const Scene& scene, UINT width, UINT height, bool& valid);
-
-    Renderer* m_renderer = nullptr;
-    ID3D12Device5* m_device = nullptr;
-    ComPtr<IDirect3DDevice9On12> m_device9On12;
-    ComPtr<IDirect3DQuery9> m_flushQuery;
-    std::array<ComPtr<ID3D12CommandAllocator>, kFrameCount> m_allocators;
-    std::array<uint64_t, kFrameCount> m_frameFenceValues = {};
-    ComPtr<ID3D12GraphicsCommandList4> m_list;
-    ComPtr<ID3D12Fence> m_fence;
-    HANDLE m_fenceEvent = nullptr;
-    uint64_t m_fenceValue = 0;
-    ComPtr<ID3D12DescriptorHeap> m_viewHeap;
-    ComPtr<ID3D12DescriptorHeap> m_rtvHeap;
-    UINT m_viewIncrement = 0;
-    UINT m_rtvIncrement = 0;
-    ComPtr<ID3D12Resource> m_constants;
-    std::byte* m_constantsMapped = nullptr;
-    ComPtr<ID3D12RootSignature> m_compositeRoot;
-    ComPtr<ID3D12PipelineState> m_compositePipeline;
-    ComPtr<ID3D12Resource> m_sceneCopy;
-    std::array<ComPtr<ID3D12Resource>, 2> m_pingPong;
-    UINT m_width = 0;
-    UINT m_height = 0;
-    std::vector<std::unique_ptr<Effect>> m_effects;
-    SkinnedCasters m_skinned;
-    std::vector<SceneInstance> m_frameInstances;
-    ComPtr<ID3D12QueryHeap> m_timestamps;
-    ComPtr<ID3D12Resource> m_timestampReadback;
-    const uint64_t* m_timestampValues = nullptr;
-    double m_timestampPeriodMs = 0.0;
-    double m_gpuMsTotal = 0.0;
-    uint32_t m_gpuSamples = 0;
-    uint64_t m_frame = 0;
-    bool m_loggedFormats = false;
-    bool m_failed = false;
-};
 
 struct ModelEntry {
     int sceneModel = -1;
     std::shared_ptr<SkinnedModel> skinned;
+};
+
+struct MaterialInfo {
+    // Translucent surfaces (glass) cast no shadow; alpha-tested ones (foliage, fences) are cut by their alpha.
+    bool translucent = false;
+    bool alphaTest = false;
+    float alphaReference = kDefaultAlphaReference;
+    std::string baseTexture;
+    bsp::Float3 reflectivity = kDefaultReflectivity;
+    // Reflections and self-illumination, for Scene::AddMaterial.
+    uint32_t sceneMaterial = Scene::kNoMaterial;
+};
+
+// What Scene::AddModel needs beyond positions, indices and albedo; alpha-tested triangles are moved last.
+struct TriangleData {
+    UINT opaqueTriangles = 0;
+    std::vector<uint32_t> alphaTriangles;
+    // Scene material of each triangle.
+    std::vector<uint32_t> materials;
+};
+
+struct SceneTexture {
+    UINT view = DescriptorHeap::kInvalid;
+    bool alpha = false;
 };
 
 struct State {
@@ -172,407 +94,34 @@ struct State {
     ComPtr<IDirect3DTexture9> depthTexture;
     ComPtr<IDirect3DSurface9> depthSurface;
     bool depthReplaced = false;
+    bool gbufferReady = false;
     DWORD renderThread = 0;
     uint64_t frame = 0;
-    uint64_t lastRunFrame = UINT64_MAX;
     bool warnedQueuedRendering = false;
-    std::unique_ptr<EffectSystem> system;
+    std::unique_ptr<Lighting> lighting;
     Scene scene;
     bool sceneInitialized = false;
     std::string failedMap;
-    uint32_t debugView = 0;
     std::unordered_map<std::string, ModelEntry> models;
-    std::unordered_map<std::string, bool> seeThroughMaterials;
+    std::unordered_map<std::string, std::optional<MaterialInfo>> materials;
+    // Textures uploaded for alpha tests and material masks, by VTF path.
+    std::unordered_map<std::string, SceneTexture> textures;
+    std::vector<std::string> mapMaterials;
     uint32_t modelErrors = 0;
     std::vector<entities::ModelEntity> entities;
     std::vector<SceneInstance> dynamicInstances;
     std::vector<SkinnedEntity> skinnedEntities;
     std::vector<studio::Matrix3x4> bones;
+    std::vector<engine::DynamicLight> dynamicLights;
+    std::vector<bsp::Mesh> brushModels;
+    bool viewmodelCapture = false;
+    // How far this frame's image is shifted, in render pixels (x right, y down), for Ray Reconstruction.
+    float pixelOffset[2] = {};
+    D3DVIEWPORT9 viewmodelViewport = {};
+    const std::vector<SkinnedEntity> noSkinnedEntities;
 };
 
 State g_state;
-
-bool EffectSystem::Initialize(Renderer& renderer, IDirect3DDevice9* device)
-{
-    m_renderer = &renderer;
-    m_device = renderer.Device();
-    HRESULT hr = device->QueryInterface(IID_PPV_ARGS(&m_device9On12));
-    if (SUCCEEDED(hr))
-        hr = device->CreateQuery(D3DQUERYTYPE_EVENT, &m_flushQuery);
-    for (auto& allocator : m_allocators) {
-        if (SUCCEEDED(hr))
-            hr = m_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator));
-    }
-    if (SUCCEEDED(hr))
-        hr = m_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, m_allocators[0].Get(), nullptr, IID_PPV_ARGS(&m_list));
-    if (SUCCEEDED(hr))
-        hr = m_list->Close();
-    if (SUCCEEDED(hr))
-        hr = m_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&m_fence));
-    if (SUCCEEDED(hr)) {
-        D3D12_DESCRIPTOR_HEAP_DESC desc = {D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kFrameCount * kDescriptorsPerFrame, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
-        hr = m_device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&m_viewHeap));
-    }
-    if (SUCCEEDED(hr)) {
-        D3D12_DESCRIPTOR_HEAP_DESC desc = {D3D12_DESCRIPTOR_HEAP_TYPE_RTV, kFrameCount};
-        hr = m_device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&m_rtvHeap));
-    }
-    if (SUCCEEDED(hr)) {
-        D3D12_HEAP_PROPERTIES heap = {D3D12_HEAP_TYPE_UPLOAD};
-        D3D12_RESOURCE_DESC desc = {};
-        desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        desc.Width = kConstantsStride * kFrameCount;
-        desc.Height = 1;
-        desc.DepthOrArraySize = 1;
-        desc.MipLevels = 1;
-        desc.SampleDesc.Count = 1;
-        desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-        hr = m_device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&m_constants));
-    }
-    if (SUCCEEDED(hr))
-        hr = m_constants->Map(0, nullptr, reinterpret_cast<void**>(&m_constantsMapped));
-    if (SUCCEEDED(hr)) {
-        D3D12_QUERY_HEAP_DESC desc = {D3D12_QUERY_HEAP_TYPE_TIMESTAMP, kFrameCount * 2};
-        hr = m_device->CreateQueryHeap(&desc, IID_PPV_ARGS(&m_timestamps));
-    }
-    if (SUCCEEDED(hr)) {
-        D3D12_HEAP_PROPERTIES heap = {D3D12_HEAP_TYPE_READBACK};
-        D3D12_RESOURCE_DESC desc = {};
-        desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        desc.Width = sizeof(uint64_t) * 2 * kFrameCount;
-        desc.Height = 1;
-        desc.DepthOrArraySize = 1;
-        desc.MipLevels = 1;
-        desc.SampleDesc.Count = 1;
-        desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-        hr = m_device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&m_timestampReadback));
-    }
-    if (SUCCEEDED(hr))
-        hr = m_timestampReadback->Map(0, nullptr, reinterpret_cast<void**>(const_cast<uint64_t**>(&m_timestampValues)));
-    if (SUCCEEDED(hr)) {
-        UINT64 frequency = 0;
-        hr = renderer.Queue()->GetTimestampFrequency(&frequency);
-        m_timestampPeriodMs = frequency ? 1000.0 / static_cast<double>(frequency) : 0.0;
-    }
-    if (SUCCEEDED(hr))
-        hr = m_device->CreateRootSignature(0, g_compositeVS, sizeof(g_compositeVS), IID_PPV_ARGS(&m_compositeRoot));
-    if (SUCCEEDED(hr)) {
-        D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = {};
-        desc.pRootSignature = m_compositeRoot.Get();
-        desc.VS = {g_compositeVS, sizeof(g_compositeVS)};
-        desc.PS = {g_compositePS, sizeof(g_compositePS)};
-        desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_RED | D3D12_COLOR_WRITE_ENABLE_GREEN | D3D12_COLOR_WRITE_ENABLE_BLUE;
-        desc.SampleMask = UINT_MAX;
-        desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-        desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-        desc.RasterizerState.DepthClipEnable = TRUE;
-        desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-        desc.NumRenderTargets = 1;
-        desc.RTVFormats[0] = DXGI_FORMAT_B8G8R8A8_UNORM;
-        desc.SampleDesc.Count = 1;
-        hr = m_device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&m_compositePipeline));
-    }
-    if (FAILED(hr)) {
-        log::Info("Effects: initialization failed ({:#010x})", Hex(hr));
-        return false;
-    }
-    m_fenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    m_viewIncrement = m_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    m_rtvIncrement = m_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-
-    m_skinned.Initialize(m_device);
-    m_effects.push_back(std::make_unique<SunShadows>());
-    for (auto& effect : m_effects) {
-        if (!effect->Initialize(m_device)) {
-            log::Info("Effects: '{}' failed to initialize", effect->Name());
-            return false;
-        }
-    }
-    if (m_effects.size() * kDescriptorsPerEffect + 1 > kDescriptorsPerFrame) {
-        log::Info("Effects: too many effects for the descriptor budget");
-        return false;
-    }
-    log::Info("Effects: initialized with {} effect(s)", m_effects.size());
-    return true;
-}
-
-ComPtr<ID3D12Resource> EffectSystem::CreateTexture(UINT width, UINT height, DXGI_FORMAT format, D3D12_RESOURCE_FLAGS flags, D3D12_RESOURCE_STATES state)
-{
-    D3D12_HEAP_PROPERTIES heap = {D3D12_HEAP_TYPE_DEFAULT};
-    D3D12_RESOURCE_DESC desc = {};
-    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    desc.Width = width;
-    desc.Height = height;
-    desc.DepthOrArraySize = 1;
-    desc.MipLevels = 1;
-    desc.Format = format;
-    desc.SampleDesc.Count = 1;
-    desc.Flags = flags;
-    ComPtr<ID3D12Resource> texture;
-    HRESULT hr = m_device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, nullptr, IID_PPV_ARGS(&texture));
-    if (FAILED(hr))
-        log::Info("Effects: {}x{} texture creation failed ({:#010x})", width, height, Hex(hr));
-    return texture;
-}
-
-bool EffectSystem::EnsureTargets(UINT width, UINT height)
-{
-    if (m_sceneCopy && width == m_width && height == m_height)
-        return true;
-    WaitForGpu();
-    m_sceneCopy = CreateTexture(width, height, DXGI_FORMAT_B8G8R8A8_UNORM, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
-    for (auto& texture : m_pingPong)
-        texture = CreateTexture(width, height, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    m_width = width;
-    m_height = height;
-    return m_sceneCopy && m_pingPong[0] && m_pingPong[1];
-}
-
-D3D12_CPU_DESCRIPTOR_HANDLE EffectSystem::Cpu(UINT index) const
-{
-    D3D12_CPU_DESCRIPTOR_HANDLE handle = m_viewHeap->GetCPUDescriptorHandleForHeapStart();
-    handle.ptr += static_cast<SIZE_T>(index) * m_viewIncrement;
-    return handle;
-}
-
-D3D12_GPU_DESCRIPTOR_HANDLE EffectSystem::Gpu(UINT index) const
-{
-    D3D12_GPU_DESCRIPTOR_HANDLE handle = m_viewHeap->GetGPUDescriptorHandleForHeapStart();
-    handle.ptr += static_cast<UINT64>(index) * m_viewIncrement;
-    return handle;
-}
-
-void EffectSystem::WaitForGpu()
-{
-    if (!m_fence)
-        return;
-    m_renderer->Queue()->Signal(m_fence.Get(), ++m_fenceValue);
-    if (m_fence->GetCompletedValue() < m_fenceValue) {
-        m_fence->SetEventOnCompletion(m_fenceValue, m_fenceEvent);
-        WaitForSingleObject(m_fenceEvent, INFINITE);
-    }
-}
-
-void EffectSystem::FillConstants(FrameConstants& constants, const Scene& scene, UINT width, UINT height, bool& valid)
-{
-    const CameraConstants& camera = m_renderer->Camera();
-    constants = {};
-    valid = Invert(camera.viewProj, constants.invViewProj);
-    std::memcpy(constants.eyePosition, camera.eyePos, sizeof(constants.eyePosition));
-    const bsp::SunLight& sun = scene.Sun();
-    constants.sunEnabled = sun.present ? 1.0f : 0.0f;
-    float length = std::sqrt(sun.direction.x * sun.direction.x + sun.direction.y * sun.direction.y + sun.direction.z * sun.direction.z);
-    if (length > 0.0f) {
-        constants.sunDirection[0] = sun.direction.x / length;
-        constants.sunDirection[1] = sun.direction.y / length;
-        constants.sunDirection[2] = sun.direction.z / length;
-    }
-    float sunLuminance = Luminance(sun.color);
-    constants.ambientRatio = sunLuminance > 0.0f ? std::max(Luminance(sun.ambient) / sunLuminance, 0.15f) : 0.3f;
-    constants.invSize[0] = 1.0f / static_cast<float>(width);
-    constants.invSize[1] = 1.0f / static_cast<float>(height);
-    constants.size[0] = width;
-    constants.size[1] = height;
-    constants.shadowStrength = 1.0f;
-    constants.bakedRadius = 12.0f;
-    constants.normalBias = 2.0f;
-    constants.debugView = g_state.debugView;
-}
-
-void EffectSystem::Run(IDirect3DSurface9* color9, IDirect3DTexture9* depth9, Scene& scene, std::span<const SceneInstance> dynamic,
-    const std::vector<SkinnedEntity>& skinned)
-{
-    if (m_failed)
-        return;
-    D3DSURFACE_DESC surfaceDesc;
-    color9->GetDesc(&surfaceDesc);
-    if (!EnsureTargets(surfaceDesc.Width, surfaceDesc.Height)) {
-        m_failed = true;
-        return;
-    }
-
-    const UINT slot = static_cast<UINT>(m_frame % kFrameCount);
-    if (m_fence->GetCompletedValue() < m_frameFenceValues[slot]) {
-        m_fence->SetEventOnCompletion(m_frameFenceValues[slot], m_fenceEvent);
-        WaitForSingleObject(m_fenceEvent, INFINITE);
-    }
-    if (m_frameFenceValues[slot] != 0) {
-        const uint64_t begin = m_timestampValues[slot * 2];
-        const uint64_t end = m_timestampValues[slot * 2 + 1];
-        if (end > begin) {
-            m_gpuMsTotal += static_cast<double>(end - begin) * m_timestampPeriodMs;
-            if (++m_gpuSamples == 300) {
-                log::Info("Effects: {:.3f} ms GPU per frame ({}x{})", m_gpuMsTotal / m_gpuSamples, m_width, m_height);
-                m_gpuMsTotal = 0.0;
-                m_gpuSamples = 0;
-            }
-        }
-    }
-
-    FrameConstants& constants = *reinterpret_cast<FrameConstants*>(m_constantsMapped + slot * kConstantsStride);
-    bool cameraValid = false;
-    FillConstants(constants, scene, m_width, m_height, cameraValid);
-    if (!cameraValid)
-        return;
-
-    m_flushQuery->Issue(D3DISSUE_END);
-    m_flushQuery->GetData(nullptr, 0, D3DGETDATA_FLUSH);
-
-    ID3D12CommandQueue* queue = m_renderer->Queue();
-    ComPtr<ID3D12Resource> color;
-    ComPtr<ID3D12Resource> depth;
-    HRESULT hr = m_device9On12->UnwrapUnderlyingResource(color9, queue, IID_PPV_ARGS(&color));
-    if (FAILED(hr)) {
-        log::Info("Effects: unwrapping the color target failed ({:#010x})", Hex(hr));
-        m_failed = true;
-        return;
-    }
-    hr = m_device9On12->UnwrapUnderlyingResource(depth9, queue, IID_PPV_ARGS(&depth));
-    if (FAILED(hr)) {
-        log::Info("Effects: unwrapping the depth texture failed ({:#010x})", Hex(hr));
-        UINT64 value = m_fenceValue;
-        ID3D12Fence* fence = m_fence.Get();
-        m_device9On12->ReturnUnderlyingResource(color9, 0, &value, &fence);
-        m_failed = true;
-        return;
-    }
-
-    const D3D12_RESOURCE_DESC colorDesc = color->GetDesc();
-    const D3D12_RESOURCE_DESC depthDesc = depth->GetDesc();
-    const DXGI_FORMAT depthView = DepthViewFormat(depthDesc.Format);
-    if (!m_loggedFormats) {
-        m_loggedFormats = true;
-        log::Info("Effects: color {}x{} format {} flags {:#x}; depth format {} flags {:#x}", colorDesc.Width, colorDesc.Height,
-            static_cast<int>(colorDesc.Format), static_cast<unsigned>(colorDesc.Flags), static_cast<int>(depthDesc.Format),
-            static_cast<unsigned>(depthDesc.Flags));
-    }
-
-    const UINT base = slot * kDescriptorsPerFrame;
-    D3D12_SHADER_RESOURCE_VIEW_DESC depthSrv = {};
-    depthSrv.Format = depthView;
-    depthSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    depthSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    depthSrv.Texture2D.MipLevels = 1;
-    D3D12_SHADER_RESOURCE_VIEW_DESC colorSrv = depthSrv;
-    D3D12_UNORDERED_ACCESS_VIEW_DESC outputUav = {};
-    outputUav.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    outputUav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-    for (UINT i = 0; i < m_effects.size(); ++i) {
-        const UINT table = base + i * kDescriptorsPerEffect;
-        ID3D12Resource* input = i == 0 ? m_sceneCopy.Get() : m_pingPong[(i - 1) % 2].Get();
-        colorSrv.Format = i == 0 ? DXGI_FORMAT_B8G8R8A8_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM;
-        m_device->CreateShaderResourceView(depth.Get(), &depthSrv, Cpu(table));
-        m_device->CreateShaderResourceView(input, &colorSrv, Cpu(table + 1));
-        m_device->CreateUnorderedAccessView(m_pingPong[i % 2].Get(), nullptr, &outputUav, Cpu(table + 2));
-    }
-    ID3D12Resource* result = m_pingPong[(m_effects.size() - 1) % 2].Get();
-    const UINT resultIndex = base + kDescriptorsPerFrame - 1;
-    colorSrv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    m_device->CreateShaderResourceView(result, &colorSrv, Cpu(resultIndex));
-    D3D12_CPU_DESCRIPTOR_HANDLE rtv = m_rtvHeap->GetCPUDescriptorHandleForHeapStart();
-    rtv.ptr += static_cast<SIZE_T>(slot) * m_rtvIncrement;
-    D3D12_RENDER_TARGET_VIEW_DESC rtvDesc = {};
-    rtvDesc.Format = ColorViewFormat(colorDesc.Format);
-    rtvDesc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
-    m_device->CreateRenderTargetView(color.Get(), &rtvDesc, rtv);
-
-    m_allocators[slot]->Reset();
-    m_list->Reset(m_allocators[slot].Get(), nullptr);
-    m_list->EndQuery(m_timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, slot * 2);
-    {
-        D3D12_RESOURCE_BARRIER barriers[] = {
-            Transition(color.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE),
-            Transition(depth.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
-        };
-        m_list->ResourceBarrier(2, barriers);
-    }
-    m_list->CopyResource(m_sceneCopy.Get(), color.Get());
-    {
-        D3D12_RESOURCE_BARRIER barriers[] = {
-            Transition(m_sceneCopy.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
-            Transition(color.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET),
-        };
-        m_list->ResourceBarrier(2, barriers);
-    }
-
-    m_frameInstances.assign(dynamic.begin(), dynamic.end());
-    m_skinned.Record(m_list.Get(), slot, skinned, m_frameInstances);
-    const D3D12_GPU_VIRTUAL_ADDRESS tlas = scene.RecordFrameTlas(m_list.Get(), slot, m_frameInstances);
-    ID3D12DescriptorHeap* heaps[] = {m_viewHeap.Get()};
-    m_list->SetDescriptorHeaps(1, heaps);
-    for (UINT i = 0; i < m_effects.size(); ++i) {
-        if (i > 0) {
-            D3D12_RESOURCE_BARRIER barrier = Transition(m_pingPong[(i - 1) % 2].Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-            m_list->ResourceBarrier(1, &barrier);
-        }
-        if (tlas == 0)
-            break;
-        EffectFrame frame{m_list.Get(), m_constants->GetGPUVirtualAddress() + slot * kConstantsStride, tlas,
-            Gpu(base + i * kDescriptorsPerEffect), m_width, m_height, scene};
-        m_effects[i]->Record(frame);
-    }
-
-    {
-        D3D12_RESOURCE_BARRIER barrier = Transition(result, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-        m_list->ResourceBarrier(1, &barrier);
-    }
-    D3D12_VIEWPORT viewport = {0.0f, 0.0f, static_cast<float>(m_width), static_cast<float>(m_height), 0.0f, 1.0f};
-    D3D12_RECT scissor = {0, 0, static_cast<LONG>(m_width), static_cast<LONG>(m_height)};
-    m_list->SetGraphicsRootSignature(m_compositeRoot.Get());
-    m_list->SetPipelineState(m_compositePipeline.Get());
-    m_list->SetGraphicsRootDescriptorTable(0, Gpu(resultIndex));
-    m_list->RSSetViewports(1, &viewport);
-    m_list->RSSetScissorRects(1, &scissor);
-    m_list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
-    m_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    m_list->DrawInstanced(3, 1, 0, 0);
-
-    std::vector<D3D12_RESOURCE_BARRIER> restore = {
-        Transition(color.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COMMON),
-        Transition(depth.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
-        Transition(m_sceneCopy.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST),
-        Transition(result, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
-    };
-    if (m_effects.size() > 1) {
-        ID3D12Resource* other = m_pingPong[m_effects.size() % 2].Get();
-        restore.push_back(Transition(other, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
-    }
-    m_list->ResourceBarrier(static_cast<UINT>(restore.size()), restore.data());
-    m_list->EndQuery(m_timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, slot * 2 + 1);
-    m_list->ResolveQueryData(m_timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, slot * 2, 2, m_timestampReadback.Get(), slot * 2 * sizeof(uint64_t));
-    hr = m_list->Close();
-    if (SUCCEEDED(hr)) {
-        ID3D12CommandList* lists[] = {m_list.Get()};
-        queue->ExecuteCommandLists(1, lists);
-    } else {
-        log::Info("Effects: closing the frame command list failed ({:#010x})", Hex(hr));
-        m_failed = true;
-    }
-    queue->Signal(m_fence.Get(), ++m_fenceValue);
-    m_frameFenceValues[slot] = m_fenceValue;
-
-    UINT64 value = m_fenceValue;
-    ID3D12Fence* fence = m_fence.Get();
-    m_device9On12->ReturnUnderlyingResource(color9, 1, &value, &fence);
-    m_device9On12->ReturnUnderlyingResource(depth9, 1, &value, &fence);
-    ++m_frame;
-}
-
-void UpdateDebugView()
-{
-    const Options& options = GetOptions();
-    if (!options.devMode)
-        return;
-    FILE* file = nullptr;
-    if (_wfopen_s(&file, (options.gameDirectory / L"gmodpp_debugview.txt").c_str(), L"r") != 0)
-        return;
-    unsigned view = 0;
-    if (fscanf_s(file, "%u", &view) == 1 && view != g_state.debugView) {
-        g_state.debugView = view;
-        log::Info("Effects: debug view {}", view);
-    }
-    std::fclose(file);
-}
 
 void RunConsoleRequests()
 {
@@ -595,21 +144,246 @@ void RunConsoleRequests()
     engine::ExecuteCommand(commands);
 }
 
-std::vector<std::byte> ReadOptional(const std::string& path)
+std::vector<std::byte> ReadOptional(const std::string& path, size_t maxBytes = SIZE_MAX)
 {
     std::vector<std::byte> data;
-    if (!engine::ReadGameFile(path, data))
+    if (!engine::ReadGameFile(path, data, maxBytes))
         data.clear();
     return data;
 }
 
+const SceneTexture& TextureFor(const std::string& vtfPath)
+{
+    auto cached = g_state.textures.find(vtfPath);
+    if (cached != g_state.textures.end())
+        return cached->second;
+    SceneTexture& texture = g_state.textures[vtfPath];
+    const std::vector<std::byte> file = ReadOptional(vtfPath);
+    std::string error;
+    const std::optional<studio::TextureImage> image = studio::ReadTexture(file, kSceneTextureSize, error);
+    if (image) {
+        constexpr DXGI_FORMAT kFormats[] = {DXGI_FORMAT_BC1_UNORM, DXGI_FORMAT_BC2_UNORM, DXGI_FORMAT_BC3_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM,
+            DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_B8G8R8X8_UNORM, DXGI_FORMAT_R8_UNORM};
+        texture.view = g_state.scene.AddTexture(kFormats[static_cast<int>(image->format)], image->width, image->height, image->mips);
+        texture.alpha = image->alpha;
+        if (texture.view == DescriptorHeap::kInvalid)
+            error = "creating the texture failed";
+    }
+    if (texture.view == DescriptorHeap::kInvalid && ++g_state.modelErrors <= 10)
+        log::Info("Scene: texture '{}' unusable ({}); alpha tests and masks that need it are skipped", vtfPath, file.empty() ? "file not found" : error);
+    return texture;
+}
+
+// A VMT colour: "[r g b]" in 0-1 or "{r g b}" in 0-255; one number sets all three.
+bsp::Float3 MaterialColor(std::string_view vmt, std::string_view key, bsp::Float3 fallback)
+{
+    std::optional<std::string> value = studio::MaterialValue(vmt, key);
+    if (!value)
+        return fallback;
+    const float scale = value->find('{') != std::string::npos ? 1.0f / 255.0f : 1.0f;
+    std::replace_if(value->begin(), value->end(), [](char c) { return c == '[' || c == ']' || c == '{' || c == '}'; }, ' ');
+    float v[3] = {};
+    int count = 0;
+    const char* p = value->data();
+    const char* end = p + value->size();
+    while (count < 3) {
+        while (p < end && std::isspace(static_cast<unsigned char>(*p)))
+            ++p;
+        const auto [next, ec] = std::from_chars(p, end, v[count]);
+        if (ec != std::errc())
+            break;
+        p = next;
+        ++count;
+    }
+    if (count == 1)
+        v[1] = v[2] = v[0];
+    else if (count != 3)
+        return fallback;
+    return {v[0] * scale, v[1] * scale, v[2] * scale};
+}
+
+// The scene material for a VMT's env_cubemap reflection and self-illumination (as LightmappedGeneric and
+// VertexLitGeneric compute their masks), or Scene::kNoMaterial when it has neither.
+uint32_t SceneMaterial(std::string_view vmt, const std::string& baseTexture)
+{
+    auto enabled = [&](std::string_view key) {
+        const std::optional<std::string> value = studio::MaterialValue(vmt, key);
+        return value && !value->empty() && value->front() != '0';
+    };
+    const std::optional<std::string> envmap = studio::MaterialValue(vmt, "$envmap");
+    const bool reflective = envmap && !envmap->empty();
+    const bool selfIllum = enabled("$selfillum");
+    if (!reflective && !selfIllum)
+        return Scene::kNoMaterial;
+    auto mask = [](const std::string& texture, uint32_t channel, bool invert) {
+        const UINT view = texture.empty() ? DescriptorHeap::kInvalid : TextureFor(texture).view;
+        return view != DescriptorHeap::kInvalid ? Scene::PackMask(view, channel, invert) : Scene::kMaskOff;
+    };
+    GpuMaterial material = {};
+    material.envmapMask = Scene::kMaskOff;
+    if (reflective) {
+        const std::string envmapMask = studio::MaterialTexture(vmt, "$envmapmask");
+        if (!envmapMask.empty())
+            material.envmapMask = mask(envmapMask, 0, false);
+        else if (enabled("$basealphaenvmapmask"))
+            material.envmapMask = mask(baseTexture, 3, true);
+        else if (enabled("$normalmapalphaenvmapmask"))
+            material.envmapMask = mask(studio::MaterialTexture(vmt, "$bumpmap"), 3, false);
+        else
+            material.envmapMask = Scene::PackMask(DescriptorHeap::kInvalid, 0, false);
+        const bsp::Float3 tint = MaterialColor(vmt, "$envmaptint", {1.0f, 1.0f, 1.0f});
+        material.envmapTint[0] = tint.x;
+        material.envmapTint[1] = tint.y;
+        material.envmapTint[2] = tint.z;
+        material.envmapContrast = MaterialColor(vmt, "$envmapcontrast", {0.0f, 0.0f, 0.0f}).x;
+        material.envmapSaturation = MaterialColor(vmt, "$envmapsaturation", {1.0f, 1.0f, 1.0f}).x;
+    }
+    material.selfIllumMask = Scene::kMaskOff;
+    if (selfIllum) {
+        const std::string selfIllumMask = studio::MaterialTexture(vmt, "$selfillummask");
+        material.selfIllumMask = selfIllumMask.empty() ? mask(baseTexture, 3, false) : mask(selfIllumMask, 0, false);
+        const bsp::Float3 tint = MaterialColor(vmt, "$selfillumtint", {1.0f, 1.0f, 1.0f});
+        material.selfIllumTint[0] = tint.x;
+        material.selfIllumTint[1] = tint.y;
+        material.selfIllumTint[2] = tint.z;
+    }
+    if (material.envmapMask == Scene::kMaskOff && material.selfIllumMask == Scene::kMaskOff)
+        return Scene::kNoMaterial;
+    return g_state.scene.AddMaterial(material);
+}
+
+// The first of a texture's candidate VMTs that exists, with what the scene needs from it.
+const std::optional<MaterialInfo>& MaterialFor(const std::string& vmtPath)
+{
+    auto cached = g_state.materials.find(vmtPath);
+    if (cached != g_state.materials.end())
+        return cached->second;
+    std::optional<MaterialInfo>& entry = g_state.materials[vmtPath];
+    std::vector<std::byte> vmt = ReadOptional(vmtPath);
+    if (vmt.empty())
+        return entry;
+    std::string text(reinterpret_cast<const char*>(vmt.data()), vmt.size());
+    // Maps ship cubemap-patched copies of their materials ("patch" shader) that include the original.
+    if (std::optional<std::string> include = studio::MaterialValue(text, "include")) {
+        std::string path = *include;
+        std::replace(path.begin(), path.end(), '\\', '/');
+        std::transform(path.begin(), path.end(), path.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        std::vector<std::byte> included = ReadOptional(path);
+        text.append("\n").append(reinterpret_cast<const char*>(included.data()), included.size());
+    }
+    auto enabled = [&](std::string_view key) {
+        const std::optional<std::string> value = studio::MaterialValue(text, key);
+        return value && !value->empty() && value->front() != '0';
+    };
+    entry.emplace();
+    entry->translucent = enabled("$translucent");
+    entry->alphaTest = enabled("$alphatest");
+    if (std::optional<std::string> reference = studio::MaterialValue(text, "$alphatestreference")) {
+        float value = 0.0f;
+        if (std::from_chars(reference->data(), reference->data() + reference->size(), value).ec == std::errc() && value > 0.0f)
+            entry->alphaReference = value;
+    }
+    entry->baseTexture = studio::MaterialTexture(text, "$basetexture");
+    if (!entry->baseTexture.empty()) {
+        std::vector<std::byte> header = ReadOptional(entry->baseTexture, studio::kVtfReflectivityHeaderSize);
+        if (std::optional<bsp::Float3> reflectivity = studio::TextureReflectivity(header))
+            entry->reflectivity = *reflectivity;
+    }
+    entry->sceneMaterial = SceneMaterial(text, entry->baseTexture);
+    return entry;
+}
+
+// The alpha-test entry of a material's triangles, or kOpaqueTriangle.
+uint32_t TriangleAlphaFor(const MaterialInfo& material)
+{
+    if (!material.alphaTest || material.baseTexture.empty())
+        return kOpaqueTriangle;
+    const SceneTexture& texture = TextureFor(material.baseTexture);
+    return texture.view != DescriptorHeap::kInvalid && texture.alpha ? Scene::PackAlpha(texture.view, material.alphaReference) : kOpaqueTriangle;
+}
+
+// Moves the triangles whose `triangleAlpha` is not kOpaqueTriangle behind the others, reordering `indices` and
+// every per-triangle vector in `perTriangle` alike.
+template <class... PerTriangle>
+TriangleData PartitionTriangles(std::vector<uint32_t>& indices, const std::vector<uint32_t>& triangleAlpha, PerTriangle&... perTriangle)
+{
+    const size_t triangles = triangleAlpha.size();
+    std::vector<size_t> order(triangles);
+    std::iota(order.begin(), order.end(), size_t{0});
+    const auto firstAlpha = std::stable_partition(order.begin(), order.end(), [&](size_t t) { return triangleAlpha[t] == kOpaqueTriangle; });
+    TriangleData partition;
+    partition.opaqueTriangles = static_cast<UINT>(firstAlpha - order.begin());
+    for (auto it = firstAlpha; it != order.end(); ++it)
+        partition.alphaTriangles.push_back(triangleAlpha[*it]);
+    if (partition.alphaTriangles.empty())
+        return partition;
+    std::vector<uint32_t> sortedIndices(indices.size());
+    for (size_t i = 0; i < triangles; ++i)
+        std::copy_n(indices.begin() + order[i] * 3, 3, sortedIndices.begin() + i * 3);
+    indices = std::move(sortedIndices);
+    auto permute = [&](auto& values) {
+        std::remove_reference_t<decltype(values)> sorted(values.size());
+        for (size_t i = 0; i < triangles; ++i)
+            sorted[i] = values[order[i]];
+        values = std::move(sorted);
+    };
+    (permute(perTriangle), ...);
+    return partition;
+}
+
+// The map material (texdata) a BSP triangle uses, or nothing.
+const std::optional<MaterialInfo>* MapMaterial(uint32_t texdata)
+{
+    if (texdata >= g_state.mapMaterials.size() || g_state.mapMaterials[texdata].empty())
+        return nullptr;
+    std::string path = "materials/" + g_state.mapMaterials[texdata] + ".vmt";
+    std::replace(path.begin(), path.end(), '\\', '/');
+    std::transform(path.begin(), path.end(), path.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return &MaterialFor(path);
+}
+
+// Partitions a BSP mesh by its materials' alpha tests and describes it for Scene::AddModel.
+ModelGeometry PrepareMesh(bsp::Mesh& mesh, TriangleData& triangles)
+{
+    std::vector<uint32_t> triangleAlpha(mesh.triangleMaterials.size(), kOpaqueTriangle);
+    for (size_t t = 0; t < triangleAlpha.size(); ++t) {
+        const std::optional<MaterialInfo>* material = MapMaterial(mesh.triangleMaterials[t]);
+        if (material != nullptr && *material)
+            triangleAlpha[t] = TriangleAlphaFor(**material);
+    }
+    triangles = PartitionTriangles(mesh.indices, triangleAlpha, mesh.triangleAlbedo, mesh.triangleMaterials);
+    triangles.materials.resize(mesh.triangleMaterials.size(), Scene::kNoMaterial);
+    for (size_t t = 0; t < triangles.materials.size(); ++t) {
+        const std::optional<MaterialInfo>* material = MapMaterial(mesh.triangleMaterials[t]);
+        if (material != nullptr && *material)
+            triangles.materials[t] = (*material)->sceneMaterial;
+    }
+    return {mesh.positions, mesh.indices, mesh.triangleAlbedo, triangles.opaqueTriangles, mesh.uvs, triangles.alphaTriangles, triangles.materials};
+}
+
+uint32_t PackAlbedo(const bsp::Float3& c)
+{
+    auto channel = [](float v) { return static_cast<uint32_t>(std::clamp(v, 0.0f, 1.0f) * 255.0f + 0.5f); };
+    return channel(c.x) | channel(c.y) << 8 | channel(c.z) << 16 | 0xFF000000u;
+}
+
 // Loads a model once: a BLAS in its bind pose for rigid use, plus skinning data for multi-bone models.
+// Brush entity models ("*N") come from the map.
 const ModelEntry& ModelFor(const std::string& mdlPath)
 {
     auto cached = g_state.models.find(mdlPath);
     if (cached != g_state.models.end())
         return cached->second;
     ModelEntry& entry = g_state.models[mdlPath];
+    if (mdlPath.starts_with('*')) {
+        size_t number = 0;
+        const auto [end, ec] = std::from_chars(mdlPath.data() + 1, mdlPath.data() + mdlPath.size(), number);
+        if (ec == std::errc() && end == mdlPath.data() + mdlPath.size() && number < g_state.brushModels.size()) {
+            TriangleData triangles;
+            entry.sceneModel = g_state.scene.AddModel(PrepareMesh(g_state.brushModels[number], triangles));
+        }
+        return entry;
+    }
 
     const std::string base = mdlPath.size() > 4 ? mdlPath.substr(0, mdlPath.size() - 4) : mdlPath;
     std::vector<std::byte> mdl = ReadOptional(mdlPath);
@@ -622,26 +396,39 @@ const ModelEntry& ModelFor(const std::string& mdlPath)
         error = "model files are missing";
     } else if (studio::ReadMaterialPaths(mdl, texturePaths, error)) {
         std::vector<bool> skip(texturePaths.size(), false);
+        std::vector<uint32_t> textureAlbedo(texturePaths.size(), PackAlbedo(kDefaultReflectivity));
+        std::vector<uint32_t> textureAlpha(texturePaths.size(), kOpaqueTriangle);
+        std::vector<uint32_t> textureMaterial(texturePaths.size(), Scene::kNoMaterial);
         for (size_t t = 0; t < texturePaths.size(); ++t) {
             for (const std::string& vmtPath : texturePaths[t]) {
-                auto material = g_state.seeThroughMaterials.find(vmtPath);
-                if (material == g_state.seeThroughMaterials.end()) {
-                    std::vector<std::byte> vmt = ReadOptional(vmtPath);
-                    if (vmt.empty())
-                        continue;
-                    material = g_state.seeThroughMaterials.emplace(vmtPath, studio::MaterialIsSeeThrough(
-                        std::string_view(reinterpret_cast<const char*>(vmt.data()), vmt.size()))).first;
-                }
-                skip[t] = material->second;
+                const std::optional<MaterialInfo>& material = MaterialFor(vmtPath);
+                if (!material)
+                    continue;
+                skip[t] = material->translucent && !material->alphaTest;
+                textureAlbedo[t] = PackAlbedo(material->reflectivity);
+                textureAlpha[t] = TriangleAlphaFor(*material);
+                textureMaterial[t] = material->sceneMaterial;
                 break;
             }
         }
         if (studio::BuildGeometry(mdl, vvd, vtx, skip, geometry, error) && !geometry.indices.empty()) {
-            entry.sceneModel = g_state.scene.AddModel(geometry);
-            if (studio::BoneCount(mdl) > 1) {
+            std::vector<uint32_t> triangleAlbedo(geometry.triangleTextures.size());
+            std::vector<uint32_t> triangleAlpha(geometry.triangleTextures.size());
+            for (size_t i = 0; i < triangleAlbedo.size(); ++i) {
+                const uint16_t texture = geometry.triangleTextures[i];
+                triangleAlbedo[i] = texture < textureAlbedo.size() ? textureAlbedo[texture] : PackAlbedo(kDefaultReflectivity);
+                triangleAlpha[i] = texture < textureAlpha.size() ? textureAlpha[texture] : kOpaqueTriangle;
+            }
+            TriangleData triangles = PartitionTriangles(geometry.indices, triangleAlpha, triangleAlbedo, geometry.triangleTextures);
+            for (uint16_t texture : geometry.triangleTextures)
+                triangles.materials.push_back(texture < textureMaterial.size() ? textureMaterial[texture] : Scene::kNoMaterial);
+            entry.sceneModel = g_state.scene.AddModel({geometry.positions, geometry.indices, triangleAlbedo, triangles.opaqueTriangles, geometry.uvs,
+                triangles.alphaTriangles, triangles.materials});
+            if (entry.sceneModel >= 0 && studio::BoneCount(mdl) > 1) {
                 auto skinned = std::make_shared<SkinnedModel>();
+                skinned->opaqueTriangles = triangles.opaqueTriangles;
                 skinned->geometry = std::move(geometry);
-                if (studio::ReadPoseToBone(mdl, skinned->poseToBone) && g_state.system->Skinned().PrepareModel(*skinned))
+                if (studio::ReadPoseToBone(mdl, skinned->poseToBone) && g_state.lighting->Skinned().PrepareModel(*skinned))
                     entry.skinned = std::move(skinned);
             }
             return entry;
@@ -657,23 +444,46 @@ bool IsFirstPersonModel(const std::string& path)
     return path.starts_with("models/weapons/v_") || path.starts_with("models/weapons/c_");
 }
 
+bool IsHeldWeapon(const entities::ModelEntity& entity, const std::optional<std::array<float, 3>>& eye)
+{
+    if (!eye || !entity.model.starts_with("models/weapons/w_"))
+        return false;
+    float distanceSquared = 0.0f;
+    for (int i = 0; i < 3; ++i) {
+        const float d = entity.transform[i][3] - (*eye)[i];
+        distanceSquared += d * d;
+    }
+    return distanceSquared < kHeldWeaponDistance * kHeldWeaponDistance;
+}
+
+void ClearScene()
+{
+    g_state.lighting->WaitForGpu();
+    g_state.lighting->Skinned().Clear();
+    g_state.lighting->InvalidateHistory();
+    g_state.scene.Clear();
+    g_state.models.clear();
+    g_state.brushModels.clear();
+    g_state.mapMaterials.clear();
+    g_state.textures.clear();
+    // Scene material indices and texture views are reset with the scene.
+    g_state.materials.clear();
+}
+
 void UpdateScene()
 {
     if (!engine::Ready())
         return;
     if (!g_state.sceneInitialized) {
         Renderer* renderer = GetRenderer();
-        g_state.sceneInitialized = g_state.scene.Initialize(renderer->Device(), renderer->Queue());
+        g_state.sceneInitialized = g_state.scene.Initialize(renderer->Device(), renderer->Queue(), renderer->Descriptors());
         if (!g_state.sceneInitialized)
             return;
     }
     std::string level = engine::LevelName();
     if (level.empty()) {
         if (g_state.scene.Ready()) {
-            g_state.system->WaitForGpu();
-            g_state.scene.Clear();
-            g_state.models.clear();
-            g_state.system->Skinned().Clear();
+            ClearScene();
             log::Info("Scene cleared");
         }
         return;
@@ -687,10 +497,12 @@ void UpdateScene()
     if (!engine::ReadGameFile(level, file)) {
         error = "the game filesystem could not read it";
     } else if (bsp::LoadWorld(file, world, error)) {
-        g_state.system->WaitForGpu();
-        g_state.models.clear();
-        g_state.system->Skinned().Clear();
-        if (g_state.scene.LoadMap(level, world)) {
+        ClearScene();
+        g_state.mapMaterials = std::move(world.materials);
+        TriangleData worldTriangles;
+        const ModelGeometry worldGeometry = PrepareMesh(world.mesh, worldTriangles);
+        if (g_state.scene.LoadMap(level, world, worldGeometry)) {
+            g_state.brushModels = std::move(world.brushModels);
             std::vector<SceneInstance> instances;
             for (const bsp::StaticProp& prop : world.props) {
                 SceneInstance& instance = instances.emplace_back();
@@ -698,10 +510,13 @@ void UpdateScene()
                 std::memcpy(instance.transform, prop.transform, sizeof(instance.transform));
             }
             std::erase_if(instances, [](const SceneInstance& instance) { return instance.model < 0; });
-            log::Info("Scene '{}': {} faces, {} displacements, {} skybox faces skipped, {} world triangles, {} of {} static props; "
-                      "sun {} dir ({:.2f} {:.2f} {:.2f})",
-                level, world.faceCount, world.displacementCount, world.skyboxFaceCount, world.indices.size() / 3, instances.size(),
-                world.props.size(), world.sun.present ? "present" : "missing", world.sun.direction.x, world.sun.direction.y, world.sun.direction.z);
+            log::Info("Scene '{}': {} faces, {} displacements, {} skybox faces and {} skybox props skipped, {} world triangles ({} alpha-tested), {} of {} static props, {} lights; "
+                      "sun {} dir ({:.2f} {:.2f} {:.2f}) color ({:.2f} {:.2f} {:.2f}), sky ({:.2f} {:.2f} {:.2f})",
+                level, world.faceCount, world.displacementCount, world.skyboxFaceCount, world.skyboxPropCount, world.mesh.indices.size() / 3, worldTriangles.alphaTriangles.size(),
+                instances.size(),
+                world.props.size(), world.lights.size(), world.sun.present ? "present" : "missing", world.sun.direction.x, world.sun.direction.y,
+                world.sun.direction.z, world.sun.color.x, world.sun.color.y, world.sun.color.z, world.sun.ambient.x, world.sun.ambient.y,
+                world.sun.ambient.z);
             g_state.scene.SetStaticInstances(std::move(instances));
             return;
         }
@@ -709,6 +524,35 @@ void UpdateScene()
     }
     log::Info("Scene: cannot load '{}': {}", level, error);
     g_state.failedMap = level;
+}
+
+void CollectEntities()
+{
+    g_state.dynamicInstances.clear();
+    g_state.skinnedEntities.clear();
+    entities::Collect(g_state.entities);
+    const std::optional<std::array<float, 3>> eye = gbuffer::EyePosition(gbuffer::LastCaptureViewProj());
+    const int localPlayer = engine::LocalPlayerIndex();
+    for (const entities::ModelEntity& entity : g_state.entities) {
+        if (IsFirstPersonModel(entity.model) || IsHeldWeapon(entity, eye))
+            continue;
+        const ModelEntry& model = ModelFor(entity.model);
+        if (model.sceneModel < 0)
+            continue;
+        const UINT mask = entity.index == localPlayer ? kLocalPlayerMask : kDynamicMask;
+        if (model.skinned) {
+            g_state.bones.resize(kMaxBones);
+            if (!entities::SetupBones(entity.renderable, reinterpret_cast<float (*)[3][4]>(g_state.bones.data()), kMaxBones))
+                continue;
+            g_state.bones.resize(std::min<size_t>(model.skinned->poseToBone.size(), kMaxBones));
+            g_state.skinnedEntities.push_back({entity.index, model.sceneModel, model.skinned, g_state.bones, mask});
+            continue;
+        }
+        SceneInstance& instance = g_state.dynamicInstances.emplace_back();
+        instance.model = model.sceneModel;
+        instance.mask = mask;
+        std::memcpy(instance.transform, entity.transform, sizeof(instance.transform));
+    }
 }
 
 }
@@ -753,83 +597,170 @@ void OnDeviceReady(IDirect3DDevice9* device, const D3DPRESENT_PARAMETERS& params
         return;
     }
     log::Info("Effects: INTZ depth buffer {}x{} bound", params.BackBufferWidth, params.BackBufferHeight);
+    g_state.gbufferReady = gbuffer::Initialize(device, params);
 
     Renderer* renderer = GetRenderer();
-    if (!g_state.system && renderer != nullptr && renderer->SupportsRaytracing()) {
-        auto system = std::make_unique<EffectSystem>();
-        if (system->Initialize(*renderer, device))
-            g_state.system = std::move(system);
+    if (!g_state.lighting && renderer != nullptr && renderer->SupportsRaytracing()) {
+        auto lighting = std::make_unique<Lighting>();
+        if (lighting->Initialize(*renderer, device))
+            g_state.lighting = std::move(lighting);
     }
 }
 
 void OnBeforeReset()
 {
-    if (g_state.system)
-        g_state.system->WaitForGpu();
+    if (g_state.lighting)
+        g_state.lighting->WaitForGpu();
+    gbuffer::Release();
+    g_state.gbufferReady = false;
     g_state.depthSurface.Reset();
     g_state.depthTexture.Reset();
+}
+
+namespace {
+void FinishCapture(gbuffer::ViewKind kind);
 }
 
 void OnPresent()
 {
     ++g_state.frame;
+    if (g_state.viewmodelCapture) {
+        g_state.viewmodelCapture = false;
+        FinishCapture(gbuffer::ViewKind::Viewmodel);
+    }
+    if (gbuffer::Active() && g_state.device != nullptr) {
+        log::Info("Effects: a G-buffer capture was still open at present; closing it");
+        gbuffer::End(g_state.device, gbuffer::ViewKind::Main);
+    }
     client::TryInstall();
     engine::TryInitialize();
     entities::TryInitialize();
-    if (g_state.system && g_state.frame % kMapPollInterval == 0) {
+    if (g_state.frame % kMapPollInterval == 0)
+        SyncSettingsFile(GetOptions().gameDirectory / L"gmodpp_settings.ini");
+    if (g_state.lighting && g_state.frame % kMapPollInterval == 0) {
         UpdateScene();
-        UpdateDebugView();
         RunConsoleRequests();
     }
 }
 
-void OnOpaqueViewFinished()
+namespace {
+
+// A capture can start when the game draws into the back buffer with our depth buffer on the render thread.
+bool CanCapture(IDirect3DDevice9* device, ComPtr<IDirect3DSurface9>& backBuffer)
 {
-    IDirect3DDevice9* device = g_state.device;
-    if (device == nullptr || !g_state.system || !g_state.scene.Ready() || !g_state.depthSurface)
-        return;
+    if (device == nullptr || !g_state.lighting || !g_state.gbufferReady || !g_state.scene.Ready() || gbuffer::Active() ||
+        !GetSettings().realtimeLighting)
+        return false;
     if (GetCurrentThreadId() != g_state.renderThread) {
         if (!g_state.warnedQueuedRendering) {
             g_state.warnedQueuedRendering = true;
             log::Info("Effects: views are drawn on a different thread than Direct3D (mat_queue_mode != 0); effects disabled");
         }
-        return;
+        return false;
     }
-    if (g_state.lastRunFrame == g_state.frame)
-        return;
-
     ComPtr<IDirect3DSurface9> renderTarget;
-    ComPtr<IDirect3DSurface9> backBuffer;
     ComPtr<IDirect3DSurface9> depthStencil;
     if (FAILED(device->GetRenderTarget(0, &renderTarget)) || FAILED(device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backBuffer)) ||
         FAILED(device->GetDepthStencilSurface(&depthStencil)))
-        return;
-    if (renderTarget != backBuffer || depthStencil != g_state.depthSurface)
-        return;
+        return false;
+    return renderTarget == backBuffer && depthStencil == g_state.depthSurface;
+}
 
-    g_state.lastRunFrame = g_state.frame;
-    entities::Collect(g_state.entities);
-    g_state.dynamicInstances.clear();
-    g_state.skinnedEntities.clear();
-    for (const entities::ModelEntity& entity : g_state.entities) {
-        if (IsFirstPersonModel(entity.model))
-            continue;
-        const ModelEntry& model = ModelFor(entity.model);
-        if (model.skinned) {
-            g_state.bones.resize(kMaxBones);
-            if (!entities::SetupBones(entity.renderable, reinterpret_cast<float (*)[3][4]>(g_state.bones.data()), kMaxBones))
-                continue;
-            g_state.bones.resize(std::min<size_t>(model.skinned->poseToBone.size(), kMaxBones));
-            g_state.skinnedEntities.push_back({entity.index, model.skinned, g_state.bones});
-            continue;
-        }
-        if (model.sceneModel < 0)
-            continue;
-        SceneInstance& instance = g_state.dynamicInstances.emplace_back();
-        instance.model = model.sceneModel;
-        std::memcpy(instance.transform, entity.transform, sizeof(instance.transform));
+void FinishCapture(gbuffer::ViewKind kind)
+{
+    IDirect3DDevice9* device = g_state.device;
+    if (device == nullptr || !gbuffer::Active())
+        return;
+    gbuffer::End(device, kind);
+    ComPtr<IDirect3DSurface9> backBuffer;
+    if (FAILED(device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backBuffer)))
+        return;
+    switch (kind) {
+    case gbuffer::ViewKind::Main:
+        CollectEntities();
+        engine::ActiveDynamicLights(g_state.dynamicLights);
+        break;
+    case gbuffer::ViewKind::Skybox:
+        g_state.dynamicInstances.clear();
+        g_state.skinnedEntities.clear();
+        g_state.dynamicLights.clear();
+        break;
+    case gbuffer::ViewKind::Viewmodel:
+        // Same scene as the main view; characters are not skinned a second time.
+        break;
     }
-    g_state.system->Run(backBuffer.Get(), g_state.depthTexture.Get(), g_state.scene, g_state.dynamicInstances, g_state.skinnedEntities);
+    g_state.scene.SetDynamicLights(g_state.dynamicLights);
+    ViewInputs inputs{backBuffer.Get(), g_state.depthTexture.Get(), gbuffer::NormalTexture(), gbuffer::FlagsTexture(), gbuffer::LightTexture(),
+        gbuffer::AlbedoTexture(), gbuffer::EmissiveTexture(), gbuffer::ProjectedLights(), kind, 0.0f, 1.0f, g_state.frame, g_state.pixelOffset[0],
+        g_state.pixelOffset[1]};
+    if (kind == gbuffer::ViewKind::Viewmodel) {
+        inputs.depthMin = g_state.viewmodelViewport.MinZ;
+        inputs.depthMax = g_state.viewmodelViewport.MaxZ;
+    }
+    const std::vector<SkinnedEntity>& skinned = kind == gbuffer::ViewKind::Viewmodel ? g_state.noSkinnedEntities : g_state.skinnedEntities;
+    g_state.lighting->Run(inputs, g_state.scene, g_state.dynamicInstances, skinned);
+}
+
+// Source draws the viewmodel with DepthRange(0, 0.1); a few sprites use 0..0.01, which is not the viewmodel.
+bool IsViewmodelRange(const D3DVIEWPORT9& viewport) { return viewport.MinZ == 0.0f && std::fabs(viewport.MaxZ - 0.1f) < 1e-4f; }
+
+}
+
+void OnViewport(const D3DVIEWPORT9& viewport)
+{
+    if (g_state.viewmodelCapture) {
+        if (IsViewmodelRange(viewport))
+            return;
+        g_state.viewmodelCapture = false;
+        FinishCapture(gbuffer::ViewKind::Viewmodel);
+        return;
+    }
+    ComPtr<IDirect3DSurface9> backBuffer;
+    if (!IsViewmodelRange(viewport) || !CanCapture(g_state.device, backBuffer))
+        return;
+    // The viewmodel is drawn after the anti-aliasing resolve, so it is not jittered.
+    gbuffer::SetJitter(0.0f, 0.0f);
+    g_state.viewmodelViewport = viewport;
+    g_state.viewmodelCapture = gbuffer::Begin(g_state.device);
+}
+
+void OnViewOpaqueBegin()
+{
+    IDirect3DDevice9* device = g_state.device;
+    ComPtr<IDirect3DSurface9> backBuffer;
+    if (!CanCapture(device, backBuffer))
+        return;
+    // A Halton(2, 3) sub-pixel pattern for temporal anti-aliasing, in NDC units (y is up in NDC).
+    float jitterX = 0.0f;
+    float jitterY = 0.0f;
+    D3DSURFACE_DESC desc;
+    backBuffer->GetDesc(&desc);
+    UINT renderWidth = 0;
+    UINT renderHeight = 0;
+    g_state.pixelOffset[0] = g_state.pixelOffset[1] = 0.0f;
+    if (g_state.lighting->RayReconstructionSize(desc.Width, desc.Height, renderWidth, renderHeight)) {
+        // Ray Reconstruction wants many phases, more as the upscale grows (DLSS programming guide 3.7.1).
+        const float ratio = static_cast<float>(desc.Width) / static_cast<float>(renderWidth);
+        const uint32_t phases = std::max(kRayReconstructionPhases, static_cast<uint32_t>(std::ceil(8.0f * ratio * ratio)));
+        const uint32_t sample = static_cast<uint32_t>(g_state.frame % phases) + 1;
+        g_state.pixelOffset[0] = Halton(sample, 2) - 0.5f;
+        g_state.pixelOffset[1] = Halton(sample, 3) - 0.5f;
+        // DLSS takes the image shift itself, as NVIDIA's Donut samples pass it (PlanarView pixel offset).
+        jitterX = g_state.pixelOffset[0] * 2.0f / static_cast<float>(renderWidth);
+        jitterY = -g_state.pixelOffset[1] * 2.0f / static_cast<float>(renderHeight);
+    } else if (GetSettings().antiAliasing == AntiAliasing::Temporal) {
+        const uint32_t sample = static_cast<uint32_t>(g_state.frame % kJitterSamples) + 1;
+        jitterX = (Halton(sample, 2) - 0.5f) * 2.0f / static_cast<float>(desc.Width);
+        jitterY = -(Halton(sample, 3) - 0.5f) * 2.0f / static_cast<float>(desc.Height);
+    }
+    gbuffer::SetJitter(jitterX, jitterY);
+    gbuffer::Begin(device);
+}
+
+void OnViewOpaqueEnd(bool inSkybox)
+{
+    if (!g_state.viewmodelCapture)
+        FinishCapture(inSkybox ? gbuffer::ViewKind::Skybox : gbuffer::ViewKind::Main);
 }
 
 }

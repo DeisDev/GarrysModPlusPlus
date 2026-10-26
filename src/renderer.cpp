@@ -19,21 +19,12 @@ namespace gmodpp {
 
 namespace {
 
-constexpr UINT kEyePosRegister = 2;
-constexpr UINT kViewProjRegister = 8;
+constexpr UINT kDescriptorCapacity = 1 << 16;
 
 // Never destroyed: releasing D3D objects during DLL_PROCESS_DETACH is unsafe.
 Renderer* g_renderer = nullptr;
 
 unsigned Hex(HRESULT hr) { return static_cast<unsigned>(hr); }
-
-void CopyRegisters(UINT start, const float* data, UINT count, UINT target, UINT targetCount, float* out)
-{
-    UINT first = std::max(start, target);
-    UINT last = std::min(start + count, target + targetCount);
-    for (UINT reg = first; reg < last; ++reg)
-        std::memcpy(out + (reg - target) * 4, data + (reg - start) * 4, sizeof(float) * 4);
-}
 
 std::string Utf8(const wchar_t* text)
 {
@@ -120,12 +111,15 @@ Renderer* Renderer::Create(LUID adapterLuid, const Options& options)
         return nullptr;
     }
 
+    if (!renderer->m_descriptors.Initialize(renderer->m_device.Get(), kDescriptorCapacity))
+        return nullptr;
+
     D3D12_FEATURE_DATA_D3D12_OPTIONS5 options5 = {};
     renderer->m_device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5, &options5, sizeof(options5));
     D3D12_FEATURE_DATA_SHADER_MODEL shaderModel = {D3D_SHADER_MODEL_6_6};
     if (FAILED(renderer->m_device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &shaderModel, sizeof(shaderModel))))
         shaderModel.HighestShaderModel = D3D_SHADER_MODEL_5_1;
-    renderer->m_raytracing = options5.RaytracingTier >= D3D12_RAYTRACING_TIER_1_1 && shaderModel.HighestShaderModel >= D3D_SHADER_MODEL_6_5;
+    renderer->m_raytracing = options5.RaytracingTier >= D3D12_RAYTRACING_TIER_1_1 && shaderModel.HighestShaderModel >= D3D_SHADER_MODEL_6_6;
 
     if (options.d3d12Debug && SUCCEEDED(renderer->m_device.As(&renderer->m_infoQueue))) {
         D3D12_MESSAGE_SEVERITY hidden[] = {D3D12_MESSAGE_SEVERITY_INFO, D3D12_MESSAGE_SEVERITY_MESSAGE, D3D12_MESSAGE_SEVERITY_WARNING};
@@ -174,13 +168,6 @@ bool Renderer::AttachGameDevice(IDirect3DDevice9* device, HWND focusWindow, cons
             m_presenter = std::move(presenter);
     }
     return true;
-}
-
-void Renderer::OnVertexShaderConstants(UINT startRegister, const float* data, UINT vector4fCount)
-{
-    CopyRegisters(startRegister, data, vector4fCount, kEyePosRegister, 1, m_camera.eyePos);
-    if (startRegister < kViewProjRegister + 4 && startRegister + vector4fCount > kViewProjRegister)
-        CopyRegisters(startRegister, data, vector4fCount, kViewProjRegister, 4, &m_camera.viewProj[0][0]);
 }
 
 void Renderer::OnPresent()

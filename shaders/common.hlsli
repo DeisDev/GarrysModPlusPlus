@@ -1,49 +1,174 @@
 #ifndef GMODPP_COMMON_HLSLI
 #define GMODPP_COMMON_HLSLI
 
+// Every compute pass shares this layout. Textures and buffers are reached through descriptor heap indices
+// in g_frame and g_pass.
+#define ROOT_SIGNATURE "RootFlags(CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED), CBV(b0), SRV(t0), RootConstants(num32BitConstants = 8, b1), " \
+    "StaticSampler(s0, filter = FILTER_MIN_MAG_MIP_LINEAR, addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP), "     "StaticSampler(s1, filter = FILTER_MIN_MAG_MIP_POINT, addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP), "     "StaticSampler(s2, filter = FILTER_MIN_MAG_MIP_LINEAR, addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP)"
+
 // Mirrors gmodpp::FrameConstants in src/effects.h.
 struct FrameConstants
 {
     row_major float4x4 invViewProj;
+    row_major float4x4 viewProj;
+    row_major float4x4 prevViewProj;
     float3 eyePosition;
-    float sunEnabled;
+    float tonemapScale;
     float3 sunDirection;
-    float ambientRatio;
+    float sunEnabled;
+    float3 sunColor;
+    uint outputSrgb;
+    float3 skyColor;
+    uint debugView;
     float2 invSize;
     uint2 size;
-    float shadowStrength;
-    float bakedRadius;
     float normalBias;
-    uint debugView;
+    uint traceMask;
+    uint frameIndex;
+    uint historyValid;
+    float3 prevEyePosition;
+    uint lightCount;
+    uint instancesView;
+    uint lightsView;
+    uint depthView;
+    uint colorView;
+    uint gbufferNormalView;
+    uint flagsView;
+    uint surfaceView;
+    uint prevSurfaceView;
+    float4 fogParams;
+    float3 fogColor;
+    uint fogEnabled;
+    uint lightView;
+    uint dynamicLightsView;
+    uint dynamicLightCount;
+    uint projectorsView;
+    uint projectorCount;
+    float lightScale;
+    float indirectScale;
+    float taaHistoryWeight;
+    float sharpening;
+    float depthMin;
+    float depthScale;
+    uint albedoView;
+    uint emissiveView;
+    uint materialsView;
+    float reflectionScale;
+    // 1 when the lighting pass writes linear colour (before the tonemap's encoding) for Ray Reconstruction.
+    uint outputLinear;
+    // Scene::LightLists.
+    uint lightRangesView;
+    uint lightIndicesView;
+    uint bspNodesView;
+    uint leafClustersView;
+    uint clusterCount;
 };
 
-ConstantBuffer<FrameConstants> g_frame : register(b0);
-Texture2D<float> g_depth : register(t1);
-Texture2D<float4> g_input : register(t2);
-RWTexture2D<float4> g_output : register(u0);
-
-float3 WorldPositionAt(int2 pixel)
+// Per-pass descriptor indices and parameters.
+struct PassConstants
 {
-    pixel = clamp(pixel, int2(0, 0), int2(g_frame.size) - 1);
-    float depth = g_depth.Load(int3(pixel, 0));
+    uint input0;
+    uint input1;
+    uint input2;
+    uint output0;
+    uint output1;
+    uint step;
+    uint output2;
+    uint padding;
+};
+
+static const uint kNoView = 0xFFFFFFFFu;
+
+ConstantBuffer<FrameConstants> g_frame : register(b0);
+ConstantBuffer<PassConstants> g_pass : register(b1);
+RaytracingAccelerationStructure g_scene : register(t0);
+SamplerState g_linearClamp : register(s0);
+SamplerState g_pointWrap : register(s1);
+SamplerState g_linearWrap : register(s2);
+
+float3 WorldPositionFromDepth(int2 pixel, float depth)
+{
+    depth = (depth - g_frame.depthMin) / g_frame.depthScale;
     float2 uv = (float2(pixel) + 0.5) * g_frame.invSize;
     float4 world = mul(g_frame.invViewProj, float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0));
     return world.xyz / world.w;
 }
 
-float3 SurfaceNormalAt(int2 pixel, float3 position)
+float DepthAt(int2 pixel)
 {
-    float3 right = WorldPositionAt(pixel + int2(1, 0)) - position;
-    float3 left = position - WorldPositionAt(pixel - int2(1, 0));
-    float3 down = WorldPositionAt(pixel + int2(0, 1)) - position;
-    float3 up = position - WorldPositionAt(pixel - int2(0, 1));
-    float3 dx = dot(right, right) < dot(left, left) ? right : left;
-    float3 dy = dot(down, down) < dot(up, up) ? down : up;
-    float3 normal = normalize(cross(dx, dy));
-    return dot(normal, g_frame.eyePosition - position) < 0.0 ? -normal : normal;
+    Texture2D<float> depth = ResourceDescriptorHeap[g_frame.depthView];
+    return depth.Load(int3(clamp(pixel, int2(0, 0), int2(g_frame.size) - 1), 0));
 }
 
-float3 ToLinear(float3 color) { return pow(max(color, 0.0), 2.2); }
-float3 ToGamma(float3 color) { return pow(max(color, 0.0), 1.0 / 2.2); }
+// Resolved surface (written by the surface pass): xyz world normal facing the camera, w distance to the eye,
+// or w = 0 where the pixel holds no G-buffer data.
+float4 SurfaceAt(uint view, int2 pixel)
+{
+    Texture2D<float4> surface = ResourceDescriptorHeap[view];
+    return surface.Load(int3(clamp(pixel, int2(0, 0), int2(g_frame.size) - 1), 0));
+}
+
+float3 SrgbToLinear(float3 color)
+{
+    return select(color <= 0.04045, color / 12.92, pow((max(color, 0.0) + 0.055) / 1.055, 2.4));
+}
+
+float3 LinearToSrgb(float3 color)
+{
+    color = max(color, 0.0);
+    return select(color <= 0.0031308, color * 12.92, 1.055 * pow(color, 1.0 / 2.4) - 0.055);
+}
+
+// The game's colour targets hold lit colour (times the tonemap scale) sRGB-encoded when it renders with sRGB writes.
+float3 Encode(float3 color)
+{
+    return g_frame.outputSrgb != 0 ? LinearToSrgb(color) : saturate(color);
+}
+
+float3 Decode(float3 color)
+{
+    return g_frame.outputSrgb != 0 ? SrgbToLinear(color) : color;
+}
+
+float Luminance(float3 color) { return dot(color, float3(0.2126, 0.7152, 0.0722)); }
+
+uint Hash(uint x)
+{
+    x ^= x >> 16;
+    x *= 0x7feb352du;
+    x ^= x >> 15;
+    x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return x;
+}
+
+float Random(inout uint state)
+{
+    state = Hash(state);
+    return float(state >> 8) * (1.0 / 16777216.0);
+}
+
+uint PixelSeed(uint2 pixel, uint salt)
+{
+    return Hash(pixel.x + pixel.y * 65536u + Hash(g_frame.frameIndex * 0x9E3779B9u + salt));
+}
+
+void BuildBasis(float3 n, out float3 t, out float3 b)
+{
+    float s = n.z >= 0.0 ? 1.0 : -1.0;
+    float a = -1.0 / (s + n.z);
+    float c = n.x * n.y * a;
+    t = float3(1.0 + s * n.x * n.x * a, s * c, -s * n.x);
+    b = float3(c, s + n.y * n.y * a, -n.y);
+}
+
+float3 CosineSample(float3 n, float u1, float u2)
+{
+    float3 t, b;
+    BuildBasis(n, t, b);
+    float r = sqrt(u1);
+    float phi = 6.28318530718 * u2;
+    return normalize(t * (r * cos(phi)) + b * (r * sin(phi)) + n * sqrt(max(1.0 - u1, 0.0)));
+}
 
 #endif

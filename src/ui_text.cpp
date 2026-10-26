@@ -1,0 +1,90 @@
+#include "ui_text.h"
+
+#include <array>
+
+namespace gmodpp::ui {
+
+namespace {
+
+// English. Format strings use std::format placeholders; keep them when translating.
+constexpr std::array<const char*, static_cast<size_t>(TextId::Count)> kEnglish = {
+    "GarrysMod++",
+    "Press Insert to close",
+    "General",
+    "Lighting",
+    "Image",
+    "Performance",
+    "Effects",
+    "Real-time lighting",
+    "Debug view",
+    "Final image",
+    "Albedo",
+    "Normals",
+    "G-buffer coverage",
+    "Direct light",
+    "Indirect light",
+    "Indirect light (raw)",
+    "Sun visibility",
+    "Game flashlight",
+    "Reflections and self-illumination",
+    "Lights",
+    "Sun",
+    "Sky",
+    "Map lights",
+    "Dynamic lights",
+    "Flashlights and lamps",
+    "Flashlight rendering",
+    "Ray traced",
+    "Game",
+    "Intensity",
+    "Indirect light",
+    "Enabled",
+    "Denoiser",
+    "Reflections",
+    "Fog",
+    "Anti-aliasing",
+    "Mode",
+    "Off",
+    "TAA",
+    "DLSS Ray Reconstruction",
+    "DLSS mode",
+    "DLAA",
+    "Quality",
+    "Balanced",
+    "Performance",
+    "Ultra performance",
+    "DLSS Ray Reconstruction is not available on this system.",
+    "Ray tracing at {}x{}",
+    "History weight",
+    "Sharpening",
+    "Statistics",
+    "Lighting: {:.2f} ms GPU",
+    "Performance",
+    "FPS: {:.0f}",
+    "Average: {:.1f} FPS",
+    "Median (50%): {:.1f} FPS",
+    "1% low: {:.1f} FPS",
+    "0.1% low: {:.1f} FPS",
+    "Frame time: {:.2f} ms average, {:.2f} ms 99th percentile",
+    "Frame time range: {:.2f} to {:.2f} ms over {} frames",
+    "Frame time (ms)",
+    "GPU time per pass",
+    "Scene update: {:.2f} ms",
+    "Surface: {:.2f} ms",
+    "Indirect trace: {:.2f} ms",
+    "Accumulation: {:.2f} ms",
+    "Denoiser: {:.2f} ms",
+    "Reflections: {:.2f} ms",
+    "Lighting: {:.2f} ms",
+    "Anti-aliasing and output: {:.2f} ms",
+    "Lights: {} map, {} dynamic, {} projected",
+    "Ray-traced instances: {}",
+    "G-buffer shaders: {} patched, {} replaced",
+    "Reset to defaults",
+};
+
+}
+
+const char* Text(TextId id) { return kEnglish[static_cast<size_t>(id)]; }
+
+}

@@ -23,6 +23,8 @@ constexpr int kGetModelSlot = 9;
 constexpr int kRenderableToWorldTransformSlot = 34;
 constexpr int kGetModelNameSlot = 3;
 constexpr int kGetModelTypeSlot = 9;
+// modtype_t: mod_bad, mod_brush, mod_sprite, mod_studio.
+constexpr int kModelTypeBrush = 1;
 constexpr int kModelTypeStudio = 3;
 constexpr int kSetupBonesSlot = 16;
 constexpr int kEngineTimeSlot = 14;
@@ -81,7 +83,10 @@ void Collect(std::vector<ModelEntity>& entities)
         if (renderable == nullptr || !Slot<bool(__fastcall*)(void*)>(renderable, kShouldDrawSlot)(renderable))
             continue;
         const void* model = Slot<const void*(__fastcall*)(void*)>(renderable, kGetModelSlot)(renderable);
-        if (model == nullptr || Slot<int(__fastcall*)(void*, const void*)>(g_modelInfo, kGetModelTypeSlot)(g_modelInfo, model) != kModelTypeStudio)
+        if (model == nullptr)
+            continue;
+        const int type = Slot<int(__fastcall*)(void*, const void*)>(g_modelInfo, kGetModelTypeSlot)(g_modelInfo, model);
+        if (type != kModelTypeStudio && type != kModelTypeBrush)
             continue;
         const char* name = Slot<const char*(__fastcall*)(void*, const void*)>(g_modelInfo, kGetModelNameSlot)(g_modelInfo, model);
         const float* transform = Slot<const float*(__fastcall*)(void*)>(renderable, kRenderableToWorldTransformSlot)(renderable);

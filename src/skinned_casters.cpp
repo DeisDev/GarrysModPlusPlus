@@ -12,7 +12,6 @@ namespace gmodpp {
 namespace {
 
 constexpr uint64_t kForgetAfterFrames = 120;
-constexpr UINT kDynamicMask = 0x04;
 
 studio::Matrix3x4 Multiply(const studio::Matrix3x4& a, const studio::Matrix3x4& b)
 {
@@ -72,20 +71,13 @@ bool SkinnedCasters::PrepareSlot(SlotState& slot, const SkinnedModel& model)
     if (!slot.vertices || FAILED(slot.vertices->Map(0, nullptr, reinterpret_cast<void**>(&slot.mapped))))
         return false;
 
-    D3D12_RAYTRACING_GEOMETRY_DESC geometry = {};
-    geometry.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
-    geometry.Flags = D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
-    geometry.Triangles.VertexBuffer.StrideInBytes = sizeof(bsp::Float3);
-    geometry.Triangles.VertexCount = vertexCount;
-    geometry.Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
-    geometry.Triangles.IndexCount = static_cast<UINT>(model.geometry.indices.size());
-    geometry.Triangles.IndexFormat = DXGI_FORMAT_R32_UINT;
+    D3D12_RAYTRACING_GEOMETRY_DESC descs[2];
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS inputs = {};
     inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
     inputs.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE | D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD;
-    inputs.NumDescs = 1;
+    inputs.NumDescs = Scene::GeometryDescs(0, vertexCount, 0, static_cast<UINT>(model.geometry.indices.size() / 3), model.opaqueTriangles, descs);
     inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
-    inputs.pGeometryDescs = &geometry;
+    inputs.pGeometryDescs = descs;
     D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO info = {};
     m_device->GetRaytracingAccelerationStructurePrebuildInfo(&inputs, &info);
     slot.scratch = CreateBuffer(std::max(info.ScratchDataSizeInBytes, info.UpdateScratchDataSizeInBytes), D3D12_HEAP_TYPE_DEFAULT,
@@ -93,7 +85,24 @@ bool SkinnedCasters::PrepareSlot(SlotState& slot, const SkinnedModel& model)
     slot.blas = CreateBuffer(info.ResultDataMaxSizeInBytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
         D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE);
     slot.built = false;
-    return slot.scratch && slot.blas;
+    if (!slot.scratch || !slot.blas)
+        return false;
+    slot.verticesView = m_descriptors->CreateRawView(slot.vertices.Get());
+    return slot.verticesView != DescriptorHeap::kInvalid;
+}
+
+void SkinnedCasters::Release(EntityState& state)
+{
+    for (SlotState& slot : state.slots)
+        m_descriptors->Free(slot.verticesView);
+    state = {};
+}
+
+void SkinnedCasters::Clear()
+{
+    for (auto& [key, state] : m_states)
+        Release(state);
+    m_states.clear();
 }
 
 void SkinnedCasters::Record(ID3D12GraphicsCommandList4* list, UINT slotIndex, const std::vector<SkinnedEntity>& entities, std::vector<SceneInstance>& instances)
@@ -104,7 +113,7 @@ void SkinnedCasters::Record(ID3D12GraphicsCommandList4* list, UINT slotIndex, co
     for (const SkinnedEntity& entity : entities) {
         EntityState& state = m_states[entity.key];
         if (state.model != entity.model) {
-            state = {};
+            Release(state);
             state.model = entity.model;
         }
         state.lastSeen = m_frame;
@@ -132,16 +141,7 @@ void SkinnedCasters::Record(ID3D12GraphicsCommandList4* list, UINT slotIndex, co
             slot.mapped[v] = out;
         }
 
-        D3D12_RAYTRACING_GEOMETRY_DESC geometry = {};
-        geometry.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
-        geometry.Flags = D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
-        geometry.Triangles.VertexBuffer.StartAddress = slot.vertices->GetGPUVirtualAddress();
-        geometry.Triangles.VertexBuffer.StrideInBytes = sizeof(bsp::Float3);
-        geometry.Triangles.VertexCount = static_cast<UINT>(model.geometry.positions.size());
-        geometry.Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
-        geometry.Triangles.IndexBuffer = model.indexBuffer->GetGPUVirtualAddress();
-        geometry.Triangles.IndexCount = static_cast<UINT>(model.geometry.indices.size());
-        geometry.Triangles.IndexFormat = DXGI_FORMAT_R32_UINT;
+        D3D12_RAYTRACING_GEOMETRY_DESC descs[2];
         D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC desc = {};
         desc.Inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
         desc.Inputs.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE | D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD;
@@ -149,9 +149,10 @@ void SkinnedCasters::Record(ID3D12GraphicsCommandList4* list, UINT slotIndex, co
             desc.Inputs.Flags |= D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE;
             desc.SourceAccelerationStructureData = slot.blas->GetGPUVirtualAddress();
         }
-        desc.Inputs.NumDescs = 1;
+        desc.Inputs.NumDescs = Scene::GeometryDescs(slot.vertices->GetGPUVirtualAddress(), static_cast<UINT>(model.geometry.positions.size()),
+            model.indexBuffer->GetGPUVirtualAddress(), static_cast<UINT>(model.geometry.indices.size() / 3), model.opaqueTriangles, descs);
         desc.Inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
-        desc.Inputs.pGeometryDescs = &geometry;
+        desc.Inputs.pGeometryDescs = descs;
         desc.DestAccelerationStructureData = slot.blas->GetGPUVirtualAddress();
         desc.ScratchAccelerationStructureData = slot.scratch->GetGPUVirtualAddress();
         list->BuildRaytracingAccelerationStructure(&desc, 0, nullptr);
@@ -159,9 +160,10 @@ void SkinnedCasters::Record(ID3D12GraphicsCommandList4* list, UINT slotIndex, co
         recorded = true;
 
         SceneInstance& instance = instances.emplace_back();
-        instance.model = -1;
+        instance.model = entity.sceneModel;
         instance.blas = slot.blas->GetGPUVirtualAddress();
-        instance.mask = kDynamicMask;
+        instance.positionsView = slot.verticesView;
+        instance.mask = entity.mask;
         std::memset(instance.transform, 0, sizeof(instance.transform));
         instance.transform[0][0] = instance.transform[1][1] = instance.transform[2][2] = 1.0f;
     }
@@ -170,7 +172,12 @@ void SkinnedCasters::Record(ID3D12GraphicsCommandList4* list, UINT slotIndex, co
         barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
         list->ResourceBarrier(1, &barrier);
     }
-    std::erase_if(m_states, [this](const auto& entry) { return m_frame - entry.second.lastSeen > kForgetAfterFrames; });
+    std::erase_if(m_states, [this](auto& entry) {
+        if (m_frame - entry.second.lastSeen <= kForgetAfterFrames)
+            return false;
+        Release(entry.second);
+        return true;
+    });
 }
 
 }

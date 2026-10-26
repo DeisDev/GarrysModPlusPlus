@@ -16,9 +16,25 @@ FetchContent_Declare(minhook
     GIT_REPOSITORY https://github.com/TsudaKageyu/minhook.git
     GIT_TAG v1.3.4
 )
-FetchContent_MakeAvailable(minhook)
+FetchContent_Declare(imgui
+    GIT_REPOSITORY https://github.com/ocornut/imgui.git
+    GIT_TAG v1.91.9b
+)
+FetchContent_MakeAvailable(minhook imgui)
+
+add_library(imgui STATIC
+    ${imgui_SOURCE_DIR}/imgui.cpp
+    ${imgui_SOURCE_DIR}/imgui_draw.cpp
+    ${imgui_SOURCE_DIR}/imgui_tables.cpp
+    ${imgui_SOURCE_DIR}/imgui_widgets.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_win32.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_dx12.cpp
+)
+target_include_directories(imgui PUBLIC ${imgui_SOURCE_DIR})
+target_compile_definitions(imgui PUBLIC IMGUI_DISABLE_OBSOLETE_FUNCTIONS UNICODE _UNICODE)
 
 find_program(DXC_EXECUTABLE dxc HINTS "$ENV{WindowsSdkVerBinPath}/x64" REQUIRED)
+find_program(FXC_EXECUTABLE fxc HINTS "$ENV{WindowsSdkVerBinPath}/x64" REQUIRED)
 set(SHADER_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/shaders")
 file(MAKE_DIRECTORY "${SHADER_OUTPUT_DIR}")
 set(SHADER_HEADERS)
@@ -28,16 +44,51 @@ function(add_shader source entry profile variable)
     add_custom_command(
         OUTPUT "${output}"
         COMMAND "${DXC_EXECUTABLE}" -nologo -T ${profile} -E ${entry} -O3 -HV 2021 -Fh "${output}" -Vn ${variable} "${CMAKE_CURRENT_SOURCE_DIR}/${source}"
-        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/${source}" "${CMAKE_CURRENT_SOURCE_DIR}/shaders/common.hlsli"
+        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/${source}" "${CMAKE_CURRENT_SOURCE_DIR}/shaders/common.hlsli" "${CMAKE_CURRENT_SOURCE_DIR}/shaders/scene.hlsli"
         COMMENT "Compiling ${source} (${entry})"
         VERBATIM
     )
     set(SHADER_HEADERS ${SHADER_HEADERS} "${output}" PARENT_SCOPE)
 endfunction()
 
-add_shader(shaders/sun_shadows.hlsl main cs_6_5 g_sunShadowsCS)
+# Direct3D 9 pixel shaders that replace the game's own, compiled with fxc for ps_3_0.
+function(add_d3d9_shader source entry variable)
+    set(output "${SHADER_OUTPUT_DIR}/${variable}.h")
+    add_custom_command(
+        OUTPUT "${output}"
+        COMMAND "${FXC_EXECUTABLE}" /nologo /T ps_3_0 /E ${entry} /O3 ${ARGN} /Fh "${output}" /Vn ${variable} "${CMAKE_CURRENT_SOURCE_DIR}/${source}"
+        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/${source}"
+        COMMENT "Compiling ${source} (${entry})"
+        VERBATIM
+    )
+    set(SHADER_HEADERS ${SHADER_HEADERS} "${output}" PARENT_SCOPE)
+endfunction()
+
+add_shader(shaders/surface.hlsl main cs_6_6 g_surfaceCS)
+add_shader(shaders/reflections.hlsl main cs_6_6 g_reflectionsCS)
+add_shader(shaders/dlss_inputs.hlsl main cs_6_6 g_dlssInputsCS)
+add_shader(shaders/dlss_resolve.hlsl main cs_6_6 g_dlssResolveCS)
+add_shader(shaders/gi_trace.hlsl main cs_6_6 g_giTraceCS)
+add_shader(shaders/gi_temporal.hlsl main cs_6_6 g_giTemporalCS)
+add_shader(shaders/gi_filter.hlsl main cs_6_6 g_giFilterCS)
+add_shader(shaders/deferred_lighting.hlsl main cs_6_6 g_deferredLightingCS)
+add_shader(shaders/taa.hlsl main cs_6_6 g_taaCS)
+add_shader(shaders/taa_sharpen.hlsl main cs_6_6 g_taaSharpenCS)
 add_shader(shaders/composite.hlsl VSMain vs_6_0 g_compositeVS)
 add_shader(shaders/composite.hlsl PSMain ps_6_0 g_compositePS)
+add_d3d9_shader(shaders/gbuffer_models.hlsl BumpMain g_gbufferBumpPS)
+add_d3d9_shader(shaders/gbuffer_models.hlsl BumpMain g_gbufferBumpSelfIllumPS /D SELFILLUM=1)
+add_d3d9_shader(shaders/gbuffer_models.hlsl BumpMain g_gbufferBumpSelfIllumFresnelPS /D SELFILLUM=3)
+foreach(normalMap 0 1)
+    if(normalMap)
+        set(suffix "")
+    else()
+        set(suffix "NoBump")
+    endif()
+    add_d3d9_shader(shaders/gbuffer_models.hlsl SkinMain g_gbufferSkin${suffix}PS /D SKIN_NORMAL_MAP=${normalMap})
+    add_d3d9_shader(shaders/gbuffer_models.hlsl SkinMain g_gbufferSkin${suffix}SelfIllumPS /D SKIN_NORMAL_MAP=${normalMap} /D SELFILLUM=2)
+    add_d3d9_shader(shaders/gbuffer_models.hlsl SkinMain g_gbufferSkin${suffix}SelfIllumFresnelPS /D SKIN_NORMAL_MAP=${normalMap} /D SELFILLUM=3)
+endforeach()
 
 add_library(gmodpp_d3d9 SHARED
     src/d3d9.def
@@ -59,20 +110,54 @@ add_library(gmodpp_d3d9 SHARED
     src/studio_model.cpp
     src/scene.cpp
     src/skinned_casters.cpp
+    src/settings.cpp
+    src/ui_text.cpp
+    src/overlay.cpp
+    src/descriptor_heap.cpp
+    src/shader_bytecode.cpp
+    src/gbuffer.cpp
+    src/dlss.cpp
+    src/lighting.cpp
     src/effects.cpp
-    src/sun_shadows.cpp
     ${SHADER_HEADERS}
 )
+# NVIDIA DLSS SDK (Ray Reconstruction): headers, the NGX static library for the static runtime, and the
+# release feature DLL, each pinned by hash.
+set(DLSS_SDK_VERSION v310.9.16)
+set(DLSS_SDK_DIR "${CMAKE_CURRENT_BINARY_DIR}/_deps/dlss-${DLSS_SDK_VERSION}")
+set(DLSS_SDK_FILES
+    "include/nvsdk_ngx.h|dc38e7467cf415379c9d12ae1b6e4a494c453ed92720fb53e92aecb523e7b848"
+    "include/nvsdk_ngx_defs.h|ea23f33497cd274860d1c25a97644fce807dcb0037c594547203343103fad03e"
+    "include/nvsdk_ngx_defs_dlssd.h|2e97fe1595b1334f71b51724f2cb67496e8c296a7a2eec5606da53055882e716"
+    "include/nvsdk_ngx_helpers.h|5bcbadfe7478b802cf6d3aca4dc5ddd7d0889b99726e69c63f9e9bd555f44471"
+    "include/nvsdk_ngx_helpers_cuda.h|f2851a76107bdf4fbcb7b261f3c35573c312d8ecb4bc18fb02d9e2cec7705042"
+    "include/nvsdk_ngx_helpers_d3d.h|ec75224f36ed6580baaf250fa83620405ad81a1d98c2c436654a0c9cf6a6b8ba"
+    "include/nvsdk_ngx_helpers_dlssd_d3d.h|6df9d02c6f47feee3afc8d12340a9f554a7ddce4ddacb1b6a13a42b26c2c6293"
+    "include/nvsdk_ngx_params.h|943bc8cc5cdae03b6303016fbad3183636f2335ae27a2d18776798c3b4efabbc"
+    "include/nvsdk_ngx_params_dlssd.h|d41e3ba8f1d72583b55273092c99bf426dc4a0d46de827229e25d5b1325a370e"
+    "lib/Windows_x86_64/x64/nvsdk_ngx_s.lib|7b9a5239c1145af5f645ab472aa066f9ea79db36ac819562312aae69d65f3765"
+    "lib/Windows_x86_64/rel/nvngx_dlssd.dll|b49435ae346f227feafe7bbe937d88277ea0ee7323975ec06488f377fdb46cee"
+)
+foreach(entry IN LISTS DLSS_SDK_FILES)
+    string(REPLACE "|" ";" parts "${entry}")
+    list(GET parts 0 file)
+    list(GET parts 1 hash)
+    file(DOWNLOAD "https://raw.githubusercontent.com/NVIDIA/DLSS/${DLSS_SDK_VERSION}/${file}" "${DLSS_SDK_DIR}/${file}"
+        EXPECTED_HASH SHA256=${hash} TLS_VERIFY ON)
+endforeach()
+set(DLSS_FEATURE_DLL "${DLSS_SDK_DIR}/lib/Windows_x86_64/rel/nvngx_dlssd.dll")
+
 set_target_properties(gmodpp_d3d9 PROPERTIES OUTPUT_NAME d3d9)
-target_include_directories(gmodpp_d3d9 PRIVATE "${SHADER_OUTPUT_DIR}")
+target_include_directories(gmodpp_d3d9 PRIVATE "${SHADER_OUTPUT_DIR}" "${DLSS_SDK_DIR}/include")
 target_compile_definitions(gmodpp_d3d9 PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
 target_compile_options(gmodpp_d3d9 PRIVATE /W4 /permissive- /utf-8)
-target_link_libraries(gmodpp_d3d9 PRIVATE d3d12 dxgi dxguid minhook)
+target_link_libraries(gmodpp_d3d9 PRIVATE d3d12 dxgi dxguid minhook imgui "${DLSS_SDK_DIR}/lib/Windows_x86_64/x64/nvsdk_ngx_s.lib")
 
 if(GMOD_DIR)
     add_custom_target(deploy
         COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:gmodpp_d3d9> "${GMOD_DIR}/bin/win64/d3d9.dll"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${DLSS_FEATURE_DLL}" "${GMOD_DIR}/bin/win64/nvngx_dlssd.dll"
         DEPENDS gmodpp_d3d9
-        COMMENT "Deploying d3d9.dll to ${GMOD_DIR}/bin/win64"
+        COMMENT "Deploying d3d9.dll and nvngx_dlssd.dll to ${GMOD_DIR}/bin/win64"
     )
 endif()

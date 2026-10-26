@@ -1,7 +1,8 @@
 #pragma once
 
 #include "bsp.h"
-#include "studio_model.h"
+#include "descriptor_heap.h"
+#include "engine_interfaces.h"
 
 #include <d3d12.h>
 #include <wrl/client.h>
@@ -13,61 +14,188 @@
 
 namespace gmodpp {
 
+// Instance masks of the scene's acceleration structure.
+constexpr UINT kWorldMask = 0x01;
+constexpr UINT kStaticPropMask = 0x02;
+constexpr UINT kDynamicMask = 0x04;
+// The local player's own body sits around the camera; viewmodel rays leave it out (see Lighting).
+constexpr UINT kLocalPlayerMask = 0x08;
+
+// Triangles for Scene::AddModel. Alpha-tested triangles come last, from `opaqueTriangles` on; each has an entry
+// in `alphaTriangles` (Scene::PackAlpha), and then the model needs `uvs`.
+struct ModelGeometry {
+    std::span<const bsp::Float3> positions;
+    std::span<const uint32_t> indices;
+    // One packed RGBA8 linear colour per triangle.
+    std::span<const uint32_t> triangleAlbedo;
+    UINT opaqueTriangles;
+    std::span<const bsp::Float2> uvs;
+    std::span<const uint32_t> alphaTriangles;
+    // Each triangle's Scene::AddMaterial index, or Scene::kNoMaterial; empty when the model has none.
+    std::span<const uint32_t> triangleMaterials;
+};
+
+// What shaders need of a surface's material beyond its albedo (Material in shaders/scene.hlsli). A mask is
+// off (Scene::kMaskOff), constant 1, or a channel of a texture (Scene::PackMask).
+struct GpuMaterial {
+    float envmapTint[3];
+    uint32_t envmapMask;
+    float selfIllumTint[3];
+    uint32_t selfIllumMask;
+    // $envmapcontrast blends the reflection towards its square, $envmapsaturation towards its grey.
+    float envmapContrast;
+    float envmapSaturation;
+    float padding[2];
+};
+
 struct SceneInstance {
     int model = -1;
-    // Explicit BLAS for geometry the scene does not own (skinned casters); used instead of `model`.
+    // Geometry the scene does not own (skinned models): their BLAS and positions view replace the model's.
     D3D12_GPU_VIRTUAL_ADDRESS blas = 0;
+    UINT positionsView = DescriptorHeap::kInvalid;
     UINT mask = 0;
     float transform[3][4];
 };
 
-// Ray-tracing acceleration structures for the current map: one BLAS per model, rebuilt TLAS per frame.
+struct SceneFrame {
+    D3D12_GPU_VIRTUAL_ADDRESS tlas = 0;
+    // Descriptor of this frame's InstanceRecord buffer, indexed by InstanceID().
+    UINT instancesView = DescriptorHeap::kInvalid;
+    UINT dynamicLightsView = DescriptorHeap::kInvalid;
+    UINT dynamicLightCount = 0;
+};
+
+// Ray-tracing acceleration structures and the per-triangle data shaders need at a hit (positions, indices
+// and albedo), plus the map's lights. One BLAS per model; the TLAS is rebuilt every frame.
 class Scene {
 public:
     static constexpr UINT kFrameSlots = 3;
+    // Layout of a light in the GPU buffers (Light in shaders/scene.hlsli).
+    struct GpuLight;
 
-    bool Initialize(ID3D12Device5* device, ID3D12CommandQueue* queue);
-    bool LoadMap(const std::string& name, const bsp::WorldGeometry& world);
+    bool Initialize(ID3D12Device5* device, ID3D12CommandQueue* queue, DescriptorHeap& descriptors);
+    // The map's lights and sun come from `world`; its triangles from `worldGeometry`.
+    bool LoadMap(const std::string& name, const bsp::WorldGeometry& world, const ModelGeometry& worldGeometry);
     // Builds a BLAS for the geometry and returns its model id, or -1 when the geometry is empty or fails.
-    int AddModel(const studio::Geometry& geometry);
+    int AddModel(const ModelGeometry& geometry);
+    // A texture for alpha tests and material masks: VTF mips in their stored layout, largest first. Returns its
+    // descriptor, or DescriptorHeap::kInvalid.
+    UINT AddTexture(DXGI_FORMAT format, UINT width, UINT height, std::span<const std::span<const std::byte>> mips);
+    // An entry of ModelGeometry::alphaTriangles: the alpha texture and the alpha test reference (0-1).
+    static uint32_t PackAlpha(UINT textureView, float reference);
+
+    static constexpr uint32_t kNoMaterial = 0xFFFFFFFF;
+    static constexpr uint32_t kMaskOff = 0xFFFFFFFF;
+    // A mask from one channel (0-3: r, g, b, a) of a texture, optionally inverted; kInvalid as the texture
+    // makes it constant 1.
+    static uint32_t PackMask(UINT textureView, uint32_t channel, bool invert);
+    // Adds a material for ModelGeometry::triangleMaterials and returns its index, or kNoMaterial when full.
+    uint32_t AddMaterial(const GpuMaterial& material);
+    UINT MaterialsView() const { return m_materialsView; }
+    // A model's BLAS geometry: its opaque triangles, then its alpha-tested ones. Returns the number of descs used.
+    static UINT GeometryDescs(D3D12_GPU_VIRTUAL_ADDRESS vertices, UINT vertexCount, D3D12_GPU_VIRTUAL_ADDRESS indices, UINT triangles,
+        UINT opaqueTriangles, D3D12_RAYTRACING_GEOMETRY_DESC (&descs)[2]);
     void SetStaticInstances(std::vector<SceneInstance> instances) { m_staticInstances = std::move(instances); }
+    // The engine's dynamic lights for the next RecordFrame.
+    void SetDynamicLights(std::span<const engine::DynamicLight> lights) { m_dynamicLights.assign(lights.begin(), lights.end()); }
     void Clear();
 
     bool Ready() const { return m_worldModel >= 0; }
     const std::string& Name() const { return m_name; }
     const bsp::SunLight& Sun() const { return m_sun; }
+    UINT LightsView() const { return m_lightsView; }
+    UINT LightCount() const { return m_lightCount; }
+
+    // The map lights each visibility cluster can see and be reached by, found per point by walking the BSP tree
+    // (LightsAt in shaders/scene.hlsli). `rangesView` holds an (offset, count) range of light indices per cluster
+    // and one more, after them, with every light for points outside any cluster.
+    struct LightLists {
+        UINT rangesView = DescriptorHeap::kInvalid;
+        UINT indicesView = DescriptorHeap::kInvalid;
+        UINT nodesView = DescriptorHeap::kInvalid;
+        UINT leafClustersView = DescriptorHeap::kInvalid;
+        UINT clusterCount = 0;
+    };
+    const LightLists& Lights() const { return m_lightLists; }
 
     // Records a TLAS build for this frame into `list`; the caller waits for `slot`'s previous use first.
-    D3D12_GPU_VIRTUAL_ADDRESS RecordFrameTlas(ID3D12GraphicsCommandList4* list, UINT slot, std::span<const SceneInstance> dynamic);
+    SceneFrame RecordFrame(ID3D12GraphicsCommandList4* list, UINT slot, std::span<const SceneInstance> dynamic);
 
 private:
+    struct Model {
+        Microsoft::WRL::ComPtr<ID3D12Resource> blas;
+        Microsoft::WRL::ComPtr<ID3D12Resource> positions;
+        Microsoft::WRL::ComPtr<ID3D12Resource> indices;
+        Microsoft::WRL::ComPtr<ID3D12Resource> albedo;
+        Microsoft::WRL::ComPtr<ID3D12Resource> uvs;
+        Microsoft::WRL::ComPtr<ID3D12Resource> alpha;
+        Microsoft::WRL::ComPtr<ID3D12Resource> materials;
+        UINT positionsView = DescriptorHeap::kInvalid;
+        UINT indicesView = DescriptorHeap::kInvalid;
+        UINT albedoView = DescriptorHeap::kInvalid;
+        UINT uvsView = DescriptorHeap::kInvalid;
+        UINT alphaView = DescriptorHeap::kInvalid;
+        UINT materialsView = DescriptorHeap::kInvalid;
+        UINT opaqueTriangles = 0;
+    };
+    struct Texture {
+        Microsoft::WRL::ComPtr<ID3D12Resource> resource;
+        UINT view = DescriptorHeap::kInvalid;
+    };
+    struct InstanceRecord;
     struct FrameTlas {
         Microsoft::WRL::ComPtr<ID3D12Resource> instances;
         D3D12_RAYTRACING_INSTANCE_DESC* mapped = nullptr;
+        Microsoft::WRL::ComPtr<ID3D12Resource> records;
+        InstanceRecord* mappedRecords = nullptr;
+        UINT recordsView = DescriptorHeap::kInvalid;
         UINT capacity = 0;
+        Microsoft::WRL::ComPtr<ID3D12Resource> dynamicLights;
+        GpuLight* mappedDynamicLights = nullptr;
+        UINT dynamicLightsView = DescriptorHeap::kInvalid;
         Microsoft::WRL::ComPtr<ID3D12Resource> scratch;
         Microsoft::WRL::ComPtr<ID3D12Resource> tlas;
     };
 
     Microsoft::WRL::ComPtr<ID3D12Resource> CreateBuffer(UINT64 size, D3D12_HEAP_TYPE heap, D3D12_RESOURCE_FLAGS flags, D3D12_RESOURCE_STATES state);
-    Microsoft::WRL::ComPtr<ID3D12Resource> Upload(const void* data, UINT64 size);
-    int BuildBlas(const std::vector<bsp::Float3>& positions, const std::vector<uint32_t>& indices);
+    // Records a copy of `data` into a new default-heap buffer; `staging` must outlive the command list.
+    Microsoft::WRL::ComPtr<ID3D12Resource> UploadToDefault(const void* data, UINT64 size, std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>>& staging);
+    bool Submit();
+    void ReleaseModel(Model& model);
     bool EnsureFrameCapacity(FrameTlas& frame, UINT count);
+    bool EnsureDynamicLights(FrameTlas& frame);
+    bool BuildLightLists(std::span<const bsp::Light> lights, const bsp::Visibility& visibility);
 
     ID3D12Device5* m_device = nullptr;
     ID3D12CommandQueue* m_queue = nullptr;
+    DescriptorHeap* m_descriptors = nullptr;
     Microsoft::WRL::ComPtr<ID3D12CommandAllocator> m_allocator;
     Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList4> m_list;
     Microsoft::WRL::ComPtr<ID3D12Fence> m_fence;
     HANDLE m_fenceEvent = nullptr;
     uint64_t m_fenceValue = 0;
 
-    std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> m_models;
+    std::vector<Model> m_models;
+    std::vector<Texture> m_textures;
+    static constexpr UINT kMaxMaterials = 8192;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_materials;
+    GpuMaterial* m_mappedMaterials = nullptr;
+    UINT m_materialsView = DescriptorHeap::kInvalid;
+    UINT m_materialCount = 0;
     std::vector<SceneInstance> m_staticInstances;
+    std::vector<engine::DynamicLight> m_dynamicLights;
     std::array<FrameTlas, kFrameSlots> m_frames;
     int m_worldModel = -1;
     std::string m_name;
     bsp::SunLight m_sun;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_lights;
+    UINT m_lightsView = DescriptorHeap::kInvalid;
+    UINT m_lightCount = 0;
+    LightLists m_lightLists;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_lightRanges;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_lightIndices;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_bspNodes;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_leafClusters;
 };
 
 }

@@ -37,6 +37,8 @@ private:
     Microsoft::WRL::ComPtr<IDXGISwapChain3> m_swapChain;
     Microsoft::WRL::ComPtr<ID3D12Fence> m_fence;
     Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> m_commandList;
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_rtvHeap;
+    UINT m_rtvIncrement = 0;
     std::array<Microsoft::WRL::ComPtr<ID3D12CommandAllocator>, kBufferCount> m_allocators;
     std::array<uint64_t, kBufferCount> m_allocatorFenceValues = {};
     Microsoft::WRL::ComPtr<IDirect3DTexture9> m_copySource;

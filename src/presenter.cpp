@@ -1,6 +1,7 @@
 #include "presenter.h"
 
 #include "log.h"
+#include "overlay.h"
 #include "renderer.h"
 
 #include <future>
@@ -110,6 +111,14 @@ bool Presenter::Initialize(IDirect3DDevice9* device, HWND fallbackWindow, const 
     }
     if (!CreateSinkWindow())
         return false;
+    D3D12_DESCRIPTOR_HEAP_DESC rtvHeap = {D3D12_DESCRIPTOR_HEAP_TYPE_RTV, kBufferCount};
+    hr = d3d12->CreateDescriptorHeap(&rtvHeap, IID_PPV_ARGS(&m_rtvHeap));
+    if (FAILED(hr)) {
+        Disable("RTV heap creation failed", hr);
+        return false;
+    }
+    m_rtvIncrement = d3d12->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    overlay::Initialize(m_window, m_renderer, DXGI_FORMAT_B8G8R8A8_UNORM, kBufferCount);
 
     m_active = true;
     log::Info("Presenter: flip-model swap chain {}x{} on window {}, sync interval {}", m_width, m_height,
@@ -161,6 +170,7 @@ bool Presenter::PresentFrame(IDirect3DDevice9* device)
 {
     if (!m_active || !EnsureCopySource(device))
         return false;
+    overlay::EnsureWindowHook();
 
     ComPtr<IDirect3DSurface9> backBuffer;
     HRESULT hr = device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backBuffer);
@@ -201,9 +211,19 @@ bool Presenter::PresentFrame(IDirect3DDevice9* device)
         };
         m_commandList->ResourceBarrier(2, before);
         m_commandList->CopyResource(target.Get(), source.Get());
+        D3D12_RESOURCE_STATES targetState = D3D12_RESOURCE_STATE_COPY_DEST;
+        if (overlay::Open()) {
+            D3D12_CPU_DESCRIPTOR_HANDLE rtv = m_rtvHeap->GetCPUDescriptorHandleForHeapStart();
+            rtv.ptr += static_cast<SIZE_T>(slot) * m_rtvIncrement;
+            m_renderer.Device()->CreateRenderTargetView(target.Get(), nullptr, rtv);
+            D3D12_RESOURCE_BARRIER toTarget = Transition(target.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            m_commandList->ResourceBarrier(1, &toTarget);
+            overlay::Render(m_commandList.Get(), rtv);
+            targetState = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        }
         D3D12_RESOURCE_BARRIER after[] = {
             Transition(source.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON),
-            Transition(target.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT),
+            Transition(target.Get(), targetState, D3D12_RESOURCE_STATE_PRESENT),
         };
         m_commandList->ResourceBarrier(2, after);
         hr = m_commandList->Close();

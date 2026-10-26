@@ -36,6 +36,7 @@ constexpr size_t kMeshMaterial = 0;
 constexpr size_t kMeshVertexOffset = 12;
 constexpr size_t kStudioVertexSize = 48;
 constexpr size_t kStudioVertexPosition = 16;
+constexpr size_t kStudioVertexTexCoord = 40;
 constexpr size_t kVvdNumLods = 12;
 constexpr size_t kVvdNumFixups = 48;
 constexpr size_t kVvdFixupTableStart = 52;
@@ -100,6 +101,7 @@ constexpr VtxStripGroupLayout kStripGroupLayouts[] = {{25}, {33}};
 
 struct StudioVertices {
     std::vector<bsp::Float3> positions;
+    std::vector<bsp::Float2> uvs;
     std::vector<VertexWeights> weights;
 };
 
@@ -124,6 +126,7 @@ bool AppendMesh(const Reader& vtx, size_t meshHeader, const StudioVertices& vert
             if (!original || meshVertexBase + *original >= vertices.positions.size())
                 return false;
             geometry.positions.push_back(vertices.positions[meshVertexBase + *original]);
+            geometry.uvs.push_back(vertices.uvs[meshVertexBase + *original]);
             geometry.weights.push_back(vertices.weights[meshVertexBase + *original]);
         }
         for (int32_t i = 0; i < *numIndices; ++i) {
@@ -155,10 +158,12 @@ std::optional<StudioVertices> Lod0Vertices(const Reader& vvd, std::string& error
     auto append = [&](int32_t index) {
         const size_t vertex = *vertexStart + static_cast<size_t>(index) * kStudioVertexSize;
         auto p = vvd.At<bsp::Float3>(vertex + kStudioVertexPosition);
+        auto uv = vvd.At<bsp::Float2>(vertex + kStudioVertexTexCoord);
         auto w = vvd.At<VertexWeights>(vertex);
-        if (!p || !w)
+        if (!p || !uv || !w)
             return false;
         vertices.positions.push_back(*p);
+        vertices.uvs.push_back(*uv);
         vertices.weights.push_back(*w);
         return true;
     };
@@ -323,6 +328,7 @@ bool BuildGeometry(std::span<const std::byte> mdlBytes, std::span<const std::byt
                     continue;
                 const size_t vtxMesh = vtxLod + *vtxMeshOffset + static_cast<size_t>(m) * 9;
                 valid = AppendMesh(vtx, vtxMesh, *vertices, modelVertexBase + *vertexOffset, layout.size, geometry);
+                geometry.triangleTextures.resize(geometry.indices.size() / 3, texture && *texture >= 0 ? static_cast<uint16_t>(*texture) : kNoTexture);
             }
         }
         if (valid)
@@ -333,20 +339,172 @@ bool BuildGeometry(std::span<const std::byte> mdlBytes, std::span<const std::byt
     return false;
 }
 
-bool MaterialIsSeeThrough(std::string_view vmt)
+std::optional<std::string> MaterialValue(std::string_view vmt, std::string_view key)
 {
-    std::string text(vmt);
-    std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    for (const char* key : {"$alphatest", "$translucent"}) {
-        size_t pos = text.find(key);
-        while (pos != std::string::npos) {
-            size_t value = text.find_first_not_of(" \t\"", pos + std::strlen(key));
-            if (value != std::string::npos && text[value] == '1')
-                return true;
-            pos = text.find(key, pos + 1);
+    // KeyValues tokens: quoted strings or bare words; "//" starts a comment.
+    std::vector<std::string> tokens;
+    for (size_t i = 0; i < vmt.size();) {
+        const char c = vmt[i];
+        if (c == '/' && i + 1 < vmt.size() && vmt[i + 1] == '/') {
+            i = vmt.find('\n', i);
+            if (i == std::string_view::npos)
+                break;
+        } else if (c == '"') {
+            size_t end = vmt.find('"', i + 1);
+            if (end == std::string_view::npos)
+                break;
+            tokens.emplace_back(vmt.substr(i + 1, end - i - 1));
+            i = end + 1;
+        } else if (c == '{' || c == '}' || std::isspace(static_cast<unsigned char>(c))) {
+            ++i;
+        } else {
+            size_t end = i;
+            while (end < vmt.size() && !std::isspace(static_cast<unsigned char>(vmt[end])) && vmt[end] != '"' && vmt[end] != '{' && vmt[end] != '}')
+                ++end;
+            tokens.emplace_back(vmt.substr(i, end - i));
+            i = end;
         }
     }
-    return false;
+    auto equalsKey = [&](const std::string& token) {
+        return token.size() == key.size() &&
+            std::equal(token.begin(), token.end(), key.begin(), [](char a, char b) { return std::tolower(static_cast<unsigned char>(a)) == std::tolower(static_cast<unsigned char>(b)); });
+    };
+    for (size_t t = 0; t + 1 < tokens.size(); ++t) {
+        if (equalsKey(tokens[t]))
+            return tokens[t + 1];
+    }
+    return std::nullopt;
+}
+
+std::string MaterialTexture(std::string_view vmt, std::string_view key)
+{
+    const std::optional<std::string> value = MaterialValue(vmt, key);
+    if (!value)
+        return {};
+    std::string path = NormalizePath(*value);
+    if (path.empty())
+        return {};
+    path.pop_back();
+    if (path.size() > 4 && path.ends_with(".vtf"))
+        path.resize(path.size() - 4);
+    return "materials/" + path + ".vtf";
+}
+
+std::optional<bsp::Float3> TextureReflectivity(std::span<const std::byte> vtfHeader)
+{
+    constexpr size_t kReflectivityOffset = 32;
+    Reader vtf(vtfHeader);
+    if (vtfHeader.size() < kVtfReflectivityHeaderSize || std::memcmp(vtfHeader.data(), "VTF", 4) != 0)
+        return std::nullopt;
+    return vtf.At<bsp::Float3>(kReflectivityOffset);
+}
+
+namespace {
+
+// VTF image formats (ImageFormat in the Source SDK's bitmap/imageformat.h).
+struct VtfFormat {
+    int32_t id;
+    TextureFormat format;
+    // Bytes per 4x4 block for block-compressed formats, else 0.
+    uint32_t blockBytes;
+    uint32_t texelBytes;
+    bool alpha;
+};
+constexpr VtfFormat kFormats[] = {{0, TextureFormat::Rgba8, 0, 4, true}, {5, TextureFormat::R8, 0, 1, false}, {12, TextureFormat::Bgra8, 0, 4, true},
+    {13, TextureFormat::Bc1, 8, 0, true}, {14, TextureFormat::Bc2, 16, 0, true}, {15, TextureFormat::Bc3, 16, 0, true},
+    {16, TextureFormat::Bgrx8, 0, 4, false}, {20, TextureFormat::Bc1, 8, 0, true}};
+constexpr VtfFormat kLowResFormat = {13, TextureFormat::Bc1, 8, 0, true};
+constexpr uint32_t kVtfEnvmapFlag = 0x4000;
+constexpr uint32_t kVtfHighResResource = 0x30;
+constexpr size_t kVtfResourcesOffset = 80;
+
+uint32_t MipBytes(const VtfFormat& format, uint32_t width, uint32_t height)
+{
+    if (format.blockBytes == 0)
+        return width * height * format.texelBytes;
+    return std::max(1u, (width + 3) / 4) * std::max(1u, (height + 3) / 4) * format.blockBytes;
+}
+
+}
+
+std::optional<TextureImage> ReadTexture(std::span<const std::byte> bytes, uint32_t maxSize, std::string& error)
+{
+    Reader vtf(bytes);
+    auto minor = vtf.At<uint32_t>(8);
+    auto headerSize = vtf.At<uint32_t>(12);
+    auto width = vtf.At<uint16_t>(16);
+    auto height = vtf.At<uint16_t>(18);
+    auto flags = vtf.At<uint32_t>(20);
+    auto frames = vtf.At<uint16_t>(24);
+    auto format = vtf.At<int32_t>(52);
+    auto mips = vtf.At<uint8_t>(56);
+    auto lowFormat = vtf.At<int32_t>(57);
+    auto lowWidth = vtf.At<uint8_t>(61);
+    auto lowHeight = vtf.At<uint8_t>(62);
+    if (bytes.size() < 4 || std::memcmp(bytes.data(), "VTF", 4) != 0 || !minor || !headerSize || !width || !height || !flags || !frames || !format ||
+        !mips || !lowFormat || !lowWidth || !lowHeight || *mips == 0 || *width == 0 || *height == 0) {
+        error = "not a VTF file";
+        return std::nullopt;
+    }
+    const VtfFormat* info = nullptr;
+    for (const VtfFormat& candidate : kFormats)
+        info = candidate.id == *format ? &candidate : info;
+    const uint16_t depth = *minor >= 2 ? vtf.At<uint16_t>(63).value_or(1) : 1;
+    if (info == nullptr || (*flags & kVtfEnvmapFlag) != 0 || depth > 1) {
+        error = std::format("image format {} (flags {:#x}, depth {}) is not supported", *format, *flags, depth);
+        return std::nullopt;
+    }
+
+    size_t offset = 0;
+    if (*minor >= 3) {
+        const uint32_t resources = vtf.At<uint32_t>(68).value_or(0);
+        for (uint32_t r = 0; r < resources && offset == 0; ++r) {
+            auto type = vtf.At<uint32_t>(kVtfResourcesOffset + r * 8);
+            auto data = vtf.At<uint32_t>(kVtfResourcesOffset + r * 8 + 4);
+            if (type && data && (*type & 0xFFFFFFu) == kVtfHighResResource)
+                offset = *data;
+        }
+    } else {
+        offset = *headerSize;
+        if (*lowFormat == kLowResFormat.id)
+            offset += MipBytes(kLowResFormat, *lowWidth, *lowHeight);
+        else if (*lowFormat != -1)
+            offset = 0;
+    }
+    if (offset == 0) {
+        error = "the image data could not be located";
+        return std::nullopt;
+    }
+
+    // Mips are stored from the smallest to the largest, each with all its frames. Block-compressed mips must be
+    // whole blocks to become a texture.
+    const bool blocks = info->blockBytes != 0;
+    int chosen = -1;
+    for (int m = 0; m < *mips; ++m) {
+        const uint32_t w = std::max(1u, static_cast<uint32_t>(*width) >> m);
+        const uint32_t h = std::max(1u, static_cast<uint32_t>(*height) >> m);
+        if (std::max(w, h) <= maxSize && (!blocks || (w % 4 == 0 && h % 4 == 0))) {
+            chosen = m;
+            break;
+        }
+    }
+    if (chosen < 0) {
+        error = std::format("no mip of the {}x{} image fits", *width, *height);
+        return std::nullopt;
+    }
+    TextureImage image{info->format, std::max(1u, static_cast<uint32_t>(*width) >> chosen), std::max(1u, static_cast<uint32_t>(*height) >> chosen),
+        info->alpha, {}};
+    image.mips.resize(*mips - chosen);
+    for (int m = *mips - 1; m >= chosen; --m) {
+        const size_t size = MipBytes(*info, std::max(1u, static_cast<uint32_t>(*width) >> m), std::max(1u, static_cast<uint32_t>(*height) >> m));
+        if (offset > bytes.size() || bytes.size() - offset < size) {
+            error = "the image data is truncated";
+            return std::nullopt;
+        }
+        image.mips[m - chosen] = bytes.subspan(offset, size);
+        offset += size * *frames;
+    }
+    return image;
 }
 
 }

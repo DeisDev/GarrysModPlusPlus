@@ -1,5 +1,6 @@
 #include "bsp.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -14,7 +15,9 @@ constexpr int32_t kIdent = 'V' | ('B' << 8) | ('S' << 16) | ('P' << 24);
 constexpr int kLumpCount = 64;
 constexpr int kLumpEntities = 0;
 constexpr int kLumpPlanes = 1;
+constexpr int kLumpTexdata = 2;
 constexpr int kLumpVertexes = 3;
+constexpr int kLumpVisibility = 4;
 constexpr int kLumpNodes = 5;
 constexpr int kLumpLeafs = 10;
 constexpr int kLumpTexinfo = 6;
@@ -26,6 +29,8 @@ constexpr int kLumpWorldLights = 15;
 constexpr int kLumpDispInfo = 26;
 constexpr int kLumpGameLump = 35;
 constexpr int kLumpDispVerts = 33;
+constexpr int kLumpTexdataStringData = 43;
+constexpr int kLumpTexdataStringTable = 44;
 constexpr int kLumpWorldLightsHdr = 54;
 
 constexpr int32_t kSurfSky2D = 0x0002;
@@ -43,8 +48,6 @@ constexpr size_t kStaticPropNameLength = 128;
 constexpr uint32_t kStaticPropNoShadow = 0x10;
 constexpr float kDegreesToRadians = 3.14159265358979f / 180.0f;
 
-constexpr int kEmitSkyLight = 3;
-constexpr int kEmitSkyAmbient = 5;
 
 #pragma pack(push, 1)
 struct Lump {
@@ -118,6 +121,13 @@ struct Texinfo {
     int32_t texdata;
 };
 
+struct Texdata {
+    Float3 reflectivity;
+    int32_t nameStringTableId;
+    int32_t width, height;
+    int32_t viewWidth, viewHeight;
+};
+
 struct Model {
     Float3 mins, maxs, origin;
     int32_t headNode;
@@ -168,6 +178,7 @@ static_assert(sizeof(Leaf) == 30);
 static_assert(sizeof(Face) == 56);
 static_assert(sizeof(Texinfo) == 72);
 static_assert(sizeof(Model) == 48);
+static_assert(sizeof(Texdata) == 32);
 static_assert(sizeof(DispVert) == 20);
 static_assert(sizeof(DispInfo) == 176);
 static_assert(sizeof(WorldLight) == 88);
@@ -202,9 +213,75 @@ struct Lumps {
     std::span<const uint16_t> edges;
     std::span<const Face> faces;
     std::span<const Texinfo> texinfos;
+    std::span<const Texdata> texdatas;
     std::span<const DispInfo> dispinfos;
     std::span<const DispVert> dispVerts;
 };
+
+uint32_t PackUnorm(Float3 c)
+{
+    auto channel = [](float v) { return static_cast<uint32_t>(std::lround(std::clamp(v, 0.0f, 1.0f) * 255.0f)); };
+    return channel(c.x) | channel(c.y) << 8 | channel(c.z) << 16 | 0xFF000000u;
+}
+
+uint32_t FaceMaterial(const Lumps& lumps, const Face& face)
+{
+    if (face.texinfo < 0 || static_cast<size_t>(face.texinfo) >= lumps.texinfos.size())
+        return kNoMaterial;
+    const int32_t texdata = lumps.texinfos[face.texinfo].texdata;
+    return texdata >= 0 && static_cast<size_t>(texdata) < lumps.texdatas.size() ? static_cast<uint32_t>(texdata) : kNoMaterial;
+}
+
+// Texture coordinates of a point on a face: texinfo's texture vectors in texels, over the texture size.
+Float2 FaceUv(const Lumps& lumps, const Face& face, Float3 p)
+{
+    const uint32_t material = FaceMaterial(lumps, face);
+    if (material == kNoMaterial)
+        return {};
+    const Texinfo& texinfo = lumps.texinfos[face.texinfo];
+    const Texdata& texdata = lumps.texdatas[material];
+    auto axis = [&](const float (&v)[4], int32_t size) {
+        return (v[0] * p.x + v[1] * p.y + v[2] * p.z + v[3]) / static_cast<float>(std::max(size, 1));
+    };
+    return {axis(texinfo.textureVecs[0], texdata.width), axis(texinfo.textureVecs[1], texdata.height)};
+}
+
+uint32_t FaceAlbedo(const Lumps& lumps, const Face& face)
+{
+    constexpr Float3 kFallback = {0.5f, 0.5f, 0.5f};
+    if (face.texinfo < 0 || static_cast<size_t>(face.texinfo) >= lumps.texinfos.size())
+        return PackUnorm(kFallback);
+    const int32_t texdata = lumps.texinfos[face.texinfo].texdata;
+    if (texdata < 0 || static_cast<size_t>(texdata) >= lumps.texdatas.size())
+        return PackUnorm(kFallback);
+    return PackUnorm(lumps.texdatas[texdata].reflectivity);
+}
+
+// Material names come from the texdata string table: offsets into a block of NUL-terminated strings.
+void ReadMaterialNames(std::span<const std::byte> file, const Header& header, std::span<const Texdata> texdatas, std::vector<std::string>& names)
+{
+    names.assign(texdatas.size(), {});
+    auto table = LumpArray<int32_t>(file, header, kLumpTexdataStringTable);
+    const Lump& data = header.lumps[kLumpTexdataStringData];
+    if (!table || data.offset < 0 || data.length <= 0 || static_cast<size_t>(data.offset) + data.length > file.size())
+        return;
+    const std::string_view strings(reinterpret_cast<const char*>(file.data() + data.offset), data.length);
+    for (size_t i = 0; i < texdatas.size(); ++i) {
+        const int32_t id = texdatas[i].nameStringTableId;
+        if (id < 0 || static_cast<size_t>(id) >= table->size())
+            continue;
+        const int32_t offset = (*table)[id];
+        if (offset < 0 || static_cast<size_t>(offset) >= strings.size())
+            continue;
+        const std::string_view rest = strings.substr(offset);
+        names[i] = std::string(rest.substr(0, rest.find('\0')));
+    }
+}
+
+bool IsSkipped(const Lumps& lumps, const Face& face)
+{
+    return face.texinfo >= 0 && static_cast<size_t>(face.texinfo) < lumps.texinfos.size() && (lumps.texinfos[face.texinfo].flags & kSkippedSurfaces) != 0;
+}
 
 bool FacePolygon(const Lumps& lumps, const Face& face, std::vector<Float3>& polygon)
 {
@@ -225,19 +302,28 @@ bool FacePolygon(const Lumps& lumps, const Face& face, std::vector<Float3>& poly
     return polygon.size() >= 3;
 }
 
-void AddPolygon(WorldGeometry& world, const std::vector<Float3>& polygon)
+void AddPolygon(Mesh& mesh, const Lumps& lumps, const Face& face, const std::vector<Float3>& polygon)
 {
-    uint32_t base = static_cast<uint32_t>(world.positions.size());
-    world.positions.insert(world.positions.end(), polygon.begin(), polygon.end());
+    const uint32_t albedo = FaceAlbedo(lumps, face);
+    const uint32_t material = FaceMaterial(lumps, face);
+    uint32_t base = static_cast<uint32_t>(mesh.positions.size());
+    for (const Float3& p : polygon) {
+        mesh.positions.push_back(p);
+        mesh.uvs.push_back(FaceUv(lumps, face, p));
+    }
     for (uint32_t i = 1; i + 1 < polygon.size(); ++i) {
-        world.indices.push_back(base);
-        world.indices.push_back(base + i);
-        world.indices.push_back(base + i + 1);
+        mesh.indices.push_back(base);
+        mesh.indices.push_back(base + i);
+        mesh.indices.push_back(base + i + 1);
+        mesh.triangleAlbedo.push_back(albedo);
+        mesh.triangleMaterials.push_back(material);
     }
 }
 
-bool AddDisplacement(WorldGeometry& world, const Lumps& lumps, const DispInfo& disp, const std::vector<Float3>& corners)
+bool AddDisplacement(Mesh& mesh, const Lumps& lumps, const Face& face, const DispInfo& disp, const std::vector<Float3>& corners)
 {
+    const uint32_t albedo = FaceAlbedo(lumps, face);
+    const uint32_t material = FaceMaterial(lumps, face);
     if (corners.size() != 4 || disp.power < 2 || disp.power > 4)
         return false;
 
@@ -261,7 +347,7 @@ bool AddDisplacement(WorldGeometry& world, const Lumps& lumps, const DispInfo& d
     const float step = 1.0f / static_cast<float>(post - 1);
     const Float3 edge0 = Scale(Sub(p[1], p[0]), step);
     const Float3 edge1 = Scale(Sub(p[2], p[3]), step);
-    uint32_t base = static_cast<uint32_t>(world.positions.size());
+    uint32_t base = static_cast<uint32_t>(mesh.positions.size());
     for (int i = 0; i < post; ++i) {
         Float3 end0 = Add(p[0], Scale(edge0, static_cast<float>(i)));
         Float3 end1 = Add(p[3], Scale(edge1, static_cast<float>(i)));
@@ -269,7 +355,8 @@ bool AddDisplacement(WorldGeometry& world, const Lumps& lumps, const DispInfo& d
         for (int j = 0; j < post; ++j) {
             const DispVert& dv = lumps.dispVerts[disp.dispVertStart + i * post + j];
             Float3 flat = Add(end0, Scale(segment, static_cast<float>(j)));
-            world.positions.push_back(Add(flat, Scale(dv.vec, dv.dist)));
+            mesh.positions.push_back(Add(flat, Scale(dv.vec, dv.dist)));
+            mesh.uvs.push_back(FaceUv(lumps, face, flat));
         }
     }
     for (int i = 0; i + 1 < post; ++i) {
@@ -278,7 +365,9 @@ bool AddDisplacement(WorldGeometry& world, const Lumps& lumps, const DispInfo& d
             uint32_t b = a + 1;
             uint32_t c = a + post;
             uint32_t d = c + 1;
-            world.indices.insert(world.indices.end(), {a, b, d, a, d, c});
+            mesh.indices.insert(mesh.indices.end(), {a, b, d, a, d, c});
+            mesh.triangleAlbedo.insert(mesh.triangleAlbedo.end(), {albedo, albedo});
+            mesh.triangleMaterials.insert(mesh.triangleMaterials.end(), {material, material});
         }
     }
     return true;
@@ -332,6 +421,82 @@ struct AreaLocator {
         return leaf.areaFlags & 0x1FF;
     }
 };
+
+// Run-length decoding as in DecompressVis (utils/common/bsplib.cpp): a zero byte is followed by a count of zero bytes.
+bool DecompressVis(std::span<const std::byte> in, std::span<uint8_t> out)
+{
+    size_t read = 0;
+    size_t written = 0;
+    while (written < out.size()) {
+        if (read >= in.size())
+            return false;
+        const uint8_t value = static_cast<uint8_t>(in[read]);
+        if (value != 0) {
+            out[written++] = value;
+            ++read;
+            continue;
+        }
+        if (read + 1 >= in.size() || in[read + 1] == std::byte{0})
+            return false;
+        written = std::min(out.size(), written + static_cast<uint8_t>(in[read + 1]));
+        read += 2;
+    }
+    return true;
+}
+
+void ReadVisibility(std::span<const std::byte> file, const Header& header, Visibility& visibility)
+{
+    auto planes = LumpArray<Plane>(file, header, kLumpPlanes);
+    auto nodes = LumpArray<Node>(file, header, kLumpNodes);
+    if (!planes || !nodes || nodes->empty())
+        return;
+    const Lump& leafLump = header.lumps[kLumpLeafs];
+    const size_t leafStride = leafLump.version == 0 ? kLeafV0Size : kLeafV1Size;
+    if (leafLump.fourCC != 0 || leafLump.length <= 0 || static_cast<size_t>(leafLump.offset) + leafLump.length > file.size() ||
+        leafLump.length % leafStride != 0)
+        return;
+    const Lump& visLump = header.lumps[kLumpVisibility];
+    if (visLump.fourCC != 0 || visLump.length < static_cast<int32_t>(sizeof(int32_t)) ||
+        static_cast<size_t>(visLump.offset) + visLump.length > file.size())
+        return;
+    const std::span<const std::byte> vis = file.subspan(visLump.offset, visLump.length);
+    int32_t clusterCount;
+    std::memcpy(&clusterCount, vis.data(), sizeof(clusterCount));
+    if (clusterCount <= 0 || (static_cast<size_t>(clusterCount) * 2 + 1) * sizeof(int32_t) > vis.size())
+        return;
+    const size_t row = (static_cast<size_t>(clusterCount) + 7) / 8;
+    std::vector<uint8_t> pvs(row * clusterCount);
+    for (int32_t c = 0; c < clusterCount; ++c) {
+        int32_t offset;
+        std::memcpy(&offset, vis.data() + sizeof(int32_t) * (1 + 2 * c), sizeof(offset));
+        if (offset < 0 || static_cast<size_t>(offset) >= vis.size() || !DecompressVis(vis.subspan(offset), std::span(pvs).subspan(c * row, row)))
+            return;
+    }
+    std::vector<BspLeaf> leaves;
+    for (size_t offset = 0; offset < static_cast<size_t>(leafLump.length); offset += leafStride) {
+        Leaf leaf;
+        std::memcpy(&leaf, file.data() + leafLump.offset + offset, sizeof(leaf));
+        leaves.push_back({leaf.cluster < clusterCount ? leaf.cluster : -1,
+            {static_cast<float>(leaf.mins[0]), static_cast<float>(leaf.mins[1]), static_cast<float>(leaf.mins[2])},
+            {static_cast<float>(leaf.maxs[0]), static_cast<float>(leaf.maxs[1]), static_cast<float>(leaf.maxs[2])}});
+    }
+    std::vector<BspNode> tree;
+    tree.reserve(nodes->size());
+    for (const Node& node : *nodes) {
+        if (node.planeNum < 0 || static_cast<size_t>(node.planeNum) >= planes->size())
+            return;
+        for (int32_t child : node.children) {
+            if (child >= 0 ? static_cast<size_t>(child) >= nodes->size() : static_cast<size_t>(-child - 1) >= leaves.size())
+                return;
+        }
+        const Plane& plane = (*planes)[node.planeNum];
+        tree.push_back({plane.normal, plane.distance, {node.children[0], node.children[1]}});
+    }
+    visibility.clusterCount = static_cast<uint32_t>(clusterCount);
+    visibility.pvs = std::move(pvs);
+    visibility.nodes = std::move(tree);
+    visibility.leaves = std::move(leaves);
+}
 
 std::optional<AreaLocator> MakeAreaLocator(std::span<const std::byte> file, const Header& header)
 {
@@ -433,7 +598,7 @@ void ReadStaticProps(std::span<const std::byte> file, const Header& header, Worl
     }
 }
 
-void ReadSun(std::span<const std::byte> file, const Header& header, SunLight& sun)
+void ReadLights(std::span<const std::byte> file, const Header& header, WorldGeometry& world)
 {
     for (int lumpIndex : {kLumpWorldLightsHdr, kLumpWorldLights}) {
         const Lump& lump = header.lumps[lumpIndex];
@@ -446,15 +611,27 @@ void ReadSun(std::span<const std::byte> file, const Header& header, SunLight& su
             std::memcpy(&light, entry, 36);
             const size_t tail = stride == kWorldLightV1Size ? 48 : 36;
             std::memcpy(&light.cluster, entry + tail, sizeof(WorldLight) - 36);
-            if (light.type == kEmitSkyLight) {
-                sun.present = true;
-                sun.direction = Scale(light.normal, -1.0f);
-                sun.color = light.intensity;
-            } else if (light.type == kEmitSkyAmbient) {
-                sun.ambient = light.intensity;
+            switch (static_cast<LightType>(light.type)) {
+            case LightType::Sky:
+                world.sun.present = true;
+                world.sun.direction = Scale(light.normal, -1.0f);
+                world.sun.color = light.intensity;
+                break;
+            case LightType::SkyAmbient:
+                world.sun.ambient = light.intensity;
+                break;
+            case LightType::Surface:
+            case LightType::Point:
+            case LightType::Spot:
+                world.lights.push_back({static_cast<LightType>(light.type), light.origin, light.intensity, light.normal, light.stopdot,
+                    light.stopdot2, light.exponent, light.radius, light.constantAttn, light.linearAttn, light.quadraticAttn, light.cluster});
+                break;
+            default:
+                break;
             }
         }
-        if (sun.present)
+        // The HDR lump is preferred; the LDR one is only a fallback for maps compiled without HDR.
+        if (world.sun.present || !world.lights.empty())
             return;
     }
 }
@@ -483,10 +660,11 @@ bool LoadWorld(std::span<const std::byte> file, WorldGeometry& world, std::strin
     auto edges = LumpArray<uint16_t>(file, header, kLumpEdges, sizeof(uint16_t) * 2);
     auto faces = LumpArray<Face>(file, header, kLumpFaces);
     auto texinfos = LumpArray<Texinfo>(file, header, kLumpTexinfo);
+    auto texdatas = LumpArray<Texdata>(file, header, kLumpTexdata);
     auto models = LumpArray<Model>(file, header, kLumpModels);
     auto dispinfos = LumpArray<DispInfo>(file, header, kLumpDispInfo);
     auto dispVerts = LumpArray<DispVert>(file, header, kLumpDispVerts);
-    if (!vertices || !surfedges || !edges || !faces || !texinfos || !models || models->empty() || !dispinfos || !dispVerts) {
+    if (!vertices || !surfedges || !edges || !faces || !texinfos || !texdatas || !models || models->empty() || !dispinfos || !dispVerts) {
         error = "a required lump is missing, compressed or malformed";
         return false;
     }
@@ -497,6 +675,7 @@ bool LoadWorld(std::span<const std::byte> file, WorldGeometry& world, std::strin
     lumps.edges = std::span<const uint16_t>(reinterpret_cast<const uint16_t*>(edges->data()), edges->size() * 2);
     lumps.faces = *faces;
     lumps.texinfos = *texinfos;
+    lumps.texdatas = *texdatas;
     lumps.dispinfos = *dispinfos;
     lumps.dispVerts = *dispVerts;
 
@@ -513,10 +692,7 @@ bool LoadWorld(std::span<const std::byte> file, WorldGeometry& world, std::strin
         if (f < 0 || static_cast<size_t>(f) >= lumps.faces.size())
             break;
         const Face& face = lumps.faces[f];
-        if (face.texinfo >= 0 && static_cast<size_t>(face.texinfo) < lumps.texinfos.size() &&
-            (lumps.texinfos[face.texinfo].flags & kSkippedSurfaces) != 0)
-            continue;
-        if (!FacePolygon(lumps, face, polygon))
+        if (IsSkipped(lumps, face) || !FacePolygon(lumps, face, polygon))
             continue;
         if (skyArea >= 0 && planes && face.planeNum < planes->size()) {
             Float3 center = {};
@@ -532,17 +708,36 @@ bool LoadWorld(std::span<const std::byte> file, WorldGeometry& world, std::strin
             }
         }
         if (face.dispinfo >= 0 && static_cast<size_t>(face.dispinfo) < lumps.dispinfos.size()) {
-            if (AddDisplacement(world, lumps, lumps.dispinfos[face.dispinfo], polygon))
+            if (AddDisplacement(world.mesh, lumps, face, lumps.dispinfos[face.dispinfo], polygon))
                 ++world.displacementCount;
             continue;
         }
-        AddPolygon(world, polygon);
+        AddPolygon(world.mesh, lumps, face, polygon);
         ++world.faceCount;
     }
 
-    ReadSun(file, header, world.sun);
+    world.brushModels.resize(models->size());
+    for (size_t m = 1; m < models->size(); ++m) {
+        const Model& model = (*models)[m];
+        for (int32_t f = model.firstFace; f < model.firstFace + model.numFaces; ++f) {
+            if (f < 0 || static_cast<size_t>(f) >= lumps.faces.size())
+                break;
+            const Face& face = lumps.faces[f];
+            if (!IsSkipped(lumps, face) && FacePolygon(lumps, face, polygon))
+                AddPolygon(world.brushModels[m], lumps, face, polygon);
+        }
+    }
+
+    ReadMaterialNames(file, header, lumps.texdatas, world.materials);
+    ReadLights(file, header, world);
+    ReadVisibility(file, header, world.visibility);
     ReadStaticProps(file, header, world);
-    if (world.indices.empty()) {
+    if (skyArea >= 0) {
+        world.skyboxPropCount = static_cast<uint32_t>(std::erase_if(world.props, [&](const StaticProp& prop) {
+            return areas->AreaAt({prop.transform[0][3], prop.transform[1][3], prop.transform[2][3]}) == skyArea;
+        }));
+    }
+    if (world.mesh.indices.empty()) {
         error = "the world model has no drawable faces";
         return false;
     }

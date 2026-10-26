@@ -4,10 +4,12 @@
 #include "d3d9_vtable.h"
 #include "effects.h"
 #include "frame_trace.h"
+#include "gbuffer.h"
 #include "log.h"
 #include "mod.h"
 #include "presenter.h"
 #include "renderer.h"
+#include "settings.h"
 #include "watchdog.h"
 
 #include <intrin.h>
@@ -82,19 +84,33 @@ bool CalledFromShaderApi(void* returnAddress)
 
 bool IsGameDevice(IDirect3DDevice9* device) { return device == g_gameDevice.load(std::memory_order_relaxed); }
 
+void RecordFrameInterval()
+{
+    static LARGE_INTEGER frequency = {};
+    static LARGE_INTEGER previous = {};
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    if (frequency.QuadPart == 0)
+        QueryPerformanceFrequency(&frequency);
+    else
+        RecordFrameTime(static_cast<float>(static_cast<double>(now.QuadPart - previous.QuadPart) * 1000.0 / static_cast<double>(frequency.QuadPart)));
+    previous = now;
+}
+
 HWND PresentFrame(IDirect3DDevice9* device, HWND requestedWindow)
 {
     static uint64_t frame = 0;
     ++frame;
+    RecordFrameInterval();
+    Renderer* renderer = GetRenderer();
+    renderer->OnPresent();
+    effects::OnPresent();
     const Options& options = GetOptions();
     if (options.devMode && frame % 30 == 0) {
         std::filesystem::path request = options.gameDirectory / L"gmodpp_capture.request";
         if (DeleteFileW(request.c_str()))
             CaptureBackBuffer(device, options.gameDirectory / std::format(L"gmodpp_capture_{}.bmp", frame));
     }
-    Renderer* renderer = GetRenderer();
-    renderer->OnPresent();
-    effects::OnPresent();
     watchdog::NotePresent();
     trace::OnFrameBoundary();
 
@@ -195,7 +211,9 @@ HRESULT STDMETHODCALLTYPE HookPresentEx(IDirect3DDevice9Ex* self, const RECT* sr
 HRESULT STDMETHODCALLTYPE HookSetVertexShaderConstantF(IDirect3DDevice9* self, UINT start, const float* data, UINT count)
 {
     if (IsGameDevice(self) && data != nullptr) {
-        GetRenderer()->OnVertexShaderConstants(start, data, count);
+        gbuffer::OnVertexShaderConstants(start, data, count);
+        static std::vector<float> jittered;
+        data = gbuffer::JitterVertexConstants(start, data, count, jittered);
         if (trace::Active()) {
             std::string values;
             for (UINT i = 0; i < count && start + i < 20; ++i) {
@@ -227,32 +245,156 @@ HRESULT STDMETHODCALLTYPE HookCreateDepthStencilSurface(IDirect3DDevice9* self, 
         return Original<Name##Fn>(self, kSlotDevice##Name) Args;                                       \
     }
 
-GMODPP_DEVICE_HOOK(SetRenderTarget, (IDirect3DDevice9* self, DWORD index, IDirect3DSurface9* surface), (self, index, surface),
-    trace::Line("SetRenderTarget {} {}", index, trace::Describe(surface)))
 GMODPP_DEVICE_HOOK(SetDepthStencilSurface, (IDirect3DDevice9* self, IDirect3DSurface9* surface), (self, surface),
     trace::Line("SetDepthStencilSurface {}", trace::Describe(surface)))
-GMODPP_DEVICE_HOOK(SetViewport, (IDirect3DDevice9* self, const D3DVIEWPORT9* vp), (self, vp),
-    trace::Line("SetViewport {} {} {}x{} z {}..{}", vp->X, vp->Y, vp->Width, vp->Height, vp->MinZ, vp->MaxZ))
 GMODPP_DEVICE_HOOK(Clear, (IDirect3DDevice9* self, DWORD count, const D3DRECT* rects, DWORD flags, D3DCOLOR color, float z, DWORD stencil),
     (self, count, rects, flags, color, z, stencil), trace::Line("Clear rects {} flags {:#x} color {:#010x} z {} stencil {}", count, flags, color, z, stencil))
 GMODPP_DEVICE_HOOK(BeginScene, (IDirect3DDevice9* self), (self), trace::Line("BeginScene"))
 GMODPP_DEVICE_HOOK(EndScene, (IDirect3DDevice9* self), (self), trace::Line("EndScene"))
-GMODPP_DEVICE_HOOK(DrawPrimitive, (IDirect3DDevice9* self, D3DPRIMITIVETYPE type, UINT start, UINT count), (self, type, start, count),
-    trace::Draw("DrawPrimitive", count))
-GMODPP_DEVICE_HOOK(DrawIndexedPrimitive, (IDirect3DDevice9* self, D3DPRIMITIVETYPE type, INT baseVertex, UINT minVertex, UINT numVertices, UINT startIndex, UINT count),
-    (self, type, baseVertex, minVertex, numVertices, startIndex, count), trace::Draw("DrawIndexedPrimitive", count))
-GMODPP_DEVICE_HOOK(DrawPrimitiveUP, (IDirect3DDevice9* self, D3DPRIMITIVETYPE type, UINT count, const void* data, UINT stride), (self, type, count, data, stride),
-    trace::Draw("DrawPrimitiveUP", count))
-GMODPP_DEVICE_HOOK(DrawIndexedPrimitiveUP, (IDirect3DDevice9* self, D3DPRIMITIVETYPE type, UINT minVertex, UINT numVertices, UINT count, const void* indices, D3DFORMAT indexFormat, const void* vertices, UINT stride),
-    (self, type, minVertex, numVertices, count, indices, indexFormat, vertices, stride), trace::Draw("DrawIndexedPrimitiveUP", count))
 GMODPP_DEVICE_HOOK(StretchRect, (IDirect3DDevice9* self, IDirect3DSurface9* src, const RECT* srcRect, IDirect3DSurface9* dst, const RECT* dstRect, D3DTEXTUREFILTERTYPE filter),
     (self, src, srcRect, dst, dstRect, filter), trace::Line("StretchRect {} -> {}", trace::Describe(src), trace::Describe(dst)))
-GMODPP_DEVICE_HOOK(SetVertexShader, (IDirect3DDevice9* self, IDirect3DVertexShader9* shader), (self, shader),
-    trace::Line("SetVertexShader {}", static_cast<void*>(shader)))
-GMODPP_DEVICE_HOOK(SetPixelShader, (IDirect3DDevice9* self, IDirect3DPixelShader9* shader), (self, shader),
-    trace::Line("SetPixelShader {}", static_cast<void*>(shader)))
-
 #undef GMODPP_DEVICE_HOOK
+
+using SetVertexShaderFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, IDirect3DVertexShader9*);
+using SetTextureFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, DWORD, IDirect3DBaseTexture9*);
+
+HRESULT STDMETHODCALLTYPE HookSetVertexShader(IDirect3DDevice9* self, IDirect3DVertexShader9* shader)
+{
+    if (IsGameDevice(self)) {
+        if (trace::Active())
+            trace::Line("SetVertexShader {}", static_cast<void*>(shader));
+        gbuffer::OnVertexShader(shader);
+    }
+    return Original<SetVertexShaderFn>(self, kSlotDeviceSetVertexShader)(self, shader);
+}
+
+HRESULT STDMETHODCALLTYPE HookCreateVertexShader(IDirect3DDevice9* self, const DWORD* code, IDirect3DVertexShader9** shader)
+{
+    auto create = Original<gbuffer::CreateVertexShaderFn>(self, kSlotDeviceCreateVertexShader);
+    if (!IsGameDevice(self))
+        return create(self, code, shader);
+    return gbuffer::CreateVertexShader(self, code, shader, create);
+}
+
+HRESULT STDMETHODCALLTYPE HookSetTexture(IDirect3DDevice9* self, DWORD stage, IDirect3DBaseTexture9* texture)
+{
+    if (IsGameDevice(self))
+        gbuffer::OnTexture(stage, texture);
+    return Original<SetTextureFn>(self, kSlotDeviceSetTexture)(self, stage, texture);
+}
+
+using SetViewportFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, const D3DVIEWPORT9*);
+
+HRESULT STDMETHODCALLTYPE HookSetViewport(IDirect3DDevice9* self, const D3DVIEWPORT9* vp)
+{
+    if (IsGameDevice(self) && vp != nullptr) {
+        if (trace::Active())
+            trace::Line("SetViewport {} {} {}x{} z {}..{}", vp->X, vp->Y, vp->Width, vp->Height, vp->MinZ, vp->MaxZ);
+        gbuffer::OnViewport(*vp);
+    }
+    HRESULT hr = Original<SetViewportFn>(self, kSlotDeviceSetViewport)(self, vp);
+    if (IsGameDevice(self) && vp != nullptr)
+        effects::OnViewport(*vp);
+    return hr;
+}
+
+using SetRenderTargetFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, DWORD, IDirect3DSurface9*);
+using DrawPrimitiveFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, D3DPRIMITIVETYPE, UINT, UINT);
+using DrawIndexedPrimitiveFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, D3DPRIMITIVETYPE, INT, UINT, UINT, UINT, UINT);
+using DrawPrimitiveUPFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, D3DPRIMITIVETYPE, UINT, const void*, UINT);
+using DrawIndexedPrimitiveUPFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, D3DPRIMITIVETYPE, UINT, UINT, UINT, const void*, D3DFORMAT, const void*, UINT);
+using SetPixelShaderFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, IDirect3DPixelShader9*);
+using SetPixelShaderConstantFFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, UINT, const float*, UINT);
+using SetRenderStateFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, D3DRENDERSTATETYPE, DWORD);
+
+HRESULT STDMETHODCALLTYPE HookSetRenderTarget(IDirect3DDevice9* self, DWORD index, IDirect3DSurface9* surface)
+{
+    if (IsGameDevice(self) && trace::Active())
+        trace::Line("SetRenderTarget {} {}", index, trace::Describe(surface));
+    HRESULT hr = Original<SetRenderTargetFn>(self, kSlotDeviceSetRenderTarget)(self, index, surface);
+    if (IsGameDevice(self) && SUCCEEDED(hr))
+        gbuffer::OnRenderTarget(self, index, surface);
+    return hr;
+}
+
+template <class Draw>
+HRESULT GameDraw(IDirect3DDevice9* self, const char* name, UINT count, Draw draw)
+{
+    if (!IsGameDevice(self))
+        return draw();
+    if (trace::Active())
+        trace::Draw(name, count);
+    const gbuffer::DrawAction action = gbuffer::BeforeDraw(self);
+    if (action == gbuffer::DrawAction::Skip)
+        return D3D_OK;
+    if (action != gbuffer::DrawAction::RedirectToLight)
+        return draw();
+    gbuffer::BeginLightRedirect(self);
+    HRESULT hr = draw();
+    gbuffer::EndLightRedirect(self);
+    return hr;
+}
+
+HRESULT STDMETHODCALLTYPE HookDrawPrimitive(IDirect3DDevice9* self, D3DPRIMITIVETYPE type, UINT start, UINT count)
+{
+    return GameDraw(self, "DrawPrimitive", count,
+        [&] { return Original<DrawPrimitiveFn>(self, kSlotDeviceDrawPrimitive)(self, type, start, count); });
+}
+
+HRESULT STDMETHODCALLTYPE HookDrawIndexedPrimitive(IDirect3DDevice9* self, D3DPRIMITIVETYPE type, INT baseVertex, UINT minVertex, UINT numVertices,
+    UINT startIndex, UINT count)
+{
+    return GameDraw(self, "DrawIndexedPrimitive", count, [&] {
+        return Original<DrawIndexedPrimitiveFn>(self, kSlotDeviceDrawIndexedPrimitive)(self, type, baseVertex, minVertex, numVertices, startIndex, count);
+    });
+}
+
+HRESULT STDMETHODCALLTYPE HookDrawPrimitiveUP(IDirect3DDevice9* self, D3DPRIMITIVETYPE type, UINT count, const void* data, UINT stride)
+{
+    return GameDraw(self, "DrawPrimitiveUP", count,
+        [&] { return Original<DrawPrimitiveUPFn>(self, kSlotDeviceDrawPrimitiveUP)(self, type, count, data, stride); });
+}
+
+HRESULT STDMETHODCALLTYPE HookDrawIndexedPrimitiveUP(IDirect3DDevice9* self, D3DPRIMITIVETYPE type, UINT minVertex, UINT numVertices, UINT count,
+    const void* indices, D3DFORMAT indexFormat, const void* vertices, UINT stride)
+{
+    return GameDraw(self, "DrawIndexedPrimitiveUP", count, [&] {
+        return Original<DrawIndexedPrimitiveUPFn>(self, kSlotDeviceDrawIndexedPrimitiveUP)(self, type, minVertex, numVertices, count, indices,
+            indexFormat, vertices, stride);
+    });
+}
+
+HRESULT STDMETHODCALLTYPE HookSetPixelShader(IDirect3DDevice9* self, IDirect3DPixelShader9* shader)
+{
+    if (IsGameDevice(self)) {
+        if (trace::Active())
+            trace::Line("SetPixelShader {}", static_cast<void*>(shader));
+        shader = gbuffer::SubstitutePixelShader(shader);
+    }
+    return Original<SetPixelShaderFn>(self, kSlotDeviceSetPixelShader)(self, shader);
+}
+
+HRESULT STDMETHODCALLTYPE HookCreatePixelShader(IDirect3DDevice9* self, const DWORD* code, IDirect3DPixelShader9** shader)
+{
+    auto create = Original<gbuffer::CreatePixelShaderFn>(self, kSlotDeviceCreatePixelShader);
+    if (!IsGameDevice(self))
+        return create(self, code, shader);
+    return gbuffer::CreatePixelShader(self, code, shader, create);
+}
+
+HRESULT STDMETHODCALLTYPE HookSetPixelShaderConstantF(IDirect3DDevice9* self, UINT start, const float* data, UINT count)
+{
+    if (IsGameDevice(self))
+        gbuffer::OnPixelShaderConstants(start, data, count);
+    return Original<SetPixelShaderConstantFFn>(self, kSlotDeviceSetPixelShaderConstantF)(self, start, data, count);
+}
+
+HRESULT STDMETHODCALLTYPE HookSetRenderState(IDirect3DDevice9* self, D3DRENDERSTATETYPE state, DWORD value)
+{
+    if (IsGameDevice(self))
+        gbuffer::OnRenderState(state, value);
+    return Original<SetRenderStateFn>(self, kSlotDeviceSetRenderState)(self, state, value);
+}
 
 void OnGameDeviceCreated(IDirect3DDevice9* device, HWND focusWindow, const D3DPRESENT_PARAMETERS& params)
 {
@@ -264,20 +406,25 @@ void OnGameDeviceCreated(IDirect3DDevice9* device, HWND focusWindow, const D3DPR
     Patch(device, kSlotDevicePresent, reinterpret_cast<void*>(&HookPresent));
     Patch(device, kSlotDeviceSetVertexShaderConstantF, reinterpret_cast<void*>(&HookSetVertexShaderConstantF));
     Patch(device, kSlotDeviceCreateDepthStencilSurface, reinterpret_cast<void*>(&HookCreateDepthStencilSurface));
+    Patch(device, kSlotDeviceCreatePixelShader, reinterpret_cast<void*>(&HookCreatePixelShader));
+    Patch(device, kSlotDeviceSetPixelShader, reinterpret_cast<void*>(&HookSetPixelShader));
+    Patch(device, kSlotDeviceSetPixelShaderConstantF, reinterpret_cast<void*>(&HookSetPixelShaderConstantF));
+    Patch(device, kSlotDeviceSetRenderState, reinterpret_cast<void*>(&HookSetRenderState));
+    Patch(device, kSlotDeviceDrawPrimitive, reinterpret_cast<void*>(&HookDrawPrimitive));
+    Patch(device, kSlotDeviceDrawIndexedPrimitive, reinterpret_cast<void*>(&HookDrawIndexedPrimitive));
+    Patch(device, kSlotDeviceSetViewport, reinterpret_cast<void*>(&HookSetViewport));
+    Patch(device, kSlotDeviceSetVertexShader, reinterpret_cast<void*>(&HookSetVertexShader));
+    Patch(device, kSlotDeviceCreateVertexShader, reinterpret_cast<void*>(&HookCreateVertexShader));
+    Patch(device, kSlotDeviceSetTexture, reinterpret_cast<void*>(&HookSetTexture));
+    Patch(device, kSlotDeviceSetRenderTarget, reinterpret_cast<void*>(&HookSetRenderTarget));
+    Patch(device, kSlotDeviceDrawPrimitiveUP, reinterpret_cast<void*>(&HookDrawPrimitiveUP));
+    Patch(device, kSlotDeviceDrawIndexedPrimitiveUP, reinterpret_cast<void*>(&HookDrawIndexedPrimitiveUP));
     if (GetOptions().devMode) {
-        Patch(device, kSlotDeviceSetRenderTarget, reinterpret_cast<void*>(&HookSetRenderTarget));
         Patch(device, kSlotDeviceSetDepthStencilSurface, reinterpret_cast<void*>(&HookSetDepthStencilSurface));
-        Patch(device, kSlotDeviceSetViewport, reinterpret_cast<void*>(&HookSetViewport));
         Patch(device, kSlotDeviceClear, reinterpret_cast<void*>(&HookClear));
         Patch(device, kSlotDeviceBeginScene, reinterpret_cast<void*>(&HookBeginScene));
         Patch(device, kSlotDeviceEndScene, reinterpret_cast<void*>(&HookEndScene));
-        Patch(device, kSlotDeviceDrawPrimitive, reinterpret_cast<void*>(&HookDrawPrimitive));
-        Patch(device, kSlotDeviceDrawIndexedPrimitive, reinterpret_cast<void*>(&HookDrawIndexedPrimitive));
-        Patch(device, kSlotDeviceDrawPrimitiveUP, reinterpret_cast<void*>(&HookDrawPrimitiveUP));
-        Patch(device, kSlotDeviceDrawIndexedPrimitiveUP, reinterpret_cast<void*>(&HookDrawIndexedPrimitiveUP));
         Patch(device, kSlotDeviceStretchRect, reinterpret_cast<void*>(&HookStretchRect));
-        Patch(device, kSlotDeviceSetVertexShader, reinterpret_cast<void*>(&HookSetVertexShader));
-        Patch(device, kSlotDeviceSetPixelShader, reinterpret_cast<void*>(&HookSetPixelShader));
     }
 
     IDirect3DDevice9Ex* deviceEx = nullptr;

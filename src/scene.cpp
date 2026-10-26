@@ -3,17 +3,75 @@
 #include "log.h"
 
 #include <algorithm>
+#include <cfloat>
+#include <cmath>
 #include <cstring>
+#include <limits>
 
 using Microsoft::WRL::ComPtr;
 
 namespace gmodpp {
 
+// Mirrors InstanceRecord in shaders/scene.hlsli.
+struct Scene::InstanceRecord {
+    uint32_t positions;
+    uint32_t indices;
+    uint32_t albedo;
+    uint32_t uvs;
+    uint32_t alpha;
+    uint32_t opaqueTriangles;
+    uint32_t materials;
+    uint32_t padding;
+};
+static_assert(sizeof(GpuMaterial) == 48);
+
+// Mirrors Light in shaders/scene.hlsli.
+struct Scene::GpuLight {
+    float origin[3];
+    uint32_t type;
+    float intensity[3];
+    float radius;
+    float normal[3];
+    float stopdot;
+    float stopdot2;
+    float exponent;
+    float constantAttn;
+    float linearAttn;
+    float quadraticAttn;
+    float padding[3];
+};
+static_assert(sizeof(Scene::GpuLight) == 80);
+// Read by ClusterAt in shaders/scene.hlsli.
+static_assert(sizeof(bsp::BspNode) == 24);
+
 namespace {
 
-constexpr UINT kWorldMask = 0x01;
-constexpr UINT kStaticPropMask = 0x02;
-constexpr UINT kDynamicMask = 0x04;
+constexpr UINT kMaxDynamicLights = 32;
+constexpr uint32_t kDynamicLightType = 3;
+constexpr float kDegreesToRadians = 3.14159265358979f / 180.0f;
+// A light is binned as far as its irradiance can reach 1/1024 of white with up to 4x light intensity and a 4x
+// tonemap scale.
+constexpr float kLightThreshold = 1.0f / 16384.0f;
+
+// How far a light can reach visibly, following the falloff in LightIrradiance (shaders/scene.hlsli).
+float LightRange(const bsp::Light& light)
+{
+    const float intensity = std::max({light.intensity.x, light.intensity.y, light.intensity.z, 0.0f});
+    float range = std::numeric_limits<float>::infinity();
+    const float limit = intensity / kLightThreshold;
+    if (light.type == bsp::LightType::Surface) {
+        range = std::sqrt(limit);
+    } else if (light.quadraticAttn > 0.0f) {
+        const float c = light.constantAttn - limit;
+        range = (-light.linearAttn + std::sqrt(std::max(light.linearAttn * light.linearAttn - 4.0f * light.quadraticAttn * c, 0.0f))) /
+            (2.0f * light.quadraticAttn);
+    } else if (light.linearAttn > 0.0f) {
+        range = (limit - light.constantAttn) / light.linearAttn;
+    }
+    if (light.radius > 0.0f)
+        range = std::min(range, light.radius);
+    return std::max(range, 0.0f);
+}
 
 unsigned Hex(HRESULT hr) { return static_cast<unsigned>(hr); }
 
@@ -22,6 +80,17 @@ D3D12_RESOURCE_BARRIER UavBarrier(ID3D12Resource* resource)
     D3D12_RESOURCE_BARRIER barrier = {};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
     barrier.UAV.pResource = resource;
+    return barrier;
+}
+
+D3D12_RESOURCE_BARRIER Transition(ID3D12Resource* resource, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after)
+{
+    D3D12_RESOURCE_BARRIER barrier = {};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = resource;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier.Transition.StateBefore = before;
+    barrier.Transition.StateAfter = after;
     return barrier;
 }
 
@@ -38,10 +107,11 @@ D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS TlasInputs(UINT count, D3D1
 
 }
 
-bool Scene::Initialize(ID3D12Device5* device, ID3D12CommandQueue* queue)
+bool Scene::Initialize(ID3D12Device5* device, ID3D12CommandQueue* queue, DescriptorHeap& descriptors)
 {
     m_device = device;
     m_queue = queue;
+    m_descriptors = &descriptors;
     HRESULT hr = device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&m_allocator));
     if (SUCCEEDED(hr))
         hr = device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, m_allocator.Get(), nullptr, IID_PPV_ARGS(&m_list));
@@ -53,8 +123,29 @@ bool Scene::Initialize(ID3D12Device5* device, ID3D12CommandQueue* queue)
         log::Info("Scene: initialization failed ({:#010x})", Hex(hr));
         return false;
     }
+    m_materials = CreateBuffer(sizeof(GpuMaterial) * kMaxMaterials, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+    if (!m_materials || FAILED(m_materials->Map(0, nullptr, reinterpret_cast<void**>(&m_mappedMaterials)))) {
+        log::Info("Scene: creating the material table failed");
+        return false;
+    }
+    m_materialsView = descriptors.CreateRawView(m_materials.Get());
+    if (m_materialsView == DescriptorHeap::kInvalid)
+        return false;
     m_fenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     return true;
+}
+
+uint32_t Scene::PackMask(UINT textureView, uint32_t channel, bool invert)
+{
+    return (textureView & 0xFFFFFFu) | (channel & 3u) << 24 | (invert ? 1u << 26 : 0u);
+}
+
+uint32_t Scene::AddMaterial(const GpuMaterial& material)
+{
+    if (m_materialCount == kMaxMaterials)
+        return kNoMaterial;
+    m_mappedMaterials[m_materialCount] = material;
+    return m_materialCount++;
 }
 
 ComPtr<ID3D12Resource> Scene::CreateBuffer(UINT64 size, D3D12_HEAP_TYPE heap, D3D12_RESOURCE_FLAGS flags, D3D12_RESOURCE_STATES state)
@@ -62,7 +153,7 @@ ComPtr<ID3D12Resource> Scene::CreateBuffer(UINT64 size, D3D12_HEAP_TYPE heap, D3
     D3D12_HEAP_PROPERTIES heapProperties = {heap};
     D3D12_RESOURCE_DESC desc = {};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    desc.Width = std::max<UINT64>(size, 4);
+    desc.Width = std::max<UINT64>((size + 3) & ~UINT64(3), 4);
     desc.Height = 1;
     desc.DepthOrArraySize = 1;
     desc.MipLevels = 1;
@@ -76,97 +167,363 @@ ComPtr<ID3D12Resource> Scene::CreateBuffer(UINT64 size, D3D12_HEAP_TYPE heap, D3
     return buffer;
 }
 
-ComPtr<ID3D12Resource> Scene::Upload(const void* data, UINT64 size)
+ComPtr<ID3D12Resource> Scene::UploadToDefault(const void* data, UINT64 size, std::vector<ComPtr<ID3D12Resource>>& staging)
 {
-    ComPtr<ID3D12Resource> buffer = CreateBuffer(size, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+    ComPtr<ID3D12Resource> upload = CreateBuffer(size, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+    ComPtr<ID3D12Resource> buffer = CreateBuffer(size, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
     void* mapped = nullptr;
-    if (buffer && SUCCEEDED(buffer->Map(0, nullptr, &mapped))) {
-        std::memcpy(mapped, data, size);
-        buffer->Unmap(0, nullptr);
-        return buffer;
-    }
-    return nullptr;
+    if (!upload || !buffer || FAILED(upload->Map(0, nullptr, &mapped)))
+        return nullptr;
+    std::memcpy(mapped, data, size);
+    upload->Unmap(0, nullptr);
+    m_list->CopyBufferRegion(buffer.Get(), 0, upload.Get(), 0, size);
+    D3D12_RESOURCE_BARRIER barrier = Transition(buffer.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    m_list->ResourceBarrier(1, &barrier);
+    staging.push_back(upload);
+    return buffer;
 }
 
-int Scene::BuildBlas(const std::vector<bsp::Float3>& positions, const std::vector<uint32_t>& indices)
+bool Scene::Submit()
 {
-    if (indices.empty())
-        return -1;
-    ComPtr<ID3D12Resource> vertexBuffer = Upload(positions.data(), positions.size() * sizeof(bsp::Float3));
-    ComPtr<ID3D12Resource> indexBuffer = Upload(indices.data(), indices.size() * sizeof(uint32_t));
-    if (!vertexBuffer || !indexBuffer)
-        return -1;
-
-    D3D12_RAYTRACING_GEOMETRY_DESC geometry = {};
-    geometry.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
-    geometry.Flags = D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
-    geometry.Triangles.VertexBuffer.StartAddress = vertexBuffer->GetGPUVirtualAddress();
-    geometry.Triangles.VertexBuffer.StrideInBytes = sizeof(bsp::Float3);
-    geometry.Triangles.VertexCount = static_cast<UINT>(positions.size());
-    geometry.Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
-    geometry.Triangles.IndexBuffer = indexBuffer->GetGPUVirtualAddress();
-    geometry.Triangles.IndexCount = static_cast<UINT>(indices.size());
-    geometry.Triangles.IndexFormat = DXGI_FORMAT_R32_UINT;
-
-    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS inputs = {};
-    inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
-    inputs.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
-    inputs.NumDescs = 1;
-    inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
-    inputs.pGeometryDescs = &geometry;
-    D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO info = {};
-    m_device->GetRaytracingAccelerationStructurePrebuildInfo(&inputs, &info);
-    ComPtr<ID3D12Resource> scratch = CreateBuffer(info.ScratchDataSizeInBytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    ComPtr<ID3D12Resource> result = CreateBuffer(info.ResultDataMaxSizeInBytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-        D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE);
-    if (!scratch || !result)
-        return -1;
-
-    m_allocator->Reset();
-    m_list->Reset(m_allocator.Get(), nullptr);
-    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC desc = {};
-    desc.Inputs = inputs;
-    desc.DestAccelerationStructureData = result->GetGPUVirtualAddress();
-    desc.ScratchAccelerationStructureData = scratch->GetGPUVirtualAddress();
-    m_list->BuildRaytracingAccelerationStructure(&desc, 0, nullptr);
     HRESULT hr = m_list->Close();
     if (FAILED(hr)) {
-        log::Info("Scene: closing the BLAS build failed ({:#010x})", Hex(hr));
-        return -1;
+        log::Info("Scene: closing the upload commands failed ({:#010x})", Hex(hr));
+        return false;
     }
     ID3D12CommandList* lists[] = {m_list.Get()};
     m_queue->ExecuteCommandLists(1, lists);
     m_queue->Signal(m_fence.Get(), ++m_fenceValue);
     m_fence->SetEventOnCompletion(m_fenceValue, m_fenceEvent);
     WaitForSingleObject(m_fenceEvent, INFINITE);
+    return true;
+}
 
-    m_models.push_back(result);
+UINT Scene::GeometryDescs(D3D12_GPU_VIRTUAL_ADDRESS vertices, UINT vertexCount, D3D12_GPU_VIRTUAL_ADDRESS indices, UINT triangles,
+    UINT opaqueTriangles, D3D12_RAYTRACING_GEOMETRY_DESC (&descs)[2])
+{
+    UINT count = 0;
+    auto add = [&](UINT first, UINT size, D3D12_RAYTRACING_GEOMETRY_FLAGS flags) {
+        if (size == 0)
+            return;
+        D3D12_RAYTRACING_GEOMETRY_DESC& geometry = descs[count++];
+        geometry = {};
+        geometry.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
+        geometry.Flags = flags;
+        geometry.Triangles.VertexBuffer.StartAddress = vertices;
+        geometry.Triangles.VertexBuffer.StrideInBytes = sizeof(bsp::Float3);
+        geometry.Triangles.VertexCount = vertexCount;
+        geometry.Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
+        geometry.Triangles.IndexBuffer = indices + static_cast<UINT64>(first) * 3 * sizeof(uint32_t);
+        geometry.Triangles.IndexCount = size * 3;
+        geometry.Triangles.IndexFormat = DXGI_FORMAT_R32_UINT;
+    };
+    add(0, opaqueTriangles, D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE);
+    // Shaders find an alpha-tested triangle's data by its index within this geometry plus opaqueTriangles.
+    add(opaqueTriangles, triangles - opaqueTriangles, D3D12_RAYTRACING_GEOMETRY_FLAG_NONE);
+    return count;
+}
+
+uint32_t Scene::PackAlpha(UINT textureView, float reference)
+{
+    return (textureView & 0xFFFFFFu) | static_cast<uint32_t>(std::lround(std::clamp(reference, 0.0f, 1.0f) * 255.0f)) << 24;
+}
+
+UINT Scene::AddTexture(DXGI_FORMAT format, UINT width, UINT height, std::span<const std::span<const std::byte>> mips)
+{
+    constexpr UINT kMaxMips = 16;
+    const UINT mipCount = static_cast<UINT>(mips.size());
+    if (mipCount == 0 || mipCount > kMaxMips)
+        return DescriptorHeap::kInvalid;
+    D3D12_HEAP_PROPERTIES heap = {D3D12_HEAP_TYPE_DEFAULT};
+    D3D12_RESOURCE_DESC desc = {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = width;
+    desc.Height = height;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = static_cast<UINT16>(mipCount);
+    desc.Format = format;
+    desc.SampleDesc.Count = 1;
+    Texture texture;
+    if (FAILED(m_device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&texture.resource))))
+        return DescriptorHeap::kInvalid;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprints[kMaxMips] = {};
+    UINT rows[kMaxMips] = {};
+    UINT64 rowBytes[kMaxMips] = {};
+    UINT64 total = 0;
+    m_device->GetCopyableFootprints(&desc, 0, mipCount, 0, footprints, rows, rowBytes, &total);
+    for (UINT mip = 0; mip < mipCount; ++mip) {
+        if (rowBytes[mip] * rows[mip] != mips[mip].size())
+            return DescriptorHeap::kInvalid;
+    }
+    ComPtr<ID3D12Resource> upload = CreateBuffer(total, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+    std::byte* mapped = nullptr;
+    if (!upload || FAILED(upload->Map(0, nullptr, reinterpret_cast<void**>(&mapped))))
+        return DescriptorHeap::kInvalid;
+    for (UINT mip = 0; mip < mipCount; ++mip) {
+        for (UINT row = 0; row < rows[mip]; ++row)
+            std::memcpy(mapped + footprints[mip].Offset + static_cast<size_t>(row) * footprints[mip].Footprint.RowPitch,
+                mips[mip].data() + row * rowBytes[mip], rowBytes[mip]);
+    }
+    upload->Unmap(0, nullptr);
+
+    m_allocator->Reset();
+    m_list->Reset(m_allocator.Get(), nullptr);
+    for (UINT mip = 0; mip < mipCount; ++mip) {
+        D3D12_TEXTURE_COPY_LOCATION destination = {texture.resource.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+        destination.SubresourceIndex = mip;
+        D3D12_TEXTURE_COPY_LOCATION source = {upload.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+        source.PlacedFootprint = footprints[mip];
+        m_list->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+    }
+    D3D12_RESOURCE_BARRIER barrier = Transition(texture.resource.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    m_list->ResourceBarrier(1, &barrier);
+    if (!Submit())
+        return DescriptorHeap::kInvalid;
+
+    texture.view = m_descriptors->Allocate();
+    if (texture.view == DescriptorHeap::kInvalid)
+        return DescriptorHeap::kInvalid;
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+    srv.Format = format;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Texture2D.MipLevels = mipCount;
+    m_device->CreateShaderResourceView(texture.resource.Get(), &srv, m_descriptors->Cpu(texture.view));
+    m_textures.push_back(std::move(texture));
+    return m_textures.back().view;
+}
+
+int Scene::AddModel(const ModelGeometry& geometry)
+{
+    const UINT triangles = static_cast<UINT>(geometry.indices.size() / 3);
+    const UINT alphaTriangles = triangles - std::min(geometry.opaqueTriangles, triangles);
+    const bool uvs = geometry.uvs.size() == geometry.positions.size();
+    const bool materials = geometry.triangleMaterials.size() == triangles;
+    if (triangles == 0 || geometry.triangleAlbedo.size() != triangles || geometry.alphaTriangles.size() != alphaTriangles || (alphaTriangles != 0 && !uvs))
+        return -1;
+    m_allocator->Reset();
+    m_list->Reset(m_allocator.Get(), nullptr);
+    std::vector<ComPtr<ID3D12Resource>> staging;
+    Model model;
+    model.opaqueTriangles = triangles - alphaTriangles;
+    model.positions = UploadToDefault(geometry.positions.data(), geometry.positions.size_bytes(), staging);
+    model.indices = UploadToDefault(geometry.indices.data(), geometry.indices.size_bytes(), staging);
+    model.albedo = UploadToDefault(geometry.triangleAlbedo.data(), geometry.triangleAlbedo.size_bytes(), staging);
+    if (uvs)
+        model.uvs = UploadToDefault(geometry.uvs.data(), geometry.uvs.size_bytes(), staging);
+    if (alphaTriangles != 0)
+        model.alpha = UploadToDefault(geometry.alphaTriangles.data(), geometry.alphaTriangles.size_bytes(), staging);
+    if (materials)
+        model.materials = UploadToDefault(geometry.triangleMaterials.data(), geometry.triangleMaterials.size_bytes(), staging);
+    if (!model.positions || !model.indices || !model.albedo || (uvs && !model.uvs) || (alphaTriangles != 0 && !model.alpha) ||
+        (materials && !model.materials)) {
+        m_list->Close();
+        return -1;
+    }
+
+    D3D12_RAYTRACING_GEOMETRY_DESC descs[2];
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS inputs = {};
+    inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
+    inputs.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
+    inputs.NumDescs = GeometryDescs(model.positions->GetGPUVirtualAddress(), static_cast<UINT>(geometry.positions.size()),
+        model.indices->GetGPUVirtualAddress(), triangles, model.opaqueTriangles, descs);
+    inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+    inputs.pGeometryDescs = descs;
+    D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO info = {};
+    m_device->GetRaytracingAccelerationStructurePrebuildInfo(&inputs, &info);
+    ComPtr<ID3D12Resource> scratch = CreateBuffer(info.ScratchDataSizeInBytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    model.blas = CreateBuffer(info.ResultDataMaxSizeInBytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE);
+    if (!scratch || !model.blas) {
+        m_list->Close();
+        return -1;
+    }
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC desc = {};
+    desc.Inputs = inputs;
+    desc.DestAccelerationStructureData = model.blas->GetGPUVirtualAddress();
+    desc.ScratchAccelerationStructureData = scratch->GetGPUVirtualAddress();
+    m_list->BuildRaytracingAccelerationStructure(&desc, 0, nullptr);
+    if (!Submit())
+        return -1;
+
+    model.positionsView = m_descriptors->CreateRawView(model.positions.Get());
+    model.indicesView = m_descriptors->CreateRawView(model.indices.Get());
+    model.albedoView = m_descriptors->CreateRawView(model.albedo.Get());
+    if (uvs)
+        model.uvsView = m_descriptors->CreateRawView(model.uvs.Get());
+    if (alphaTriangles != 0)
+        model.alphaView = m_descriptors->CreateRawView(model.alpha.Get());
+    if (materials)
+        model.materialsView = m_descriptors->CreateRawView(model.materials.Get());
+    if (model.positionsView == DescriptorHeap::kInvalid || model.indicesView == DescriptorHeap::kInvalid || model.albedoView == DescriptorHeap::kInvalid ||
+        (uvs && model.uvsView == DescriptorHeap::kInvalid) || (alphaTriangles != 0 && model.alphaView == DescriptorHeap::kInvalid) ||
+        (materials && model.materialsView == DescriptorHeap::kInvalid)) {
+        ReleaseModel(model);
+        return -1;
+    }
+    m_models.push_back(std::move(model));
     return static_cast<int>(m_models.size() - 1);
 }
 
-int Scene::AddModel(const studio::Geometry& geometry)
+void Scene::ReleaseModel(Model& model)
 {
-    return BuildBlas(geometry.positions, geometry.indices);
+    m_descriptors->Free(model.positionsView);
+    m_descriptors->Free(model.indicesView);
+    m_descriptors->Free(model.albedoView);
+    m_descriptors->Free(model.uvsView);
+    m_descriptors->Free(model.alphaView);
+    m_descriptors->Free(model.materialsView);
+    model = {};
 }
 
 void Scene::Clear()
 {
+    for (Model& model : m_models)
+        ReleaseModel(model);
     m_models.clear();
+    for (Texture& texture : m_textures)
+        m_descriptors->Free(texture.view);
+    m_textures.clear();
+    m_materialCount = 0;
     m_staticInstances.clear();
     m_worldModel = -1;
     m_name.clear();
     m_sun = {};
+    m_descriptors->Free(m_lightsView);
+    m_lightsView = DescriptorHeap::kInvalid;
+    m_lights.Reset();
+    m_lightCount = 0;
+    m_descriptors->Free(m_lightLists.rangesView);
+    m_descriptors->Free(m_lightLists.indicesView);
+    m_descriptors->Free(m_lightLists.nodesView);
+    m_descriptors->Free(m_lightLists.leafClustersView);
+    m_lightLists = {};
+    m_lightRanges.Reset();
+    m_lightIndices.Reset();
+    m_bspNodes.Reset();
+    m_leafClusters.Reset();
 }
 
-bool Scene::LoadMap(const std::string& name, const bsp::WorldGeometry& world)
+bool Scene::LoadMap(const std::string& name, const bsp::WorldGeometry& world, const ModelGeometry& worldGeometry)
 {
-    Clear();
-    m_worldModel = BuildBlas(world.positions, world.indices);
+    m_worldModel = AddModel(worldGeometry);
     if (m_worldModel < 0)
         return false;
+
+    std::vector<GpuLight> lights;
+    for (const bsp::Light& light : world.lights) {
+        GpuLight& gpu = lights.emplace_back();
+        gpu = {{light.origin.x, light.origin.y, light.origin.z}, static_cast<uint32_t>(light.type), {light.intensity.x, light.intensity.y, light.intensity.z},
+            light.radius, {light.normal.x, light.normal.y, light.normal.z}, light.stopdot, light.stopdot2, light.exponent, light.constantAttn,
+            light.linearAttn, light.quadraticAttn, {}};
+    }
+    if (!lights.empty()) {
+        if (!BuildLightLists(world.lights, world.visibility))
+            return false;
+        m_allocator->Reset();
+        m_list->Reset(m_allocator.Get(), nullptr);
+        std::vector<ComPtr<ID3D12Resource>> staging;
+        m_lights = UploadToDefault(lights.data(), lights.size() * sizeof(GpuLight), staging);
+        if (!m_lights || !Submit())
+            return false;
+        m_lightsView = m_descriptors->CreateRawView(m_lights.Get());
+        m_lightCount = static_cast<UINT>(lights.size());
+    }
     m_name = name;
     m_sun = world.sun;
     return true;
+}
+
+bool Scene::BuildLightLists(std::span<const bsp::Light> lights, const bsp::Visibility& visibility)
+{
+    const UINT clusterCount = visibility.nodes.empty() ? 0 : visibility.clusterCount;
+    std::vector<bsp::Float3> low(clusterCount, {FLT_MAX, FLT_MAX, FLT_MAX});
+    std::vector<bsp::Float3> high(clusterCount, {-FLT_MAX, -FLT_MAX, -FLT_MAX});
+    for (const bsp::BspLeaf& leaf : visibility.leaves) {
+        if (leaf.cluster < 0 || static_cast<UINT>(leaf.cluster) >= clusterCount)
+            continue;
+        bsp::Float3& lo = low[leaf.cluster];
+        bsp::Float3& hi = high[leaf.cluster];
+        lo = {std::min(lo.x, leaf.mins.x), std::min(lo.y, leaf.mins.y), std::min(lo.z, leaf.mins.z)};
+        hi = {std::max(hi.x, leaf.maxs.x), std::max(hi.y, leaf.maxs.y), std::max(hi.z, leaf.maxs.z)};
+    }
+
+    std::vector<uint32_t> ranges;
+    std::vector<uint32_t> indices;
+    ranges.reserve((clusterCount + 1) * 2);
+    std::vector<float> lightRanges(lights.size());
+    for (size_t i = 0; i < lights.size(); ++i)
+        lightRanges[i] = LightRange(lights[i]);
+    size_t maxPerCluster = 0;
+    for (UINT c = 0; c < clusterCount; ++c) {
+        const size_t first = indices.size();
+        for (uint32_t i = 0; i < lights.size(); ++i) {
+            const bsp::Light& light = lights[i];
+            if (!visibility.Sees(light.cluster, static_cast<int32_t>(c)))
+                continue;
+            // Distance from the light to the cluster's bounds.
+            const float d[3] = {std::max({low[c].x - light.origin.x, 0.0f, light.origin.x - high[c].x}),
+                std::max({low[c].y - light.origin.y, 0.0f, light.origin.y - high[c].y}),
+                std::max({low[c].z - light.origin.z, 0.0f, light.origin.z - high[c].z})};
+            if (d[0] * d[0] + d[1] * d[1] + d[2] * d[2] <= lightRanges[i] * lightRanges[i])
+                indices.push_back(i);
+        }
+        ranges.push_back(static_cast<uint32_t>(first));
+        ranges.push_back(static_cast<uint32_t>(indices.size() - first));
+        maxPerCluster = std::max(maxPerCluster, indices.size() - first);
+    }
+    const size_t binned = indices.size();
+    ranges.push_back(static_cast<uint32_t>(indices.size()));
+    ranges.push_back(static_cast<uint32_t>(lights.size()));
+    for (uint32_t i = 0; i < lights.size(); ++i)
+        indices.push_back(i);
+
+    std::vector<int32_t> leafClusters;
+    for (const bsp::BspLeaf& leaf : visibility.leaves)
+        leafClusters.push_back(leaf.cluster);
+    if (clusterCount == 0) {
+        leafClusters.assign(1, -1);
+    }
+
+    m_allocator->Reset();
+    m_list->Reset(m_allocator.Get(), nullptr);
+    std::vector<ComPtr<ID3D12Resource>> staging;
+    m_lightRanges = UploadToDefault(ranges.data(), ranges.size() * sizeof(uint32_t), staging);
+    m_lightIndices = UploadToDefault(indices.data(), indices.size() * sizeof(uint32_t), staging);
+    m_leafClusters = UploadToDefault(leafClusters.data(), leafClusters.size() * sizeof(int32_t), staging);
+    if (clusterCount > 0)
+        m_bspNodes = UploadToDefault(visibility.nodes.data(), visibility.nodes.size() * sizeof(bsp::BspNode), staging);
+    if (!m_lightRanges || !m_lightIndices || !m_leafClusters || (clusterCount > 0 && !m_bspNodes) || !Submit())
+        return false;
+    LightLists lists;
+    lists.clusterCount = clusterCount;
+    lists.rangesView = m_descriptors->CreateRawView(m_lightRanges.Get());
+    lists.indicesView = m_descriptors->CreateRawView(m_lightIndices.Get());
+    lists.leafClustersView = m_descriptors->CreateRawView(m_leafClusters.Get());
+    lists.nodesView = clusterCount > 0 ? m_descriptors->CreateRawView(m_bspNodes.Get()) : DescriptorHeap::kInvalid;
+    m_lightLists = lists;
+    if (lists.rangesView == DescriptorHeap::kInvalid || lists.indicesView == DescriptorHeap::kInvalid ||
+        lists.leafClustersView == DescriptorHeap::kInvalid || (clusterCount > 0 && lists.nodesView == DescriptorHeap::kInvalid))
+        return false;
+    if (clusterCount == 0)
+        log::Info("Scene: the map has no visibility data; every point is lit by all {} lights", lights.size());
+    else
+        log::Info("Scene: {} visibility clusters see {:.1f} lights on average, {} at most", clusterCount,
+            static_cast<double>(binned) / clusterCount, maxPerCluster);
+    return true;
+}
+
+bool Scene::EnsureDynamicLights(FrameTlas& frame)
+{
+    if (frame.dynamicLights)
+        return true;
+    frame.dynamicLights = CreateBuffer(sizeof(GpuLight) * kMaxDynamicLights, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+    if (!frame.dynamicLights || FAILED(frame.dynamicLights->Map(0, nullptr, reinterpret_cast<void**>(&frame.mappedDynamicLights)))) {
+        frame.dynamicLights.Reset();
+        return false;
+    }
+    frame.dynamicLightsView = m_descriptors->CreateRawView(frame.dynamicLights.Get());
+    return frame.dynamicLightsView != DescriptorHeap::kInvalid;
 }
 
 bool Scene::EnsureFrameCapacity(FrameTlas& frame, UINT count)
@@ -177,33 +534,48 @@ bool Scene::EnsureFrameCapacity(FrameTlas& frame, UINT count)
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS inputs = TlasInputs(capacity, 0);
     D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO info = {};
     m_device->GetRaytracingAccelerationStructurePrebuildInfo(&inputs, &info);
-    frame = {};
+    const UINT recordsView = frame.recordsView != DescriptorHeap::kInvalid ? frame.recordsView : m_descriptors->Allocate();
+    frame.instances.Reset();
+    frame.records.Reset();
+    frame.scratch.Reset();
+    frame.tlas.Reset();
+    frame.recordsView = recordsView;
     frame.instances = CreateBuffer(sizeof(D3D12_RAYTRACING_INSTANCE_DESC) * capacity, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+    frame.records = CreateBuffer(sizeof(InstanceRecord) * capacity, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
     frame.scratch = CreateBuffer(info.ScratchDataSizeInBytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     frame.tlas = CreateBuffer(info.ResultDataMaxSizeInBytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
         D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE);
-    if (!frame.instances || !frame.scratch || !frame.tlas ||
-        FAILED(frame.instances->Map(0, nullptr, reinterpret_cast<void**>(&frame.mapped)))) {
-        frame = {};
+    if (recordsView == DescriptorHeap::kInvalid || !frame.instances || !frame.records || !frame.scratch || !frame.tlas ||
+        FAILED(frame.instances->Map(0, nullptr, reinterpret_cast<void**>(&frame.mapped))) ||
+        FAILED(frame.records->Map(0, nullptr, reinterpret_cast<void**>(&frame.mappedRecords)))) {
+        frame.tlas.Reset();
+        frame.capacity = 0;
         return false;
     }
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+    srv.Format = DXGI_FORMAT_R32_TYPELESS;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Buffer.NumElements = capacity * sizeof(InstanceRecord) / 4;
+    srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+    m_device->CreateShaderResourceView(frame.records.Get(), &srv, m_descriptors->Cpu(recordsView));
     frame.capacity = capacity;
     return true;
 }
 
-D3D12_GPU_VIRTUAL_ADDRESS Scene::RecordFrameTlas(ID3D12GraphicsCommandList4* list, UINT slot, std::span<const SceneInstance> dynamic)
+SceneFrame Scene::RecordFrame(ID3D12GraphicsCommandList4* list, UINT slot, std::span<const SceneInstance> dynamic)
 {
     FrameTlas& frame = m_frames[slot % kFrameSlots];
     const UINT count = static_cast<UINT>(1 + m_staticInstances.size() + dynamic.size());
     if (!EnsureFrameCapacity(frame, count))
-        return 0;
+        return {};
 
     UINT written = 0;
-    auto write = [&](int model, D3D12_GPU_VIRTUAL_ADDRESS blas, const float (*transform)[4], UINT mask) {
-        if (blas == 0 && model >= 0 && static_cast<size_t>(model) < m_models.size())
-            blas = m_models[model]->GetGPUVirtualAddress();
-        if (blas == 0)
+    auto write = [&](const SceneInstance& source, const float (*transform)[4], UINT mask) {
+        if (source.model < 0 || static_cast<size_t>(source.model) >= m_models.size())
             return;
+        const Model& model = m_models[source.model];
+        D3D12_GPU_VIRTUAL_ADDRESS blas = source.blas != 0 ? source.blas : model.blas->GetGPUVirtualAddress();
         D3D12_RAYTRACING_INSTANCE_DESC& instance = frame.mapped[written];
         instance = {};
         if (transform != nullptr)
@@ -214,13 +586,17 @@ D3D12_GPU_VIRTUAL_ADDRESS Scene::RecordFrameTlas(ID3D12GraphicsCommandList4* lis
         instance.InstanceMask = mask;
         instance.Flags = D3D12_RAYTRACING_INSTANCE_FLAG_TRIANGLE_CULL_DISABLE;
         instance.AccelerationStructure = blas;
+        frame.mappedRecords[written] = {source.positionsView != DescriptorHeap::kInvalid ? source.positionsView : model.positionsView,
+            model.indicesView, model.albedoView, model.uvsView, model.alphaView, model.opaqueTriangles, model.materialsView, 0};
         ++written;
     };
-    write(m_worldModel, 0, nullptr, kWorldMask);
+    SceneInstance world;
+    world.model = m_worldModel;
+    write(world, nullptr, kWorldMask);
     for (const SceneInstance& instance : m_staticInstances)
-        write(instance.model, instance.blas, instance.transform, kStaticPropMask);
+        write(instance, instance.transform, kStaticPropMask);
     for (const SceneInstance& instance : dynamic)
-        write(instance.model, instance.blas, instance.transform, instance.mask != 0 ? instance.mask : kDynamicMask);
+        write(instance, instance.transform, instance.mask != 0 ? instance.mask : kDynamicMask);
 
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC desc = {};
     desc.Inputs = TlasInputs(written, frame.instances->GetGPUVirtualAddress());
@@ -229,7 +605,21 @@ D3D12_GPU_VIRTUAL_ADDRESS Scene::RecordFrameTlas(ID3D12GraphicsCommandList4* lis
     list->BuildRaytracingAccelerationStructure(&desc, 0, nullptr);
     D3D12_RESOURCE_BARRIER barrier = UavBarrier(frame.tlas.Get());
     list->ResourceBarrier(1, &barrier);
-    return frame.tlas->GetGPUVirtualAddress();
+
+    SceneFrame result{frame.tlas->GetGPUVirtualAddress(), frame.recordsView};
+    if (!m_dynamicLights.empty() && EnsureDynamicLights(frame)) {
+        for (const engine::DynamicLight& light : m_dynamicLights) {
+            if (result.dynamicLightCount == kMaxDynamicLights || light.radius <= 0.0f)
+                continue;
+            GpuLight& gpu = frame.mappedDynamicLights[result.dynamicLightCount++];
+            const bool spot = light.outerAngle > 0.0f;
+            gpu = {{light.origin[0], light.origin[1], light.origin[2]}, kDynamicLightType, {light.color[0], light.color[1], light.color[2]},
+                light.radius, {light.direction[0], light.direction[1], light.direction[2]}, spot ? std::cos(light.innerAngle * kDegreesToRadians) : 0.0f,
+                spot ? std::cos(light.outerAngle * kDegreesToRadians) : -1.0f, spot ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f, {}};
+        }
+        result.dynamicLightsView = frame.dynamicLightsView;
+    }
+    return result;
 }
 
 }

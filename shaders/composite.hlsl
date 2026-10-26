@@ -1,5 +1,3 @@
-#include "common.hlsli"
-
 #define ROOT_SIGNATURE "DescriptorTable(SRV(t0), visibility = SHADER_VISIBILITY_PIXEL)"
 
 Texture2D<float4> g_result : register(t0);
