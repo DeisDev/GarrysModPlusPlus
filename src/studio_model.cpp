@@ -202,6 +202,16 @@ std::optional<StudioVertices> Lod0Vertices(const Reader& vvd, std::string& error
 
 }
 
+Matrix3x4 Multiply(const Matrix3x4& a, const Matrix3x4& b)
+{
+    Matrix3x4 out;
+    for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 4; ++c)
+            out[r][c] = a[r][0] * b[0][c] + a[r][1] * b[1][c] + a[r][2] * b[2][c] + (c == 3 ? a[r][3] : 0.0f);
+    }
+    return out;
+}
+
 int BoneCount(std::span<const std::byte> mdlBytes)
 {
     Reader mdl(mdlBytes);

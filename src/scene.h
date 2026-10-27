@@ -22,7 +22,8 @@ namespace gmodpp {
 constexpr UINT kWorldMask = 0x01;
 constexpr UINT kStaticPropMask = 0x02;
 constexpr UINT kDynamicMask = 0x04;
-// The local player's own body sits around the camera; viewmodel and indirect rays leave it out (see Lighting).
+// The local player's own body and what it holds sit around the camera; viewmodel and indirect rays leave them out (see
+// Lighting).
 constexpr UINT kLocalPlayerMask = 0x08;
 // The 3D skybox's scaled-down scene, which only the skybox view's rays meet.
 constexpr UINT kSkyboxMask = 0x10;

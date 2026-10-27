@@ -50,9 +50,6 @@ const D3DFORMAT kIntzFormat = static_cast<D3DFORMAT>(MAKEFOURCC('I', 'N', 'T', '
 
 constexpr uint32_t kJitterSamples = 8;
 constexpr uint32_t kRayReconstructionPhases = 32;
-// The local player's held weapon is drawn as a world model right next to the camera; in first person it would
-// shadow the viewmodel and cast a floating shadow, so weapon world models this close to the eye are left out.
-constexpr float kHeldWeaponDistance = 96.0f;
 // VRAD shadows a static prop by the convex pieces of its collision model's first solid or, without one, by the
 // convex hull of each of its meshes (CreateCollisionModel and AddPolysForRayTrace in
 // utils/vrad/vradstaticprops.cpp). Lights placed in lamp models lose most of their light to those hulls, which the
@@ -77,6 +74,9 @@ struct ModelEntry {
     bsp::Float3 center = {};
     // Its vertices' sway when some of its materials sway in the wind.
     std::shared_ptr<SwayingModel> swaying;
+    // A single-bone model's bind pose to its bone. Weapons are merged onto their holder's hand bone, so where an
+    // attached one is drawn follows that bone, not its entity's transform.
+    std::optional<studio::Matrix3x4> rootPoseToBone;
 };
 
 struct MaterialInfo {
@@ -588,6 +588,9 @@ const ModelEntry& ModelFor(const std::string& mdlPath)
                 }
                 entry.swaying = std::move(swaying);
             }
+            std::vector<studio::Matrix3x4> poseToBone;
+            if (entry.sceneModel >= 0 && studio::BoneCount(mdl) == 1 && studio::ReadPoseToBone(mdl, poseToBone))
+                entry.rootPoseToBone = poseToBone[0];
             if (entry.sceneModel >= 0 && studio::BoneCount(mdl) > 1) {
                 auto skinned = std::make_shared<SkinnedModel>();
                 skinned->opaqueTriangles = triangles.opaqueTriangles;
@@ -720,18 +723,6 @@ bool InSkybox(const entities::ModelEntity& entity, const bsp::Float3& center)
     const auto& m = entity.transform;
     return g_state.skyboxTest.InSkybox({m[0][0] * center.x + m[0][1] * center.y + m[0][2] * center.z + m[0][3],
         m[1][0] * center.x + m[1][1] * center.y + m[1][2] * center.z + m[1][3], m[2][0] * center.x + m[2][1] * center.y + m[2][2] * center.z + m[2][3]});
-}
-
-bool IsHeldWeapon(const entities::ModelEntity& entity, const std::optional<std::array<float, 3>>& eye)
-{
-    if (!eye || !entity.model.starts_with("models/weapons/w_"))
-        return false;
-    float distanceSquared = 0.0f;
-    for (int i = 0; i < 3; ++i) {
-        const float d = entity.transform[i][3] - (*eye)[i];
-        distanceSquared += d * d;
-    }
-    return distanceSquared < kHeldWeaponDistance * kHeldWeaponDistance;
 }
 
 void ClearScene()
@@ -916,15 +907,18 @@ void CollectEntities()
     g_state.skinnedEntities.clear();
     g_state.currentTransforms.clear();
     entities::Collect(g_state.entities);
-    const std::optional<std::array<float, 3>> eye = gbuffer::EyePosition(gbuffer::LastCaptureViewProj());
     const int localPlayer = engine::LocalPlayerIndex();
+    const auto player = std::find_if(g_state.entities.begin(), g_state.entities.end(), [&](const entities::ModelEntity& e) { return e.index == localPlayer; });
+    const void* playerRenderable = player != g_state.entities.end() ? player->renderable : nullptr;
     for (const entities::ModelEntity& entity : g_state.entities) {
-        if (IsFirstPersonModel(entity.model) || IsHeldWeapon(entity, eye))
+        if (IsFirstPersonModel(entity.model))
             continue;
         const ModelEntry& model = ModelFor(entity.model);
         if (model.sceneModel < 0)
             continue;
-        const UINT mask = entity.index == localPlayer ? kLocalPlayerMask : InSkybox(entity, model.center) ? kSkyboxMask : kDynamicMask;
+        // What the local player holds goes with its body, so the viewmodel's rays never meet its weapon.
+        const bool carried = entity.index == localPlayer || (entity.parent != nullptr && entity.parent == playerRenderable);
+        const UINT mask = carried ? kLocalPlayerMask : InSkybox(entity, model.center) ? kSkyboxMask : kDynamicMask;
         if (model.skinned) {
             g_state.bones.resize(kMaxBones);
             if (!entities::SetupBones(entity.renderable, reinterpret_cast<float (*)[3][4]>(g_state.bones.data()), kMaxBones))
@@ -933,10 +927,18 @@ void CollectEntities()
             g_state.skinnedEntities.push_back({entity.index, model.sceneModel, model.skinned, g_state.bones, mask});
             continue;
         }
+        studio::Matrix3x4 transform;
+        std::memcpy(transform.data(), entity.transform, sizeof(transform));
+        if (entity.parent != nullptr && model.rootPoseToBone) {
+            g_state.bones.resize(kMaxBones);
+            if (!entities::SetupBones(entity.renderable, reinterpret_cast<float (*)[3][4]>(g_state.bones.data()), kMaxBones))
+                continue;
+            transform = studio::Multiply(g_state.bones[0], *model.rootPoseToBone);
+        }
         SceneInstance& instance = g_state.dynamicInstances.emplace_back();
         instance.model = model.sceneModel;
         instance.mask = mask;
-        std::memcpy(instance.transform, entity.transform, sizeof(instance.transform));
+        std::memcpy(instance.transform, transform.data(), sizeof(instance.transform));
         TrackMotion(instance, entity.index);
     }
     CollectRopes();

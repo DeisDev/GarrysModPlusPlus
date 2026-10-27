@@ -9,6 +9,8 @@ namespace gmodpp::entities {
 struct ModelEntity {
     int index;
     void* renderable;
+    // The renderable of the entity it is attached to (its move parent), or null; a held weapon's is its owner's.
+    void* parent;
     std::string model;
     float transform[3][4];
 };

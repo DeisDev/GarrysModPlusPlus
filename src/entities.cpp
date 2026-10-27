@@ -23,6 +23,9 @@ constexpr int kGetHighestEntityIndexSlot = 6;
 constexpr int kGetClientRenderableSlot = 5;
 constexpr int kShouldDrawSlot = 3;
 constexpr int kGetModelSlot = 9;
+// IClientRenderable::GetShadowParent: decodes the move parent handle and returns that entity's renderable
+// (client.dll+0x1b4860, C_BaseCombatWeapon's renderable vtable found through RTTI in Ghidra).
+constexpr int kGetShadowParentSlot = 28;
 constexpr int kRenderableToWorldTransformSlot = 34;
 constexpr int kGetModelNameSlot = 3;
 constexpr int kGetModelTypeSlot = 9;
@@ -129,6 +132,7 @@ void Collect(std::vector<ModelEntity>& entities)
         ModelEntity& out = entities.emplace_back();
         out.index = index;
         out.renderable = renderable;
+        out.parent = Slot<void*(__fastcall*)(void*)>(renderable, kGetShadowParentSlot)(renderable);
         out.model = name;
         std::memcpy(out.transform, transform, sizeof(out.transform));
     }

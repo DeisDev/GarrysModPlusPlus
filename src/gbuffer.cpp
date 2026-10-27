@@ -932,10 +932,13 @@ void End(IDirect3DDevice9* device, ViewKind kind)
     if (kind != ViewKind::Viewmodel) {
         // Every lit shader's vertex fog constant holds the view's range fog (cFogParams: end / range, 1,
         // 1 - max density, 1 / range) and pixel c29 its colour, even in the preview shaders that do not fog.
+        // Source writes that constant only when fog is on, so in a view without fog it still holds the last
+        // fogged view's (gm_publicindoorswimmingpool, which has none, turned black a few hundred units away);
+        // zero density stands for no fog.
         const auto& range = g_state.vertexConstants[kVertexFogRegister];
         const auto& color = g_state.constants[kFogColorRegister];
         Fog& fog = g_state.fog[kind == ViewKind::Skybox ? 1 : 0];
-        fog.params = {range[0] - 1.0f, 0.0f, 1.0f - range[2], range[3]};
+        fog.params = engine::FogEnabled() ? std::array<float, 4>{range[0] - 1.0f, 0.0f, 1.0f - range[2], range[3]} : std::array<float, 4>{};
         fog.color = {color[0], color[1], color[2]};
         fog.known = true;
     }

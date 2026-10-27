@@ -36,6 +36,9 @@ constexpr int kBeginRenderSlot = 0;
 constexpr int kEndRenderSlot = 1;
 constexpr int kSetIntRenderingParameterSlot = 113;
 constexpr int kEnableFixedLightingParameter = 0;
+// IMatRenderContext::GetFogMode, as the render.GetFogMode Lua binding calls it (client.dll+0xbf300 in Ghidra).
+constexpr int kGetFogModeSlot = 45;
+constexpr int kMaterialFogNone = 0;
 // IVEfx::CL_GetActiveDLights (engine.dll+0x143320, CVEfx vtable slot 6 found through RTTI in Ghidra). It fills
 // up to 32 pointers to GMod's 72-byte dlight_t; CL_AllocDlight (engine.dll+0x9a1a0) stores the key at 40,
 // four bytes later than the Source SDK 2013 layout.
@@ -201,6 +204,19 @@ bool SetFixedLighting(int mode)
     Slot<void(__fastcall*)(void*, int, int)>(context, kSetIntRenderingParameterSlot)(context, kEnableFixedLightingParameter, mode);
     Slot<void(__fastcall*)(void*)>(context, kEndRenderSlot)(context);
     return true;
+}
+
+bool FogEnabled()
+{
+    if (g_materialSystem == nullptr)
+        return false;
+    void* context = Slot<void*(__fastcall*)(void*)>(g_materialSystem, kGetRenderContextSlot)(g_materialSystem);
+    if (context == nullptr)
+        return false;
+    Slot<void(__fastcall*)(void*)>(context, kBeginRenderSlot)(context);
+    const int mode = Slot<int(__fastcall*)(void*)>(context, kGetFogModeSlot)(context);
+    Slot<void(__fastcall*)(void*)>(context, kEndRenderSlot)(context);
+    return mode != kMaterialFogNone;
 }
 
 }

@@ -13,16 +13,6 @@ namespace {
 
 constexpr uint64_t kForgetAfterFrames = 120;
 
-studio::Matrix3x4 Multiply(const studio::Matrix3x4& a, const studio::Matrix3x4& b)
-{
-    studio::Matrix3x4 out;
-    for (int r = 0; r < 3; ++r) {
-        for (int c = 0; c < 4; ++c)
-            out[r][c] = a[r][0] * b[0][c] + a[r][1] * b[1][c] + a[r][2] * b[2][c] + (c == 3 ? a[r][3] : 0.0f);
-    }
-    return out;
-}
-
 bsp::Float3 Transform(const studio::Matrix3x4& m, const bsp::Float3& p)
 {
     return {m[0][0] * p.x + m[0][1] * p.y + m[0][2] * p.z + m[0][3],
@@ -142,7 +132,7 @@ void SkinnedCasters::Record(ID3D12GraphicsCommandList4* list, const Scene& scene
 
         skin.resize(model.poseToBone.size());
         for (size_t b = 0; b < skin.size() && b < entity.boneToWorld.size(); ++b)
-            skin[b] = Multiply(entity.boneToWorld[b], model.poseToBone[b]);
+            skin[b] = studio::Multiply(entity.boneToWorld[b], model.poseToBone[b]);
         for (size_t v = 0; v < model.geometry.positions.size(); ++v) {
             const studio::VertexWeights& w = model.geometry.weights[v];
             const bsp::Float3& p = model.geometry.positions[v];

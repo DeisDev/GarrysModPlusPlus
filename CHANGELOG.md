@@ -19,6 +19,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Shadows of swaying grass, leaves and trees (`$treesway`) now move with them.
 - The menu and log show the GPU time of the 3D skybox and viewmodel, which the lighting total now includes.
 - Ropes and cables, such as power lines, cast shadows.
+- Held weapons, including your own, cast shadows and show in reflections, placed in the hand that holds them.
 
 ### Changed
 
@@ -55,3 +56,4 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fixed shadows of leaves and other alpha-tested surfaces looking like square blocks.
 - Fixed objects right behind window glass showing a mirror image like a cubemap.
 - Fixed the held weapon looking see-through in front of bright areas.
+- Fixed maps without fog turning black a short distance away, as on gm_publicindoorswimmingpool.

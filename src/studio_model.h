@@ -30,6 +30,9 @@ struct Geometry {
 
 using Matrix3x4 = std::array<std::array<float, 4>, 3>;
 
+// The affine transform `b`, then `a`.
+Matrix3x4 Multiply(const Matrix3x4& a, const Matrix3x4& b);
+
 // Number of bones in the model; models with more than one bone are skinned.
 int BoneCount(std::span<const std::byte> mdl);
 

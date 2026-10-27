@@ -49,4 +49,8 @@ ComputeLightingFn ComputeLightingFunction();
 // (2 = G-buffer outputs). Returns false when the material system is unavailable.
 bool SetFixedLighting(int mode);
 
+// Whether the view being drawn has fog (IMatRenderContext::GetFogMode is not MATERIAL_FOG_NONE); false when the
+// material system is unavailable.
+bool FogEnabled();
+
 }
