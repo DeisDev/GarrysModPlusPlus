@@ -43,7 +43,7 @@ public:
     bool PrepareModel(SkinnedModel& model);
     // Each entity's slot is reused every Scene::kFrameSlots calls with it, so the caller must wait for the frame
     // that many calls back before recording.
-    void Record(ID3D12GraphicsCommandList4* list, const std::vector<SkinnedEntity>& entities, std::vector<SceneInstance>& instances);
+    void Record(ID3D12GraphicsCommandList4* list, const Scene& scene, const std::vector<SkinnedEntity>& entities, std::vector<SceneInstance>& instances);
     void Clear();
 
 private:
@@ -65,7 +65,12 @@ private:
     };
 
     Microsoft::WRL::ComPtr<ID3D12Resource> CreateBuffer(UINT64 size, D3D12_HEAP_TYPE heap, D3D12_RESOURCE_FLAGS flags, D3D12_RESOURCE_STATES state);
-    bool PrepareSlot(SlotState& slot, const SkinnedModel& model);
+    bool PrepareSlot(SlotState& slot, const SkinnedModel& model, const Scene& scene, int sceneModel);
+    // Describes an entity's BLAS: the skinned vertices in `vertices` and, where its scene model has them, its
+    // opacity micromaps (`triangles` and `linkage` back the descs).
+    static void Describe(const SkinnedModel& model, const Scene& scene, int sceneModel,
+        D3D12_GPU_VIRTUAL_ADDRESS vertices, D3D12_GPU_VIRTUAL_ADDRESS indices, D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS& inputs,
+        D3D12_RAYTRACING_GEOMETRY_DESC (&descs)[2], D3D12_RAYTRACING_GEOMETRY_TRIANGLES_DESC& triangles, D3D12_RAYTRACING_GEOMETRY_OMM_LINKAGE_DESC& linkage);
     void Release(EntityState& state);
 
     ID3D12Device5* m_device = nullptr;

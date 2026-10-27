@@ -87,6 +87,17 @@ struct FrameConstants {
     float aoIntensity;
     uint32_t volumetricView;
     float volumetricDensity;
+    uint32_t geometricNormalView;
+    uint32_t exactLights;
+    uint32_t sampledLightRays;
+    uint32_t indirectBounces;
+    uint32_t aoRays;
+    uint32_t volumeRays;
+    uint32_t volumetricSteps;
+    uint32_t sunShadowMask;
+    uint32_t indirectMask;
+    uint32_t bounceMask;
+    uint32_t indirectRayFlags;
 };
 
 // What blocks the sun at a pixel of the main view (Lighting::RequestProbe).
@@ -159,7 +170,8 @@ private:
         UINT uav = DescriptorHeap::kInvalid;
         D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     };
-    enum class Pass { Surface, Primary, Probes, Ao, Volumetrics, Direct, GiTrace, GiTemporal, GiFilter, Lighting, TemporalAntiAliasing, Sharpen, Reflections, ReflectionTemporal, DlssInputs, DlssResolve, Count };
+    // DirectWide is Direct for more exact lights or shared shadow rays than the High preset's.
+    enum class Pass { Surface, Primary, Probes, Ao, Volumetrics, Direct, GiTrace, GiTemporal, GiFilter, Lighting, TemporalAntiAliasing, Sharpen, Reflections, ReflectionTemporal, DlssInputs, DlssResolve, DirectWide, Count };
     // Mirrors PassConstants in shaders/common.hlsli: descriptor indices (none by default) and a parameter.
     struct PassArgs {
         UINT input0 = DescriptorHeap::kInvalid;
@@ -172,7 +184,8 @@ private:
         UINT output2 = DescriptorHeap::kInvalid;
         UINT output3 = DescriptorHeap::kInvalid;
         UINT step = 0;
-        UINT padding[2] = {};
+        UINT output4 = DescriptorHeap::kInvalid;
+        UINT padding = 0;
     };
     // Render-resolution copies of the G-buffer for Ray Reconstruction, written together by Pass::DlssInputs.
     enum RayReconstructionInput { RrColor, RrDepth, RrNormal, RrFlags, RrLight, RrAlbedo, RrEmissive, RrInputCount };
@@ -210,6 +223,9 @@ private:
     std::array<UINT, kSlots> m_projectorViews = {};
     Microsoft::WRL::ComPtr<ID3D12RootSignature> m_computeRoot;
     std::array<Microsoft::WRL::ComPtr<ID3D12PipelineState>, static_cast<size_t>(Pass::Count)> m_pipelines;
+    // Shader Model 6.9 variants of the passes that trace rays, which let traversal use opacity micromaps.
+    std::array<Microsoft::WRL::ComPtr<ID3D12PipelineState>, static_cast<size_t>(Pass::Count)> m_micromapPipelines;
+    bool m_useMicromaps = false;
     Microsoft::WRL::ComPtr<ID3D12RootSignature> m_compositeRoot;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_compositePipeline;
 
@@ -220,6 +236,8 @@ private:
     Texture m_motion;
     Texture m_previousDistance;
     Texture m_pixelFlags;
+    // The face normal of each pixel's triangle (shaders/primary.hlsl), which ray origins and directions keep to.
+    Texture m_geometricNormal;
     // Exact direct light of the main view's current and last frame (shaders/direct.hlsl), and its sampled remainder.
     std::array<Texture, 2> m_direct;
     Texture m_directRemainder;

@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <filesystem>
 #include <iterator>
 #include <memory>
 #include <string>
@@ -51,6 +52,44 @@ void LogDisplayTopology(IDXGIFactory4* factory)
     }
 }
 
+// The directory holding this DLL, relative to the game's executable: the Agility SDK runtime is deployed to its
+// D3D12 subdirectory, and side-by-side runtimes are named relative to the executable.
+std::string AgilityRuntimePath()
+{
+    HMODULE module = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCWSTR>(&AgilityRuntimePath),
+        &module);
+    wchar_t modulePath[MAX_PATH];
+    wchar_t exePath[MAX_PATH];
+    if (GetModuleFileNameW(module, modulePath, MAX_PATH) == 0 || GetModuleFileNameW(nullptr, exePath, MAX_PATH) == 0)
+        return {};
+    const std::filesystem::path runtime = std::filesystem::path(modulePath).parent_path() / L"D3D12";
+    std::error_code error;
+    const std::filesystem::path relative = std::filesystem::relative(runtime, std::filesystem::path(exePath).parent_path(), error);
+    return error ? std::string() : relative.string() + "\\";
+}
+
+// A device factory that loads the Agility SDK's D3D12Core.dll for this process's devices alone (independent devices;
+// no developer mode or exported SDK version needed), or nothing where the system's D3D12 cannot do that.
+ComPtr<ID3D12DeviceFactory> AgilityDeviceFactory()
+{
+    ComPtr<ID3D12SDKConfiguration1> configuration;
+    HRESULT hr = D3D12GetInterface(CLSID_D3D12SDKConfiguration, IID_PPV_ARGS(&configuration));
+    if (FAILED(hr)) {
+        log::Info("D3D12 SDK configuration unavailable ({:#010x}); using the system D3D12 runtime", Hex(hr));
+        return nullptr;
+    }
+    const std::string path = AgilityRuntimePath();
+    ComPtr<ID3D12DeviceFactory> factory;
+    hr = configuration->CreateDeviceFactory(D3D12_SDK_VERSION, path.c_str(), IID_PPV_ARGS(&factory));
+    if (FAILED(hr)) {
+        log::Info("Agility SDK {} runtime at '{}' could not be loaded ({:#010x}); using the system D3D12 runtime", D3D12_SDK_VERSION, path, Hex(hr));
+        return nullptr;
+    }
+    log::Info("Agility SDK {} runtime loaded from '{}'", D3D12_SDK_VERSION, path);
+    return factory;
+}
+
 }
 
 Renderer* GetRenderer() { return g_renderer; }
@@ -64,9 +103,11 @@ Renderer* Renderer::Create(LUID adapterLuid, const Options& options)
         return nullptr;
     }
 
+    ComPtr<ID3D12DeviceFactory> agility = AgilityDeviceFactory();
     if (options.d3d12Debug) {
         ComPtr<ID3D12Debug1> debug;
-        if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)))) {
+        const HRESULT debugResult = agility ? agility->GetConfigurationInterface(CLSID_D3D12Debug, IID_PPV_ARGS(&debug)) : D3D12GetDebugInterface(IID_PPV_ARGS(&debug));
+        if (SUCCEEDED(debugResult)) {
             debug->EnableDebugLayer();
             debug->SetEnableGPUBasedValidation(options.gpuValidation);
         } else {
@@ -97,7 +138,8 @@ Renderer* Renderer::Create(LUID adapterLuid, const Options& options)
 
     auto renderer = std::make_unique<Renderer>();
     renderer->m_adapterLuid = adapterLuid;
-    hr = D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&renderer->m_device));
+    hr = agility ? agility->CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&renderer->m_device))
+                 : D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&renderer->m_device));
     if (FAILED(hr)) {
         log::Info("D3D12CreateDevice on '{}' failed: {:#010x}", adapterName, Hex(hr));
         return nullptr;
@@ -116,10 +158,17 @@ Renderer* Renderer::Create(LUID adapterLuid, const Options& options)
 
     D3D12_FEATURE_DATA_D3D12_OPTIONS5 options5 = {};
     renderer->m_device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5, &options5, sizeof(options5));
-    D3D12_FEATURE_DATA_SHADER_MODEL shaderModel = {D3D_SHADER_MODEL_6_6};
-    if (FAILED(renderer->m_device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &shaderModel, sizeof(shaderModel))))
-        shaderModel.HighestShaderModel = D3D_SHADER_MODEL_5_1;
+    // A runtime that does not know the shader model asked about fails the query, so ask for 6.6 after 6.9.
+    D3D12_FEATURE_DATA_SHADER_MODEL shaderModel = {D3D_SHADER_MODEL_5_1};
+    for (D3D_SHADER_MODEL highest : {D3D_SHADER_MODEL_6_9, D3D_SHADER_MODEL_6_6}) {
+        D3D12_FEATURE_DATA_SHADER_MODEL query = {highest};
+        if (SUCCEEDED(renderer->m_device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &query, sizeof(query)))) {
+            shaderModel = query;
+            break;
+        }
+    }
     renderer->m_raytracing = options5.RaytracingTier >= D3D12_RAYTRACING_TIER_1_1 && shaderModel.HighestShaderModel >= D3D_SHADER_MODEL_6_6;
+    renderer->m_opacityMicromaps = options5.RaytracingTier >= D3D12_RAYTRACING_TIER_1_2 && shaderModel.HighestShaderModel >= D3D_SHADER_MODEL_6_9;
 
     if (options.d3d12Debug && SUCCEEDED(renderer->m_device.As(&renderer->m_infoQueue))) {
         D3D12_MESSAGE_SEVERITY hidden[] = {D3D12_MESSAGE_SEVERITY_INFO, D3D12_MESSAGE_SEVERITY_MESSAGE, D3D12_MESSAGE_SEVERITY_WARNING};
@@ -129,9 +178,9 @@ Renderer* Renderer::Create(LUID adapterLuid, const Options& options)
         renderer->m_infoQueue->PushStorageFilter(&filter);
     }
 
-    log::Info("D3D12 device on '{}': raytracing tier {:#x}, shader model {:#x}, inline raytracing {}", adapterName,
+    log::Info("D3D12 device on '{}': raytracing tier {:#x}, shader model {:#x}, inline raytracing {}, opacity micromaps {}", adapterName,
         static_cast<int>(options5.RaytracingTier), static_cast<int>(shaderModel.HighestShaderModel),
-        renderer->m_raytracing ? "available" : "unavailable");
+        renderer->m_raytracing ? "available" : "unavailable", renderer->m_opacityMicromaps ? "available" : "unavailable");
 
     g_renderer = renderer.release();
     return g_renderer;

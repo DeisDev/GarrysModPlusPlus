@@ -29,6 +29,13 @@ enum class AntiAliasing : uint32_t { Off = 0, Temporal = 1, RayReconstruction = 
 // DLSS quality modes, from native resolution (DLAA) to the lowest render resolution.
 enum class DlssMode : uint32_t { Dlaa = 0, Quality, Balanced, Performance, UltraPerformance, Count };
 
+// Ray tracing quality presets; Custom keeps the detail settings as they are.
+enum class QualityPreset : uint32_t { Low = 0, Medium, High, Ultra, Custom, Count };
+
+// What static props the map marks as casting no shadows (mostly foliage) block: nothing, as in the game's baked
+// lighting; the sun; or the sun and the first bounce of indirect light. Later bounces always pass through them.
+enum class FoliageShadows : uint32_t { Off = 0, Sun, SunAndIndirect, Count };
+
 // Options shown in the in-game menu. Read on the render thread; the menu edits them on the same thread.
 struct Settings {
     bool realtimeLighting = true;
@@ -62,8 +69,28 @@ struct Settings {
     float taaHistoryWeight = 0.9f;
     float sharpening = 0.3f;
 
+    // Ray tracing quality (ApplyPreset); the defaults are QualityPreset::High.
+    QualityPreset qualityPreset = QualityPreset::High;
+    // Local lights per pixel whose shadows are traced exactly; the others share sampledLightRays shadow rays.
+    int exactLights = 4;
+    int sampledLightRays = 2;
+    int indirectRays = 1;
+    // Diffuse bounces traced from surfaces off screen; on-screen hits reuse last frame's light.
+    int indirectBounces = 2;
+    int aoRays = 1;
+    // Rays per update of each irradiance volume probe.
+    int volumeRays = 32;
+    int volumetricSteps = 16;
+    FoliageShadows foliageShadows = FoliageShadows::SunAndIndirect;
+    // Indirect light and ambient occlusion rays take alpha-tested surfaces from their opacity micromaps alone.
+    bool fastAlphaTests = false;
+    bool opacityMicromaps = true;
+
     bool operator==(const Settings&) const = default;
 };
+
+// Sets the ray tracing detail settings to a preset's values; QualityPreset::Custom leaves them.
+void ApplyPreset(Settings& settings, QualityPreset preset);
 
 Settings& GetSettings();
 
@@ -73,6 +100,7 @@ struct SettingRange {
     float maximum;
 };
 SettingRange RangeOf(float Settings::* field);
+SettingRange RangeOf(int Settings::* field);
 
 // Plain key=value text; unknown keys are ignored and missing ones keep their current value.
 bool LoadSettings(const std::filesystem::path& path, Settings& settings);
@@ -82,7 +110,7 @@ void SaveSettings(const std::filesystem::path& path, const Settings& settings);
 void SyncSettingsFile(const std::filesystem::path& path);
 void MarkSettingsChanged();
 
-enum class GpuPass : uint32_t { SceneUpdate, Surface, Volume, DirectLight, IndirectTrace, Accumulation, Denoiser, Reflections, Lighting, Resolve, Count };
+enum class GpuPass : uint32_t { SceneUpdate, Surface, Volume, DirectLight, AmbientOcclusion, IndirectTrace, Accumulation, Denoiser, Reflections, Lighting, Resolve, Count };
 
 // Figures the renderer reports for the menu.
 struct Statistics {
@@ -104,6 +132,10 @@ struct Statistics {
     uint32_t renderHeight = 0;
     uint32_t gbufferShaders = 0;
     uint32_t replacedShaders = 0;
+    bool opacityMicromapsAvailable = false;
+    // Alpha-tested and translucent triangles with an opacity micromap, and the micromaps they share.
+    uint32_t micromapTriangles = 0;
+    uint32_t micromaps = 0;
 };
 
 Statistics& GetStatistics();

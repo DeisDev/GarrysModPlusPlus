@@ -779,6 +779,8 @@ void SetJitter(float x, float y)
     g_state.jitter[1] = y;
 }
 
+std::array<float, 2> Jitter() { return {g_state.jitter[0], g_state.jitter[1]}; }
+
 void OnTexture(DWORD stage, IDirect3DBaseTexture9* texture)
 {
     if (stage < kTextureStages && !g_state.ownCall)

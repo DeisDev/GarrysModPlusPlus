@@ -43,6 +43,8 @@ void OnVertexShaderConstants(UINT start, const float* data, UINT count);
 const float* JitterVertexConstants(UINT start, const float* data, UINT count, std::vector<float>& scratch);
 // Clip-space offsets (NDC units) added to the next captures' projection, for temporal anti-aliasing.
 void SetJitter(float x, float y);
+// The offsets SetJitter last set, which the current or last capture was drawn with.
+std::array<float, 2> Jitter();
 
 using Matrix4 = std::array<std::array<float, 4>, 4>;
 // Source's view-projection rows (c8-c11), unjittered, as the last G-buffer draw of the current or last capture

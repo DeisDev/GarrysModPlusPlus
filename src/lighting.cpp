@@ -8,27 +8,37 @@
 #include "settings.h"
 
 #include <g_aoCS.h>
+#include <g_aoOmmCS.h>
 #include <g_compositePS.h>
 #include <g_compositeVS.h>
 #include <g_deferredLightingCS.h>
 #include <g_directCS.h>
+#include <g_directOmmCS.h>
+#include <g_directWideCS.h>
+#include <g_directWideOmmCS.h>
 #include <g_dlssInputsCS.h>
 #include <g_dlssResolveCS.h>
 #include <g_giFilterCS.h>
 #include <g_giTemporalCS.h>
 #include <g_giTraceCS.h>
+#include <g_giTraceOmmCS.h>
 #include <g_primaryCS.h>
+#include <g_primaryOmmCS.h>
 #include <g_probesCS.h>
+#include <g_probesOmmCS.h>
 #include <g_reflectionTemporalCS.h>
 #include <g_reflectionsCS.h>
+#include <g_reflectionsOmmCS.h>
 #include <g_surfaceCS.h>
 #include <g_taaCS.h>
 #include <g_taaSharpenCS.h>
 #include <g_volumetricsCS.h>
+#include <g_volumetricsOmmCS.h>
 
 #include <bit>
 #include <cmath>
 #include <cstring>
+#include <tuple>
 
 using Microsoft::WRL::ComPtr;
 
@@ -36,7 +46,7 @@ namespace gmodpp {
 
 namespace {
 
-constexpr UINT kConstantsStride = 2 * D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT;
+constexpr UINT kConstantsStride = 4 * D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT;
 static_assert(sizeof(FrameConstants) <= kConstantsStride);
 // Each slot has the view's constants and a copy for the passes Ray Reconstruction runs at render resolution.
 constexpr UINT kConstantsPerSlot = 2;
@@ -310,16 +320,25 @@ bool Lighting::Initialize(Renderer& renderer, IDirect3DDevice9* device)
     }
     if (SUCCEEDED(hr))
         hr = m_device->CreateRootSignature(0, g_surfaceCS, sizeof(g_surfaceCS), IID_PPV_ARGS(&m_computeRoot));
-    const std::pair<const BYTE*, size_t> shaders[] = {{g_surfaceCS, sizeof(g_surfaceCS)}, {g_primaryCS, sizeof(g_primaryCS)}, {g_probesCS, sizeof(g_probesCS)}, {g_aoCS, sizeof(g_aoCS)}, {g_volumetricsCS, sizeof(g_volumetricsCS)}, {g_directCS, sizeof(g_directCS)}, {g_giTraceCS, sizeof(g_giTraceCS)},
-        {g_giTemporalCS, sizeof(g_giTemporalCS)}, {g_giFilterCS, sizeof(g_giFilterCS)}, {g_deferredLightingCS, sizeof(g_deferredLightingCS)},
-        {g_taaCS, sizeof(g_taaCS)}, {g_taaSharpenCS, sizeof(g_taaSharpenCS)}, {g_reflectionsCS, sizeof(g_reflectionsCS)}, {g_reflectionTemporalCS, sizeof(g_reflectionTemporalCS)},
-        {g_dlssInputsCS, sizeof(g_dlssInputsCS)}, {g_dlssResolveCS, sizeof(g_dlssResolveCS)}};
+    const bool micromaps = renderer.SupportsOpacityMicromaps();
+    const std::span<const BYTE> shaders[] = {g_surfaceCS, g_primaryCS, g_probesCS, g_aoCS, g_volumetricsCS, g_directCS, g_giTraceCS, g_giTemporalCS,
+        g_giFilterCS, g_deferredLightingCS, g_taaCS, g_taaSharpenCS, g_reflectionsCS, g_reflectionTemporalCS, g_dlssInputsCS, g_dlssResolveCS, g_directWideCS};
     static_assert(std::size(shaders) == static_cast<size_t>(Pass::Count));
     for (size_t i = 0; i < m_pipelines.size() && SUCCEEDED(hr); ++i) {
         D3D12_COMPUTE_PIPELINE_STATE_DESC desc = {};
         desc.pRootSignature = m_computeRoot.Get();
-        desc.CS = {shaders[i].first, shaders[i].second};
+        desc.CS = {shaders[i].data(), shaders[i].size()};
         hr = m_device->CreateComputePipelineState(&desc, IID_PPV_ARGS(&m_pipelines[i]));
+    }
+    // Variants of the passes that trace rays whose ray queries let opacity micromaps settle alpha tests.
+    const std::pair<Pass, std::span<const BYTE>> micromapShaders[] = {{Pass::Primary, g_primaryOmmCS}, {Pass::Probes, g_probesOmmCS}, {Pass::Ao, g_aoOmmCS},
+        {Pass::Volumetrics, g_volumetricsOmmCS}, {Pass::Direct, g_directOmmCS}, {Pass::GiTrace, g_giTraceOmmCS}, {Pass::Reflections, g_reflectionsOmmCS},
+        {Pass::DirectWide, g_directWideOmmCS}};
+    for (size_t i = 0; i < std::size(micromapShaders) && SUCCEEDED(hr) && micromaps; ++i) {
+        D3D12_COMPUTE_PIPELINE_STATE_DESC desc = {};
+        desc.pRootSignature = m_computeRoot.Get();
+        desc.CS = {micromapShaders[i].second.data(), micromapShaders[i].second.size()};
+        hr = m_device->CreateComputePipelineState(&desc, IID_PPV_ARGS(&m_micromapPipelines[static_cast<size_t>(micromapShaders[i].first)]));
     }
     if (SUCCEEDED(hr))
         hr = m_device->CreateRootSignature(0, g_compositeVS, sizeof(g_compositeVS), IID_PPV_ARGS(&m_compositeRoot));
@@ -378,6 +397,7 @@ bool Lighting::Initialize(Renderer& renderer, IDirect3DDevice9* device)
     for (UINT i = 0; i < RrInputCount; ++i)
         m_rrInputs[i].uav = m_rrInputUavs + i;
     GetStatistics().rayReconstructionAvailable = m_rayReconstruction.Initialize(m_device, ModuleDirectory(), GetOptions().gameDirectory);
+    GetStatistics().opacityMicromapsAvailable = micromaps;
     log::Info("Lighting: initialized");
     return true;
 }
@@ -445,6 +465,7 @@ bool Lighting::EnsureTargets(UINT width, UINT height)
     ok = ok && CreateTarget(m_motion, width, height, DXGI_FORMAT_R16G16_FLOAT);
     ok = ok && CreateTarget(m_previousDistance, width, height, DXGI_FORMAT_R32_FLOAT);
     ok = ok && CreateTarget(m_pixelFlags, width, height, DXGI_FORMAT_R8_UINT);
+    ok = ok && CreateTarget(m_geometricNormal, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT);
     for (Texture& texture : m_direct)
         ok = ok && CreateTarget(texture, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT);
     ok = ok && CreateTarget(m_directRemainder, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT);
@@ -511,7 +532,8 @@ void Lighting::Dispatch(Pass pass, const PassArgs& args)
 
 void Lighting::DispatchGroups(Pass pass, const PassArgs& args, UINT x, UINT y, UINT z)
 {
-    m_list->SetPipelineState(m_pipelines[static_cast<size_t>(pass)].Get());
+    ID3D12PipelineState* micromapPipeline = m_micromapPipelines[static_cast<size_t>(pass)].Get();
+    m_list->SetPipelineState(m_useMicromaps && micromapPipeline != nullptr ? micromapPipeline : m_pipelines[static_cast<size_t>(pass)].Get());
     m_list->SetComputeRoot32BitConstants(2, sizeof(PassArgs) / sizeof(UINT), &args, 0);
     m_list->Dispatch(x, y, z);
 }
@@ -557,7 +579,16 @@ bool Lighting::FillConstants(FrameConstants& constants, const Scene& scene, cons
 {
     constants = {};
     std::memcpy(constants.viewProj, gbuffer::LastCaptureViewProj().data(), sizeof(constants.viewProj));
-    if (!Invert(constants.viewProj, constants.invViewProj))
+    // The depth was drawn with the jittered projection; reconstructing with the plain one shifts positions by up to
+    // half a pixel, which puts points by a crease behind the other surface.
+    float jittered[4][4];
+    std::memcpy(jittered, constants.viewProj, sizeof(jittered));
+    const std::array<float, 2> jitter = gbuffer::Jitter();
+    for (int c = 0; c < 4; ++c) {
+        jittered[0][c] += jitter[0] * constants.viewProj[3][c];
+        jittered[1][c] += jitter[1] * constants.viewProj[3][c];
+    }
+    if (!Invert(jittered, constants.invViewProj))
         return false;
     // The eye is the point the projection sends to w = 0: the inverse maps clip-space (0, 0, 1, 0) to it.
     const float (*inv)[4] = constants.invViewProj;
@@ -599,6 +630,13 @@ bool Lighting::FillConstants(FrameConstants& constants, const Scene& scene, cons
     constants.debugView = static_cast<uint32_t>(settings.debugView);
     constants.materialsView = scene.MaterialsView();
     constants.reflectionScale = settings.reflections ? settings.reflectionIntensity : 0.0f;
+    constants.exactLights = static_cast<uint32_t>(settings.exactLights);
+    constants.sampledLightRays = static_cast<uint32_t>(settings.sampledLightRays);
+    constants.indirectBounces = static_cast<uint32_t>(settings.indirectBounces);
+    constants.aoRays = static_cast<uint32_t>(settings.aoRays);
+    constants.volumeRays = static_cast<uint32_t>(settings.volumeRays);
+    constants.volumetricSteps = static_cast<uint32_t>(settings.volumetricSteps);
+    constants.indirectRayFlags = m_useMicromaps && settings.fastAlphaTests ? D3D12_RAY_FLAG_FORCE_OMM_2_STATE : D3D12_RAY_FLAG_NONE;
     constants.depthMin = inputs.depthMin;
     constants.depthScale = inputs.depthMax - inputs.depthMin;
     const gbuffer::Fog& fog = gbuffer::ViewFog(inputs.kind);
@@ -724,10 +762,10 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
                         frameMs += statistics.frameMs[(statistics.nextFrame + statistics.frameMs.size() - i) % statistics.frameMs.size()];
                     const auto& p = statistics.passMs;
                     log::Info("Lighting: {:.3f} ms GPU per frame ({}x{} traced at {}x{}; scene {:.2f}, surface {:.2f}, volume {:.2f}, direct {:.2f}, "
-                              "indirect {:.2f}, accumulation {:.2f}, denoiser {:.2f}, reflections {:.2f}, lighting {:.2f}, resolve {:.2f}); frame time {:.2f} ms, "
-                              "tonemap scale {:.3f}",
+                              "ao {:.2f}, indirect {:.2f}, accumulation {:.2f}, denoiser {:.2f}, reflections {:.2f}, lighting {:.2f}, resolve {:.2f}); "
+                              "frame time {:.2f} ms, tonemap scale {:.3f}",
                         statistics.lightingMs, m_width, m_height, statistics.renderWidth, statistics.renderHeight, p[0], p[1], p[2], p[3], p[4],
-                        p[5], p[6], p[7], p[8], p[9], frames ? frameMs / frames : 0.0, gbuffer::TonemapScale());
+                        p[5], p[6], p[7], p[8], p[9], p[10], frames ? frameMs / frames : 0.0, gbuffer::TonemapScale());
                 }
             }
         }
@@ -757,6 +795,9 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     std::byte* slotConstants = m_constantsMapped + slot * kConstantsPerSlot * kConstantsStride;
     const D3D12_GPU_VIRTUAL_ADDRESS slotConstantsGpu = m_constants->GetGPUVirtualAddress() + slot * kConstantsPerSlot * kConstantsStride;
     FrameConstants& constants = *reinterpret_cast<FrameConstants*>(slotConstants);
+    // Ray queries that allow opacity micromaps cost a little even where there are none, so maps without them, and the
+    // setting that turns them off, use the plain passes; instances then ignore their micromaps (Scene::RecordFrame).
+    m_useMicromaps = m_renderer->SupportsOpacityMicromaps() && GetSettings().opacityMicromaps && scene.HasMicromaps();
     if (!FillConstants(constants, scene, inputs)) {
         if (++m_cameraFailures % 300 == 1)
             log::Info("Lighting: the camera of view kind {} cannot be inverted; view left unlit ({} times)", static_cast<int>(inputs.kind), m_cameraFailures);
@@ -883,6 +924,7 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     constants.motionView = m_motion.srv;
     constants.previousDistanceView = m_previousDistance.srv;
     constants.pixelFlagsView = m_pixelFlags.srv;
+    constants.geometricNormalView = m_geometricNormal.srv;
     const bool probe = main && m_probeRequested && m_probeBuffer;
     constants.probeView = probe ? m_probeUav : kInvalidView;
     constants.probePixel = m_probePixel;
@@ -924,8 +966,8 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     }
 
     m_frameInstances.assign(dynamic.begin(), dynamic.end());
-    m_skinned.Record(m_list.Get(), skinned, m_frameInstances);
-    const SceneFrame frame = scene.RecordFrame(m_list.Get(), slot, m_frameInstances);
+    m_skinned.Record(m_list.Get(), scene, skinned, m_frameInstances);
+    const SceneFrame frame = scene.RecordFrame(m_list.Get(), slot, m_frameInstances, m_useMicromaps);
     constants.instancesView = frame.instancesView;
     constants.dynamicLightsView = frame.dynamicLightsView;
     constants.dynamicLightCount = GetSettings().dynamicLights && inputs.kind != gbuffer::ViewKind::Skybox ? frame.dynamicLightCount : 0u;
@@ -935,6 +977,7 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
         statistics.dynamicLights = constants.dynamicLightCount;
         statistics.projectedLights = constants.projectorCount;
         statistics.sceneInstances = static_cast<uint32_t>(1 + m_frameInstances.size());
+        std::tie(statistics.micromapTriangles, statistics.micromaps) = scene.MicromapCounts();
     }
     if (frame.tlas == 0 || (inputs.kind == gbuffer::ViewKind::Skybox && !scene.HasSkybox()))
         constants.traceMask = 0;
@@ -942,6 +985,10 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
         constants.traceMask = kSkyboxMask;
     else
         constants.traceMask = inputs.kind == gbuffer::ViewKind::Viewmodel ? kViewmodelTraceMask : kTraceMask;
+    const FoliageShadows foliage = GetSettings().foliageShadows;
+    constants.sunShadowMask = foliage == FoliageShadows::Off ? constants.traceMask & ~kShadowlessPropMask : constants.traceMask;
+    constants.indirectMask = foliage == FoliageShadows::SunAndIndirect ? constants.traceMask : constants.traceMask & ~kShadowlessPropMask;
+    constants.bounceMask = constants.traceMask & ~kShadowlessPropMask;
 
     auto bindCompute = [&](D3D12_GPU_VIRTUAL_ADDRESS frameConstants) {
         ID3D12DescriptorHeap* heaps[] = {m_descriptors->Heap()};
@@ -987,10 +1034,11 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     Dispatch(Pass::Surface, {.output0 = m_surface[current].uav});
     Use(m_surface[current], read);
     Use(m_surface[previous], read);
-    for (Texture* texture : {&m_visibility, &m_motion, &m_previousDistance, &m_pixelFlags})
+    for (Texture* texture : {&m_visibility, &m_motion, &m_previousDistance, &m_pixelFlags, &m_geometricNormal})
         Use(*texture, write);
-    Dispatch(Pass::Primary, {.output0 = m_visibility.uav, .output1 = m_motion.uav, .output2 = m_previousDistance.uav, .output3 = m_pixelFlags.uav});
-    for (Texture* texture : {&m_visibility, &m_motion, &m_previousDistance, &m_pixelFlags})
+    Dispatch(Pass::Primary, {.output0 = m_visibility.uav, .output1 = m_motion.uav, .output2 = m_previousDistance.uav, .output3 = m_pixelFlags.uav,
+        .output4 = m_geometricNormal.uav});
+    for (Texture* texture : {&m_visibility, &m_motion, &m_previousDistance, &m_pixelFlags, &m_geometricNormal})
         Use(*texture, read);
     mark();
     if (copyVolume && constants.traceMask != 0) {
@@ -1033,7 +1081,8 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     Texture& direct = m_direct[current];
     Use(direct, write);
     Use(m_directRemainder, write);
-    Dispatch(Pass::Direct, {.output0 = direct.uav, .output1 = m_directRemainder.uav});
+    const bool wideLightSets = constants.exactLights > 4 || constants.sampledLightRays > 2;
+    Dispatch(wideLightSets ? Pass::DirectWide : Pass::Direct, {.output0 = direct.uav, .output1 = m_directRemainder.uav});
     if (probe) {
         D3D12_RESOURCE_BARRIER barrier = Transition(m_probeBuffer.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
         m_list->ResourceBarrier(1, &barrier);
@@ -1057,6 +1106,7 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
         if (rayReconstruction)
             reinterpret_cast<FrameConstants*>(slotConstants + kConstantsStride)->aoView = m_ao.srv;
     }
+    mark();
     PassArgs trace = {.input1 = m_directRemainder.srv, .input2 = m_direct[previous].srv, .output0 = m_giRaw.uav};
     Texture* indirect = nullptr;
     // Untraced views and the distant 3D skybox (traced for reflections and sun shadows only) take the sky's
@@ -1086,6 +1136,7 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
             Use(*m_lastDenoised, read);
             trace.input0 = m_lastDenoised->srv;
         }
+        trace.step = static_cast<UINT>(GetSettings().indirectRays);
         Use(m_giRaw, write);
         Dispatch(Pass::GiTrace, trace);
         mark();

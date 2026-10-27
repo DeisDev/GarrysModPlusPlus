@@ -81,6 +81,22 @@ struct FrameConstants
     // Half-resolution in-scattered light (shaders/volumetrics.hlsl), or kNoView, and the haze's density per unit.
     uint volumetricView;
     float volumetricDensity;
+    // Written by shaders/primary.hlsl: the face normal under each pixel, facing the eye.
+    uint geometricNormalView;
+    // Ray tracing quality (Settings in src/settings.h).
+    uint exactLights;
+    uint sampledLightRays;
+    uint indirectBounces;
+    uint aoRays;
+    uint volumeRays;
+    uint volumetricSteps;
+    // traceMask without what may not block each kind of ray: sun shadows, the first indirect bounce (and ambient
+    // occlusion), and later bounces (shadowless props, by FoliageShadows).
+    uint sunShadowMask;
+    uint indirectMask;
+    uint bounceMask;
+    // Ray flags added to indirect light and ambient occlusion rays.
+    uint indirectRayFlags;
 };
 
 // Per-pass descriptor indices and parameters; mirrors Lighting::PassArgs in src/lighting.h.
@@ -96,7 +112,8 @@ struct PassConstants
     uint output2;
     uint output3;
     uint step;
-    uint2 padding;
+    uint output4;
+    uint padding;
 };
 
 static const uint kNoView = 0xFFFFFFFFu;

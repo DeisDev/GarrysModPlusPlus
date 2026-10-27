@@ -2,8 +2,8 @@
 
 // Ray-traced ambient occlusion: contact shadows finer than the denoised indirect light keeps, applied to it in
 // the lighting pass.
-// Trace (step 0): one cosine-weighted ray of kRadius per pixel; a hit at distance t counts as t / kRadius of
-// open sky. The result is blended into last frame's accumulation, found with the motion vectors.
+// Trace (step 0): g_frame.aoRays cosine-weighted rays of kRadius per pixel; a hit at distance t counts as
+// t / kRadius of open sky. The result is blended into last frame's accumulation, found with the motion vectors.
 // input0: last frame's accumulation (r: occlusion, g: sample count), or none; output0: this frame's.
 // Blur (step 1): a 5x5 blur over the same surface. input0: accumulation; output0: ambient occlusion (r).
 
@@ -13,12 +13,16 @@ static const float kMaxSamples = 16.0;
 float Trace(int2 pixel, float4 surface)
 {
     float3 position = LitPosition(WorldPositionFromDepth(pixel, DepthAt(pixel)));
-    float3 origin = position + surface.xyz * (g_frame.normalBias * (1.0 + surface.w * 0.002));
+    float3 geometricNormal = GeometricNormalAt(pixel);
+    float3 origin = SurfaceRayOrigin(position, geometricNormal, surface.w);
     uint seed = PixelSeed(pixel, 0xA0u);
-    HitInfo hit;
-    if (!TraceHit(origin, CosineSample(surface.xyz, Random(seed), Random(seed)), kRadius, g_frame.traceMask & ~kLocalPlayerMask, hit))
-        return 1.0;
-    return saturate(hit.t / kRadius);
+    float open = 0.0;
+    for (uint r = 0; r < g_frame.aoRays; ++r) {
+        float3 direction = AboveSurface(CosineSample(surface.xyz, Random(seed), Random(seed)), geometricNormal);
+        HitInfo hit;
+        open += TraceHit(origin, direction, kRadius, g_frame.indirectMask & ~kLocalPlayerMask, hit, g_frame.indirectRayFlags) ? saturate(hit.t / kRadius) : 1.0;
+    }
+    return open / g_frame.aoRays;
 }
 
 float2 History(int2 pixel, float4 surface)

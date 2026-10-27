@@ -248,8 +248,8 @@ void DrawPerformance(const Statistics& statistics)
 
     ImGui::SeparatorText(Text(TextId::SectionGpuPasses));
     TextLine(TextId::StatLightingTime, statistics.lightingMs);
-    const TextId passes[] = {TextId::PassSceneUpdate, TextId::PassSurface, TextId::PassVolume, TextId::PassDirectLight, TextId::PassIndirectTrace, TextId::PassAccumulation,
-        TextId::PassDenoiser, TextId::PassReflections, TextId::PassLighting, TextId::PassResolve};
+    const TextId passes[] = {TextId::PassSceneUpdate, TextId::PassSurface, TextId::PassVolume, TextId::PassDirectLight, TextId::PassAmbientOcclusion,
+        TextId::PassIndirectTrace, TextId::PassAccumulation, TextId::PassDenoiser, TextId::PassReflections, TextId::PassLighting, TextId::PassResolve};
     static_assert(std::size(passes) == static_cast<size_t>(GpuPass::Count));
     for (size_t i = 0; i < std::size(passes); ++i)
         TextLine(passes[i], statistics.passMs[i]);
@@ -304,6 +304,84 @@ void DrawLightingTab(Settings& settings)
         ToggleRow(TextId::VolumetricLight, settings.volumetricLight, settings, &Settings::volumetricIntensity);
         ImGui::EndTable();
     }
+}
+
+// A table row with a whole-number slider; changing it leaves the quality preset.
+void IntSliderRow(TextId label, Settings& settings, int Settings::* field)
+{
+    ImGui::TableNextRow();
+    ImGui::TableNextColumn();
+    ImGui::TextUnformatted(Text(label));
+    ImGui::TableNextColumn();
+    ImGui::PushID(static_cast<int>(label));
+    const SettingRange range = RangeOf(field);
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    if (ImGui::SliderInt("##value", &(settings.*field), static_cast<int>(range.minimum), static_cast<int>(range.maximum)))
+        settings.qualityPreset = QualityPreset::Custom;
+    ImGui::PopID();
+}
+
+void DrawRayTracingTab(Settings& settings)
+{
+    const TextId presets[] = {TextId::PresetLow, TextId::PresetMedium, TextId::PresetHigh, TextId::PresetUltra, TextId::PresetCustom};
+    static_assert(std::size(presets) == static_cast<size_t>(QualityPreset::Count));
+    const int preset = static_cast<int>(settings.qualityPreset);
+    if (ImGui::BeginCombo(Text(TextId::QualityPreset), Text(presets[preset]))) {
+        for (int i = 0; i < static_cast<int>(std::size(presets)); ++i) {
+            if (ImGui::Selectable(Text(presets[i]), i == preset))
+                ApplyPreset(settings, static_cast<QualityPreset>(i));
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::SeparatorText(Text(TextId::SectionShadows));
+    if (BeginOptionTable("shadows")) {
+        IntSliderRow(TextId::ExactLights, settings, &Settings::exactLights);
+        IntSliderRow(TextId::SampledLightRays, settings, &Settings::sampledLightRays);
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn();
+        ImGui::TextUnformatted(Text(TextId::FoliageShadows));
+        ImGui::TableNextColumn();
+        const TextId foliage[] = {TextId::FoliageOff, TextId::FoliageSun, TextId::FoliageSunAndIndirect};
+        static_assert(std::size(foliage) == static_cast<size_t>(FoliageShadows::Count));
+        const int mode = static_cast<int>(settings.foliageShadows);
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        if (ImGui::BeginCombo("##foliage", Text(foliage[mode]))) {
+            for (int i = 0; i < static_cast<int>(std::size(foliage)); ++i) {
+                if (ImGui::Selectable(Text(foliage[i]), i == mode) && i != mode) {
+                    settings.foliageShadows = static_cast<FoliageShadows>(i);
+                    settings.qualityPreset = QualityPreset::Custom;
+                }
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::EndTable();
+    }
+    ImGui::SeparatorText(Text(TextId::SectionIndirect));
+    if (BeginOptionTable("indirect")) {
+        IntSliderRow(TextId::IndirectRays, settings, &Settings::indirectRays);
+        IntSliderRow(TextId::IndirectBounces, settings, &Settings::indirectBounces);
+        IntSliderRow(TextId::AoRays, settings, &Settings::aoRays);
+        IntSliderRow(TextId::VolumeRays, settings, &Settings::volumeRays);
+        ImGui::EndTable();
+    }
+    ImGui::SeparatorText(Text(TextId::SectionEffects));
+    if (BeginOptionTable("effects")) {
+        IntSliderRow(TextId::VolumetricSteps, settings, &Settings::volumetricSteps);
+        ImGui::EndTable();
+    }
+    ImGui::SeparatorText(Text(TextId::SectionAlphaTests));
+    const Statistics& statistics = GetStatistics();
+    ImGui::BeginDisabled(!statistics.opacityMicromapsAvailable);
+    ImGui::Checkbox(Text(TextId::OpacityMicromaps), &settings.opacityMicromaps);
+    ImGui::BeginDisabled(!settings.opacityMicromaps);
+    if (ImGui::Checkbox(Text(TextId::FastAlphaTests), &settings.fastAlphaTests))
+        settings.qualityPreset = QualityPreset::Custom;
+    ImGui::EndDisabled();
+    ImGui::EndDisabled();
+    if (!statistics.opacityMicromapsAvailable)
+        ImGui::TextDisabled("%s", Text(TextId::MicromapsUnavailable));
+    else
+        TextLine(TextId::StatMicromaps, statistics.micromapTriangles, statistics.micromaps);
 }
 
 void DrawImageTab(Settings& settings)
@@ -390,6 +468,7 @@ void DrawMenu()
         if (ImGui::BeginTabBar("##tabs")) {
             Tab(TextId::TabGeneral, [&] { DrawGeneralTab(settings); });
             Tab(TextId::TabLighting, [&] { DrawLightingTab(settings); });
+            Tab(TextId::TabRayTracing, [&] { DrawRayTracingTab(settings); });
             Tab(TextId::TabImage, [&] { DrawImageTab(settings); });
             Tab(TextId::TabPerformance, [] { DrawPerformanceTab(); });
             ImGui::EndTabBar();

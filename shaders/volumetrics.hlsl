@@ -2,7 +2,7 @@
 
 // Volumetric light: sunlight and projected lights (flashlights, lamps) scattered by a thin, even haze between
 // the eye and each surface, at half resolution.
-// March (step 0): kSteps samples along each eye ray, offset per pixel and frame, each with a shadow ray to the
+// March (step 0): g_frame.volumetricSteps samples along each eye ray, offset per pixel and frame, each with a shadow ray to the
 // sun and to every projected light; a Henyey-Greenstein phase function favours light seen against its direction.
 // output0: in-scattered radiance before the tonemap scale.
 // Accumulate (step 1): blends the march, averaged with its neighbours of similar depth, into last frame's
@@ -10,7 +10,6 @@
 // length); input1: last frame's accumulation; output0: this frame's (rgb, sample count); input2: 1 when last
 // frame's accumulation may be used.
 
-static const uint kSteps = 16;
 // Far surfaces scatter over this much air at most.
 static const float kMaxDistance = 4096.0;
 // Sky pixels scatter over less: the sky texture already shows the haze outside.
@@ -40,16 +39,16 @@ float4 March(int2 pixel)
     float rayLength = surface.w > 0.0 ? min(surface.w, kMaxDistance) : kSkyDistance;
     float3 direction = toTarget / max(sqrt(dot(toTarget, toTarget)), 1e-3);
     uint seed = PixelSeed(full, 0xB1u);
-    float step = rayLength / kSteps;
+    float step = rayLength / g_frame.volumetricSteps;
     float density = g_frame.volumetricDensity;
     float sunPhase = Phase(dot(direction, g_frame.sunDirection));
     float3 light = 0.0;
-    for (uint s = 0; s < kSteps; ++s) {
+    for (uint s = 0; s < g_frame.volumetricSteps; ++s) {
         float t = (s + Random(seed)) * step;
         float3 position = g_frame.eyePosition + direction * t;
         float3 scattered = 0.0;
         if (g_frame.sunEnabled != 0.0)
-            scattered += g_frame.sunColor * sunPhase * SunVisibility(position);
+            scattered += g_frame.sunColor * sunPhase * SunVisibility(position, g_frame.sunShadowMask);
         for (uint p = 0; p < g_frame.projectorCount; ++p) {
             float3 toLight;
             float distance;

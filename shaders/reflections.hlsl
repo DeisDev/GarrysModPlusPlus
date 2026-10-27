@@ -50,7 +50,7 @@ float3 ReflectedRadiance(float3 origin, float3 direction, float3 ambient, inout 
             return previous;
     }
     float3 shadowOrigin = hit.position + hit.normal;
-    float3 irradiance = SunIrradiance(hit, shadowOrigin) + ambient;
+    float3 irradiance = SunIrradiance(hit, shadowOrigin, g_frame.sunShadowMask) + ambient;
     float3 light;
     float3 toLight;
     float distance;
@@ -109,7 +109,8 @@ void main(uint3 id : SV_DispatchThreadID)
     float reflectivity = mask * g_frame.reflectionScale;
     if (reflectivity > 0.0) {
         float3 normal = surface.xyz;
-        float3 origin = position + normal * (g_frame.normalBias * (1.0 + surface.w * 0.002));
+        float3 geometricNormal = GeometricNormalAt(pixel);
+        float3 origin = SurfaceRayOrigin(position, geometricNormal, surface.w);
         float3 ambient = g_frame.skyColor;
         if (g_pass.input1 != kNoView) {
             Texture2D<float4> denoised = ResourceDescriptorHeap[g_pass.input1];
@@ -118,7 +119,7 @@ void main(uint3 id : SV_DispatchThreadID)
         uint seed = PixelSeed(pixel, 0x8Fu);
         float hitDistance;
         // As LightmappedGeneric and VertexLitGeneric shape their cubemap term.
-        float3 specular = ReflectedRadiance(origin, reflect(view, normal), ambient * g_frame.indirectScale, seed, hitDistance) *
+        float3 specular = ReflectedRadiance(origin, AboveSurface(reflect(view, normal), geometricNormal), ambient * g_frame.indirectScale, seed, hitDistance) *
             material.envmapTint * reflectivity;
         specular = lerp(specular, specular * specular, material.envmapContrast);
         specular = lerp(dot(specular, float3(0.299, 0.587, 0.114)), specular, material.envmapSaturation);

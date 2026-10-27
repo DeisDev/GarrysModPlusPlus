@@ -3,6 +3,14 @@
 
 #include "common.hlsli"
 
+// Ray queries of the Shader Model 6.9 variants (OPACITY_MICROMAPS) let traversal use opacity micromaps, which
+// settle alpha-tested candidates in their known opaque and transparent regions without the shader.
+#if OPACITY_MICROMAPS
+#define SCENE_RAY_QUERY(flags) RayQuery<flags, RAYQUERY_FLAG_ALLOW_OPACITY_MICROMAPS>
+#else
+#define SCENE_RAY_QUERY(flags) RayQuery<flags>
+#endif
+
 // Mirrors Scene::InstanceRecord in src/scene.cpp: descriptor indices of raw buffers. A model's alpha-tested and
 // translucent triangles follow its opaque ones in a second BLAS geometry; `alpha` holds one Scene::PackAlpha or
 // Scene::PackTranslucent entry for each, `materials` a material table index per triangle.
@@ -89,22 +97,28 @@ float3 UnpackAlbedo(uint packed)
 static const uint kTranslucentFlag = 0x80000000u;
 static const uint kNoAlphaTexture = 0xFFFFFFu;
 
+// Mirrors AlphaTriangle in src/scene.cpp.
+struct AlphaTriangle
+{
+    uint packed;
+    float2 uv0;
+    float2 uv1;
+    float2 uv2;
+    uint padding;
+};
+
 // Opacity where a ray crosses a candidate in a model's non-opaque geometry: 0 or 1 for alpha-tested triangles,
 // texture alpha times $alpha for translucent ones (`translucent`).
 float CandidateOpacity(uint instance, uint alphaPrimitive, float2 barycentrics, out bool translucent)
 {
-    InstanceRecord record = LoadInstance(instance);
-    ByteAddressBuffer alpha = ResourceDescriptorHeap[record.alpha];
-    uint packed = alpha.Load(alphaPrimitive * 4);
+    ByteAddressBuffer alpha = ResourceDescriptorHeap[LoadInstance(instance).alpha];
+    AlphaTriangle entry = alpha.Load<AlphaTriangle>(alphaPrimitive * 32);
+    uint packed = entry.packed;
     translucent = (packed & kTranslucentFlag) != 0;
     float value = ((packed >> 24) & 0x7F) * (1.0 / 127.0);
     float textureAlpha = 1.0;
     if ((packed & 0xFFFFFF) != kNoAlphaTexture) {
-        ByteAddressBuffer indices = ResourceDescriptorHeap[record.indices];
-        ByteAddressBuffer uvs = ResourceDescriptorHeap[record.uvs];
-        uint3 index = indices.Load3((record.opaqueTriangles + alphaPrimitive) * 12);
-        float2 uv0 = uvs.Load<float2>(index.x * 8);
-        float2 uv = uv0 + barycentrics.x * (uvs.Load<float2>(index.y * 8) - uv0) + barycentrics.y * (uvs.Load<float2>(index.z * 8) - uv0);
+        float2 uv = entry.uv0 + barycentrics.x * (entry.uv1 - entry.uv0) + barycentrics.y * (entry.uv2 - entry.uv0);
         Texture2D<float4> texture = ResourceDescriptorHeap[packed & 0xFFFFFF];
         textureAlpha = texture.SampleLevel(g_pointWrap, uv, 0.0).a;
     }
@@ -132,17 +146,18 @@ struct HitInfo
     float3x4 objectToWorld;
 };
 
-// The closest triangle along a ray, or false when it reaches tMax.
-bool TraceHit(float3 origin, float3 direction, float tMax, uint mask, out HitInfo hit)
+// The closest triangle along a ray, or false when it reaches tMax. `rayFlags` is RAY_FLAG_NONE or
+// g_frame.indirectRayFlags.
+bool TraceHit(float3 origin, float3 direction, float tMax, uint mask, out HitInfo hit, uint rayFlags = RAY_FLAG_NONE)
 {
     hit = (HitInfo)0;
-    RayQuery<RAY_FLAG_NONE> query;
+    SCENE_RAY_QUERY(RAY_FLAG_NONE) query;
     RayDesc ray;
     ray.Origin = origin;
     ray.Direction = direction;
-    ray.TMin = 0.5;
+    ray.TMin = 0.01;
     ray.TMax = tMax;
-    query.TraceRayInline(g_scene, RAY_FLAG_NONE, mask, ray);
+    query.TraceRayInline(g_scene, rayFlags, mask, ray);
     while (query.Proceed()) {
         if (CandidateIsSolid(query.CandidateInstanceID(), query.CandidatePrimitiveIndex(), query.CandidateTriangleBarycentrics()))
             query.CommitNonOpaqueTriangleHit();
@@ -174,6 +189,32 @@ float3 LitPosition(float3 position)
     return g_frame.eyePosition + direction * max(hit.t - 2.0, 0.0);
 }
 
+// How far rays from a G-buffer point `distance` from the eye start off its surface.
+float SurfaceBias(float distance) { return g_frame.normalBias * (1.0 + distance * 0.002); }
+
+// The face normal under a G-buffer pixel (shaders/primary.hlsl). Normal maps tilt the G-buffer normal far from it at
+// grooves and bevels, and rays that leave along the tilted normal start under the surface.
+float3 GeometricNormalAt(int2 pixel)
+{
+    Texture2D<float4> normals = ResourceDescriptorHeap[g_frame.geometricNormalView];
+    return normals.Load(int3(clamp(pixel, int2(0, 0), int2(g_frame.size) - 1), 0)).xyz;
+}
+
+// Where rays from a G-buffer point start: off the surface along its face normal and back towards the eye. At a crease
+// the normal alone can leave the origin a hair from the other surface, and rays that meet it closer than TMin slip
+// through to the sky behind (bright lines along wall edges). The way back to the eye is open, since the eye saw it.
+float3 SurfaceRayOrigin(float3 position, float3 geometricNormal, float distance)
+{
+    return position + (geometricNormal + normalize(g_frame.eyePosition - position) * 0.5) * SurfaceBias(distance);
+}
+
+// A direction sampled around a normal-mapped normal, mirrored back above the surface where it points into it.
+float3 AboveSurface(float3 direction, float3 geometricNormal)
+{
+    float below = dot(direction, geometricNormal);
+    return below < 0.0 ? direction - 2.0 * below * geometricNormal : direction;
+}
+
 // Face normal (facing the ray origin) and albedo of a hit triangle.
 HitSurface SurfaceOf(HitInfo hit, float3 origin, float3 direction)
 {
@@ -197,11 +238,11 @@ HitSurface SurfaceOf(HitInfo hit, float3 origin, float3 direction)
 }
 
 // The closest surface along a ray, or false when it reaches tMax.
-bool TraceClosest(float3 origin, float3 direction, float tMax, uint mask, out HitSurface surface)
+bool TraceClosest(float3 origin, float3 direction, float tMax, uint mask, out HitSurface surface, uint rayFlags = RAY_FLAG_NONE)
 {
     surface = (HitSurface)0;
     HitInfo hit;
-    if (!TraceHit(origin, direction, tMax, mask, hit))
+    if (!TraceHit(origin, direction, tMax, mask, hit, rayFlags))
         return false;
     surface = SurfaceOf(hit, origin, direction);
     return true;
@@ -307,11 +348,11 @@ float Transmittance(float3 origin, float3 direction, float tMax, uint mask)
 {
     if (mask == 0)
         return 1.0;
-    RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER> query;
+    SCENE_RAY_QUERY(RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER) query;
     RayDesc ray;
     ray.Origin = origin;
     ray.Direction = direction;
-    ray.TMin = 0.5;
+    ray.TMin = 0.01;
     ray.TMax = tMax;
     query.TraceRayInline(g_scene, RAY_FLAG_NONE, mask, ray);
     float transmittance = 1.0;
@@ -326,18 +367,19 @@ float Transmittance(float3 origin, float3 direction, float tMax, uint mask)
     return query.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? 0.0 : transmittance;
 }
 
-float SunVisibility(float3 origin)
+// `mask` is g_frame.sunShadowMask, or g_frame.bounceMask for the light of indirect bounces.
+float SunVisibility(float3 origin, uint mask)
 {
-    return Transmittance(origin, g_frame.sunDirection, 65536.0, g_frame.traceMask);
+    return Transmittance(origin, g_frame.sunDirection, 65536.0, mask);
 }
 
 // Sunlight reaching a hit surface, with its shadow ray starting at `origin`.
-float3 SunIrradiance(HitSurface hit, float3 origin)
+float3 SunIrradiance(HitSurface hit, float3 origin, uint mask)
 {
     float lambert = saturate(dot(hit.normal, g_frame.sunDirection));
     if (g_frame.sunEnabled == 0.0 || lambert <= 0.0)
         return 0.0;
-    return g_frame.sunColor * lambert * SunVisibility(origin);
+    return g_frame.sunColor * lambert * SunVisibility(origin, mask);
 }
 
 // Map lights that can reach a position: the (offset, count) range of light indices of its visibility cluster

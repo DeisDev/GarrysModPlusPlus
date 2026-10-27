@@ -1,9 +1,9 @@
 #include "scene.hlsli"
 
-// One cosine-weighted diffuse bounce per pixel. The result is an irradiance estimate: a sky miss returns
+// Cosine-weighted diffuse bounces per pixel. The result is an irradiance estimate: a sky miss returns
 // the sky irradiance, a hit returns its albedo times the light reaching it. Where the hit was on screen last
 // frame that is last frame's whole irradiance there (exact direct plus denoised light); elsewhere it is the sun,
-// one local light picked by SampleLight and one more traced bounce.
+// one local light picked by SampleLight and g_frame.indirectBounces - 1 more traced bounces.
 // The sampled remainder of the direct light (direct.hlsl) is added, so the denoiser handles both.
 // input0: last frame's denoised light, or none; input1: sampled direct remainder; input2: last frame's exact direct
 // light; output0: raw estimate; step: samples per pixel.
@@ -30,14 +30,24 @@ float3 PreviousIrradiance(float3 position, float3 normal)
     return denoised.Load(int3(pixel, 0)).rgb + direct.Load(int3(pixel, 0)).rgb;
 }
 
-// Indirect light at an off-screen hit: one more diffuse bounce that sees the sky or a sunlit surface.
-float3 SecondBounce(HitSurface hit, float3 origin, inout uint seed)
+// Indirect light at an off-screen hit: more diffuse bounces, each seeing the sky or a sunlit surface. Rays after the
+// first pass through shadowless props (g_frame.bounceMask): in grass they would cross many alpha-tested blades for
+// light the denoiser blurs anyway.
+float3 FurtherBounces(HitSurface hit, float3 origin, inout uint seed)
 {
-    float3 direction = CosineSample(hit.normal, Random(seed), Random(seed));
-    HitSurface next;
-    if (!TraceClosest(origin, direction, kMaxDistance, g_frame.traceMask, next))
-        return g_frame.skyColor;
-    return next.albedo * SunIrradiance(next, next.position + next.normal);
+    float3 irradiance = 0.0;
+    float3 throughput = 1.0;
+    for (uint bounce = 1; bounce < g_frame.indirectBounces; ++bounce) {
+        float3 direction = CosineSample(hit.normal, Random(seed), Random(seed));
+        HitSurface next;
+        if (!TraceClosest(origin, direction, kMaxDistance, g_frame.bounceMask, next, g_frame.indirectRayFlags))
+            return irradiance + throughput * g_frame.skyColor;
+        origin = next.position + next.normal;
+        irradiance += throughput * next.albedo * SunIrradiance(next, origin, g_frame.bounceMask);
+        throughput *= next.albedo;
+        hit = next;
+    }
+    return irradiance;
 }
 
 float3 HitIrradiance(HitSurface hit, inout uint seed)
@@ -46,14 +56,14 @@ float3 HitIrradiance(HitSurface hit, inout uint seed)
     if (previous.x >= 0.0)
         return previous;
     float3 origin = hit.position + hit.normal * 1.0;
-    float3 irradiance = SunIrradiance(hit, origin);
+    float3 irradiance = SunIrradiance(hit, origin, g_frame.bounceMask);
     float3 light;
     float3 toLight;
     float distance;
     bool attached;
     if (SampleLight(LightSetAt(hit.position, hit.normal), hit.position, hit.normal, seed, light, toLight, distance, attached))
         irradiance += light * Transmittance(origin, toLight, ShadowRayLength(attached, distance), ShadowMask(attached));
-    return irradiance + SecondBounce(hit, origin, seed);
+    return irradiance + FurtherBounces(hit, origin, seed);
 }
 
 [RootSignature(ROOT_SIGNATURE)]
@@ -72,8 +82,9 @@ void main(uint3 id : SV_DispatchThreadID)
     float3 normal = surface.xyz;
     float3 position = LitPosition(WorldPositionFromDepth(pixel, DepthAt(pixel)));
     uint seed = PixelSeed(id.xy, 0x51u);
-    float bias = g_frame.normalBias * (1.0 + surface.w * 0.002);
-    float3 origin = position + normal * bias;
+    float bias = SurfaceBias(surface.w);
+    float3 geometricNormal = GeometricNormalAt(pixel);
+    float3 origin = SurfaceRayOrigin(position, geometricNormal, surface.w);
     // Props that ignore normals gather light from every direction, as VRAD lit them; rays through their thin
     // surfaces start on the far side.
     Texture2D<uint> pixelFlags = ResourceDescriptorHeap[g_frame.pixelFlagsView];
@@ -81,9 +92,10 @@ void main(uint3 id : SV_DispatchThreadID)
     uint samples = max(g_pass.step, 1u);
     float3 estimate = 0.0;
     for (uint s = 0; s < samples; ++s) {
-        float3 direction = ignoreNormals ? UniformSphere(Random(seed), Random(seed)) : CosineSample(normal, Random(seed), Random(seed));
+        float3 direction = ignoreNormals ? UniformSphere(Random(seed), Random(seed))
+                                           : AboveSurface(CosineSample(normal, Random(seed), Random(seed)), geometricNormal);
         HitSurface hit;
-        if (TraceClosest(ignoreNormals ? position + direction * bias : origin, direction, kMaxDistance, g_frame.traceMask, hit))
+        if (TraceClosest(ignoreNormals ? position + direction * bias : origin, direction, kMaxDistance, g_frame.indirectMask, hit, g_frame.indirectRayFlags))
             estimate += ClampSample(hit.albedo * HitIrradiance(hit, seed));
         else
             estimate += g_frame.skyColor;

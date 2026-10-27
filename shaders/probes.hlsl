@@ -7,7 +7,7 @@
 // whose cell changed starts over.
 //
 // Trace (step 0, input4: 1 when last frame's volume may be used): every frame a share of the probes traces
-// kProbeRays rays. A hit returns its albedo times the
+// g_frame.volumeRays rays. A hit returns its albedo times the
 // light reaching it (sun, one light picked by SampleLight, and last frame's volume as indirect light), a miss
 // the sky. Probes that mostly see back faces are inside geometry and marked invalid.
 // input0-2: last frame's red, green and blue coefficients; input3: last frame's cells (xyz) and validity (w);
@@ -19,7 +19,6 @@
 // direct light. input0-3: this frame's coefficients and cells; output0-2: the volume the game samples.
 
 static const uint3 kProbeGrid = uint3(32, 32, 16);
-static const uint kProbeRays = 32;
 // Probes away from the camera are traced every this many frames.
 static const uint kUpdatePeriod = 4;
 static const float kHistoryWeight = 0.85;
@@ -89,18 +88,18 @@ void Trace(uint3 id)
     float3 a = 0.0;
     float3 b[3] = {(float3)0.0, (float3)0.0, (float3)0.0};
     uint backFaces = 0;
-    for (uint r = 0; r < kProbeRays; ++r) {
-        float3 direction = UniformSphere((r + Random(seed)) / kProbeRays, Random(seed));
+    for (uint r = 0; r < g_frame.volumeRays; ++r) {
+        float3 direction = UniformSphere((r + Random(seed)) / g_frame.volumeRays, Random(seed));
         float3 radiance = g_frame.skyColor;
         HitInfo hit;
-        if (TraceHit(position, direction, kMaxDistance, g_frame.traceMask & ~kLocalPlayerMask, hit)) {
+        if (TraceHit(position, direction, kMaxDistance, g_frame.indirectMask & ~kLocalPlayerMask, hit)) {
             if (HitBackFace(hit, direction)) {
                 ++backFaces;
                 radiance = 0.0;
             } else {
                 HitSurface surface = SurfaceOf(hit, position, direction);
                 float3 origin = surface.position + surface.normal;
-                float3 irradiance = SunIrradiance(surface, origin) + VolumeIrradiance(surface.position, surface.normal) * g_frame.indirectScale;
+                float3 irradiance = SunIrradiance(surface, origin, g_frame.bounceMask) + VolumeIrradiance(surface.position, surface.normal) * g_frame.indirectScale;
                 float3 light;
                 float3 toLight;
                 float distance;
@@ -115,13 +114,13 @@ void Trace(uint3 id)
         b[1] += radiance.g * direction;
         b[2] += radiance.b * direction;
     }
-    a /= kProbeRays;
-    float4 sampled[3] = {float4(a.r, b[0] * (2.0 / kProbeRays)), float4(a.g, b[1] * (2.0 / kProbeRays)), float4(a.b, b[2] * (2.0 / kProbeRays))};
+    a /= g_frame.volumeRays;
+    float4 sampled[3] = {float4(a.r, b[0] * (2.0 / g_frame.volumeRays)), float4(a.g, b[1] * (2.0 / g_frame.volumeRays)), float4(a.b, b[2] * (2.0 / g_frame.volumeRays))};
     float weight = fresh ? 0.0 : kHistoryWeight;
     redOut[texel] = lerp(sampled[0], previous[0], weight);
     greenOut[texel] = lerp(sampled[1], previous[1], weight);
     blueOut[texel] = lerp(sampled[2], previous[2], weight);
-    cellsOut[texel] = int4(cell, backFaces > kProbeRays * kInsideFraction ? 0 : 1);
+    cellsOut[texel] = int4(cell, backFaces > g_frame.volumeRays * kInsideFraction ? 0 : 1);
 }
 
 // Light of irradiance E (facing it) from direction d gives E max(n.d, 0), whose L1 fit is E / 4 + (E / 2) d.n.
@@ -135,7 +134,7 @@ void AddDirection(float3 irradiance, float3 direction, inout float4 value[3])
 void AddDirectLight(float3 position, inout float4 value[3])
 {
     if (g_frame.sunEnabled != 0.0)
-        AddDirection(g_frame.sunColor * SunVisibility(position), g_frame.sunDirection, value);
+        AddDirection(g_frame.sunColor * SunVisibility(position, g_frame.sunShadowMask), g_frame.sunDirection, value);
     LightSet set = LightSetAt(position, 0.0);
     uint top[kProbeLights];
     float topWeight[kProbeLights];

@@ -26,6 +26,8 @@ public:
     bool AttachGameDevice(IDirect3DDevice9* device, HWND focusWindow, const D3DPRESENT_PARAMETERS& params);
     Presenter* GetPresenter() const { return m_presenter.get(); }
     bool SupportsRaytracing() const { return m_raytracing; }
+    // Raytracing tier 1.2 and Shader Model 6.9, through the Agility SDK runtime.
+    bool SupportsOpacityMicromaps() const { return m_opacityMicromaps; }
     void OnPresent();
     void OnReset();
 
@@ -39,6 +41,7 @@ private:
     std::unique_ptr<Presenter> m_presenter;
     LUID m_adapterLuid = {};
     bool m_raytracing = false;
+    bool m_opacityMicromaps = false;
     uint64_t m_frame = 0;
 };
 

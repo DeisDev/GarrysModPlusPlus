@@ -687,7 +687,7 @@ void UpdateScene()
         return;
     if (!g_state.sceneInitialized) {
         Renderer* renderer = GetRenderer();
-        g_state.sceneInitialized = g_state.scene.Initialize(renderer->Device(), renderer->Queue(), renderer->Descriptors());
+        g_state.sceneInitialized = g_state.scene.Initialize(renderer->Device(), renderer->Queue(), renderer->Descriptors(), renderer->SupportsOpacityMicromaps());
         if (!g_state.sceneInitialized)
             return;
     }
@@ -749,6 +749,10 @@ void UpdateScene()
                 world.sun.direction.z, world.sun.color.x, world.sun.color.y, world.sun.color.z, world.sun.ambient.x, world.sun.ambient.y,
                 world.sun.ambient.z);
             g_state.scene.SetStaticInstances(std::move(instances));
+            if (GetRenderer()->SupportsOpacityMicromaps()) {
+                const auto [triangles, micromaps] = g_state.scene.MicromapCounts();
+                log::Info("Scene: {} alpha-tested or translucent triangles have opacity micromaps ({} micromaps)", triangles, micromaps);
+            }
             return;
         }
         error = "building acceleration structures failed";

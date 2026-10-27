@@ -62,7 +62,21 @@ bool SkinnedCasters::PrepareModel(SkinnedModel& model)
     return true;
 }
 
-bool SkinnedCasters::PrepareSlot(SlotState& slot, const SkinnedModel& model)
+void SkinnedCasters::Describe(const SkinnedModel& model, const Scene& scene, int sceneModel,
+    D3D12_GPU_VIRTUAL_ADDRESS vertices, D3D12_GPU_VIRTUAL_ADDRESS indices, D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS& inputs,
+    D3D12_RAYTRACING_GEOMETRY_DESC (&descs)[2], D3D12_RAYTRACING_GEOMETRY_TRIANGLES_DESC& triangles, D3D12_RAYTRACING_GEOMETRY_OMM_LINKAGE_DESC& linkage)
+{
+    const UINT triangleCount = static_cast<UINT>(model.geometry.indices.size() / 3);
+    inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
+    inputs.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE | D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD;
+    inputs.NumDescs = Scene::GeometryDescs(vertices, static_cast<UINT>(model.geometry.positions.size()), indices, triangleCount, model.opaqueTriangles, descs);
+    inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+    inputs.pGeometryDescs = descs;
+    if (model.opaqueTriangles < triangleCount && scene.LinkMicromaps(sceneModel, descs[inputs.NumDescs - 1], triangles, linkage))
+        inputs.Flags |= D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_DISABLE_OMMS;
+}
+
+bool SkinnedCasters::PrepareSlot(SlotState& slot, const SkinnedModel& model, const Scene& scene, int sceneModel)
 {
     if (slot.blas)
         return true;
@@ -72,12 +86,10 @@ bool SkinnedCasters::PrepareSlot(SlotState& slot, const SkinnedModel& model)
         return false;
 
     D3D12_RAYTRACING_GEOMETRY_DESC descs[2];
+    D3D12_RAYTRACING_GEOMETRY_TRIANGLES_DESC triangles;
+    D3D12_RAYTRACING_GEOMETRY_OMM_LINKAGE_DESC linkage;
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS inputs = {};
-    inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
-    inputs.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE | D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD;
-    inputs.NumDescs = Scene::GeometryDescs(0, vertexCount, 0, static_cast<UINT>(model.geometry.indices.size() / 3), model.opaqueTriangles, descs);
-    inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
-    inputs.pGeometryDescs = descs;
+    Describe(model, scene, sceneModel, 0, 0, inputs, descs, triangles, linkage);
     D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO info = {};
     m_device->GetRaytracingAccelerationStructurePrebuildInfo(&inputs, &info);
     slot.scratch = CreateBuffer(std::max(info.ScratchDataSizeInBytes, info.UpdateScratchDataSizeInBytes), D3D12_HEAP_TYPE_DEFAULT,
@@ -105,7 +117,7 @@ void SkinnedCasters::Clear()
     m_states.clear();
 }
 
-void SkinnedCasters::Record(ID3D12GraphicsCommandList4* list, const std::vector<SkinnedEntity>& entities, std::vector<SceneInstance>& instances)
+void SkinnedCasters::Record(ID3D12GraphicsCommandList4* list, const Scene& scene, const std::vector<SkinnedEntity>& entities, std::vector<SceneInstance>& instances)
 {
     ++m_frame;
     if (!entities.empty())
@@ -125,7 +137,7 @@ void SkinnedCasters::Record(ID3D12GraphicsCommandList4* list, const std::vector<
         state.lastRecord = m_records;
         SlotState& slot = state.slots[state.slot];
         const SkinnedModel& model = *entity.model;
-        if (!PrepareSlot(slot, model))
+        if (!PrepareSlot(slot, model, scene, entity.sceneModel))
             continue;
 
         skin.resize(model.poseToBone.size());
@@ -148,17 +160,15 @@ void SkinnedCasters::Record(ID3D12GraphicsCommandList4* list, const std::vector<
         }
 
         D3D12_RAYTRACING_GEOMETRY_DESC descs[2];
+        D3D12_RAYTRACING_GEOMETRY_TRIANGLES_DESC triangles;
+        D3D12_RAYTRACING_GEOMETRY_OMM_LINKAGE_DESC linkage;
         D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC desc = {};
-        desc.Inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
-        desc.Inputs.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE | D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD;
+        Describe(model, scene, entity.sceneModel, slot.vertices->GetGPUVirtualAddress(), model.indexBuffer->GetGPUVirtualAddress(), desc.Inputs, descs,
+            triangles, linkage);
         if (slot.built) {
             desc.Inputs.Flags |= D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE;
             desc.SourceAccelerationStructureData = slot.blas->GetGPUVirtualAddress();
         }
-        desc.Inputs.NumDescs = Scene::GeometryDescs(slot.vertices->GetGPUVirtualAddress(), static_cast<UINT>(model.geometry.positions.size()),
-            model.indexBuffer->GetGPUVirtualAddress(), static_cast<UINT>(model.geometry.indices.size() / 3), model.opaqueTriangles, descs);
-        desc.Inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
-        desc.Inputs.pGeometryDescs = descs;
         desc.DestAccelerationStructureData = slot.blas->GetGPUVirtualAddress();
         desc.ScratchAccelerationStructureData = slot.scratch->GetGPUVirtualAddress();
         list->BuildRaytracingAccelerationStructure(&desc, 0, nullptr);

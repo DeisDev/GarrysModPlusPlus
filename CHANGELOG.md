@@ -13,6 +13,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Volumetric light from the sun and flashlights, with an on/off switch and strength in the menu.
 - Debug views for reflections, motion vectors and ambient occlusion.
 - Particles and effects that ask the engine for the light at a point now get real-time light.
+- Ray tracing quality presets (Low, Medium, High, Ultra) and settings for shadow rays, indirect rays and bounces, ambient occlusion rays, light volume rays, volumetric light steps and foliage shadows.
+- Opacity micromaps make ray tracing through grass, leaves and fences faster on GPUs that support them, with an option for faster, approximate alpha tests in indirect light.
+- The ambient occlusion pass has its own GPU time in the menu and log.
 
 ### Changed
 
@@ -22,6 +25,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Lights inside lamp models are blocked by the lamp the way the map's baked lighting was, so rooms are no longer brighter than intended.
 - Grass and other props the map marks as casting no shadows now cast shadows from the sun.
 - Values in `gmodpp_settings.ini` are limited to the ranges the menu offers.
+- Grassy areas render faster: later indirect light bounces pass through grass, and alpha tests read less data.
+- The DirectX 12 Agility SDK runtime is installed to `bin/win64/D3D12`; without it, opacity micromaps are unavailable.
 
 ### Fixed
 
@@ -35,3 +40,4 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fixed walls and floors whose material tints their lighting (`$color2`) looking too bright.
 - Fixed grass and other foliage turning black where it faces away from the light.
 - Fixed ghost copies of nearby objects appearing in the sky with DLSS Ray Reconstruction.
+- Fixed bright lines along the edges of walls, floors and ceilings, and along grooves in normal-mapped floors.

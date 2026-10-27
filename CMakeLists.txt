@@ -33,17 +33,37 @@ add_library(imgui STATIC
 target_include_directories(imgui PUBLIC ${imgui_SOURCE_DIR})
 target_compile_definitions(imgui PUBLIC IMGUI_DISABLE_OBSOLETE_FUNCTIONS UNICODE _UNICODE)
 
-find_program(DXC_EXECUTABLE dxc HINTS "$ENV{WindowsSdkVerBinPath}/x64" REQUIRED)
+# DirectX Shader Compiler with Shader Model 6.9 (opacity micromaps in inline ray queries), pinned by hash.
+set(DXC_VERSION v1.9.2602)
+set(DXC_DIR "${CMAKE_CURRENT_BINARY_DIR}/_deps/dxc-${DXC_VERSION}")
+if(NOT EXISTS "${DXC_DIR}/bin/x64/dxc.exe")
+    file(DOWNLOAD "https://github.com/microsoft/DirectXShaderCompiler/releases/download/${DXC_VERSION}/dxc_2026_02_20.zip" "${DXC_DIR}.zip"
+        EXPECTED_HASH SHA256=a1e89031421cf3c1fca6627766ab3020ca4f962ac7e2caa7fab2b33a8436151e TLS_VERIFY ON)
+    file(ARCHIVE_EXTRACT INPUT "${DXC_DIR}.zip" DESTINATION "${DXC_DIR}")
+endif()
+set(DXC_EXECUTABLE "${DXC_DIR}/bin/x64/dxc.exe")
 find_program(FXC_EXECUTABLE fxc HINTS "$ENV{WindowsSdkVerBinPath}/x64" REQUIRED)
+
+# DirectX 12 Agility SDK: headers for opacity micromaps and the D3D12Core.dll runtime the device is created
+# from (renderer.cpp), pinned by hash.
+set(AGILITY_SDK_VERSION 1.619.6)
+set(AGILITY_SDK_DIR "${CMAKE_CURRENT_BINARY_DIR}/_deps/agility-${AGILITY_SDK_VERSION}")
+if(NOT EXISTS "${AGILITY_SDK_DIR}/build/native/include/d3d12.h")
+    file(DOWNLOAD "https://api.nuget.org/v3-flatcontainer/microsoft.direct3d.d3d12/${AGILITY_SDK_VERSION}/microsoft.direct3d.d3d12.${AGILITY_SDK_VERSION}.nupkg"
+        "${AGILITY_SDK_DIR}.zip" EXPECTED_HASH SHA256=08f0489281401aa430fc37322d6c3fc98a8025175aacd714c10d562f4963f1e9 TLS_VERIFY ON)
+    file(ARCHIVE_EXTRACT INPUT "${AGILITY_SDK_DIR}.zip" DESTINATION "${AGILITY_SDK_DIR}")
+endif()
+set(AGILITY_RUNTIME_DIR "${AGILITY_SDK_DIR}/build/native/bin/x64")
 set(SHADER_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/shaders")
 file(MAKE_DIRECTORY "${SHADER_OUTPUT_DIR}")
 set(SHADER_HEADERS)
 
+# Extra arguments are dxc options.
 function(add_shader source entry profile variable)
     set(output "${SHADER_OUTPUT_DIR}/${variable}.h")
     add_custom_command(
         OUTPUT "${output}"
-        COMMAND "${DXC_EXECUTABLE}" -nologo -T ${profile} -E ${entry} -O3 -HV 2021 -Fh "${output}" -Vn ${variable} "${CMAKE_CURRENT_SOURCE_DIR}/${source}"
+        COMMAND "${DXC_EXECUTABLE}" -nologo -T ${profile} -E ${entry} -O3 -HV 2021 ${ARGN} -Fh "${output}" -Vn ${variable} "${CMAKE_CURRENT_SOURCE_DIR}/${source}"
         DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/${source}" "${CMAKE_CURRENT_SOURCE_DIR}/shaders/common.hlsli" "${CMAKE_CURRENT_SOURCE_DIR}/shaders/scene.hlsli"
         COMMENT "Compiling ${source} (${entry})"
         VERBATIM
@@ -70,16 +90,17 @@ function(add_d3d9_shader source entry variable)
 endfunction()
 
 add_shader(shaders/surface.hlsl main cs_6_6 g_surfaceCS)
-add_shader(shaders/primary.hlsl main cs_6_6 g_primaryCS)
-add_shader(shaders/probes.hlsl main cs_6_6 g_probesCS)
-add_shader(shaders/ao.hlsl main cs_6_6 g_aoCS)
-add_shader(shaders/volumetrics.hlsl main cs_6_6 g_volumetricsCS)
-add_shader(shaders/direct.hlsl main cs_6_6 g_directCS)
-add_shader(shaders/reflections.hlsl main cs_6_6 g_reflectionsCS)
+# Passes that trace rays, and their Shader Model 6.9 variants that let ray queries use opacity micromaps.
+foreach(pass primary probes ao volumetrics direct reflections gi_trace)
+    string(REPLACE "_t" "T" variable ${pass})
+    add_shader(shaders/${pass}.hlsl main cs_6_6 g_${variable}CS)
+    add_shader(shaders/${pass}.hlsl main cs_6_9 g_${variable}OmmCS -D OPACITY_MICROMAPS=1)
+endforeach()
+add_shader(shaders/direct.hlsl main cs_6_6 g_directWideCS -D WIDE_LIGHT_SETS=1)
+add_shader(shaders/direct.hlsl main cs_6_9 g_directWideOmmCS -D WIDE_LIGHT_SETS=1 -D OPACITY_MICROMAPS=1)
 add_shader(shaders/reflection_temporal.hlsl main cs_6_6 g_reflectionTemporalCS)
 add_shader(shaders/dlss_inputs.hlsl main cs_6_6 g_dlssInputsCS)
 add_shader(shaders/dlss_resolve.hlsl main cs_6_6 g_dlssResolveCS)
-add_shader(shaders/gi_trace.hlsl main cs_6_6 g_giTraceCS)
 add_shader(shaders/gi_temporal.hlsl main cs_6_6 g_giTemporalCS)
 add_shader(shaders/gi_filter.hlsl main cs_6_6 g_giFilterCS)
 add_shader(shaders/deferred_lighting.hlsl main cs_6_6 g_deferredLightingCS)
@@ -146,6 +167,7 @@ add_library(gmodpp_d3d9 SHARED
     src/bsp.cpp
     src/studio_model.cpp
     src/convex_hull.cpp
+    src/opacity_micromaps.cpp
     src/scene.cpp
     src/skinned_casters.cpp
     src/settings.cpp
@@ -206,6 +228,8 @@ add_library(lzma_dec STATIC "${LZMA_SDK_DIR}/LzmaDec.c")
 target_include_directories(lzma_dec PUBLIC "${LZMA_SDK_DIR}")
 
 set_target_properties(gmodpp_d3d9 PROPERTIES OUTPUT_NAME d3d9)
+# The Agility SDK's d3d12.h comes before the Windows SDK's.
+target_include_directories(gmodpp_d3d9 BEFORE PRIVATE "${AGILITY_SDK_DIR}/build/native/include")
 target_include_directories(gmodpp_d3d9 PRIVATE "${SHADER_OUTPUT_DIR}" "${DLSS_SDK_DIR}/include")
 target_compile_definitions(gmodpp_d3d9 PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
 target_compile_options(gmodpp_d3d9 PRIVATE /W4 /permissive- /utf-8)
@@ -215,7 +239,10 @@ if(GMOD_DIR)
     add_custom_target(deploy
         COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:gmodpp_d3d9> "${GMOD_DIR}/bin/win64/d3d9.dll"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different "${DLSS_FEATURE_DLL}" "${GMOD_DIR}/bin/win64/nvngx_dlssd.dll"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${GMOD_DIR}/bin/win64/D3D12"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${AGILITY_RUNTIME_DIR}/D3D12Core.dll" "${AGILITY_RUNTIME_DIR}/d3d12SDKLayers.dll"
+            "${GMOD_DIR}/bin/win64/D3D12/"
         DEPENDS gmodpp_d3d9
-        COMMENT "Deploying d3d9.dll and nvngx_dlssd.dll to ${GMOD_DIR}/bin/win64"
+        COMMENT "Deploying d3d9.dll, nvngx_dlssd.dll and the Agility SDK runtime to ${GMOD_DIR}/bin/win64"
     )
 endif()

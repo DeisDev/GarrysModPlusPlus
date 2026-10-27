@@ -1,9 +1,29 @@
 #include "common.hlsli"
 
 // Render-resolution inputs for DLSS Ray Reconstruction, taken from the native-resolution G-buffer: each render
-// pixel uses the native pixel under its centre.
+// pixel uses the native pixel under its centre, and the depth at the centre itself.
 // input0, input1: render width and height; output0: first of seven consecutive UAVs: colour, depth, normal,
 // flags, light, albedo, self-illumination.
+
+// Depth at a point between native pixel centres (`centre` in native pixels). The native pixel's own depth would
+// put the point on its surface's plane up to half a pixel away, which by a crease lies behind the other surface.
+// Depth is linear across a plane in screen space, so blending the four native pixels around the point is exact on
+// one surface and stays in front of both at a crease; across a silhouette the nearest pixel is kept.
+float DepthAtPoint(float2 centre, int2 nearest)
+{
+    int2 base = int2(floor(centre - 0.5));
+    float2 blend = centre - 0.5 - float2(base);
+    float4 depths = float4(DepthAt(base), DepthAt(base + int2(1, 0)), DepthAt(base + int2(0, 1)), DepthAt(base + int2(1, 1)));
+    float4 distances = float4(length(WorldPositionFromDepth(base, depths.x) - g_frame.eyePosition),
+        length(WorldPositionFromDepth(base + int2(1, 0), depths.y) - g_frame.eyePosition),
+        length(WorldPositionFromDepth(base + int2(0, 1), depths.z) - g_frame.eyePosition),
+        length(WorldPositionFromDepth(base + int2(1, 1), depths.w) - g_frame.eyePosition));
+    float nearestDistance = min(min(distances.x, distances.y), min(distances.z, distances.w));
+    float farthestDistance = max(max(distances.x, distances.y), max(distances.z, distances.w));
+    if (any(depths >= 1.0) || farthestDistance > nearestDistance * 1.05 + 1.0)
+        return DepthAt(nearest);
+    return lerp(lerp(depths.x, depths.y, blend.x), lerp(depths.z, depths.w, blend.x), blend.y);
+}
 
 [RootSignature(ROOT_SIGNATURE)]
 [numthreads(8, 8, 1)]
@@ -13,7 +33,8 @@ void main(uint3 id : SV_DispatchThreadID)
     if (any(id.xy >= renderSize))
         return;
     int2 pixel = int2(id.xy);
-    int2 source = min(int2((float2(pixel) + 0.5) * float2(g_frame.size) / float2(renderSize)), int2(g_frame.size) - 1);
+    float2 centre = (float2(pixel) + 0.5) * float2(g_frame.size) / float2(renderSize);
+    int2 source = min(int2(centre), int2(g_frame.size) - 1);
     int3 load = int3(source, 0);
 
     Texture2D<float4> color = ResourceDescriptorHeap[g_frame.colorView];
@@ -22,7 +43,7 @@ void main(uint3 id : SV_DispatchThreadID)
     Texture2D<float4> light = ResourceDescriptorHeap[g_frame.lightView];
     Texture2D<float4> albedo = ResourceDescriptorHeap[g_frame.albedoView];
     Texture2D<float4> emissive = ResourceDescriptorHeap[g_frame.emissiveView];
-    float depth = DepthAt(source);
+    float depth = DepthAtPoint(centre, source);
     float4 coverage = flags.Load(load);
 
     RWTexture2D<float4> colorOut = ResourceDescriptorHeap[g_pass.output0];

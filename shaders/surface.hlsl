@@ -3,23 +3,22 @@
 // Resolves the G-buffer into one surface texture the lighting passes share: the world normal (with a depth
 // fallback) turned toward the camera and the distance to the eye.
 
-float3 PositionAt(int2 pixel)
+// The step to the neighbour on the side of `pixel` (along `axis`) that lies in the pixel's own plane. Depth is linear
+// across a plane in screen space, so that side's second depth difference is zero; picking it keeps a pixel next
+// to a crease from taking the other plane's slope, whose normal would start its rays inside the wall.
+float3 PlaneStep(int2 pixel, int2 axis, float depth, float3 position)
 {
-    return WorldPositionFromDepth(pixel, DepthAt(pixel));
+    float after = DepthAt(pixel + axis);
+    float before = DepthAt(pixel - axis);
+    bool forward = abs(DepthAt(pixel + axis * 2) - 2.0 * after + depth) < abs(DepthAt(pixel - axis * 2) - 2.0 * before + depth);
+    return forward ? WorldPositionFromDepth(pixel + axis, after) - position : position - WorldPositionFromDepth(pixel - axis, before);
 }
 
 // World brushes whose materials need no normals are drawn without them, so the G-buffer holds zero there.
-// Brushes are planar, so the normal of the depth surface is exact away from edges; the smaller neighbour
-// difference on each axis keeps edges from blending two planes.
-float3 DepthNormal(int2 pixel, float3 position)
+// Brushes are planar, so the normal of the depth surface is exact.
+float3 DepthNormal(int2 pixel, float depth, float3 position)
 {
-    float3 right = PositionAt(pixel + int2(1, 0)) - position;
-    float3 left = position - PositionAt(pixel - int2(1, 0));
-    float3 down = PositionAt(pixel + int2(0, 1)) - position;
-    float3 up = position - PositionAt(pixel - int2(0, 1));
-    float3 dx = dot(right, right) < dot(left, left) ? right : left;
-    float3 dy = dot(down, down) < dot(up, up) ? down : up;
-    return normalize(cross(dy, dx));
+    return normalize(cross(PlaneStep(pixel, int2(0, 1), depth, position), PlaneStep(pixel, int2(1, 0), depth, position)));
 }
 
 [RootSignature(ROOT_SIGNATURE)]
@@ -40,7 +39,7 @@ void main(uint3 id : SV_DispatchThreadID)
     float3 position = WorldPositionFromDepth(pixel, depth);
     float3 toEye = g_frame.eyePosition - position;
     float3 stored = gbufferNormal.Load(int3(pixel, 0)).xyz;
-    float3 normal = dot(stored, stored) > 0.25 ? normalize(stored) : DepthNormal(pixel, position);
+    float3 normal = dot(stored, stored) > 0.25 ? normalize(stored) : DepthNormal(pixel, depth, position);
     // Two-sided materials report the front-face normal on back faces.
     if (dot(normal, toEye) < 0.0)
         normal = -normal;

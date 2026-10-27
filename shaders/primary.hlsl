@@ -6,7 +6,8 @@
 // motion covers moving objects as well as the camera; pixels without a matching triangle follow the camera.
 // output0: visibility (instance, triangle, barycentrics; instance kNoView where nothing matches the G-buffer);
 // output1: motion in pixels towards last frame's position; output2: last frame's distance from the eye;
-// output3: kPixelHit, kPixelUnlit and kPixelIgnoreNormals flags.
+// output3: kPixelHit, kPixelUnlit and kPixelIgnoreNormals flags; output4: the triangle's face normal facing the eye, or the
+// G-buffer normal without a triangle (the normal map's normal can point into the surface, which rays must not).
 
 float3 InterpolatedPosition(uint positionsView, uint3 index, float2 barycentrics)
 {
@@ -38,11 +39,13 @@ void main(uint3 id : SV_DispatchThreadID)
     RWTexture2D<float2> motion = ResourceDescriptorHeap[g_pass.output1];
     RWTexture2D<float> previousDistance = ResourceDescriptorHeap[g_pass.output2];
     RWTexture2D<uint> flags = ResourceDescriptorHeap[g_pass.output3];
+    RWTexture2D<float4> geometricNormal = ResourceDescriptorHeap[g_pass.output4];
     float4 surface = SurfaceAt(g_frame.surfaceView, pixel);
     float3 position = WorldPositionFromDepth(pixel, DepthAt(pixel));
     float3 previous = position;
     uint4 visible = uint4(kNoView, 0, 0, 0);
     uint pixelFlags = 0;
+    float3 faceNormal = surface.xyz;
     if (surface.w > 0.0 && g_frame.traceMask != 0) {
         float3 view = normalize(position - g_frame.eyePosition);
         HitInfo hit;
@@ -53,6 +56,7 @@ void main(uint3 id : SV_DispatchThreadID)
             pixelFlags = kPixelHit | ((MaterialFlags(hit) & kMaterialUnlit) != 0 ? kPixelUnlit : 0u) |
                 ((LoadInstance(hit.instance).flags & kInstanceIgnoreNormals) != 0 ? kPixelIgnoreNormals : 0u);
             previous = position + HitMotion(hit);
+            faceNormal = SurfaceOf(hit, g_frame.eyePosition, view).normal;
         }
     }
     float2 pixelMotion = 0.0;
@@ -67,4 +71,5 @@ void main(uint3 id : SV_DispatchThreadID)
     motion[pixel] = pixelMotion;
     previousDistance[pixel] = length(previous - g_frame.prevEyePosition);
     flags[pixel] = pixelFlags;
+    geometricNormal[pixel] = float4(faceNormal, 0.0);
 }

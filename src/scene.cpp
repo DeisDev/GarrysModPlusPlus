@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <optional>
 
 using Microsoft::WRL::ComPtr;
 
@@ -27,6 +28,15 @@ struct Scene::InstanceRecord {
     uint32_t padding[3];
 };
 static_assert(sizeof(GpuMaterial) == 48);
+
+// Mirrors AlphaTriangle in shaders/scene.hlsli: an alpha-tested or translucent triangle's ModelGeometry::alphaTriangles
+// entry with its texture coordinates, so a candidate's alpha test reads one record.
+struct AlphaTriangle {
+    uint32_t packed;
+    bsp::Float2 uvs[3];
+    uint32_t padding;
+};
+static_assert(sizeof(AlphaTriangle) == 32);
 
 // Mirrors Light in shaders/scene.hlsli.
 struct Scene::GpuLight {
@@ -116,9 +126,10 @@ D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS TlasInputs(UINT count, D3D1
 
 }
 
-bool Scene::Initialize(ID3D12Device5* device, ID3D12CommandQueue* queue, DescriptorHeap& descriptors)
+bool Scene::Initialize(ID3D12Device5* device, ID3D12CommandQueue* queue, DescriptorHeap& descriptors, bool opacityMicromaps)
 {
     m_device = device;
+    m_opacityMicromaps = opacityMicromaps;
     m_queue = queue;
     m_descriptors = &descriptors;
     HRESULT hr = device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&m_allocator));
@@ -304,6 +315,10 @@ UINT Scene::AddTexture(DXGI_FORMAT format, UINT width, UINT height, std::span<co
     srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     srv.Texture2D.MipLevels = mipCount;
     m_device->CreateShaderResourceView(texture.resource.Get(), &srv, m_descriptors->Cpu(texture.view));
+    if (m_opacityMicromaps) {
+        if (std::optional<omm::AlphaImage> alpha = omm::DecodeAlpha(format, width, height, mips[0]))
+            m_alphaImages[texture.view] = std::move(*alpha);
+    }
     m_textures.push_back(std::move(texture));
     return m_textures.back().view;
 }
@@ -326,8 +341,14 @@ int Scene::AddModel(const ModelGeometry& geometry)
     model.albedo = UploadToDefault(geometry.triangleAlbedo.data(), geometry.triangleAlbedo.size_bytes(), staging);
     if (uvs)
         model.uvs = UploadToDefault(geometry.uvs.data(), geometry.uvs.size_bytes(), staging);
-    if (alphaTriangles != 0)
-        model.alpha = UploadToDefault(geometry.alphaTriangles.data(), geometry.alphaTriangles.size_bytes(), staging);
+    if (alphaTriangles != 0) {
+        std::vector<AlphaTriangle> records(alphaTriangles);
+        for (UINT t = 0; t < alphaTriangles; ++t) {
+            const uint32_t* triangle = geometry.indices.data() + static_cast<size_t>(model.opaqueTriangles + t) * 3;
+            records[t] = {geometry.alphaTriangles[t], {geometry.uvs[triangle[0]], geometry.uvs[triangle[1]], geometry.uvs[triangle[2]]}, 0};
+        }
+        model.alpha = UploadToDefault(records.data(), records.size() * sizeof(AlphaTriangle), staging);
+    }
     if (materials)
         model.materials = UploadToDefault(geometry.triangleMaterials.data(), geometry.triangleMaterials.size_bytes(), staging);
     if (!model.positions || !model.indices || !model.albedo || (uvs && !model.uvs) || (alphaTriangles != 0 && !model.alpha) ||
@@ -342,6 +363,16 @@ int Scene::AddModel(const ModelGeometry& geometry)
     inputs.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
     inputs.NumDescs = GeometryDescs(model.positions->GetGPUVirtualAddress(), static_cast<UINT>(geometry.positions.size()),
         model.indices->GetGPUVirtualAddress(), triangles, model.opaqueTriangles, descs);
+    D3D12_RAYTRACING_GEOMETRY_TRIANGLES_DESC alphaTriangleDesc;
+    D3D12_RAYTRACING_GEOMETRY_OMM_LINKAGE_DESC linkage;
+    if (m_opacityMicromaps && alphaTriangles != 0) {
+        if (!AddMicromaps(model, geometry, descs[inputs.NumDescs - 1], alphaTriangleDesc, linkage, staging)) {
+            m_list->Close();
+            return -1;
+        }
+        // Turning opacity micromaps off in the settings disables them per instance.
+        inputs.Flags |= D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_DISABLE_OMMS;
+    }
     inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
     inputs.pGeometryDescs = descs;
     D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO info = {};
@@ -380,6 +411,82 @@ int Scene::AddModel(const ModelGeometry& geometry)
     return static_cast<int>(m_models.size() - 1);
 }
 
+bool Scene::AddMicromaps(Model& model, const ModelGeometry& geometry, D3D12_RAYTRACING_GEOMETRY_DESC& alphaGeometry,
+    D3D12_RAYTRACING_GEOMETRY_TRIANGLES_DESC& triangles, D3D12_RAYTRACING_GEOMETRY_OMM_LINKAGE_DESC& linkage, std::vector<ComPtr<ID3D12Resource>>& staging)
+{
+    std::vector<omm::AlphaTriangle> alpha(geometry.alphaTriangles.size());
+    for (size_t t = 0; t < alpha.size(); ++t) {
+        const uint32_t* triangle = geometry.indices.data() + (model.opaqueTriangles + t) * 3;
+        alpha[t] = {geometry.alphaTriangles[t], {geometry.uvs[triangle[0]], geometry.uvs[triangle[1]], geometry.uvs[triangle[2]]}};
+    }
+    const omm::Micromaps baked = omm::Bake(alpha, m_alphaImages);
+    model.micromapIndices = UploadToDefault(baked.indices.data(), baked.indices.size() * sizeof(int32_t), staging);
+    if (!model.micromapIndices)
+        return false;
+    if (!baked.descs.empty()) {
+        ComPtr<ID3D12Resource> data = UploadToDefault(baked.data.data(), baked.data.size(), staging);
+        ComPtr<ID3D12Resource> descs = UploadToDefault(baked.descs.data(), baked.descs.size() * sizeof(D3D12_RAYTRACING_OPACITY_MICROMAP_DESC), staging);
+        if (!data || !descs)
+            return false;
+        staging.push_back(data);
+        staging.push_back(descs);
+        D3D12_RAYTRACING_OPACITY_MICROMAP_ARRAY_DESC arrayDesc = {};
+        arrayDesc.NumOmmHistogramEntries = static_cast<UINT>(baked.histogram.size());
+        arrayDesc.pOmmHistogram = baked.histogram.data();
+        arrayDesc.InputBuffer = data->GetGPUVirtualAddress();
+        arrayDesc.PerOmmDescs = {descs->GetGPUVirtualAddress(), sizeof(D3D12_RAYTRACING_OPACITY_MICROMAP_DESC)};
+        D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS inputs = {};
+        inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_OPACITY_MICROMAP_ARRAY;
+        inputs.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
+        inputs.NumDescs = 1;
+        inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+        inputs.pOpacityMicromapArrayDesc = &arrayDesc;
+        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO info = {};
+        m_device->GetRaytracingAccelerationStructurePrebuildInfo(&inputs, &info);
+        ComPtr<ID3D12Resource> scratch = CreateBuffer(info.ScratchDataSizeInBytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        model.micromaps = CreateBuffer(info.ResultDataMaxSizeInBytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE);
+        if (!scratch || !model.micromaps)
+            return false;
+        staging.push_back(scratch);
+        D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC build = {};
+        build.Inputs = inputs;
+        build.DestAccelerationStructureData = model.micromaps->GetGPUVirtualAddress();
+        build.ScratchAccelerationStructureData = scratch->GetGPUVirtualAddress();
+        m_list->BuildRaytracingAccelerationStructure(&build, 0, nullptr);
+        D3D12_RESOURCE_BARRIER barrier = UavBarrier(model.micromaps.Get());
+        m_list->ResourceBarrier(1, &barrier);
+    }
+    model.hasMicromaps = true;
+    Link(model, alphaGeometry, triangles, linkage);
+    ++m_micromapModels;
+    m_micromapTriangles += static_cast<uint32_t>(std::count_if(baked.indices.begin(), baked.indices.end(), [](int32_t index) { return index >= 0; }));
+    m_micromapCount += static_cast<uint32_t>(baked.descs.size());
+    return true;
+}
+
+void Scene::Link(const Model& model, D3D12_RAYTRACING_GEOMETRY_DESC& alphaGeometry, D3D12_RAYTRACING_GEOMETRY_TRIANGLES_DESC& triangles,
+    D3D12_RAYTRACING_GEOMETRY_OMM_LINKAGE_DESC& linkage)
+{
+    triangles = alphaGeometry.Triangles;
+    linkage = {};
+    linkage.OpacityMicromapIndexBuffer = {model.micromapIndices->GetGPUVirtualAddress(), sizeof(int32_t)};
+    linkage.OpacityMicromapIndexFormat = DXGI_FORMAT_R32_UINT;
+    linkage.OpacityMicromapArray = model.micromaps ? model.micromaps->GetGPUVirtualAddress() : 0;
+    alphaGeometry.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_OMM_TRIANGLES;
+    alphaGeometry.OmmTriangles = {&triangles, &linkage};
+}
+
+bool Scene::LinkMicromaps(int model, D3D12_RAYTRACING_GEOMETRY_DESC& alphaGeometry, D3D12_RAYTRACING_GEOMETRY_TRIANGLES_DESC& triangles,
+    D3D12_RAYTRACING_GEOMETRY_OMM_LINKAGE_DESC& linkage) const
+{
+    if (model < 0 || static_cast<size_t>(model) >= m_models.size() || !m_models[model].hasMicromaps)
+        return false;
+    Link(m_models[model], alphaGeometry, triangles, linkage);
+    return true;
+}
+
 void Scene::ReleaseModel(Model& model)
 {
     m_descriptors->Free(model.positionsView);
@@ -399,6 +506,10 @@ void Scene::Clear()
     for (Texture& texture : m_textures)
         m_descriptors->Free(texture.view);
     m_textures.clear();
+    m_alphaImages.clear();
+    m_micromapTriangles = 0;
+    m_micromapCount = 0;
+    m_micromapModels = 0;
     m_materialCount = 0;
     m_staticInstances.clear();
     m_hasSkybox = false;
@@ -603,7 +714,7 @@ void Scene::SetStaticInstances(std::vector<SceneInstance> instances)
     m_hasSkybox = std::any_of(m_staticInstances.begin(), m_staticInstances.end(), [](const SceneInstance& instance) { return instance.mask == kSkyboxMask; });
 }
 
-SceneFrame Scene::RecordFrame(ID3D12GraphicsCommandList4* list, UINT slot, std::span<const SceneInstance> dynamic)
+SceneFrame Scene::RecordFrame(ID3D12GraphicsCommandList4* list, UINT slot, std::span<const SceneInstance> dynamic, bool micromaps)
 {
     static_assert(sizeof(InstanceRecord) == 96);
     FrameTlas& frame = m_frames[slot % kFrameSlots];
@@ -627,6 +738,8 @@ SceneFrame Scene::RecordFrame(ID3D12GraphicsCommandList4* list, UINT slot, std::
         instance.InstanceID = written;
         instance.InstanceMask = mask;
         instance.Flags = D3D12_RAYTRACING_INSTANCE_FLAG_TRIANGLE_CULL_DISABLE;
+        if (model.hasMicromaps && !micromaps)
+            instance.Flags |= D3D12_RAYTRACING_INSTANCE_FLAG_DISABLE_OMMS;
         instance.AccelerationStructure = blas;
         InstanceRecord& record = frame.mappedRecords[written];
         record = {source.positionsView != DescriptorHeap::kInvalid ? source.positionsView : model.positionsView, model.indicesView, model.albedoView,

@@ -4,6 +4,7 @@
 #include "convex_hull.h"
 #include "descriptor_heap.h"
 #include "engine_interfaces.h"
+#include "opacity_micromaps.h"
 
 #include <d3d12.h>
 #include <wrl/client.h>
@@ -11,6 +12,7 @@
 #include <array>
 #include <span>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace gmodpp {
@@ -98,7 +100,8 @@ public:
     // Layout of a light in the GPU buffers (Light in shaders/scene.hlsli).
     struct GpuLight;
 
-    bool Initialize(ID3D12Device5* device, ID3D12CommandQueue* queue, DescriptorHeap& descriptors);
+    // With `opacityMicromaps`, models get opacity micromaps for their alpha-tested and translucent triangles.
+    bool Initialize(ID3D12Device5* device, ID3D12CommandQueue* queue, DescriptorHeap& descriptors, bool opacityMicromaps);
     // The map's lights and sun come from `world`, with the hulls that block some lights; its triangles from
     // `worldGeometry`.
     bool LoadMap(const std::string& name, const bsp::WorldGeometry& world, std::span<const LightHull> lightHulls, const ModelGeometry& worldGeometry);
@@ -128,6 +131,11 @@ public:
     // descs used.
     static UINT GeometryDescs(D3D12_GPU_VIRTUAL_ADDRESS vertices, UINT vertexCount, D3D12_GPU_VIRTUAL_ADDRESS indices, UINT triangles,
         UINT opaqueTriangles, D3D12_RAYTRACING_GEOMETRY_DESC (&descs)[2]);
+    // Points the alpha geometry of a copy of a model (skinned casters) at the model's opacity micromaps; false when it
+    // has none. `triangles` and `linkage` must stay alive until the build is recorded. Such BLASes need
+    // ALLOW_DISABLE_OMMS, as RecordFrame may disable their micromaps.
+    bool LinkMicromaps(int model, D3D12_RAYTRACING_GEOMETRY_DESC& alphaGeometry, D3D12_RAYTRACING_GEOMETRY_TRIANGLES_DESC& triangles,
+        D3D12_RAYTRACING_GEOMETRY_OMM_LINKAGE_DESC& linkage) const;
     // Static props, and the 3D skybox's geometry with kSkyboxMask; a mask of 0 means kStaticPropMask.
     void SetStaticInstances(std::vector<SceneInstance> instances);
     bool HasSkybox() const { return m_hasSkybox; }
@@ -159,8 +167,12 @@ public:
         return instance < m_recorded.size() ? m_recorded[instance] : std::pair<int, UINT>{-1, 0};
     }
 
-    // Records a TLAS build for this frame into `list`; the caller waits for `slot`'s previous use first.
-    SceneFrame RecordFrame(ID3D12GraphicsCommandList4* list, UINT slot, std::span<const SceneInstance> dynamic);
+    // Records a TLAS build for this frame into `list`; the caller waits for `slot`'s previous use first. Without
+    // `micromaps`, instances ignore their models' opacity micromaps.
+    SceneFrame RecordFrame(ID3D12GraphicsCommandList4* list, UINT slot, std::span<const SceneInstance> dynamic, bool micromaps);
+    // Alpha triangles with an opacity micromap, and the micromaps they share, over all models.
+    std::pair<uint32_t, uint32_t> MicromapCounts() const { return {m_micromapTriangles, m_micromapCount}; }
+    bool HasMicromaps() const { return m_micromapModels != 0; }
 
 private:
     struct Model {
@@ -171,6 +183,9 @@ private:
         Microsoft::WRL::ComPtr<ID3D12Resource> uvs;
         Microsoft::WRL::ComPtr<ID3D12Resource> alpha;
         Microsoft::WRL::ComPtr<ID3D12Resource> materials;
+        Microsoft::WRL::ComPtr<ID3D12Resource> micromaps;
+        Microsoft::WRL::ComPtr<ID3D12Resource> micromapIndices;
+        bool hasMicromaps = false;
         UINT positionsView = DescriptorHeap::kInvalid;
         UINT indicesView = DescriptorHeap::kInvalid;
         UINT albedoView = DescriptorHeap::kInvalid;
@@ -203,9 +218,15 @@ private:
     Microsoft::WRL::ComPtr<ID3D12Resource> UploadToDefault(const void* data, UINT64 size, std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>>& staging);
     bool Submit();
     void ReleaseModel(Model& model);
+    static void Link(const Model& model, D3D12_RAYTRACING_GEOMETRY_DESC& alphaGeometry, D3D12_RAYTRACING_GEOMETRY_TRIANGLES_DESC& triangles,
+        D3D12_RAYTRACING_GEOMETRY_OMM_LINKAGE_DESC& linkage);
     bool EnsureFrameCapacity(FrameTlas& frame, UINT count);
     bool EnsureDynamicLights(FrameTlas& frame);
     bool BuildLightLists(std::span<const bsp::Light> lights, const bsp::Visibility& visibility);
+    // Bakes and records the build of a model's opacity micromap array and points its alpha geometry at it.
+    bool AddMicromaps(Model& model, const ModelGeometry& geometry, D3D12_RAYTRACING_GEOMETRY_DESC& alphaGeometry,
+        D3D12_RAYTRACING_GEOMETRY_TRIANGLES_DESC& triangles, D3D12_RAYTRACING_GEOMETRY_OMM_LINKAGE_DESC& linkage,
+        std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>>& staging);
 
     ID3D12Device5* m_device = nullptr;
     ID3D12CommandQueue* m_queue = nullptr;
@@ -218,6 +239,12 @@ private:
 
     std::vector<Model> m_models;
     std::vector<Texture> m_textures;
+    bool m_opacityMicromaps = false;
+    // Alpha of the textures alpha tests read, by descriptor, for baking opacity micromaps.
+    std::unordered_map<uint32_t, omm::AlphaImage> m_alphaImages;
+    uint32_t m_micromapTriangles = 0;
+    uint32_t m_micromapCount = 0;
+    uint32_t m_micromapModels = 0;
     static constexpr UINT kMaxMaterials = 8192;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_materials;
     GpuMaterial* m_mappedMaterials = nullptr;
