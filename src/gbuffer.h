@@ -26,7 +26,8 @@ HRESULT CreatePixelShader(IDirect3DDevice9* device, const DWORD* code, IDirect3D
 
 // Device hook callbacks. `SubstitutePixelShader` returns the shader to bind for the requested one.
 IDirect3DPixelShader9* SubstitutePixelShader(IDirect3DPixelShader9* requested);
-enum class DrawAction { Draw, Skip, RedirectToLight };
+// Forward: wrap the draw in BeginForwardDraw and EndForwardDraw.
+enum class DrawAction { Draw, Skip, RedirectToLight, Forward };
 DrawAction BeforeDraw(IDirect3DDevice9* device);
 // Wrap a draw for which BeforeDraw returned RedirectToLight.
 void BeginLightRedirect(IDirect3DDevice9* device);
@@ -50,6 +51,7 @@ const Matrix4& LastCaptureViewProj();
 // The eye position of a view-projection, or nothing when it is degenerate.
 std::optional<std::array<float, 3>> EyePosition(const Matrix4& viewProj);
 void OnTexture(DWORD stage, IDirect3DBaseTexture9* texture);
+void OnSamplerState(DWORD sampler, D3DSAMPLERSTATETYPE type, DWORD value);
 void OnRenderState(D3DRENDERSTATETYPE state, DWORD value);
 void OnPixelShaderConstants(UINT start, const float* data, UINT count);
 
@@ -93,5 +95,35 @@ struct Fog {
     bool known = false;
 };
 const Fog& ViewFog(ViewKind kind);
+
+// The irradiance volume that lights what the game draws after the capture (shaders/probes.hlsl): kProbeGrid
+// probes kProbeSpacing apart around the camera, as three volume textures holding a + b.n for red, green and
+// blue. Null when the device could not create them.
+inline constexpr UINT kProbeGrid[3] = {32, 32, 16};
+inline constexpr float kProbeSpacing = 64.0f;
+std::array<IDirect3DVolumeTexture9*, 3> ProbeTextures();
+
+// What the forward-lit shaders read (shaders/forward_light.hlsli).
+struct ForwardConstants {
+    std::array<float, 3> eye;
+    float tonemapScale;
+    // Irradiance outside the volume.
+    std::array<float, 3> fallback;
+    // The volume's first cell.
+    std::array<int, 3> probeOrigin;
+    // Unknown fog means none.
+    Fog fog;
+    // Debug views show the light alone, as if the albedo were white.
+    bool lightOnly;
+};
+
+// Until EndForward the game's LIGHTING_PREVIEW shaders are selected and swapped for variants lit by the probe
+// volume, as are the model shader replacements, so the view's translucent surfaces get real-time light.
+void BeginForward(IDirect3DDevice9* device, const ForwardConstants& constants);
+void EndForward(IDirect3DDevice9* device);
+// Around a draw for which BeforeDraw returned DrawAction::Forward: binds the volume and the constants, and puts
+// the game's sampler state back afterwards.
+void BeginForwardDraw(IDirect3DDevice9* device);
+void EndForwardDraw(IDirect3DDevice9* device);
 
 }

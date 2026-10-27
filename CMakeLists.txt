@@ -52,12 +52,17 @@ function(add_shader source entry profile variable)
 endfunction()
 
 # Direct3D 9 pixel shaders that replace the game's own, compiled with fxc for ps_3_0.
+# Extra arguments are fxc options; PROFILE <profile> replaces ps_3_0.
 function(add_d3d9_shader source entry variable)
+    cmake_parse_arguments(PARSE_ARGV 3 SHADER "" "PROFILE" "")
+    if(NOT SHADER_PROFILE)
+        set(SHADER_PROFILE ps_3_0)
+    endif()
     set(output "${SHADER_OUTPUT_DIR}/${variable}.h")
     add_custom_command(
         OUTPUT "${output}"
-        COMMAND "${FXC_EXECUTABLE}" /nologo /T ps_3_0 /E ${entry} /O3 ${ARGN} /Fh "${output}" /Vn ${variable} "${CMAKE_CURRENT_SOURCE_DIR}/${source}"
-        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/${source}"
+        COMMAND "${FXC_EXECUTABLE}" /nologo /T ${SHADER_PROFILE} /E ${entry} /O3 ${SHADER_UNPARSED_ARGUMENTS} /Fh "${output}" /Vn ${variable} "${CMAKE_CURRENT_SOURCE_DIR}/${source}"
+        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/${source}" "${CMAKE_CURRENT_SOURCE_DIR}/shaders/forward_light.hlsli"
         COMMENT "Compiling ${source} (${entry})"
         VERBATIM
     )
@@ -65,7 +70,13 @@ function(add_d3d9_shader source entry variable)
 endfunction()
 
 add_shader(shaders/surface.hlsl main cs_6_6 g_surfaceCS)
+add_shader(shaders/primary.hlsl main cs_6_6 g_primaryCS)
+add_shader(shaders/probes.hlsl main cs_6_6 g_probesCS)
+add_shader(shaders/ao.hlsl main cs_6_6 g_aoCS)
+add_shader(shaders/volumetrics.hlsl main cs_6_6 g_volumetricsCS)
+add_shader(shaders/direct.hlsl main cs_6_6 g_directCS)
 add_shader(shaders/reflections.hlsl main cs_6_6 g_reflectionsCS)
+add_shader(shaders/reflection_temporal.hlsl main cs_6_6 g_reflectionTemporalCS)
 add_shader(shaders/dlss_inputs.hlsl main cs_6_6 g_dlssInputsCS)
 add_shader(shaders/dlss_resolve.hlsl main cs_6_6 g_dlssResolveCS)
 add_shader(shaders/gi_trace.hlsl main cs_6_6 g_giTraceCS)
@@ -76,9 +87,19 @@ add_shader(shaders/taa.hlsl main cs_6_6 g_taaCS)
 add_shader(shaders/taa_sharpen.hlsl main cs_6_6 g_taaSharpenCS)
 add_shader(shaders/composite.hlsl VSMain vs_6_0 g_compositeVS)
 add_shader(shaders/composite.hlsl PSMain ps_6_0 g_compositePS)
-add_d3d9_shader(shaders/gbuffer_models.hlsl BumpMain g_gbufferBumpPS)
-add_d3d9_shader(shaders/gbuffer_models.hlsl BumpMain g_gbufferBumpSelfIllumPS /D SELFILLUM=1)
-add_d3d9_shader(shaders/gbuffer_models.hlsl BumpMain g_gbufferBumpSelfIllumFresnelPS /D SELFILLUM=3)
+add_d3d9_shader(shaders/forward_snippet.hlsl main g_forwardSnippetPS)
+add_d3d9_shader(shaders/forward_snippet.hlsl main g_forwardSnippetPS2 PROFILE ps_2_b /D FORWARD_PS2=1)
+# G-buffer replacements (g_gbuffer*) and their forward-lit variants (g_forward*).
+foreach(forward 0 1)
+    if(forward)
+        set(prefix forward)
+    else()
+        set(prefix gbuffer)
+    endif()
+    add_d3d9_shader(shaders/gbuffer_models.hlsl BumpMain g_${prefix}BumpPS /D FORWARD=${forward})
+    add_d3d9_shader(shaders/gbuffer_models.hlsl BumpMain g_${prefix}BumpSelfIllumPS /D SELFILLUM=1 /D FORWARD=${forward})
+    add_d3d9_shader(shaders/gbuffer_models.hlsl BumpMain g_${prefix}BumpSelfIllumFresnelPS /D SELFILLUM=3 /D FORWARD=${forward})
+endforeach()
 foreach(normalMap 0 1)
     if(normalMap)
         set(suffix "")
@@ -91,10 +112,17 @@ foreach(normalMap 0 1)
         else()
             set(name "Skin${suffix}")
         endif()
-        set(defines /D SKIN_NORMAL_MAP=${normalMap} /D SKIN_DETAIL=${detail})
-        add_d3d9_shader(shaders/gbuffer_models.hlsl SkinMain g_gbuffer${name}PS ${defines})
-        add_d3d9_shader(shaders/gbuffer_models.hlsl SkinMain g_gbuffer${name}SelfIllumPS ${defines} /D SELFILLUM=2)
-        add_d3d9_shader(shaders/gbuffer_models.hlsl SkinMain g_gbuffer${name}SelfIllumFresnelPS ${defines} /D SELFILLUM=3)
+        foreach(forward 0 1)
+            if(forward)
+                set(prefix forward)
+            else()
+                set(prefix gbuffer)
+            endif()
+            set(defines /D SKIN_NORMAL_MAP=${normalMap} /D SKIN_DETAIL=${detail} /D FORWARD=${forward})
+            add_d3d9_shader(shaders/gbuffer_models.hlsl SkinMain g_${prefix}${name}PS ${defines})
+            add_d3d9_shader(shaders/gbuffer_models.hlsl SkinMain g_${prefix}${name}SelfIllumPS ${defines} /D SELFILLUM=2)
+            add_d3d9_shader(shaders/gbuffer_models.hlsl SkinMain g_${prefix}${name}SelfIllumFresnelPS ${defines} /D SELFILLUM=3)
+        endforeach()
     endforeach()
 endforeach()
 
@@ -113,9 +141,11 @@ add_library(gmodpp_d3d9 SHARED
     src/module_scan.cpp
     src/client_hooks.cpp
     src/engine_interfaces.cpp
+    src/light_queries.cpp
     src/entities.cpp
     src/bsp.cpp
     src/studio_model.cpp
+    src/convex_hull.cpp
     src/scene.cpp
     src/skinned_casters.cpp
     src/settings.cpp

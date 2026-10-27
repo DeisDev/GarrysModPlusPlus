@@ -28,6 +28,7 @@ extern const int kSlotDeviceSetPixelShaderConstantF;
 extern const int kSlotDeviceSetRenderState;
 extern const int kSlotDeviceCreateVertexShader;
 extern const int kSlotDeviceSetTexture;
+extern const int kSlotDeviceSetSamplerState;
 extern const int kSlotDeviceExPresentEx;
 extern const int kSlotDeviceExResetEx;
 

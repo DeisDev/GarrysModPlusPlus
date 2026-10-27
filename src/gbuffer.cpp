@@ -5,6 +5,23 @@
 #include "settings.h"
 #include "shader_bytecode.h"
 
+#include <g_forwardBumpPS.h>
+#include <g_forwardBumpSelfIllumFresnelPS.h>
+#include <g_forwardBumpSelfIllumPS.h>
+#include <g_forwardSkinDetailPS.h>
+#include <g_forwardSkinDetailSelfIllumFresnelPS.h>
+#include <g_forwardSkinDetailSelfIllumPS.h>
+#include <g_forwardSkinNoBumpDetailPS.h>
+#include <g_forwardSkinNoBumpDetailSelfIllumFresnelPS.h>
+#include <g_forwardSkinNoBumpDetailSelfIllumPS.h>
+#include <g_forwardSkinNoBumpPS.h>
+#include <g_forwardSkinNoBumpSelfIllumFresnelPS.h>
+#include <g_forwardSkinNoBumpSelfIllumPS.h>
+#include <g_forwardSkinPS.h>
+#include <g_forwardSkinSelfIllumFresnelPS.h>
+#include <g_forwardSkinSelfIllumPS.h>
+#include <g_forwardSnippetPS.h>
+#include <g_forwardSnippetPS2.h>
 #include <g_gbufferBumpPS.h>
 #include <g_gbufferBumpSelfIllumFresnelPS.h>
 #include <g_gbufferBumpSelfIllumPS.h>
@@ -67,6 +84,8 @@ constexpr float kPreviewGamma = 2.2f;
 // ProjectedShadow: Source's render-to-texture prop shadows, which would darken the albedo; ray-traced shadows
 // replace them.
 enum class ShaderKind { Other, GBuffer, Flashlight, ProjectedShadow };
+// The render targets a capture draw writes: the game's, the G-buffer, or the albedo alone (decals that multiply it).
+enum class Targets { Game, GBuffer, Albedo };
 
 // Where a flashlight shader keeps the projected light's parameters, or -1.
 struct FlashlightRegisters {
@@ -84,6 +103,13 @@ struct ShaderInfo {
     FlashlightRegisters flashlight;
     // Its replacement writes self-illumination to the emissive target.
     bool emissive = false;
+    // The variant lit by the probe volume after the capture, the samplers it reads the volume from and the
+    // registers of its constants (shaders/forward_light.hlsli).
+    IDirect3DPixelShader9* forward = nullptr;
+    std::array<UINT, 3> probeSamplers = {};
+    std::array<UINT, bytecode::kForwardUniforms> forwardUniforms = {};
+    // The skin detail blend mode its replacement applies (shaders/gbuffer_models.hlsl), or -1.
+    int detailMode = -1;
 };
 
 enum class SelfIllum { None, Mask, Fresnel };
@@ -97,7 +123,28 @@ const BYTE* const kReplacementCode[][3] = {
     {g_gbufferSkinDetailPS, g_gbufferSkinDetailSelfIllumPS, g_gbufferSkinDetailSelfIllumFresnelPS},
     {g_gbufferSkinNoBumpDetailPS, g_gbufferSkinNoBumpDetailSelfIllumPS, g_gbufferSkinNoBumpDetailSelfIllumFresnelPS},
 };
+const BYTE* const kForwardReplacementCode[][3] = {
+    {g_forwardBumpPS, g_forwardBumpSelfIllumPS, g_forwardBumpSelfIllumFresnelPS},
+    {g_forwardSkinPS, g_forwardSkinSelfIllumPS, g_forwardSkinSelfIllumFresnelPS},
+    {g_forwardSkinNoBumpPS, g_forwardSkinNoBumpSelfIllumPS, g_forwardSkinNoBumpSelfIllumFresnelPS},
+    {g_forwardSkinDetailPS, g_forwardSkinDetailSelfIllumPS, g_forwardSkinDetailSelfIllumFresnelPS},
+    {g_forwardSkinNoBumpDetailPS, g_forwardSkinNoBumpDetailSelfIllumPS, g_forwardSkinNoBumpDetailSelfIllumFresnelPS},
+};
 using Replacements = std::array<std::array<ComPtr<IDirect3DPixelShader9>, 3>, static_cast<size_t>(ReplacedShader::Count)>;
+// The samplers shaders/gbuffer_models.hlsl reads the probe volume from in its FORWARD variants.
+constexpr std::array<UINT, 3> kModelProbeSamplers = {5, 6, 7};
+// The pixel shader constants shaders/forward_light.hlsli reads: c217-c223 in our ps_3_0 shaders, c0-c6 in the
+// ps_2_b snippet before the patch moves them.
+constexpr UINT kForwardConstants = 217;
+constexpr UINT kForwardConstantCount = bytecode::kForwardUniforms;
+constexpr std::array<UINT, kForwardConstantCount> kModelForwardUniforms = {217, 218, 219, 220, 221, 222, 223};
+// Sampler states a forward draw changes on its probe samplers, which are put back afterwards.
+constexpr D3DSAMPLERSTATETYPE kProbeSamplerStates[] = {D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_ADDRESSW, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER,
+    D3DSAMP_MIPFILTER, D3DSAMP_SRGBTEXTURE};
+constexpr DWORD kProbeSamplerValues[] = {D3DTADDRESS_WRAP, D3DTADDRESS_WRAP, D3DTADDRESS_WRAP, D3DTEXF_LINEAR, D3DTEXF_LINEAR, D3DTEXF_NONE, FALSE};
+// Direct3D 9's initial values of those states.
+constexpr DWORD kDefaultSamplerValues[] = {D3DTADDRESS_WRAP, D3DTADDRESS_WRAP, D3DTADDRESS_WRAP, D3DTEXF_POINT, D3DTEXF_POINT, D3DTEXF_NONE, FALSE};
+constexpr size_t kTrackedSamplerStates = std::size(kProbeSamplerStates);
 
 // A render state as the device has it and as the game last set it.
 struct TrackedState {
@@ -119,12 +166,26 @@ struct State {
     // The game's render target when the capture began, and the one it has set since.
     ComPtr<IDirect3DSurface9> colorTarget;
     IDirect3DSurface9* gameTarget = nullptr;
-    bool gbufferBound = false;
+    Targets boundTargets = Targets::Game;
     bool loggedOtherTarget = false;
     // Set while this module calls the device, so the hooks do not take its calls for the game's.
     bool ownCall = false;
     D3DVIEWPORT9 viewport = {};
     Replacements replacements;
+    Replacements forwardReplacements;
+    // Forward variants of the patched preview shaders, by the shader they replace.
+    std::unordered_map<IDirect3DPixelShader9*, ComPtr<IDirect3DPixelShader9>> forwardVariants;
+    std::array<ComPtr<IDirect3DVolumeTexture9>, 3> probeTextures;
+    bool forwardActive = false;
+    std::array<std::array<float, 4>, kForwardConstantCount> forwardConstants = {};
+    // The game's sampler states on each stage (kProbeSamplerStates).
+    std::array<std::array<DWORD, kTrackedSamplerStates>, kTextureStages> samplerStates = {};
+    uint32_t forwardShaders = 0;
+    // Skin shaders seen with each detail blend mode (-1 counted at 7).
+    std::array<uint32_t, 8> detailModes = {};
+    uint32_t forwardFailures = 0;
+    uint32_t forwardDraws = 0;
+    uint32_t forwardLogged = 0;
     std::unordered_map<IDirect3DPixelShader9*, ShaderInfo> shaders;
     std::unordered_map<IDirect3DVertexShader9*, FlashlightRegisters> vertexShaders;
     FlashlightRegisters boundVertex;
@@ -204,6 +265,12 @@ SelfIllum BumpSelfIllum(const std::vector<bytecode::Constant>& constants)
 }
 
 constexpr UINT kSkinDetailSampler = 13;
+// The skin shader's g_SelfIllumTint_and_DetailBlendFactor (its .w is the detail blend factor).
+constexpr UINT kSkinDetailFactor = 0;
+// A post-lighting detail add comes after the lighting math; a pre-lighting one right after the sample.
+constexpr size_t kLateDetailGap = 12;
+// g_SkinDetailMode in shaders/gbuffer_models.hlsl.
+constexpr UINT kDetailModeRegister = 216;
 
 SelfIllum SkinSelfIllum(const std::vector<bytecode::Constant>& constants)
 {
@@ -217,12 +284,13 @@ SelfIllum SkinSelfIllum(const std::vector<bytecode::Constant>& constants)
     return SelfIllum::None;
 }
 
-IDirect3DPixelShader9* EnsureReplacement(IDirect3DDevice9* device, ReplacedShader shader, SelfIllum selfIllum, CreatePixelShaderFn create)
+IDirect3DPixelShader9* EnsureReplacement(IDirect3DDevice9* device, ReplacedShader shader, SelfIllum selfIllum, CreatePixelShaderFn create,
+    bool forward = false)
 {
     const size_t s = static_cast<size_t>(shader);
     const size_t v = static_cast<size_t>(selfIllum);
-    ComPtr<IDirect3DPixelShader9>& slot = g_state.replacements[s][v];
-    if (!slot && FAILED(create(device, reinterpret_cast<const DWORD*>(kReplacementCode[s][v]), &slot)))
+    ComPtr<IDirect3DPixelShader9>& slot = (forward ? g_state.forwardReplacements : g_state.replacements)[s][v];
+    if (!slot && FAILED(create(device, reinterpret_cast<const DWORD*>((forward ? kForwardReplacementCode : kReplacementCode)[s][v]), &slot)))
         log::Info("G-buffer: creating a replacement pixel shader failed");
     return slot.Get();
 }
@@ -311,10 +379,13 @@ int FogRegister(const std::vector<bytecode::Constant>& constants)
 }
 
 void Register(IDirect3DPixelShader9* shader, ShaderKind kind, int fogRegister, IDirect3DPixelShader9* substitute,
-    const FlashlightRegisters& flashlight = {}, bool emissive = false)
+    const FlashlightRegisters& flashlight = {}, bool emissive = false, IDirect3DPixelShader9* forward = nullptr, std::array<UINT, 3> probeSamplers = {},
+    std::array<UINT, kForwardConstantCount> forwardUniforms = {}, int detailMode = -1)
 {
     // Shader addresses are reused after the game releases one, so every creation overwrites the old entry.
-    g_state.shaders[shader] = {kind, fogRegister, flashlight, emissive};
+    g_state.shaders[shader] = {kind, fogRegister, flashlight, emissive, forward, probeSamplers, forwardUniforms, detailMode};
+    if (forward == nullptr || forward != g_state.forwardVariants[shader].Get())
+        g_state.forwardVariants.erase(shader);
     if (substitute != nullptr)
         g_state.substitutes[shader] = substitute;
     else
@@ -366,6 +437,17 @@ bool Initialize(IDirect3DDevice9* device, const D3DPRESENT_PARAMETERS& params)
         return false;
     }
     log::Info("G-buffer: {}x{} targets ready (MRT blending: {})", params.BackBufferWidth, params.BackBufferHeight, blending);
+    // A reset puts every sampler state back to its default.
+    for (auto& stage : g_state.samplerStates)
+        std::copy(std::begin(kDefaultSamplerValues), std::end(kDefaultSamplerValues), stage.begin());
+    for (ComPtr<IDirect3DVolumeTexture9>& texture : g_state.probeTextures) {
+        if (FAILED(device->CreateVolumeTexture(kProbeGrid[0], kProbeGrid[1], kProbeGrid[2], 1, 0, D3DFMT_A16B16G16R16F, D3DPOOL_DEFAULT, &texture, nullptr))) {
+            log::Info("G-buffer: creating the probe volume textures failed; translucent surfaces keep their baked light");
+            for (ComPtr<IDirect3DVolumeTexture9>& created : g_state.probeTextures)
+                created.Reset();
+            break;
+        }
+    }
     return true;
 }
 
@@ -382,7 +464,10 @@ void Release()
     g_state.lightSurface.Reset();
     g_state.light.Reset();
     g_state.colorTarget.Reset();
+    for (ComPtr<IDirect3DVolumeTexture9>& texture : g_state.probeTextures)
+        texture.Reset();
     g_state.active = false;
+    g_state.forwardActive = false;
 }
 
 HRESULT CreatePixelShader(IDirect3DDevice9* device, const DWORD* code, IDirect3DPixelShader9** shader, CreatePixelShaderFn create)
@@ -398,7 +483,27 @@ HRESULT CreatePixelShader(IDirect3DDevice9* device, const DWORD* code, IDirect3D
         bytecode::ReplaceDefLiteral(patched, kPreviewGamma, 1.0f);
         HRESULT hr = create(device, patched.data(), shader);
         if (SUCCEEDED(hr)) {
-            Register(*shader, ShaderKind::GBuffer, -1, nullptr);
+            // The same shader lights translucent surfaces after the capture once the snippet takes its outputs.
+            ComPtr<IDirect3DPixelShader9> forward;
+            std::array<UINT, 3> samplers = {};
+            std::array<UINT, kForwardConstantCount> uniforms = {};
+            const bool shaderModel3 = D3DSHADER_VERSION_MAJOR(patched[0]) >= 3;
+            const auto* snippet = reinterpret_cast<const DWORD*>(shaderModel3 ? g_forwardSnippetPS : g_forwardSnippetPS2);
+            const char* reason = "the device rejected the patched shader";
+            if (const std::optional<bytecode::ForwardPatch> patch =
+                    bytecode::AppendForwardLighting(patched, {snippet, bytecode::TokenCount(snippet)}, shaderModel3 ? kForwardConstants : 0, reason);
+                patch && SUCCEEDED(create(device, patch->code.data(), &forward))) {
+                samplers = patch->samplers;
+                uniforms = patch->uniforms;
+                ++g_state.forwardShaders;
+            } else {
+                forward.Reset();
+                if (++g_state.forwardFailures <= 5)
+                    log::Info("G-buffer: a preview shader gets no forward-lit variant: {}", reason);
+            }
+            Register(*shader, ShaderKind::GBuffer, -1, nullptr, {}, false, forward.Get(), samplers, uniforms);
+            if (forward)
+                g_state.forwardVariants[*shader] = std::move(forward);
             ++g_state.patchedShaders;
             ++GetStatistics().gbufferShaders;
         }
@@ -417,26 +522,34 @@ HRESULT CreatePixelShader(IDirect3DDevice9* device, const DWORD* code, IDirect3D
         return hr;
     }
     IDirect3DPixelShader9* substitute = nullptr;
+    IDirect3DPixelShader9* forward = nullptr;
     SelfIllum selfIllum = SelfIllum::None;
+    int detailMode = -1;
     if (HasConstant(constants, "g_DiffuseModulation") && HasConstant(constants, "BumpmapSampler")) {
         selfIllum = BumpSelfIllum(constants);
         substitute = EnsureReplacement(device, ReplacedShader::Bump, selfIllum, create);
+        forward = EnsureReplacement(device, ReplacedShader::Bump, selfIllum, create, true);
     } else if (IsSkinShader(constants)) {
         selfIllum = SkinSelfIllum(constants);
         const bool normalMap = HasConstant(constants, "NormalMapSampler");
-        // Other detail blend modes are left out: the replacement then shows the base texture alone.
-        const bool detail = HasRegister(constants, "DetailSampler", bytecode::RegisterSet::Sampler, kSkinDetailSampler) &&
-            bytecode::ModulatesSampleBy2x(original, kSkinDetailSampler);
+        // Detail blend modes the replacement does not know leave the base texture alone.
+        if (HasRegister(constants, "DetailSampler", bytecode::RegisterSet::Sampler, kSkinDetailSampler)) {
+            detailMode = bytecode::DetailBlendMode(original, kSkinDetailSampler, kSkinDetailFactor, kLateDetailGap);
+            if (g_state.detailModes[detailMode >= 0 ? detailMode : 7]++ == 0)
+                log::Info("G-buffer: skin shader with detail blend mode {}", detailMode);
+        }
+        const bool detail = detailMode >= 0;
         const ReplacedShader replaced = detail ? (normalMap ? ReplacedShader::SkinDetail : ReplacedShader::SkinNoBumpDetail)
                                                : (normalMap ? ReplacedShader::Skin : ReplacedShader::SkinNoBump);
         substitute = EnsureReplacement(device, replaced, selfIllum, create);
+        forward = EnsureReplacement(device, replaced, selfIllum, create, true);
     }
     if (substitute != nullptr) {
         ++g_state.replacedShaders;
         ++GetStatistics().replacedShaders;
     }
     Register(*shader, substitute != nullptr ? ShaderKind::GBuffer : ShaderKind::Other, FogRegister(constants), substitute, {},
-        substitute != nullptr && selfIllum != SelfIllum::None);
+        substitute != nullptr && (selfIllum != SelfIllum::None || detailMode == 5), forward, kModelProbeSamplers, kModelForwardUniforms, detailMode);
     return hr;
 }
 
@@ -445,6 +558,8 @@ IDirect3DPixelShader9* SubstitutePixelShader(IDirect3DPixelShader9* requested)
     g_state.requested = requested;
     auto info = g_state.shaders.find(requested);
     g_state.bound = info != g_state.shaders.end() ? info->second : ShaderInfo{};
+    if (g_state.forwardActive && g_state.bound.forward != nullptr)
+        return g_state.bound.forward;
     if (!g_state.active)
         return requested;
     auto substitute = g_state.substitutes.find(requested);
@@ -467,15 +582,23 @@ void SetDeviceState(IDirect3DDevice9* device, D3DRENDERSTATETYPE state, TrackedS
     tracked.device = value;
 }
 
-// G-buffer draws write albedo, normal, self-illumination and coverage; every other draw goes to the game's
-// render target alone, as D3D12 needs a null view where a shader writes nothing.
-void BindTargets(IDirect3DDevice9* device, bool gbuffer)
+// The skin replacement's detail blend mode; the game never uses its register.
+void SetDetailMode(IDirect3DDevice9* device)
 {
-    if (g_state.gbufferBound == gbuffer)
+    const float mode[4] = {static_cast<float>(g_state.bound.detailMode), 0.0f, 0.0f, 0.0f};
+    OwnCall([&] { device->SetPixelShaderConstantF(kDetailModeRegister, mode, 1); });
+}
+
+// G-buffer draws write albedo, normal, self-illumination and coverage; every other draw goes to one target alone,
+// as D3D12 needs a null view where a shader writes nothing.
+void BindTargets(IDirect3DDevice9* device, Targets targets)
+{
+    if (g_state.boundTargets == targets)
         return;
-    g_state.gbufferBound = gbuffer;
+    g_state.boundTargets = targets;
+    const bool gbuffer = targets == Targets::GBuffer;
     OwnCall([&] {
-        device->SetRenderTarget(0, gbuffer ? g_state.albedoSurface.Get() : g_state.colorTarget.Get());
+        device->SetRenderTarget(0, targets == Targets::Game ? g_state.colorTarget.Get() : g_state.albedoSurface.Get());
         device->SetRenderTarget(kNormalTarget, gbuffer ? g_state.normalSurface.Get() : nullptr);
         device->SetRenderTarget(kEmissiveTarget, gbuffer ? g_state.emissiveSurface.Get() : nullptr);
         device->SetRenderTarget(kFlagsTarget, gbuffer ? g_state.flagsSurface.Get() : nullptr);
@@ -495,6 +618,8 @@ DrawAction BeforeDraw(IDirect3DDevice9* device)
         fog.color = {color[0], color[1], color[2]};
         fog.known = true;
     }
+    if (g_state.forwardActive && g_state.bound.forward != nullptr)
+        return DrawAction::Forward;
     if (!g_state.active)
         return DrawAction::Draw;
     // Preview shaders write unlit materials as surfaces to be lit. Those drawn without a depth test ($ignorez,
@@ -504,10 +629,16 @@ DrawAction BeforeDraw(IDirect3DDevice9* device)
         g_state.loggedOtherTarget = true;
         log::Info("G-buffer: a G-buffer draw went to another render target during a capture; it is drawn there unlit");
     }
-    BindTargets(device, gbuffer);
+    // Multiplying decals (DecalModulate's mod2x blend, in gamma space with grey neutral) darken the surface under
+    // them, so they multiply its albedo; the composite would cover them in the game's target.
+    const bool modulate = !gbuffer && g_state.bound.kind == ShaderKind::Other && g_state.blending && g_state.depthTest &&
+        g_state.gameTarget == g_state.colorTarget.Get() && g_state.sourceBlend == D3DBLEND_DESTCOLOR && g_state.destinationBlend == D3DBLEND_SRCCOLOR;
+    BindTargets(device, gbuffer ? Targets::GBuffer : modulate ? Targets::Albedo : Targets::Game);
     if (gbuffer) {
         SetDeviceState(device, D3DRS_SRGBWRITEENABLE, g_state.srgbWrite, FALSE);
         SetDeviceState(device, D3DRS_COLORWRITEENABLE2, g_state.emissiveWrites, g_state.bound.emissive ? kColorWriteRgb : 0);
+    } else if (modulate) {
+        SetDeviceState(device, D3DRS_SRGBWRITEENABLE, g_state.srgbWrite, FALSE);
     } else {
         SetDeviceState(device, D3DRS_SRGBWRITEENABLE, g_state.srgbWrite, g_state.srgbWrite.game);
     }
@@ -522,6 +653,8 @@ DrawAction BeforeDraw(IDirect3DDevice9* device)
         CaptureProjectedLight();
         return GetSettings().flashlightMode == FlashlightMode::Game ? DrawAction::RedirectToLight : DrawAction::Skip;
     }
+    if (gbuffer && g_state.bound.detailMode >= 0)
+        SetDetailMode(device);
     if (gbuffer) {
         // The game's sRGB state for its own lit surfaces says how the back buffer is encoded.
         ++(g_state.srgbWrite.game ? g_state.srgbDraws : g_state.linearDraws);
@@ -555,8 +688,8 @@ void OnRenderTarget(IDirect3DDevice9* device, DWORD index, IDirect3DSurface9* su
         return;
     g_state.gameTarget = surface;
     // The game replaced the albedo target; its own target must not be paired with the G-buffer's.
-    if (g_state.gbufferBound) {
-        g_state.gbufferBound = false;
+    if (g_state.boundTargets != Targets::Game) {
+        g_state.boundTargets = Targets::Game;
         OwnCall([&] {
             device->SetRenderTarget(kNormalTarget, nullptr);
             device->SetRenderTarget(kEmissiveTarget, nullptr);
@@ -638,8 +771,94 @@ void SetJitter(float x, float y)
 
 void OnTexture(DWORD stage, IDirect3DBaseTexture9* texture)
 {
-    if (stage < kTextureStages)
+    if (stage < kTextureStages && !g_state.ownCall)
         g_state.textures[stage] = texture;
+}
+
+void OnSamplerState(DWORD sampler, D3DSAMPLERSTATETYPE type, DWORD value)
+{
+    if (sampler >= kTextureStages || g_state.ownCall)
+        return;
+    for (size_t i = 0; i < kTrackedSamplerStates; ++i) {
+        if (kProbeSamplerStates[i] == type)
+            g_state.samplerStates[sampler][i] = value;
+    }
+}
+
+std::array<IDirect3DVolumeTexture9*, 3> ProbeTextures()
+{
+    return {g_state.probeTextures[0].Get(), g_state.probeTextures[1].Get(), g_state.probeTextures[2].Get()};
+}
+
+void BeginForward(IDirect3DDevice9* device, const ForwardConstants& constants)
+{
+    if (!g_state.probeTextures[0])
+        return;
+    const float extent[3] = {kProbeSpacing * kProbeGrid[0], kProbeSpacing * kProbeGrid[1], kProbeSpacing * kProbeGrid[2]};
+    auto& c = g_state.forwardConstants;
+    c[1] = {constants.fallback[0], constants.fallback[1], constants.fallback[2], constants.lightOnly ? 1.0f : 0.0f};
+    c[2] = {constants.fog.color[0], constants.fog.color[1], constants.fog.color[2], 0.0f};
+    c[3] = {1.0f / extent[0], 1.0f / extent[1], 1.0f / extent[2], 0.0f};
+    // The window ends at the centres of its outermost probes.
+    c[0] = {0.0f, 2.0f / (extent[0] - kProbeSpacing), 2.0f / (extent[1] - kProbeSpacing), 2.0f / (extent[2] - kProbeSpacing)};
+    c[4] = {(constants.probeOrigin[0] + kProbeGrid[0] * 0.5f) * kProbeSpacing, (constants.probeOrigin[1] + kProbeGrid[1] * 0.5f) * kProbeSpacing,
+        (constants.probeOrigin[2] + kProbeGrid[2] * 0.5f) * kProbeSpacing, 0.0f};
+    c[5] = {constants.eye[0], constants.eye[1], constants.eye[2], constants.tonemapScale};
+    c[6] = constants.fog.known ? constants.fog.params : std::array<float, 4>{};
+    g_state.forwardActive = engine::SetFixedLighting(2);
+    g_state.forwardDraws = 0;
+    // The pixel shader bound now was chosen before forward lighting began.
+    device->SetPixelShader(g_state.requested);
+}
+
+void EndForward(IDirect3DDevice9* device)
+{
+    if (!g_state.forwardActive)
+        return;
+    g_state.forwardActive = false;
+    engine::SetFixedLighting(0);
+    device->SetPixelShader(g_state.requested);
+    if (g_state.forwardLogged < 3) {
+        ++g_state.forwardLogged;
+        log::Info("G-buffer: {} forward-lit draws ({} preview shaders have a forward variant, {} could not take one)", g_state.forwardDraws,
+            g_state.forwardShaders, g_state.forwardFailures);
+    }
+}
+
+void BeginForwardDraw(IDirect3DDevice9* device)
+{
+    if (g_state.bound.detailMode >= 0)
+        SetDetailMode(device);
+    ++g_state.forwardDraws;
+    // Additive draws (glows, sprites) add light; they are shown as drawn.
+    g_state.forwardConstants[0][0] = g_state.blending && g_state.destinationBlend == D3DBLEND_ONE ? 1.0f : 0.0f;
+    OwnCall([&] {
+        for (UINT i = 0; i < kForwardConstantCount; ++i)
+            device->SetPixelShaderConstantF(g_state.bound.forwardUniforms[i], g_state.forwardConstants[i].data(), 1);
+        for (size_t i = 0; i < 3; ++i) {
+            const UINT stage = g_state.bound.probeSamplers[i];
+            device->SetTexture(stage, g_state.probeTextures[i].Get());
+            for (size_t s = 0; s < kTrackedSamplerStates; ++s)
+                device->SetSamplerState(stage, kProbeSamplerStates[s], kProbeSamplerValues[s]);
+        }
+    });
+}
+
+void EndForwardDraw(IDirect3DDevice9* device)
+{
+    OwnCall([&] {
+        // The game caches the constants it set; registers a ps_2_b variant borrowed get the game's values back.
+        for (UINT r : g_state.bound.forwardUniforms) {
+            if (r < kTrackedRegisters)
+                device->SetPixelShaderConstantF(r, g_state.constants[r].data(), 1);
+        }
+        for (size_t i = 0; i < 3; ++i) {
+            const UINT stage = g_state.bound.probeSamplers[i];
+            device->SetTexture(stage, g_state.textures[stage]);
+            for (size_t s = 0; s < kTrackedSamplerStates; ++s)
+                device->SetSamplerState(stage, kProbeSamplerStates[s], g_state.samplerStates[stage][s]);
+        }
+    });
 }
 
 std::span<const ProjectedLight> ProjectedLights() { return g_state.lastProjected; }
@@ -664,7 +883,7 @@ void OnRenderState(D3DRENDERSTATETYPE state, DWORD value)
 
 void OnPixelShaderConstants(UINT start, const float* data, UINT count)
 {
-    if (data == nullptr)
+    if (data == nullptr || g_state.ownCall)
         return;
     for (UINT r = start; r < start + count && r < kTrackedRegisters; ++r)
         std::memcpy(g_state.constants[r].data(), data + (r - start) * 4, sizeof(float) * 4);
@@ -682,7 +901,7 @@ bool Begin(IDirect3DDevice9* device)
     g_state.colorTarget.Reset();
     device->GetRenderTarget(0, &g_state.colorTarget);
     g_state.gameTarget = g_state.colorTarget.Get();
-    g_state.gbufferBound = false;
+    g_state.boundTargets = Targets::Game;
     g_state.active = true;
     g_state.fogWindow = false;
     ++g_state.sections;
@@ -724,7 +943,7 @@ void End(IDirect3DDevice9* device, ViewKind kind)
     g_state.flashlightDraws = 0;
     g_state.projected.clear();
     engine::SetFixedLighting(0);
-    BindTargets(device, false);
+    BindTargets(device, Targets::Game);
     SetDeviceState(device, D3DRS_SRGBWRITEENABLE, g_state.srgbWrite, g_state.srgbWrite.game);
     SetDeviceState(device, D3DRS_COLORWRITEENABLE2, g_state.emissiveWrites, g_state.emissiveWrites.game);
     g_state.active = false;

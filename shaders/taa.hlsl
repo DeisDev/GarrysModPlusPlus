@@ -1,7 +1,7 @@
 #include "common.hlsli"
 
 // Temporal anti-aliasing resolve. The scene is rendered with a sub-pixel jitter that changes every frame; the
-// history is reprojected with the previous camera and clipped to the colour range of the current 3x3
+// history is reprojected with the motion vectors (shaders/primary.hlsl) and clipped to the colour range of the current 3x3
 // neighbourhood (in YCoCg) before blending, which rejects most ghosting from motion and disocclusion.
 // input0: shaded colour (encoded); input1: last frame's history (linear); output0: new history; step: 1 when the
 // history may be used.
@@ -45,10 +45,9 @@ void main(uint3 id : SV_DispatchThreadID)
         return;
     }
 
-    float3 position = WorldPositionFromDepth(pixel, DepthAt(pixel));
-    float4 clip = mul(g_frame.prevViewProj, float4(position, 1.0));
-    float2 uv = float2(clip.x / clip.w * 0.5 + 0.5, 0.5 - clip.y / clip.w * 0.5);
-    if (clip.w <= 0.0 || any(uv < 0.0) || any(uv > 1.0)) {
+    Texture2D<float2> motion = ResourceDescriptorHeap[g_frame.motionView];
+    float2 uv = (float2(pixel) + 0.5 + motion.Load(int3(pixel, 0))) * g_frame.invSize;
+    if (any(uv < 0.0) || any(uv > 1.0)) {
         output[pixel] = float4(YCoCgToRgb(center), 1.0);
         return;
     }

@@ -5,6 +5,7 @@
 #include "engine_interfaces.h"
 #include "entities.h"
 #include "gbuffer.h"
+#include "light_queries.h"
 #include "lighting.h"
 #include "log.h"
 #include "mod.h"
@@ -41,6 +42,8 @@ constexpr float kDefaultAlphaReference = 0.5f;
 // Alpha and mask textures are read from a mip no larger than this; shadows and reflections need no more detail.
 constexpr uint32_t kSceneTextureSize = 256;
 constexpr uint32_t kOpaqueTriangle = 0xFFFFFFFF;
+// Never a PackAlpha value (they always have a texture view below 0xFFFFFF) nor a PackTranslucent one (bit 31 set).
+constexpr uint32_t kDroppedTriangle = 0x7FFFFFFF;
 const D3DFORMAT kIntzFormat = static_cast<D3DFORMAT>(MAKEFOURCC('I', 'N', 'T', 'Z'));
 
 constexpr uint32_t kJitterSamples = 8;
@@ -48,6 +51,11 @@ constexpr uint32_t kRayReconstructionPhases = 32;
 // The local player's held weapon is drawn as a world model right next to the camera; in first person it would
 // shadow the viewmodel and cast a floating shadow, so weapon world models this close to the eye are left out.
 constexpr float kHeldWeaponDistance = 96.0f;
+// VRAD shadows a static prop by the convex pieces of its collision model's first solid or, without one, by the
+// convex hull of each of its meshes (CreateCollisionModel and AddPolysForRayTrace in
+// utils/vrad/vradstaticprops.cpp). Lights placed in lamp models lose most of their light to those hulls, which the
+// lamps' open meshes let out, so lights this close to a hull are blocked by it.
+constexpr float kFixtureMargin = 2.0f;
 
 unsigned Hex(HRESULT hr) { return static_cast<unsigned>(hr); }
 
@@ -63,13 +71,19 @@ float Halton(uint32_t index, uint32_t base)
 struct ModelEntry {
     int sceneModel = -1;
     std::shared_ptr<SkinnedModel> skinned;
+    // Where the model is, in its own space: brush models (`*N`) keep their faces away from their origin.
+    bsp::Float3 center = {};
 };
 
 struct MaterialInfo {
-    // Translucent surfaces (glass) cast no shadow; alpha-tested ones (foliage, fences) are cut by their alpha.
+    // Translucent surfaces (glass, foliage) let part of the light through; alpha-tested ones (foliage, fences) are
+    // cut by their alpha. Additive ones are light effects (beams, glows) that block nothing.
     bool translucent = false;
+    bool additive = false;
     bool alphaTest = false;
     float alphaReference = kDefaultAlphaReference;
+    // $alpha.
+    float opacity = 1.0f;
     std::string baseTexture;
     bsp::Float3 reflectivity = kDefaultReflectivity;
     // Reflections and self-illumination, for Scene::AddMaterial.
@@ -110,10 +124,15 @@ struct State {
     uint32_t modelErrors = 0;
     std::vector<entities::ModelEntity> entities;
     std::vector<SceneInstance> dynamicInstances;
+    // Last main view's transform of each rigid dynamic entity, by entity index, for motion vectors.
+    std::unordered_map<int, std::array<std::array<float, 4>, 3>> previousTransforms;
+    std::unordered_map<int, std::array<std::array<float, 4>, 3>> currentTransforms;
     std::vector<SkinnedEntity> skinnedEntities;
     std::vector<studio::Matrix3x4> bones;
     std::vector<engine::DynamicLight> dynamicLights;
     std::vector<bsp::Mesh> brushModels;
+    // The map's 3D skybox test (BSP tree, leaf areas and bounds), to keep its entities out of the main view's rays.
+    bsp::WorldGeometry skyboxTest;
     bool viewmodelCapture = false;
     // How far this frame's image is shifted, in render pixels (x right, y down), for Ray Reconstruction.
     float pixelOffset[2] = {};
@@ -128,6 +147,20 @@ void RunConsoleRequests()
     const Options& options = GetOptions();
     if (!options.devMode || !g_state.scene.Ready())
         return;
+    // "x y": a pixel of the main view, by default its centre.
+    const std::filesystem::path probe = options.gameDirectory / L"gmodpp_probe.request";
+    if (FILE* request = nullptr; _wfopen_s(&request, probe.c_str(), L"r") == 0) {
+        unsigned x = 0;
+        unsigned y = 0;
+        const bool given = fscanf_s(request, "%u %u", &x, &y) == 2;
+        std::fclose(request);
+        DeleteFileW(probe.c_str());
+        D3DSURFACE_DESC desc = {};
+        ComPtr<IDirect3DSurface9> backBuffer;
+        if (!given && g_state.device != nullptr && SUCCEEDED(g_state.device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backBuffer)))
+            backBuffer->GetDesc(&desc);
+        g_state.lighting->RequestProbe(given ? x : desc.Width / 2, given ? y : desc.Height / 2);
+    }
     const std::filesystem::path path = options.gameDirectory / L"gmodpp_console.txt";
     FILE* file = nullptr;
     if (_wfopen_s(&file, path.c_str(), L"r") != 0)
@@ -202,9 +235,40 @@ bsp::Float3 MaterialColor(std::string_view vmt, std::string_view key, bsp::Float
     return {v[0] * scale, v[1] * scale, v[2] * scale};
 }
 
+// The shader a VMT names (its first token), in lower case.
+std::string ShaderName(std::string_view vmt)
+{
+    size_t i = 0;
+    while (i < vmt.size()) {
+        if (std::isspace(static_cast<unsigned char>(vmt[i]))) {
+            ++i;
+        } else if (vmt.substr(i, 2) == "//") {
+            i = vmt.find('\n', i);
+            if (i == std::string_view::npos)
+                return {};
+        } else {
+            break;
+        }
+    }
+    const bool quoted = i < vmt.size() && vmt[i] == '"';
+    i += quoted ? 1 : 0;
+    std::string name;
+    for (; i < vmt.size(); ++i) {
+        const char c = vmt[i];
+        if (quoted ? c == '"' : std::isspace(static_cast<unsigned char>(c)) || c == '{')
+            break;
+        name += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return name;
+}
+
+// Shaders whose surfaces show their texture without lighting. Their LIGHTING_PREVIEW variants write the G-buffer
+// like lit ones, so the material table tells them apart.
+bool IsUnlitShader(std::string_view shader) { return shader == "unlitgeneric" || shader == "unlittwotexture" || shader == "monitorscreen"; }
+
 // The scene material for a VMT's env_cubemap reflection and self-illumination (as LightmappedGeneric and
-// VertexLitGeneric compute their masks), or Scene::kNoMaterial when it has neither.
-uint32_t SceneMaterial(std::string_view vmt, const std::string& baseTexture)
+// VertexLitGeneric compute their masks) and whether it is unlit, or Scene::kNoMaterial when it has none of them.
+uint32_t SceneMaterial(std::string_view vmt, const std::string& baseTexture, bool unlit)
 {
     auto enabled = [&](std::string_view key) {
         const std::optional<std::string> value = studio::MaterialValue(vmt, key);
@@ -213,13 +277,14 @@ uint32_t SceneMaterial(std::string_view vmt, const std::string& baseTexture)
     const std::optional<std::string> envmap = studio::MaterialValue(vmt, "$envmap");
     const bool reflective = envmap && !envmap->empty();
     const bool selfIllum = enabled("$selfillum");
-    if (!reflective && !selfIllum)
+    if (!reflective && !selfIllum && !unlit)
         return Scene::kNoMaterial;
     auto mask = [](const std::string& texture, uint32_t channel, bool invert) {
         const UINT view = texture.empty() ? DescriptorHeap::kInvalid : TextureFor(texture).view;
         return view != DescriptorHeap::kInvalid ? Scene::PackMask(view, channel, invert) : Scene::kMaskOff;
     };
     GpuMaterial material = {};
+    material.flags = unlit ? Scene::kMaterialUnlit : 0u;
     material.envmapMask = Scene::kMaskOff;
     if (reflective) {
         const std::string envmapMask = studio::MaterialTexture(vmt, "$envmapmask");
@@ -247,7 +312,7 @@ uint32_t SceneMaterial(std::string_view vmt, const std::string& baseTexture)
         material.selfIllumTint[1] = tint.y;
         material.selfIllumTint[2] = tint.z;
     }
-    if (material.envmapMask == Scene::kMaskOff && material.selfIllumMask == Scene::kMaskOff)
+    if (material.envmapMask == Scene::kMaskOff && material.selfIllumMask == Scene::kMaskOff && !unlit)
         return Scene::kNoMaterial;
     return g_state.scene.AddMaterial(material);
 }
@@ -263,20 +328,30 @@ const std::optional<MaterialInfo>& MaterialFor(const std::string& vmtPath)
     if (vmt.empty())
         return entry;
     std::string text(reinterpret_cast<const char*>(vmt.data()), vmt.size());
+    std::string shader = ShaderName(text);
     // Maps ship cubemap-patched copies of their materials ("patch" shader) that include the original.
     if (std::optional<std::string> include = studio::MaterialValue(text, "include")) {
         std::string path = *include;
         std::replace(path.begin(), path.end(), '\\', '/');
         std::transform(path.begin(), path.end(), path.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
         std::vector<std::byte> included = ReadOptional(path);
-        text.append("\n").append(reinterpret_cast<const char*>(included.data()), included.size());
+        const std::string_view includedText(reinterpret_cast<const char*>(included.data()), included.size());
+        if (shader == "patch")
+            shader = ShaderName(includedText);
+        text.append("\n").append(includedText);
     }
     auto enabled = [&](std::string_view key) {
         const std::optional<std::string> value = studio::MaterialValue(text, key);
         return value && !value->empty() && value->front() != '0';
     };
     entry.emplace();
-    entry->translucent = enabled("$translucent");
+    if (std::optional<std::string> alpha = studio::MaterialValue(text, "$alpha")) {
+        float value = 1.0f;
+        if (std::from_chars(alpha->data(), alpha->data() + alpha->size(), value).ec == std::errc())
+            entry->opacity = std::clamp(value, 0.0f, 1.0f);
+    }
+    entry->translucent = enabled("$translucent") || entry->opacity < 1.0f;
+    entry->additive = enabled("$additive");
     entry->alphaTest = enabled("$alphatest");
     if (std::optional<std::string> reference = studio::MaterialValue(text, "$alphatestreference")) {
         float value = 0.0f;
@@ -289,40 +364,50 @@ const std::optional<MaterialInfo>& MaterialFor(const std::string& vmtPath)
         if (std::optional<bsp::Float3> reflectivity = studio::TextureReflectivity(header))
             entry->reflectivity = *reflectivity;
     }
-    entry->sceneMaterial = SceneMaterial(text, entry->baseTexture);
+    entry->sceneMaterial = SceneMaterial(text, entry->baseTexture, IsUnlitShader(shader));
     return entry;
 }
 
-// The alpha-test entry of a material's triangles, or kOpaqueTriangle.
+// The alpha-test or translucency entry of a material's triangles, kOpaqueTriangle, or kDroppedTriangle for
+// additive materials.
 uint32_t TriangleAlphaFor(const MaterialInfo& material)
 {
-    if (!material.alphaTest || material.baseTexture.empty())
+    if (material.additive)
+        return kDroppedTriangle;
+    if (!material.alphaTest && !material.translucent)
         return kOpaqueTriangle;
-    const SceneTexture& texture = TextureFor(material.baseTexture);
-    return texture.view != DescriptorHeap::kInvalid && texture.alpha ? Scene::PackAlpha(texture.view, material.alphaReference) : kOpaqueTriangle;
+    const SceneTexture* texture = material.baseTexture.empty() ? nullptr : &TextureFor(material.baseTexture);
+    const UINT alphaView = texture != nullptr && texture->view != DescriptorHeap::kInvalid && texture->alpha ? texture->view : DescriptorHeap::kInvalid;
+    if (material.alphaTest)
+        return alphaView != DescriptorHeap::kInvalid ? Scene::PackAlpha(alphaView, material.alphaReference) : kOpaqueTriangle;
+    return Scene::PackTranslucent(alphaView, material.opacity);
 }
 
-// Moves the triangles whose `triangleAlpha` is not kOpaqueTriangle behind the others, reordering `indices` and
-// every per-triangle vector in `perTriangle` alike.
+// Moves the triangles whose `triangleAlpha` is not kOpaqueTriangle behind the others and removes those marked
+// kDroppedTriangle, reordering `indices` and every per-triangle vector in `perTriangle` alike.
 template <class... PerTriangle>
 TriangleData PartitionTriangles(std::vector<uint32_t>& indices, const std::vector<uint32_t>& triangleAlpha, PerTriangle&... perTriangle)
 {
-    const size_t triangles = triangleAlpha.size();
-    std::vector<size_t> order(triangles);
-    std::iota(order.begin(), order.end(), size_t{0});
+    std::vector<size_t> order;
+    order.reserve(triangleAlpha.size());
+    for (size_t t = 0; t < triangleAlpha.size(); ++t) {
+        if (triangleAlpha[t] != kDroppedTriangle)
+            order.push_back(t);
+    }
+    const size_t triangles = order.size();
     const auto firstAlpha = std::stable_partition(order.begin(), order.end(), [&](size_t t) { return triangleAlpha[t] == kOpaqueTriangle; });
     TriangleData partition;
     partition.opaqueTriangles = static_cast<UINT>(firstAlpha - order.begin());
     for (auto it = firstAlpha; it != order.end(); ++it)
         partition.alphaTriangles.push_back(triangleAlpha[*it]);
-    if (partition.alphaTriangles.empty())
+    if (partition.alphaTriangles.empty() && triangles == triangleAlpha.size())
         return partition;
-    std::vector<uint32_t> sortedIndices(indices.size());
+    std::vector<uint32_t> sortedIndices(triangles * 3);
     for (size_t i = 0; i < triangles; ++i)
         std::copy_n(indices.begin() + order[i] * 3, 3, sortedIndices.begin() + i * 3);
     indices = std::move(sortedIndices);
     auto permute = [&](auto& values) {
-        std::remove_reference_t<decltype(values)> sorted(values.size());
+        std::remove_reference_t<decltype(values)> sorted(triangles);
         for (size_t i = 0; i < triangles; ++i)
             sorted[i] = values[order[i]];
         values = std::move(sorted);
@@ -379,8 +464,18 @@ const ModelEntry& ModelFor(const std::string& mdlPath)
         size_t number = 0;
         const auto [end, ec] = std::from_chars(mdlPath.data() + 1, mdlPath.data() + mdlPath.size(), number);
         if (ec == std::errc() && end == mdlPath.data() + mdlPath.size() && number < g_state.brushModels.size()) {
+            bsp::Mesh& mesh = g_state.brushModels[number];
+            if (!mesh.positions.empty()) {
+                bsp::Float3 low = mesh.positions[0];
+                bsp::Float3 high = low;
+                for (const bsp::Float3& p : mesh.positions) {
+                    low = {std::min(low.x, p.x), std::min(low.y, p.y), std::min(low.z, p.z)};
+                    high = {std::max(high.x, p.x), std::max(high.y, p.y), std::max(high.z, p.z)};
+                }
+                entry.center = {(low.x + high.x) * 0.5f, (low.y + high.y) * 0.5f, (low.z + high.z) * 0.5f};
+            }
             TriangleData triangles;
-            entry.sceneModel = g_state.scene.AddModel(PrepareMesh(g_state.brushModels[number], triangles));
+            entry.sceneModel = g_state.scene.AddModel(PrepareMesh(mesh, triangles));
         }
         return entry;
     }
@@ -404,7 +499,7 @@ const ModelEntry& ModelFor(const std::string& mdlPath)
                 const std::optional<MaterialInfo>& material = MaterialFor(vmtPath);
                 if (!material)
                     continue;
-                skip[t] = material->translucent && !material->alphaTest;
+                skip[t] = material->additive;
                 textureAlbedo[t] = PackAlbedo(material->reflectivity);
                 textureAlpha[t] = TriangleAlphaFor(*material);
                 textureMaterial[t] = material->sceneMaterial;
@@ -439,9 +534,121 @@ const ModelEntry& ModelFor(const std::string& mdlPath)
     return entry;
 }
 
+// The convex hulls of static props that VRAD's shadows hid most of a light behind: those the light sits in or
+// against.
+std::vector<LightHull> FixtureHulls(const bsp::WorldGeometry& world)
+{
+    struct PropModel {
+        bool read = false;
+        bool bounded = false;
+        bsp::Float3 mins = {};
+        bsp::Float3 maxs = {};
+        bool hullsRead = false;
+        bool fromCollision = false;
+        // Model-space points of each convex hull VRAD shadowed the model with.
+        std::vector<std::vector<bsp::Float3>> hulls;
+    };
+    std::vector<PropModel> models(world.propModels.size());
+    const auto transform = [](const float m[3][4], const bsp::Float3& p) {
+        return bsp::Float3{m[0][0] * p.x + m[0][1] * p.y + m[0][2] * p.z + m[0][3], m[1][0] * p.x + m[1][1] * p.y + m[1][2] * p.z + m[1][3],
+            m[2][0] * p.x + m[2][1] * p.y + m[2][2] * p.z + m[2][3]};
+    };
+    std::vector<LightHull> result;
+    std::vector<uint32_t> nearby;
+    size_t collisionHulls = 0;
+    size_t failedHulls = 0;
+    std::string failedModels;
+    for (const bsp::StaticProp& prop : world.props) {
+        PropModel& model = models[prop.model];
+        const std::string& path = world.propModels[prop.model];
+        const std::string base = path.size() > 4 ? path.substr(0, path.size() - 4) : path;
+        if (!model.read) {
+            model.read = true;
+            model.bounded = studio::ReadBounds(ReadOptional(path), model.mins, model.maxs);
+        }
+        bsp::Float3 low = {INFINITY, INFINITY, INFINITY};
+        bsp::Float3 high = {-INFINITY, -INFINITY, -INFINITY};
+        for (int corner = 0; corner < 8 && model.bounded; ++corner) {
+            const bsp::Float3 p = transform(prop.transform, {corner & 1 ? model.maxs.x : model.mins.x, corner & 2 ? model.maxs.y : model.mins.y,
+                corner & 4 ? model.maxs.z : model.mins.z});
+            low = {std::min(low.x, p.x - kFixtureMargin), std::min(low.y, p.y - kFixtureMargin), std::min(low.z, p.z - kFixtureMargin)};
+            high = {std::max(high.x, p.x + kFixtureMargin), std::max(high.y, p.y + kFixtureMargin), std::max(high.z, p.z + kFixtureMargin)};
+        }
+        nearby.clear();
+        for (uint32_t i = 0; i < world.lights.size(); ++i) {
+            if (!model.bounded || bsp::InBounds(world.lights[i].origin, low, high))
+                nearby.push_back(i);
+        }
+        if (nearby.empty())
+            continue;
+        if (!model.hullsRead) {
+            model.hullsRead = true;
+            const std::vector<std::byte> phy = ReadOptional(base + ".phy");
+            studio::Geometry geometry;
+            std::string error;
+            model.fromCollision = !phy.empty();
+            if (!phy.empty()) {
+                if (!studio::ReadCollisionPieces(phy, model.hulls, error) && ++g_state.modelErrors <= 10)
+                    log::Info("Scene: collision model of '{}' skipped: {}", path, error);
+            } else if (studio::BuildGeometry(ReadOptional(path), ReadOptional(base + ".vvd"), ReadOptional(base + ".dx90.vtx"), {}, geometry, error)) {
+                std::vector<std::vector<uint32_t>> vertices;
+                for (size_t t = 0; t < geometry.triangleTextures.size(); ++t) {
+                    const size_t mesh = geometry.triangleTextures[t];
+                    if (vertices.size() <= mesh)
+                        vertices.resize(mesh + 1);
+                    vertices[mesh].insert(vertices[mesh].end(), geometry.indices.begin() + t * 3, geometry.indices.begin() + t * 3 + 3);
+                }
+                for (std::vector<uint32_t>& mesh : vertices) {
+                    std::sort(mesh.begin(), mesh.end());
+                    mesh.erase(std::unique(mesh.begin(), mesh.end()), mesh.end());
+                    std::vector<bsp::Float3>& points = model.hulls.emplace_back();
+                    for (uint32_t v : mesh)
+                        points.push_back(geometry.positions[v]);
+                }
+            }
+        }
+        for (const std::vector<bsp::Float3>& piece : model.hulls) {
+            if (piece.empty())
+                continue;
+            std::vector<bsp::Float3> points(piece.size());
+            std::transform(piece.begin(), piece.end(), points.begin(), [&](const bsp::Float3& p) { return transform(prop.transform, p); });
+            std::vector<hull::Plane> planes = hull::Build(points);
+            if (planes.empty()) {
+                if (++failedHulls <= 4)
+                    failedModels += (failedModels.empty() ? "" : ", ") + path;
+                continue;
+            }
+            for (uint32_t light : nearby) {
+                if (hull::Distance(planes, world.lights[light].origin) <= kFixtureMargin) {
+                    result.push_back({light, planes});
+                    collisionHulls += model.fromCollision ? 1 : 0;
+                }
+            }
+        }
+    }
+    std::vector<uint32_t> lights;
+    for (const LightHull& entry : result)
+        lights.push_back(entry.light);
+    std::sort(lights.begin(), lights.end());
+    log::Info("Scene: {} lights sit in or against {} static prop hulls ({} from collision models), which block them as in VRAD ({} flat or "
+              "failed hulls{}{})",
+        std::unique(lights.begin(), lights.end()) - lights.begin(), result.size(), collisionHulls, failedHulls, failedModels.empty() ? "" : ": ",
+        failedModels);
+    return result;
+}
+
 bool IsFirstPersonModel(const std::string& path)
 {
     return path.starts_with("models/weapons/v_") || path.starts_with("models/weapons/c_");
+}
+
+// Entities of the 3D skybox's scaled-down scene (skybox brush entities, animated props) would shadow the map
+// from far away, so they are traced like the skybox's static geometry.
+bool InSkybox(const entities::ModelEntity& entity, const bsp::Float3& center)
+{
+    const auto& m = entity.transform;
+    return g_state.skyboxTest.InSkybox({m[0][0] * center.x + m[0][1] * center.y + m[0][2] * center.z + m[0][3],
+        m[1][0] * center.x + m[1][1] * center.y + m[1][2] * center.z + m[1][3], m[2][0] * center.x + m[2][1] * center.y + m[2][2] * center.z + m[2][3]});
 }
 
 bool IsHeldWeapon(const entities::ModelEntity& entity, const std::optional<std::array<float, 3>>& eye)
@@ -462,8 +669,10 @@ void ClearScene()
     g_state.lighting->Skinned().Clear();
     g_state.lighting->InvalidateHistory();
     g_state.scene.Clear();
+    light_queries::Clear();
     g_state.models.clear();
     g_state.brushModels.clear();
+    g_state.skyboxTest = {};
     g_state.mapMaterials.clear();
     g_state.textures.clear();
     // Scene material indices and texture views are reset with the scene.
@@ -501,8 +710,13 @@ void UpdateScene()
         g_state.mapMaterials = std::move(world.materials);
         TriangleData worldTriangles;
         const ModelGeometry worldGeometry = PrepareMesh(world.mesh, worldTriangles);
-        if (g_state.scene.LoadMap(level, world, worldGeometry)) {
+        if (g_state.scene.LoadMap(level, world, FixtureHulls(world), worldGeometry)) {
             g_state.brushModels = std::move(world.brushModels);
+            g_state.skyboxTest.visibility.nodes = std::move(world.visibility.nodes);
+            g_state.skyboxTest.visibility.leaves = std::move(world.visibility.leaves);
+            g_state.skyboxTest.skyArea = world.skyArea;
+            g_state.skyboxTest.skyMins = world.skyMins;
+            g_state.skyboxTest.skyMaxs = world.skyMaxs;
             std::vector<SceneInstance> instances;
             const auto addProps = [&](const std::vector<bsp::StaticProp>& props, UINT mask) {
                 for (const bsp::StaticProp& prop : props) {
@@ -544,6 +758,7 @@ void CollectEntities()
 {
     g_state.dynamicInstances.clear();
     g_state.skinnedEntities.clear();
+    g_state.currentTransforms.clear();
     entities::Collect(g_state.entities);
     const std::optional<std::array<float, 3>> eye = gbuffer::EyePosition(gbuffer::LastCaptureViewProj());
     const int localPlayer = engine::LocalPlayerIndex();
@@ -553,7 +768,7 @@ void CollectEntities()
         const ModelEntry& model = ModelFor(entity.model);
         if (model.sceneModel < 0)
             continue;
-        const UINT mask = entity.index == localPlayer ? kLocalPlayerMask : kDynamicMask;
+        const UINT mask = entity.index == localPlayer ? kLocalPlayerMask : InSkybox(entity, model.center) ? kSkyboxMask : kDynamicMask;
         if (model.skinned) {
             g_state.bones.resize(kMaxBones);
             if (!entities::SetupBones(entity.renderable, reinterpret_cast<float (*)[3][4]>(g_state.bones.data()), kMaxBones))
@@ -566,7 +781,14 @@ void CollectEntities()
         instance.model = model.sceneModel;
         instance.mask = mask;
         std::memcpy(instance.transform, entity.transform, sizeof(instance.transform));
+        auto& current = g_state.currentTransforms[entity.index];
+        std::memcpy(current.data(), entity.transform, sizeof(current));
+        if (auto previous = g_state.previousTransforms.find(entity.index); previous != g_state.previousTransforms.end()) {
+            std::memcpy(instance.previousTransform, previous->second.data(), sizeof(instance.previousTransform));
+            instance.previousKnown = true;
+        }
     }
+    std::swap(g_state.previousTransforms, g_state.currentTransforms);
 }
 
 }
@@ -646,8 +868,11 @@ void OnPresent()
         log::Info("Effects: a G-buffer capture was still open at present; closing it");
         gbuffer::End(g_state.device, gbuffer::ViewKind::Main);
     }
+    if (g_state.device != nullptr)
+        gbuffer::EndForward(g_state.device);
     client::TryInstall();
     engine::TryInitialize();
+    light_queries::TryInstall();
     entities::TryInitialize();
     if (g_state.frame % kMapPollInterval == 0)
         SyncSettingsFile(GetOptions().gameDirectory / L"gmodpp_settings.ini");
@@ -707,12 +932,40 @@ void FinishCapture(gbuffer::ViewKind kind)
     ViewInputs inputs{backBuffer.Get(), g_state.depthTexture.Get(), gbuffer::NormalTexture(), gbuffer::FlagsTexture(), gbuffer::LightTexture(),
         gbuffer::AlbedoTexture(), gbuffer::EmissiveTexture(), gbuffer::ProjectedLights(), kind, 0.0f, 1.0f, g_state.frame, g_state.pixelOffset[0],
         g_state.pixelOffset[1]};
+    if (kind == gbuffer::ViewKind::Main)
+        inputs.probes = gbuffer::ProbeTextures();
     if (kind == gbuffer::ViewKind::Viewmodel) {
         inputs.depthMin = g_state.viewmodelViewport.MinZ;
         inputs.depthMax = g_state.viewmodelViewport.MaxZ;
     }
     const std::vector<SkinnedEntity>& skinned = kind == gbuffer::ViewKind::Viewmodel ? g_state.noSkinnedEntities : g_state.skinnedEntities;
     g_state.lighting->Run(inputs, g_state.scene, g_state.dynamicInstances, skinned);
+    if (const std::optional<ProbeResult> probe = g_state.lighting->TakeProbe()) {
+        std::string model = "none";
+        for (const auto& [path, entry] : g_state.models) {
+            if (entry.sceneModel == probe->model && probe->model >= 0)
+                model = path;
+        }
+        if (probe->model == 0)
+            model = "the world";
+        log::Info("Probe: sun visibility {:.2f} at ({:.1f} {:.1f} {:.1f}); blocked by instance {} (model {} '{}', mask {:#x}), triangle {}, {:.1f} units away",
+            probe->sunVisibility, probe->origin[0], probe->origin[1], probe->origin[2], static_cast<int>(probe->instance), probe->model, model, probe->mask,
+            probe->triangle, probe->distance);
+    }
+    if (kind == gbuffer::ViewKind::Main && g_state.lighting->VolumeReady()) {
+        gbuffer::ForwardConstants forward = {};
+        if (const std::optional<std::array<float, 3>> eye = gbuffer::EyePosition(gbuffer::LastCaptureViewProj()))
+            forward.eye = *eye;
+        forward.tonemapScale = gbuffer::TonemapScale();
+        const bsp::Float3& ambient = g_state.scene.Sun().ambient;
+        const float sky = GetSettings().skyIntensity;
+        forward.fallback = {ambient.x * sky, ambient.y * sky, ambient.z * sky};
+        forward.probeOrigin = g_state.lighting->VolumeOrigin();
+        if (GetSettings().fog)
+            forward.fog = gbuffer::ViewFog(gbuffer::ViewKind::Main);
+        forward.lightOnly = GetSettings().debugView != DebugView::Final;
+        gbuffer::BeginForward(device, forward);
+    }
 }
 
 // Source draws the viewmodel with DepthRange(0, 0.1); a few sprites use 0..0.01, which is not the viewmodel.
@@ -775,6 +1028,12 @@ void OnViewOpaqueEnd(bool inSkybox)
 {
     if (!g_state.viewmodelCapture)
         FinishCapture(inSkybox ? gbuffer::ViewKind::Skybox : gbuffer::ViewKind::Main);
+}
+
+void OnViewTranslucentEnd()
+{
+    if (g_state.device != nullptr)
+        gbuffer::EndForward(g_state.device);
 }
 
 }

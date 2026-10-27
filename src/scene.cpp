@@ -21,7 +21,8 @@ struct Scene::InstanceRecord {
     uint32_t alpha;
     uint32_t opaqueTriangles;
     uint32_t materials;
-    uint32_t padding;
+    uint32_t previousPositions;
+    float previousTransform[3][4];
 };
 static_assert(sizeof(GpuMaterial) == 48);
 
@@ -38,9 +39,15 @@ struct Scene::GpuLight {
     float constantAttn;
     float linearAttn;
     float quadraticAttn;
-    float padding[3];
+    // Byte offset in the lights buffer of the light's hull records, and their number.
+    uint32_t hullOffset;
+    uint32_t hullCount;
+    float padding;
 };
 static_assert(sizeof(Scene::GpuLight) == 80);
+// A hull record in the lights buffer: its plane count, then each plane as (normal, distance).
+constexpr size_t kHullHeaderBytes = 16;
+static_assert(sizeof(hull::Plane) == 16);
 // Read by ClusterAt in shaders/scene.hlsli.
 static_assert(sizeof(bsp::BspNode) == 24);
 
@@ -218,14 +225,20 @@ UINT Scene::GeometryDescs(D3D12_GPU_VIRTUAL_ADDRESS vertices, UINT vertexCount, 
         geometry.Triangles.IndexFormat = DXGI_FORMAT_R32_UINT;
     };
     add(0, opaqueTriangles, D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE);
-    // Shaders find an alpha-tested triangle's data by its index within this geometry plus opaqueTriangles.
-    add(opaqueTriangles, triangles - opaqueTriangles, D3D12_RAYTRACING_GEOMETRY_FLAG_NONE);
+    // Shaders find a triangle's data by its index within this geometry plus opaqueTriangles. Shadow rays multiply
+    // the transmittance of each translucent candidate, so none may be reported twice.
+    add(opaqueTriangles, triangles - opaqueTriangles, D3D12_RAYTRACING_GEOMETRY_FLAG_NO_DUPLICATE_ANYHIT_INVOCATION);
     return count;
 }
 
 uint32_t Scene::PackAlpha(UINT textureView, float reference)
 {
-    return (textureView & 0xFFFFFFu) | static_cast<uint32_t>(std::lround(std::clamp(reference, 0.0f, 1.0f) * 255.0f)) << 24;
+    return (textureView & 0xFFFFFFu) | static_cast<uint32_t>(std::lround(std::clamp(reference, 0.0f, 1.0f) * 127.0f)) << 24;
+}
+
+uint32_t Scene::PackTranslucent(UINT textureView, float opacity)
+{
+    return (textureView & 0xFFFFFFu) | static_cast<uint32_t>(std::lround(std::clamp(opacity, 0.0f, 1.0f) * 127.0f)) << 24 | 1u << 31;
 }
 
 UINT Scene::AddTexture(DXGI_FORMAT format, UINT width, UINT height, std::span<const std::span<const std::byte>> mips)
@@ -405,7 +418,7 @@ void Scene::Clear()
     m_leafClusters.Reset();
 }
 
-bool Scene::LoadMap(const std::string& name, const bsp::WorldGeometry& world, const ModelGeometry& worldGeometry)
+bool Scene::LoadMap(const std::string& name, const bsp::WorldGeometry& world, std::span<const LightHull> lightHulls, const ModelGeometry& worldGeometry)
 {
     m_worldModel = AddModel(worldGeometry);
     if (m_worldModel < 0)
@@ -418,13 +431,31 @@ bool Scene::LoadMap(const std::string& name, const bsp::WorldGeometry& world, co
             light.radius, {light.normal.x, light.normal.y, light.normal.z}, light.stopdot, light.stopdot2, light.exponent, light.constantAttn,
             light.linearAttn, light.quadraticAttn, {}};
     }
+    std::vector<std::byte> hulls;
+    for (size_t i = 0; i < lights.size(); ++i) {
+        lights[i].hullOffset = static_cast<uint32_t>(lights.size() * sizeof(GpuLight) + hulls.size());
+        for (const LightHull& entry : lightHulls) {
+            if (entry.light != i || entry.planes.empty())
+                continue;
+            ++lights[i].hullCount;
+            const size_t at = hulls.size();
+            hulls.resize(at + kHullHeaderBytes + entry.planes.size() * sizeof(hull::Plane));
+            const auto planeCount = static_cast<uint32_t>(entry.planes.size());
+            std::memcpy(hulls.data() + at, &planeCount, sizeof(planeCount));
+            std::memcpy(hulls.data() + at + kHullHeaderBytes, entry.planes.data(), entry.planes.size() * sizeof(hull::Plane));
+        }
+    }
     if (!lights.empty()) {
         if (!BuildLightLists(world.lights, world.visibility))
             return false;
         m_allocator->Reset();
         m_list->Reset(m_allocator.Get(), nullptr);
         std::vector<ComPtr<ID3D12Resource>> staging;
-        m_lights = UploadToDefault(lights.data(), lights.size() * sizeof(GpuLight), staging);
+        std::vector<std::byte> buffer(lights.size() * sizeof(GpuLight) + hulls.size());
+        std::memcpy(buffer.data(), lights.data(), lights.size() * sizeof(GpuLight));
+        if (!hulls.empty())
+            std::memcpy(buffer.data() + lights.size() * sizeof(GpuLight), hulls.data(), hulls.size());
+        m_lights = UploadToDefault(buffer.data(), buffer.size(), staging);
         if (!m_lights || !Submit())
             return false;
         m_lightsView = m_descriptors->CreateRawView(m_lights.Get());
@@ -572,12 +603,14 @@ void Scene::SetStaticInstances(std::vector<SceneInstance> instances)
 
 SceneFrame Scene::RecordFrame(ID3D12GraphicsCommandList4* list, UINT slot, std::span<const SceneInstance> dynamic)
 {
+    static_assert(sizeof(InstanceRecord) == 80);
     FrameTlas& frame = m_frames[slot % kFrameSlots];
     const UINT count = static_cast<UINT>(1 + m_staticInstances.size() + dynamic.size());
     if (!EnsureFrameCapacity(frame, count))
         return {};
 
     UINT written = 0;
+    m_recorded.clear();
     auto write = [&](const SceneInstance& source, const float (*transform)[4], UINT mask) {
         if (source.model < 0 || static_cast<size_t>(source.model) >= m_models.size())
             return;
@@ -593,8 +626,11 @@ SceneFrame Scene::RecordFrame(ID3D12GraphicsCommandList4* list, UINT slot, std::
         instance.InstanceMask = mask;
         instance.Flags = D3D12_RAYTRACING_INSTANCE_FLAG_TRIANGLE_CULL_DISABLE;
         instance.AccelerationStructure = blas;
-        frame.mappedRecords[written] = {source.positionsView != DescriptorHeap::kInvalid ? source.positionsView : model.positionsView,
-            model.indicesView, model.albedoView, model.uvsView, model.alphaView, model.opaqueTriangles, model.materialsView, 0};
+        InstanceRecord& record = frame.mappedRecords[written];
+        record = {source.positionsView != DescriptorHeap::kInvalid ? source.positionsView : model.positionsView, model.indicesView, model.albedoView,
+            model.uvsView, model.alphaView, model.opaqueTriangles, model.materialsView, source.previousPositionsView, {}};
+        std::memcpy(record.previousTransform, source.previousKnown ? source.previousTransform : instance.Transform, sizeof(record.previousTransform));
+        m_recorded.emplace_back(source.model, mask);
         ++written;
     };
     SceneInstance world;

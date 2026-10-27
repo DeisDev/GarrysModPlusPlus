@@ -17,6 +17,8 @@ enum class DebugView : uint32_t {
     SunVisibility = 7,
     GameFlashlight = 8,
     Reflections = 9,
+    MotionVectors = 10,
+    AmbientOcclusion = 11,
     Count
 };
 
@@ -37,7 +39,11 @@ struct Settings {
     bool projectedLights = true;
     bool indirectLight = true;
     bool denoiser = true;
+    bool ambientOcclusion = true;
     bool reflections = true;
+    // Translucent surfaces lit from the ray-traced irradiance volume instead of baked light.
+    bool translucentLighting = true;
+    bool volumetricLight = true;
     bool fog = true;
     FlashlightMode flashlightMode = FlashlightMode::RayTraced;
     float sunIntensity = 1.0f;
@@ -46,6 +52,10 @@ struct Settings {
     float indirectIntensity = 1.0f;
     float projectedIntensity = 1.0f;
     float reflectionIntensity = 1.0f;
+    // How much ambient occlusion darkens indirect light, which already holds the larger-scale occlusion.
+    float aoIntensity = 0.5f;
+    // Scales the haze's density.
+    float volumetricIntensity = 1.0f;
     AntiAliasing antiAliasing = AntiAliasing::Temporal;
     DlssMode dlssMode = DlssMode::Quality;
     // Share of the reprojected history kept each frame; higher is smoother but slower to react.
@@ -65,7 +75,7 @@ void SaveSettings(const std::filesystem::path& path, const Settings& settings);
 void SyncSettingsFile(const std::filesystem::path& path);
 void MarkSettingsChanged();
 
-enum class GpuPass : uint32_t { SceneUpdate, Surface, IndirectTrace, Accumulation, Denoiser, Reflections, Lighting, Resolve, Count };
+enum class GpuPass : uint32_t { SceneUpdate, Surface, Volume, DirectLight, IndirectTrace, Accumulation, Denoiser, Reflections, Lighting, Resolve, Count };
 
 // Figures the renderer reports for the menu.
 struct Statistics {

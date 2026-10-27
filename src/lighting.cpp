@@ -1,24 +1,32 @@
 #include "lighting.h"
 
 #include "gbuffer.h"
+#include "light_queries.h"
 #include "log.h"
 #include "mod.h"
 #include "renderer.h"
 #include "settings.h"
 
+#include <g_aoCS.h>
 #include <g_compositePS.h>
 #include <g_compositeVS.h>
 #include <g_deferredLightingCS.h>
+#include <g_directCS.h>
 #include <g_dlssInputsCS.h>
 #include <g_dlssResolveCS.h>
 #include <g_giFilterCS.h>
 #include <g_giTemporalCS.h>
 #include <g_giTraceCS.h>
+#include <g_primaryCS.h>
+#include <g_probesCS.h>
+#include <g_reflectionTemporalCS.h>
 #include <g_reflectionsCS.h>
 #include <g_surfaceCS.h>
 #include <g_taaCS.h>
 #include <g_taaSharpenCS.h>
+#include <g_volumetricsCS.h>
 
+#include <bit>
 #include <cmath>
 #include <cstring>
 
@@ -52,13 +60,14 @@ static_assert(sizeof(GpuProjector) == 112);
 constexpr UINT kTraceMask = kWorldMask | kStaticPropMask | kDynamicMask | kLocalPlayerMask;
 // The viewmodel is drawn inside the local player's body, which would shadow it.
 constexpr UINT kViewmodelTraceMask = kTraceMask & ~kLocalPlayerMask;
-constexpr UINT kFilterSteps[] = {1, 2, 4};
+constexpr UINT kFilterSteps[] = {1, 2, 4, 8, 16};
 // The viewmodel has no history, so it takes several indirect samples per pixel.
 constexpr UINT kViewmodelIndirectSamples = 8;
 constexpr UINT kPassCount = static_cast<UINT>(GpuPass::Count);
 // A timestamp before the first pass and after each one.
 constexpr UINT kMarkers = kPassCount + 1;
 constexpr uint32_t kTimingSamples = 120;
+constexpr UINT kProbeBytes = 32;
 
 unsigned Hex(HRESULT hr) { return static_cast<unsigned>(hr); }
 
@@ -98,6 +107,62 @@ bool Invert(const float m[4][4], float out[4][4])
         return false;
     for (int i = 0; i < 16; ++i)
         (&out[0][0])[i] = inv[i] / det;
+    return true;
+}
+
+// Splits a view-projection into a rigid world-to-view transform (x right, y up, z forward from the eye) and the
+// projection after it, both row-major for row vectors (v' = v M) as Ray Reconstruction takes them.
+bool SplitViewProjection(const float viewProj[4][4], const float eye[3], float worldToView[16], float viewToClip[16])
+{
+    auto normalize = [](float v[3]) {
+        const float length = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+        if (length < 1e-12f)
+            return false;
+        for (int i = 0; i < 3; ++i)
+            v[i] /= length;
+        return true;
+    };
+    auto dot = [](const float a[3], const float b[3]) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; };
+    float axes[3][3];
+    for (int i = 0; i < 3; ++i)
+        axes[2][i] = viewProj[3][i];
+    if (!normalize(axes[2]))
+        return false;
+    // Right and up from clip x and y, made orthogonal to forward and to each other.
+    for (int row = 0; row < 2; ++row) {
+        for (int i = 0; i < 3; ++i)
+            axes[row][i] = viewProj[row][i];
+        for (int other : {2, 0}) {
+            if (other == row)
+                continue;
+            const float d = dot(axes[row], axes[other]);
+            for (int i = 0; i < 3; ++i)
+                axes[row][i] -= d * axes[other][i];
+        }
+        if (!normalize(axes[row]))
+            return false;
+    }
+    // Column-vector forms: view = [axes, -axes * eye], its inverse = [axes^T, eye].
+    float view[4][4] = {};
+    float inverseView[4][4] = {};
+    for (int a = 0; a < 3; ++a) {
+        for (int i = 0; i < 3; ++i) {
+            view[a][i] = axes[a][i];
+            inverseView[i][a] = axes[a][i];
+        }
+        view[a][3] = -dot(axes[a], eye);
+        inverseView[a][3] = eye[a];
+    }
+    view[3][3] = inverseView[3][3] = 1.0f;
+    for (int i = 0; i < 4; ++i) {
+        for (int j = 0; j < 4; ++j) {
+            float projection = 0.0f;
+            for (int k = 0; k < 4; ++k)
+                projection += viewProj[i][k] * inverseView[k][j];
+            viewToClip[j * 4 + i] = projection;
+            worldToView[j * 4 + i] = view[i][j];
+        }
+    }
     return true;
 }
 
@@ -205,6 +270,31 @@ bool Lighting::Initialize(Renderer& renderer, IDirect3DDevice9* device)
         srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
         m_device->CreateShaderResourceView(m_projectors.Get(), &srv, m_descriptors->Cpu(m_projectorViews[slot]));
     }
+    if (SUCCEEDED(hr) && GetOptions().devMode) {
+        D3D12_HEAP_PROPERTIES heap = {D3D12_HEAP_TYPE_DEFAULT};
+        D3D12_RESOURCE_DESC desc = {};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        desc.Width = kProbeBytes;
+        desc.Height = 1;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = 1;
+        desc.SampleDesc.Count = 1;
+        desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        hr = m_device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&m_probeBuffer));
+        m_probeReadback = SUCCEEDED(hr) ? CreateBuffer(m_device, D3D12_HEAP_TYPE_READBACK, kProbeBytes, D3D12_RESOURCE_STATE_COPY_DEST) : nullptr;
+        m_probeUav = m_descriptors->Allocate();
+        if (SUCCEEDED(hr) && (!m_probeReadback || m_probeUav == DescriptorHeap::kInvalid))
+            hr = E_OUTOFMEMORY;
+        if (SUCCEEDED(hr)) {
+            D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
+            uav.Format = DXGI_FORMAT_R32_TYPELESS;
+            uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+            uav.Buffer.NumElements = kProbeBytes / 4;
+            uav.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+            m_device->CreateUnorderedAccessView(m_probeBuffer.Get(), nullptr, &uav, m_descriptors->Cpu(m_probeUav));
+        }
+    }
     if (SUCCEEDED(hr)) {
         D3D12_QUERY_HEAP_DESC desc = {D3D12_QUERY_HEAP_TYPE_TIMESTAMP, kSlots * kMarkers};
         hr = m_device->CreateQueryHeap(&desc, IID_PPV_ARGS(&m_timestamps));
@@ -220,9 +310,9 @@ bool Lighting::Initialize(Renderer& renderer, IDirect3DDevice9* device)
     }
     if (SUCCEEDED(hr))
         hr = m_device->CreateRootSignature(0, g_surfaceCS, sizeof(g_surfaceCS), IID_PPV_ARGS(&m_computeRoot));
-    const std::pair<const BYTE*, size_t> shaders[] = {{g_surfaceCS, sizeof(g_surfaceCS)}, {g_giTraceCS, sizeof(g_giTraceCS)},
+    const std::pair<const BYTE*, size_t> shaders[] = {{g_surfaceCS, sizeof(g_surfaceCS)}, {g_primaryCS, sizeof(g_primaryCS)}, {g_probesCS, sizeof(g_probesCS)}, {g_aoCS, sizeof(g_aoCS)}, {g_volumetricsCS, sizeof(g_volumetricsCS)}, {g_directCS, sizeof(g_directCS)}, {g_giTraceCS, sizeof(g_giTraceCS)},
         {g_giTemporalCS, sizeof(g_giTemporalCS)}, {g_giFilterCS, sizeof(g_giFilterCS)}, {g_deferredLightingCS, sizeof(g_deferredLightingCS)},
-        {g_taaCS, sizeof(g_taaCS)}, {g_taaSharpenCS, sizeof(g_taaSharpenCS)}, {g_reflectionsCS, sizeof(g_reflectionsCS)},
+        {g_taaCS, sizeof(g_taaCS)}, {g_taaSharpenCS, sizeof(g_taaSharpenCS)}, {g_reflectionsCS, sizeof(g_reflectionsCS)}, {g_reflectionTemporalCS, sizeof(g_reflectionTemporalCS)},
         {g_dlssInputsCS, sizeof(g_dlssInputsCS)}, {g_dlssResolveCS, sizeof(g_dlssResolveCS)}};
     static_assert(std::size(shaders) == static_cast<size_t>(Pass::Count));
     for (size_t i = 0; i < m_pipelines.size() && SUCCEEDED(hr); ++i) {
@@ -259,6 +349,29 @@ bool Lighting::Initialize(Renderer& renderer, IDirect3DDevice9* device)
         log::Info("Lighting: initialization failed ({:#010x})", Hex(hr));
         return false;
     }
+    const UINT* grid = gbuffer::kProbeGrid;
+    bool volume = true;
+    for (auto& set : m_probeHistory) {
+        for (size_t i = 0; i < set.size(); ++i)
+            volume = volume && CreateTarget(set[i], grid[0], grid[1], i < 3 ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R16G16B16A16_SINT, grid[2]);
+    }
+    for (Texture& texture : m_probeVolume)
+        volume = volume && CreateTarget(texture, grid[0], grid[1], DXGI_FORMAT_R16G16B16A16_FLOAT, grid[2]);
+    if (!volume) {
+        log::Info("Lighting: creating the irradiance volume failed; translucent surfaces keep their baked light");
+        m_probeVolume = {};
+    } else {
+        const D3D12_RESOURCE_DESC desc = m_probeVolume[0].resource->GetDesc();
+        UINT64 bytes = 0;
+        m_device->GetCopyableFootprints(&desc, 0, 1, 0, &m_volumeFootprints[0], nullptr, nullptr, &bytes);
+        bytes = (bytes + D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1) & ~static_cast<UINT64>(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1);
+        for (size_t i = 1; i < m_volumeFootprints.size(); ++i) {
+            m_volumeFootprints[i] = m_volumeFootprints[0];
+            m_volumeFootprints[i].Offset = bytes * i;
+        }
+        for (auto& readback : m_volumeReadback)
+            readback = CreateBuffer(m_device, D3D12_HEAP_TYPE_READBACK, bytes * m_volumeFootprints.size(), D3D12_RESOURCE_STATE_COPY_DEST);
+    }
     m_fenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     m_rtvIncrement = m_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     m_skinned.Initialize(m_device, *m_descriptors);
@@ -269,14 +382,14 @@ bool Lighting::Initialize(Renderer& renderer, IDirect3DDevice9* device)
     return true;
 }
 
-bool Lighting::CreateTarget(Texture& texture, UINT width, UINT height, DXGI_FORMAT format)
+bool Lighting::CreateTarget(Texture& texture, UINT width, UINT height, DXGI_FORMAT format, UINT depth)
 {
     D3D12_HEAP_PROPERTIES heap = {D3D12_HEAP_TYPE_DEFAULT};
     D3D12_RESOURCE_DESC desc = {};
-    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Dimension = depth != 0 ? D3D12_RESOURCE_DIMENSION_TEXTURE3D : D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     desc.Width = width;
     desc.Height = height;
-    desc.DepthOrArraySize = 1;
+    desc.DepthOrArraySize = static_cast<UINT16>(depth != 0 ? depth : 1);
     desc.MipLevels = 1;
     desc.Format = format;
     desc.SampleDesc.Count = 1;
@@ -296,13 +409,14 @@ bool Lighting::CreateTarget(Texture& texture, UINT width, UINT height, DXGI_FORM
         return false;
     D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
     srv.Format = format;
-    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv.ViewDimension = depth != 0 ? D3D12_SRV_DIMENSION_TEXTURE3D : D3D12_SRV_DIMENSION_TEXTURE2D;
     srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     srv.Texture2D.MipLevels = 1;
     m_device->CreateShaderResourceView(texture.resource.Get(), &srv, m_descriptors->Cpu(texture.srv));
     D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
     uav.Format = format;
-    uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    uav.ViewDimension = depth != 0 ? D3D12_UAV_DIMENSION_TEXTURE3D : D3D12_UAV_DIMENSION_TEXTURE2D;
+    uav.Texture3D.WSize = depth != 0 ? depth : 0;
     m_device->CreateUnorderedAccessView(texture.resource.Get(), nullptr, &uav, m_descriptors->Cpu(texture.uav));
     return true;
 }
@@ -327,15 +441,33 @@ bool Lighting::EnsureTargets(UINT width, UINT height)
     bool ok = true;
     for (Texture& texture : m_surface)
         ok = ok && CreateTarget(texture, width, height, DXGI_FORMAT_R32G32B32A32_FLOAT);
+    ok = ok && CreateTarget(m_visibility, width, height, DXGI_FORMAT_R32G32B32A32_UINT);
+    ok = ok && CreateTarget(m_motion, width, height, DXGI_FORMAT_R16G16_FLOAT);
+    ok = ok && CreateTarget(m_previousDistance, width, height, DXGI_FORMAT_R32_FLOAT);
+    ok = ok && CreateTarget(m_pixelFlags, width, height, DXGI_FORMAT_R8_UINT);
+    for (Texture& texture : m_direct)
+        ok = ok && CreateTarget(texture, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT);
+    ok = ok && CreateTarget(m_directRemainder, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT);
     ok = ok && CreateTarget(m_giRaw, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT);
     for (Texture& texture : m_giHistory)
         ok = ok && CreateTarget(texture, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT);
+    // Squared luminance of fireflies overflows FP16.
+    for (Texture& texture : m_giMoments)
+        ok = ok && CreateTarget(texture, width, height, DXGI_FORMAT_R32G32_FLOAT);
     for (Texture& texture : m_giFiltered)
         ok = ok && CreateTarget(texture, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT);
     // Linear (Ray Reconstruction) or encoded shaded colour.
     for (Texture& texture : m_lit)
         ok = ok && CreateTarget(texture, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT);
     ok = ok && CreateTarget(m_reflections, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT);
+    for (Texture& texture : m_aoHistory)
+        ok = ok && CreateTarget(texture, width, height, DXGI_FORMAT_R16G16_FLOAT);
+    ok = ok && CreateTarget(m_ao, width, height, DXGI_FORMAT_R16_FLOAT);
+    ok = ok && CreateTarget(m_volumetricMarch, (width + 1) / 2, (height + 1) / 2, DXGI_FORMAT_R16G16B16A16_FLOAT);
+    for (Texture& texture : m_volumetricHistory)
+        ok = ok && CreateTarget(texture, (width + 1) / 2, (height + 1) / 2, DXGI_FORMAT_R16G16B16A16_FLOAT);
+    for (Texture& texture : m_reflectionHistory)
+        ok = ok && CreateTarget(texture, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT);
     for (Texture& texture : m_taaHistory)
         ok = ok && CreateTarget(texture, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT);
     for (Texture& texture : m_viewmodelIndirect)
@@ -343,17 +475,20 @@ bool Lighting::EnsureTargets(UINT width, UINT height)
     ok = ok && CreateTarget(m_resolved, width, height, DXGI_FORMAT_R8G8B8A8_UNORM);
     // Ray Reconstruction's inputs use the top-left render-size part of these.
     constexpr DXGI_FORMAT kRrFormats[] = {DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R16G16B16A16_FLOAT,
-        DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16G16_FLOAT};
+        DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16G16B16A16_FLOAT};
     static_assert(std::size(kRrFormats) == RrInputCount);
     for (UINT i = 0; i < RrInputCount; ++i)
         ok = ok && CreateTarget(m_rrInputs[i], width, height, kRrFormats[i]);
     ok = ok && CreateTarget(m_rrSpecularAlbedo, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT);
     ok = ok && CreateTarget(m_rrRoughness, width, height, DXGI_FORMAT_R16_FLOAT);
+    ok = ok && CreateTarget(m_rrHitDistance, width, height, DXGI_FORMAT_R16_FLOAT);
     ok = ok && CreateTarget(m_rrOutput, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT);
     m_rayReconstruction.ReleaseFeature();
     m_width = width;
     m_height = height;
     m_historyValid = false;
+    m_volumetricHistoryValid = false;
+    m_lastDenoised = nullptr;
     return ok;
 }
 
@@ -366,11 +501,45 @@ void Lighting::Use(Texture& texture, D3D12_RESOURCE_STATES state)
     texture.state = state;
 }
 
-void Lighting::Dispatch(Pass pass, const std::array<UINT, 8>& constants)
+void Lighting::Dispatch(Pass pass, const PassArgs& args)
+{
+    static_assert(sizeof(PassArgs) == 12 * sizeof(UINT));
+    m_list->SetPipelineState(m_pipelines[static_cast<size_t>(pass)].Get());
+    m_list->SetComputeRoot32BitConstants(2, sizeof(PassArgs) / sizeof(UINT), &args, 0);
+    m_list->Dispatch((m_gridWidth + 7) / 8, (m_gridHeight + 7) / 8, 1);
+}
+
+void Lighting::DispatchGroups(Pass pass, const PassArgs& args, UINT x, UINT y, UINT z)
 {
     m_list->SetPipelineState(m_pipelines[static_cast<size_t>(pass)].Get());
-    m_list->SetComputeRoot32BitConstants(2, static_cast<UINT>(constants.size()), constants.data(), 0);
-    m_list->Dispatch((m_gridWidth + 7) / 8, (m_gridHeight + 7) / 8, 1);
+    m_list->SetComputeRoot32BitConstants(2, sizeof(PassArgs) / sizeof(UINT), &args, 0);
+    m_list->Dispatch(x, y, z);
+}
+
+void Lighting::PublishVolume(UINT slot)
+{
+    const UINT* grid = gbuffer::kProbeGrid;
+    const size_t texels = static_cast<size_t>(grid[0]) * grid[1] * grid[2];
+    void* mapped = nullptr;
+    const D3D12_RANGE range = {0, static_cast<SIZE_T>(m_volumeReadback[slot]->GetDesc().Width)};
+    if (FAILED(m_volumeReadback[slot]->Map(0, &range, &mapped)))
+        return;
+    // Interleaved per texel: red, green and blue RGBA16F texels, each four halves.
+    m_volumeTexels.resize(texels * 12);
+    for (size_t channel = 0; channel < m_volumeFootprints.size(); ++channel) {
+        const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& footprint = m_volumeFootprints[channel];
+        const auto* base = static_cast<const std::byte*>(mapped) + footprint.Offset;
+        for (UINT z = 0; z < grid[2]; ++z) {
+            for (UINT y = 0; y < grid[1]; ++y) {
+                const std::byte* row = base + (static_cast<size_t>(z) * footprint.Footprint.Height + y) * footprint.Footprint.RowPitch;
+                for (UINT x = 0; x < grid[0]; ++x)
+                    std::memcpy(m_volumeTexels.data() + ((static_cast<size_t>(z) * grid[1] + y) * grid[0] + x) * 12 + channel * 4, row + x * 8, 8);
+            }
+        }
+    }
+    const D3D12_RANGE written = {0, 0};
+    m_volumeReadback[slot]->Unmap(0, &written);
+    light_queries::Publish(m_volumeReadbackOrigin[slot], {grid[0], grid[1], grid[2]}, gbuffer::kProbeSpacing, m_volumeTexels);
 }
 
 void Lighting::WaitForGpu()
@@ -528,6 +697,10 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
         m_fence->SetEventOnCompletion(m_slotFenceValues[slot], m_fenceEvent);
         WaitForSingleObject(m_fenceEvent, INFINITE);
     }
+    if (m_volumeReadbackPending[slot]) {
+        m_volumeReadbackPending[slot] = false;
+        PublishVolume(slot);
+    }
     // Timings of the main view that last used this slot; skybox runs reuse the markers but are not counted.
     if (m_slotFenceValues[slot] != 0 && m_slotWasMain[slot]) {
         const uint64_t* markers = m_timestampValues + slot * kMarkers;
@@ -550,10 +723,11 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
                     for (size_t i = 1; i <= frames; ++i)
                         frameMs += statistics.frameMs[(statistics.nextFrame + statistics.frameMs.size() - i) % statistics.frameMs.size()];
                     const auto& p = statistics.passMs;
-                    log::Info("Lighting: {:.3f} ms GPU per frame ({}x{} traced at {}x{}; scene {:.2f}, surface {:.2f}, indirect {:.2f}, "
-                              "accumulation {:.2f}, denoiser {:.2f}, reflections {:.2f}, lighting {:.2f}, resolve {:.2f}); frame time {:.2f} ms",
+                    log::Info("Lighting: {:.3f} ms GPU per frame ({}x{} traced at {}x{}; scene {:.2f}, surface {:.2f}, volume {:.2f}, direct {:.2f}, "
+                              "indirect {:.2f}, accumulation {:.2f}, denoiser {:.2f}, reflections {:.2f}, lighting {:.2f}, resolve {:.2f}); frame time {:.2f} ms, "
+                              "tonemap scale {:.3f}",
                         statistics.lightingMs, m_width, m_height, statistics.renderWidth, statistics.renderHeight, p[0], p[1], p[2], p[3], p[4],
-                        p[5], p[6], p[7], frames ? frameMs / frames : 0.0);
+                        p[5], p[6], p[7], p[8], p[9], frames ? frameMs / frames : 0.0, gbuffer::TonemapScale());
                 }
             }
         }
@@ -588,6 +762,25 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
             log::Info("Lighting: the camera of view kind {} cannot be inverted; view left unlit ({} times)", static_cast<int>(inputs.kind), m_cameraFailures);
         return;
     }
+    // The irradiance volume follows the main view's camera in whole cells.
+    const bool volume = main && scene.Ready() && GetSettings().translucentLighting && inputs.probes[0] != nullptr && m_probeVolume[0].resource;
+    if (main)
+        m_volumeReady = false;
+    for (int i = 0; i < 3; ++i) {
+        if (volume)
+            m_probeOrigin[i] = static_cast<int>(std::floor(constants.eyePosition[i] / gbuffer::kProbeSpacing)) - static_cast<int>(gbuffer::kProbeGrid[i] / 2);
+        constants.probeOrigin[i] = m_probeOrigin[i];
+    }
+    constants.probeSpacing = gbuffer::kProbeSpacing;
+    // The 3D skybox's scaled-down scene has no contact shadows worth tracing.
+    const bool ambientOcclusion = GetSettings().ambientOcclusion && inputs.kind != gbuffer::ViewKind::Skybox;
+    constants.aoView = kInvalidView;
+    constants.aoIntensity = GetSettings().aoIntensity;
+    constants.volumetricView = kInvalidView;
+    // Haze thin enough that light crosses about 6,000 units at the default intensity.
+    constexpr float kVolumetricDensity = 1.0f / 6000.0f;
+    constants.volumetricDensity = kVolumetricDensity * GetSettings().volumetricIntensity;
+    const bool volumetrics = main && GetSettings().volumetricLight && GetSettings().volumetricIntensity > 0.0f;
 
     m_flushQuery->Issue(D3DISSUE_END);
     m_flushQuery->GetData(nullptr, 0, D3DGETDATA_FLUSH);
@@ -625,6 +818,16 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
             }
             cookies.push_back(cookie);
         }
+    }
+    // The game's probe volume textures, filled by copies at the end of the irradiance volume passes.
+    std::array<ComPtr<ID3D12Resource>, 3> probeTargets;
+    bool copyVolume = volume;
+    for (size_t i = 0; i < probeTargets.size() && copyVolume; ++i) {
+        if (FAILED(m_device9On12->UnwrapUnderlyingResource(inputs.probes[i], queue, IID_PPV_ARGS(&probeTargets[i])))) {
+            copyVolume = false;
+            break;
+        }
+        resources9.push_back(inputs.probes[i]);
     }
     ID3D12Resource* color = resources[0].Get();
     ID3D12Resource* depth = resources[1].Get();
@@ -676,6 +879,13 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     const UINT previous = 1 - current;
     constants.surfaceView = m_surface[current].srv;
     constants.prevSurfaceView = m_surface[previous].srv;
+    constants.visibilityView = m_visibility.srv;
+    constants.motionView = m_motion.srv;
+    constants.previousDistanceView = m_previousDistance.srv;
+    constants.pixelFlagsView = m_pixelFlags.srv;
+    const bool probe = main && m_probeRequested && m_probeBuffer;
+    constants.probeView = probe ? m_probeUav : kInvalidView;
+    constants.probePixel = m_probePixel;
 
     D3D12_CPU_DESCRIPTOR_HANDLE rtv = m_rtvHeap->GetCPUDescriptorHandleForHeapStart();
     rtv.ptr += static_cast<SIZE_T>(slot) * m_rtvIncrement;
@@ -714,7 +924,7 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     }
 
     m_frameInstances.assign(dynamic.begin(), dynamic.end());
-    m_skinned.Record(m_list.Get(), slot, skinned, m_frameInstances);
+    m_skinned.Record(m_list.Get(), skinned, m_frameInstances);
     const SceneFrame frame = scene.RecordFrame(m_list.Get(), slot, m_frameInstances);
     constants.instancesView = frame.instancesView;
     constants.dynamicLightsView = frame.dynamicLightsView;
@@ -751,7 +961,7 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
         // The passes before Ray Reconstruction run at render resolution on copies of the G-buffer.
         for (Texture& texture : m_rrInputs)
             Use(texture, write);
-        Dispatch(Pass::DlssInputs, {renderWidth, renderHeight, 0, m_rrInputUavs});
+        Dispatch(Pass::DlssInputs, {.input0 = renderWidth, .input1 = renderHeight, .output0 = m_rrInputUavs});
         for (Texture& texture : m_rrInputs)
             Use(texture, read);
         FrameConstants& render = *reinterpret_cast<FrameConstants*>(slotConstants + kConstantsStride);
@@ -774,22 +984,91 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     }
     mark();
     Use(m_surface[current], write);
-    Dispatch(Pass::Surface, {0, 0, 0, m_surface[current].uav});
-    mark();
+    Dispatch(Pass::Surface, {.output0 = m_surface[current].uav});
     Use(m_surface[current], read);
     Use(m_surface[previous], read);
-    Texture* indirect = &m_giFiltered[0];
+    for (Texture* texture : {&m_visibility, &m_motion, &m_previousDistance, &m_pixelFlags})
+        Use(*texture, write);
+    Dispatch(Pass::Primary, {.output0 = m_visibility.uav, .output1 = m_motion.uav, .output2 = m_previousDistance.uav, .output3 = m_pixelFlags.uav});
+    for (Texture* texture : {&m_visibility, &m_motion, &m_previousDistance, &m_pixelFlags})
+        Use(*texture, read);
+    mark();
+    if (copyVolume && constants.traceMask != 0) {
+        auto& last = m_probeHistory[previous];
+        auto& next = m_probeHistory[current];
+        for (Texture& texture : last)
+            Use(texture, read);
+        for (Texture& texture : next)
+            Use(texture, write);
+        const UINT groups[3] = {gbuffer::kProbeGrid[0] / 4, gbuffer::kProbeGrid[1] / 4, gbuffer::kProbeGrid[2] / 4};
+        DispatchGroups(Pass::Probes, {.input0 = last[0].srv, .input1 = last[1].srv, .input2 = last[2].srv, .input3 = last[3].srv,
+            .input4 = m_probeHistoryValid ? 1u : 0u, .output0 = next[0].uav, .output1 = next[1].uav, .output2 = next[2].uav, .output3 = next[3].uav,
+            .step = 0}, groups[0], groups[1], groups[2]);
+        for (Texture& texture : next)
+            Use(texture, read);
+        for (Texture& texture : m_probeVolume)
+            Use(texture, write);
+        DispatchGroups(Pass::Probes, {.input0 = next[0].srv, .input1 = next[1].srv, .input2 = next[2].srv, .input3 = next[3].srv,
+            .output0 = m_probeVolume[0].uav, .output1 = m_probeVolume[1].uav, .output2 = m_probeVolume[2].uav, .step = 1}, groups[0], groups[1], groups[2]);
+        for (size_t i = 0; i < probeTargets.size(); ++i) {
+            Use(m_probeVolume[i], D3D12_RESOURCE_STATE_COPY_SOURCE);
+            D3D12_RESOURCE_BARRIER barrier = Transition(probeTargets[i].Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+            m_list->ResourceBarrier(1, &barrier);
+            m_list->CopyResource(probeTargets[i].Get(), m_probeVolume[i].resource.Get());
+            barrier = Transition(probeTargets[i].Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+            m_list->ResourceBarrier(1, &barrier);
+            if (m_volumeReadback[slot]) {
+                D3D12_TEXTURE_COPY_LOCATION destination = {m_volumeReadback[slot].Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+                destination.PlacedFootprint = m_volumeFootprints[i];
+                D3D12_TEXTURE_COPY_LOCATION source = {m_probeVolume[i].resource.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+                m_list->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+            }
+        }
+        m_volumeReadbackPending[slot] = m_volumeReadback[slot] != nullptr;
+        m_volumeReadbackOrigin[slot] = m_probeOrigin;
+        m_probeHistoryValid = true;
+        m_volumeReady = true;
+    }
+    mark();
+    Texture& direct = m_direct[current];
+    Use(direct, write);
+    Use(m_directRemainder, write);
+    Dispatch(Pass::Direct, {.output0 = direct.uav, .output1 = m_directRemainder.uav});
+    if (probe) {
+        D3D12_RESOURCE_BARRIER barrier = Transition(m_probeBuffer.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        m_list->ResourceBarrier(1, &barrier);
+        m_list->CopyResource(m_probeReadback.Get(), m_probeBuffer.Get());
+        barrier = Transition(m_probeBuffer.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        m_list->ResourceBarrier(1, &barrier);
+    }
+    Use(direct, read);
+    Use(m_directRemainder, read);
+    Use(m_direct[previous], read);
+    mark();
+    if (ambientOcclusion && constants.traceMask != 0) {
+        Use(m_aoHistory[previous], read);
+        Use(m_aoHistory[current], write);
+        Dispatch(Pass::Ao, {.input0 = main ? m_aoHistory[previous].srv : kInvalidView, .output0 = m_aoHistory[current].uav, .step = 0});
+        Use(m_aoHistory[current], read);
+        Use(m_ao, write);
+        Dispatch(Pass::Ao, {.input0 = m_aoHistory[current].srv, .output0 = m_ao.uav, .step = 1});
+        Use(m_ao, read);
+        constants.aoView = m_ao.srv;
+        if (rayReconstruction)
+            reinterpret_cast<FrameConstants*>(slotConstants + kConstantsStride)->aoView = m_ao.srv;
+    }
+    PassArgs trace = {.input1 = m_directRemainder.srv, .input2 = m_direct[previous].srv, .output0 = m_giRaw.uav};
+    Texture* indirect = nullptr;
     // Untraced views and the distant 3D skybox (traced for reflections and sun shadows only) take the sky's
     // light as their indirect light.
     if (constants.traceMask == 0 || inputs.kind == gbuffer::ViewKind::Skybox) {
-        indirect = nullptr;
         mark();
         mark();
         mark();
-    } else if (constants.traceMask != 0 && !main) {
-        Use(m_giFiltered[0], read);
+    } else if (!main) {
         Use(m_giRaw, write);
-        Dispatch(Pass::GiTrace, {kInvalidView, 0, 0, m_giRaw.uav, 0, kViewmodelIndirectSamples});
+        trace.step = kViewmodelIndirectSamples;
+        Dispatch(Pass::GiTrace, trace);
         mark();
         mark();
         Texture* source = &m_giRaw;
@@ -797,60 +1076,101 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
             Texture* target = &m_viewmodelIndirect[i % 2];
             Use(*source, read);
             Use(*target, write);
-            Dispatch(Pass::GiFilter, {source->srv, 0, 0, target->uav, 0, kFilterSteps[i]});
+            Dispatch(Pass::GiFilter, {.input0 = source->srv, .input2 = i == 0 ? 1u : 0u, .output0 = target->uav, .step = kFilterSteps[i]});
             source = target;
         }
         indirect = source;
         mark();
-    } else if (constants.traceMask != 0 && rayReconstruction) {
-        // Ray Reconstruction denoises the raw estimate itself.
+    } else {
+        if (m_lastDenoised != nullptr) {
+            Use(*m_lastDenoised, read);
+            trace.input0 = m_lastDenoised->srv;
+        }
         Use(m_giRaw, write);
-        Dispatch(Pass::GiTrace, {kInvalidView, 0, 0, m_giRaw.uav});
-        indirect = &m_giRaw;
-        mark();
-        mark();
-        mark();
-    } else if (constants.traceMask != 0) {
-        Use(m_giFiltered[0], read);
-        Use(m_giRaw, write);
-        Dispatch(Pass::GiTrace, {m_giFiltered[0].srv, 0, 0, m_giRaw.uav});
+        Dispatch(Pass::GiTrace, trace);
         mark();
         Use(m_giRaw, read);
         Use(m_giHistory[previous], read);
+        Use(m_giMoments[previous], read);
         Use(m_giHistory[current], write);
-        Dispatch(Pass::GiTemporal, {m_giRaw.srv, m_giHistory[previous].srv, 0, m_giHistory[current].uav});
+        Use(m_giMoments[current], write);
+        Dispatch(Pass::GiTemporal, {.input0 = m_giRaw.srv, .input1 = m_giHistory[previous].srv, .input2 = m_giMoments[previous].srv,
+            .output0 = m_giHistory[current].uav, .output1 = m_giMoments[current].uav});
+        Use(m_giMoments[current], read);
         mark();
         Texture* source = &m_giHistory[current];
-        for (size_t i = 0; i < std::size(kFilterSteps) && GetSettings().denoiser; ++i) {
+        // Ray Reconstruction denoises the raw estimate itself; the accumulation still serves indirect rays and
+        // reflections.
+        for (size_t i = 0; i < std::size(kFilterSteps) && GetSettings().denoiser && !rayReconstruction; ++i) {
             Texture* target = &m_giFiltered[i % 2];
             Use(*source, read);
             Use(*target, write);
-            Dispatch(Pass::GiFilter, {source->srv, 0, 0, target->uav, 0, kFilterSteps[i]});
+            Dispatch(Pass::GiFilter, {.input0 = source->srv, .input1 = i == 0 ? m_giMoments[current].srv : kInvalidView, .input2 = i == 0 ? 1u : 0u,
+                .output0 = target->uav, .step = kFilterSteps[i]});
             source = target;
         }
         indirect = source;
         mark();
     }
+    if (main)
+        m_lastDenoised = indirect;
+    Texture* shaded = indirect != nullptr && rayReconstruction ? &m_giRaw : indirect;
     UINT reflections = kInvalidView;
     if (constants.traceMask != 0) {
         Use(m_lit[previous], read);
         Use(m_reflections, write);
+        PassArgs args = {.input0 = m_lit[previous].srv, .output0 = m_reflections.uav};
+        if (indirect != nullptr) {
+            Use(*indirect, read);
+            args.input1 = indirect->srv;
+        }
         if (rayReconstruction) {
             Use(m_rrSpecularAlbedo, write);
             Use(m_rrRoughness, write);
-            Dispatch(Pass::Reflections, {m_lit[previous].srv, 0, 0, m_reflections.uav, m_rrSpecularAlbedo.uav, 0, m_rrRoughness.uav});
-        } else {
-            Dispatch(Pass::Reflections, {m_lit[previous].srv, 0, 0, m_reflections.uav, kInvalidView});
+            Use(m_rrHitDistance, write);
+            args.output1 = m_rrSpecularAlbedo.uav;
+            args.output2 = m_rrRoughness.uav;
+            args.output3 = m_rrHitDistance.uav;
         }
+        Dispatch(Pass::Reflections, args);
         Use(m_reflections, read);
         reflections = m_reflections.srv;
+        // Ray Reconstruction takes the raw reflections with their guides.
+        if (main && !rayReconstruction) {
+            Use(m_reflectionHistory[previous], read);
+            Use(m_reflectionHistory[current], write);
+            Dispatch(Pass::ReflectionTemporal, {.input0 = m_reflections.srv, .input1 = m_reflectionHistory[previous].srv,
+                .output0 = m_reflectionHistory[current].uav, .step = m_reflectionHistoryValid ? 1u : 0u});
+            Use(m_reflectionHistory[current], read);
+            reflections = m_reflectionHistory[current].srv;
+        }
     }
+    if (main)
+        m_reflectionHistoryValid = reflections != kInvalidView && !rayReconstruction;
     mark();
-    if (indirect != nullptr)
-        Use(*indirect, read);
+    if (volumetrics && constants.traceMask != 0) {
+        const UINT halfWidth = (m_gridWidth + 1) / 2;
+        const UINT halfHeight = (m_gridHeight + 1) / 2;
+        Use(m_volumetricMarch, write);
+        DispatchGroups(Pass::Volumetrics, {.output0 = m_volumetricMarch.uav, .step = 0}, (halfWidth + 7) / 8, (halfHeight + 7) / 8, 1);
+        Use(m_volumetricMarch, read);
+        Use(m_volumetricHistory[previous], read);
+        Use(m_volumetricHistory[current], write);
+        DispatchGroups(Pass::Volumetrics, {.input0 = m_volumetricMarch.srv, .input1 = m_volumetricHistory[previous].srv,
+            .input2 = m_volumetricHistoryValid ? 1u : 0u, .output0 = m_volumetricHistory[current].uav, .step = 1}, (halfWidth + 7) / 8, (halfHeight + 7) / 8, 1);
+        Use(m_volumetricHistory[current], read);
+        constants.volumetricView = m_volumetricHistory[current].srv;
+        if (rayReconstruction)
+            reinterpret_cast<FrameConstants*>(slotConstants + kConstantsStride)->volumetricView = m_volumetricHistory[current].srv;
+    }
+    if (main)
+        m_volumetricHistoryValid = volumetrics && constants.traceMask != 0 && constants.historyValid != 0;
+    if (shaded != nullptr)
+        Use(*shaded, read);
     Use(m_giRaw, read);
     Use(m_lit[current], write);
-    Dispatch(Pass::Lighting, {indirect != nullptr ? indirect->srv : kInvalidView, m_giRaw.srv, reflections, m_lit[current].uav});
+    Dispatch(Pass::Lighting, {.input0 = shaded != nullptr ? shaded->srv : kInvalidView, .input1 = m_giRaw.srv, .input2 = reflections,
+        .input3 = direct.srv, .input4 = m_directRemainder.srv, .output0 = m_lit[current].uav});
     mark();
     // The 3D skybox is drawn before the main view, which covers it again, so only the main view is resolved.
     Texture* output = &m_lit[current];
@@ -860,10 +1180,13 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
         Use(m_surface[current], read);
         Use(m_rrSpecularAlbedo, read);
         Use(m_rrRoughness, read);
+        Use(m_rrHitDistance, read);
         Use(m_rrOutput, write);
-        const RayReconstruction::Inputs rr{m_lit[current].resource.Get(), m_rrInputs[RrDepth].resource.Get(), m_rrInputs[RrMotion].resource.Get(),
+        SplitViewProjection(constants.viewProj, constants.eyePosition, m_worldToView, m_viewToClip);
+        const RayReconstruction::Inputs rr{m_lit[current].resource.Get(), m_rrInputs[RrDepth].resource.Get(), m_motion.resource.Get(),
             m_surface[current].resource.Get(), m_rrInputs[RrAlbedo].resource.Get(), m_rrSpecularAlbedo.resource.Get(), m_rrRoughness.resource.Get(),
-            m_rrOutput.resource.Get(), renderWidth, renderHeight, inputs.jitterX, inputs.jitterY, !m_historyValid};
+            m_rrHitDistance.resource.Get(), m_rrOutput.resource.Get(), m_worldToView, m_viewToClip, renderWidth, renderHeight, inputs.jitterX,
+            inputs.jitterY, !m_historyValid};
         rayReconstructed = m_rayReconstruction.Evaluate(m_list.Get(), GetSettings().dlssMode, m_width, m_height, rr);
         // NGX leaves its own descriptor heap and root signature bound.
         bindCompute(slotConstantsGpu);
@@ -872,18 +1195,18 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
         if (rayReconstructed) {
             Use(m_rrOutput, read);
             Use(m_resolved, write);
-            Dispatch(Pass::DlssResolve, {m_rrOutput.srv, 0, 0, m_resolved.uav});
+            Dispatch(Pass::DlssResolve, {.input0 = m_rrOutput.srv, .output0 = m_resolved.uav});
             output = &m_resolved;
         }
     } else if (main && GetSettings().antiAliasing == AntiAliasing::Temporal) {
         Use(m_lit[current], read);
         Use(m_taaHistory[previous], read);
         Use(m_taaHistory[current], write);
-        Dispatch(Pass::TemporalAntiAliasing, {m_lit[current].srv, m_taaHistory[previous].srv, 0, m_taaHistory[current].uav, 0,
-            m_taaHistoryValid ? 1u : 0u});
+        Dispatch(Pass::TemporalAntiAliasing, {.input0 = m_lit[current].srv, .input1 = m_taaHistory[previous].srv, .output0 = m_taaHistory[current].uav,
+            .step = m_taaHistoryValid ? 1u : 0u});
         Use(m_taaHistory[current], read);
         Use(m_resolved, write);
-        Dispatch(Pass::Sharpen, {m_taaHistory[current].srv, 0, 0, m_resolved.uav});
+        Dispatch(Pass::Sharpen, {.input0 = m_taaHistory[current].srv, .output0 = m_resolved.uav});
         output = &m_resolved;
     }
     m_taaHistoryValid = main ? output == &m_resolved && !rayReconstruction : m_taaHistoryValid;
@@ -929,6 +1252,22 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     queue->Signal(m_fence.Get(), ++m_fenceValue);
     m_slotFenceValues[slot] = m_fenceValue;
     ReturnResources(resources9, static_cast<UINT>(resources9.size()));
+    if (probe) {
+        m_probeRequested = false;
+        WaitForGpu();
+        uint32_t data[kProbeBytes / 4] = {};
+        void* mapped = nullptr;
+        const D3D12_RANGE range = {0, kProbeBytes};
+        if (SUCCEEDED(m_probeReadback->Map(0, &range, &mapped))) {
+            std::memcpy(data, mapped, sizeof(data));
+            const D3D12_RANGE written = {0, 0};
+            m_probeReadback->Unmap(0, &written);
+            ProbeResult result = {data[0], data[1], std::bit_cast<float>(data[2]), std::bit_cast<float>(data[3]),
+                {std::bit_cast<float>(data[4]), std::bit_cast<float>(data[5]), std::bit_cast<float>(data[6])}, -1, 0};
+            std::tie(result.model, result.mask) = scene.InstanceInfo(result.instance);
+            m_probe = result;
+        }
+    }
     ++m_run;
     if (main) {
         std::memcpy(m_prevViewProj, constants.viewProj, sizeof(m_prevViewProj));

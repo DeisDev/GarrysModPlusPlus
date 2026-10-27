@@ -105,9 +105,11 @@ void SkinnedCasters::Clear()
     m_states.clear();
 }
 
-void SkinnedCasters::Record(ID3D12GraphicsCommandList4* list, UINT slotIndex, const std::vector<SkinnedEntity>& entities, std::vector<SceneInstance>& instances)
+void SkinnedCasters::Record(ID3D12GraphicsCommandList4* list, const std::vector<SkinnedEntity>& entities, std::vector<SceneInstance>& instances)
 {
     ++m_frame;
+    if (!entities.empty())
+        ++m_records;
     bool recorded = false;
     std::vector<studio::Matrix3x4> skin;
     for (const SkinnedEntity& entity : entities) {
@@ -117,7 +119,11 @@ void SkinnedCasters::Record(ID3D12GraphicsCommandList4* list, UINT slotIndex, co
             state.model = entity.model;
         }
         state.lastSeen = m_frame;
-        SlotState& slot = state.slots[slotIndex % Scene::kFrameSlots];
+        const SlotState& previousSlot = state.slots[state.slot];
+        const UINT previousPositions = state.lastRecord + 1 == m_records && previousSlot.built ? previousSlot.verticesView : DescriptorHeap::kInvalid;
+        state.slot = (state.slot + 1) % Scene::kFrameSlots;
+        state.lastRecord = m_records;
+        SlotState& slot = state.slots[state.slot];
         const SkinnedModel& model = *entity.model;
         if (!PrepareSlot(slot, model))
             continue;
@@ -163,6 +169,7 @@ void SkinnedCasters::Record(ID3D12GraphicsCommandList4* list, UINT slotIndex, co
         instance.model = entity.sceneModel;
         instance.blas = slot.blas->GetGPUVirtualAddress();
         instance.positionsView = slot.verticesView;
+        instance.previousPositionsView = previousPositions;
         instance.mask = entity.mask;
         std::memset(instance.transform, 0, sizeof(instance.transform));
         instance.transform[0][0] = instance.transform[1][1] = instance.transform[2][2] = 1.0f;

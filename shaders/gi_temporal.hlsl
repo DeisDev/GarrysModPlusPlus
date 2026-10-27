@@ -1,10 +1,16 @@
 #include "common.hlsli"
 
-// Accumulates the raw indirect estimate over frames. Last frame's history is reprojected with bilinear taps
-// that are each rejected when the surface there differs (distance or normal).
-// input0: raw estimate; input1: last frame's history (rgb irradiance, a sample count); output0: new history.
+// Accumulates the raw light estimate over frames, with the first two moments of its luminance for the denoiser's
+// variance (gi_filter.hlsl). Last frame's history is found with the motion vectors (shaders/primary.hlsl) and read
+// with bilinear taps that are each rejected when the surface there differs (distance or normal). Once a few
+// samples are in, a sample far brighter than the history's spread is scaled down before it is blended in; the
+// moments keep its true luminance, so lasting changes widen the spread and get through.
+// input0: raw estimate; input1: last frame's history (rgb, sample count); input2: last frame's moments;
+// output0: new history; output1: new moments.
 
 static const float kMaxSamples = 32.0;
+static const float kClampSamples = 4.0;
+static const float kClampDeviations = 4.0;
 
 [RootSignature(ROOT_SIGNATURE)]
 [numthreads(8, 8, 1)]
@@ -14,42 +20,56 @@ void main(uint3 id : SV_DispatchThreadID)
         return;
     int2 pixel = int2(id.xy);
     RWTexture2D<float4> output = ResourceDescriptorHeap[g_pass.output0];
+    RWTexture2D<float2> momentsOutput = ResourceDescriptorHeap[g_pass.output1];
     Texture2D<float4> raw = ResourceDescriptorHeap[g_pass.input0];
     Texture2D<float4> history = ResourceDescriptorHeap[g_pass.input1];
+    Texture2D<float2> historyMoments = ResourceDescriptorHeap[g_pass.input2];
     float4 surface = SurfaceAt(g_frame.surfaceView, pixel);
     if (surface.w <= 0.0) {
         output[pixel] = 0.0;
+        momentsOutput[pixel] = 0.0;
         return;
     }
     float3 current = raw.Load(int3(pixel, 0)).rgb;
-    float3 position = WorldPositionFromDepth(pixel, DepthAt(pixel));
+    float luminance = Luminance(current);
 
     float4 accumulated = 0.0;
+    float2 moments = 0.0;
     float weightSum = 0.0;
     if (g_frame.historyValid != 0) {
-        float4 clip = mul(g_frame.prevViewProj, float4(position, 1.0));
-        float2 previous = float2(clip.x / clip.w * 0.5 + 0.5, 0.5 - clip.y / clip.w * 0.5) * float2(g_frame.size) - 0.5;
+        Texture2D<float2> motion = ResourceDescriptorHeap[g_frame.motionView];
+        Texture2D<float> previousDistance = ResourceDescriptorHeap[g_frame.previousDistanceView];
+        float2 previous = float2(pixel) + motion.Load(int3(pixel, 0));
         int2 base = int2(floor(previous));
         float2 f = previous - float2(base);
-        float distance = length(position - g_frame.prevEyePosition);
+        float distance = previousDistance.Load(int3(pixel, 0));
         [unroll]
         for (int i = 0; i < 4; ++i) {
             int2 tap = base + int2(i & 1, i >> 1);
-            if (clip.w <= 0.0 || any(tap < 0) || any(tap >= int2(g_frame.size)))
+            if (any(tap < 0) || any(tap >= int2(g_frame.size)))
                 continue;
             float4 previousSurface = SurfaceAt(g_frame.prevSurfaceView, tap);
             if (previousSurface.w <= 0.0 || abs(previousSurface.w - distance) > 2.0 + distance * 0.01 || dot(previousSurface.xyz, surface.xyz) < 0.9)
                 continue;
             float weight = (i & 1 ? f.x : 1.0 - f.x) * (i >> 1 ? f.y : 1.0 - f.y);
             accumulated += history.Load(int3(tap, 0)) * weight;
+            moments += historyMoments.Load(int3(tap, 0)) * weight;
             weightSum += weight;
         }
     }
     if (weightSum < 1e-3) {
         output[pixel] = float4(current, 1.0);
+        momentsOutput[pixel] = float2(luminance, luminance * luminance);
         return;
     }
     accumulated /= weightSum;
+    moments /= weightSum;
     float samples = min(accumulated.a + 1.0, kMaxSamples);
+    if (accumulated.a >= kClampSamples) {
+        float limit = moments.x + kClampDeviations * sqrt(max(moments.y - moments.x * moments.x, 0.0));
+        if (luminance > limit)
+            current *= limit / luminance;
+    }
     output[pixel] = float4(lerp(accumulated.rgb, current, 1.0 / samples), samples);
+    momentsOutput[pixel] = lerp(moments, float2(luminance, luminance * luminance), 1.0 / samples);
 }

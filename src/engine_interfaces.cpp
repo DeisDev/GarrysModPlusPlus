@@ -22,6 +22,9 @@ using CreateInterfaceFn = void*(__cdecl*)(const char* name, int* returnCode);
 constexpr int kGetLocalPlayerSlot = 12;
 constexpr int kGetLevelNameSlot = 51;
 constexpr int kClientCmdUnrestrictedSlot = 106;
+// GetLightForPoint (slot 1, engine.dll+0x7ee20) calls this slot (engine.dll+0x7d210), which forwards its
+// arguments to the engine's lighting function (engine.dll+0x1df6d0; Ghidra).
+constexpr int kComputeLightingSlot = 67;
 constexpr int kReadSlot = 0;
 constexpr int kOpenSlot = 2;
 constexpr int kCloseSlot = 3;
@@ -102,6 +105,11 @@ void TryInitialize()
 }
 
 bool Ready() { return g_engineClient != nullptr && g_fileSystem != nullptr; }
+
+ComputeLightingFn ComputeLightingFunction()
+{
+    return g_engineClient != nullptr ? Slot<ComputeLightingFn>(g_engineClient, kComputeLightingSlot) : nullptr;
+}
 
 std::string LevelName()
 {

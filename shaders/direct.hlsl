@@ -1,0 +1,118 @@
+#include "scene.hlsli"
+
+// Direct light of each G-buffer pixel. The sun and the kExactLights strongest local lights get a shadow ray each;
+// the other lights share kRemainderSamples shadow rays, picked in proportion to their light in one pass (weighted
+// reservoir sampling) and weighted to keep the sum unbiased. The exact part stays sharp; the noisy remainder is
+// added to the indirect estimate (gi_trace.hlsl) and denoised with it.
+// output0: exact direct irradiance (rgb) and sun visibility (a); output1: sampled remainder.
+
+static const uint kExactLights = 4;
+static const uint kRemainderSamples = 2;
+
+[RootSignature(ROOT_SIGNATURE)]
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id.xy >= g_frame.size))
+        return;
+    int2 pixel = int2(id.xy);
+    RWTexture2D<float4> exactOutput = ResourceDescriptorHeap[g_pass.output0];
+    RWTexture2D<float4> remainderOutput = ResourceDescriptorHeap[g_pass.output1];
+    float4 surface = SurfaceAt(g_frame.surfaceView, pixel);
+    if (surface.w <= 0.0) {
+        exactOutput[pixel] = 0.0;
+        remainderOutput[pixel] = 0.0;
+        return;
+    }
+    float3 normal = surface.xyz;
+    float3 position = LitPosition(WorldPositionFromDepth(pixel, DepthAt(pixel)));
+    float3 origin = position + normal * (g_frame.normalBias * (1.0 + surface.w * 0.002));
+    uint seed = PixelSeed(pixel, 0x2Du);
+
+    float3 exact = 0.0;
+    float sunVisibility = 0.0;
+    float lambert = saturate(dot(normal, g_frame.sunDirection));
+    if (g_frame.sunEnabled != 0.0 && lambert > 0.0) {
+        sunVisibility = SunVisibility(origin);
+        exact += g_frame.sunColor * lambert * sunVisibility;
+    }
+
+    LightSet set = LightSetAt(position, normal);
+    uint top[kExactLights];
+    float topWeight[kExactLights];
+    uint picked[kRemainderSamples];
+    float pickedWeight[kRemainderSamples];
+    [unroll]
+    for (uint k = 0; k < kExactLights; ++k) {
+        top[k] = 0;
+        topWeight[k] = 0.0;
+    }
+    [unroll]
+    for (uint s = 0; s < kRemainderSamples; ++s) {
+        picked[s] = 0;
+        pickedWeight[s] = 1.0;
+    }
+    float remainder = 0.0;
+    for (uint i = 0; i < set.count; ++i) {
+        float3 toLight;
+        float distance;
+        float weight = Luminance(SetLightIrradiance(set, i, position, normal, toLight, distance));
+        if (weight <= VisibleIrradiance())
+            continue;
+        // Insert into the strongest lights; whatever drops out (this light or a displaced one) joins the remainder.
+        uint candidate = i;
+        float candidateWeight = weight;
+        [unroll]
+        for (uint k = 0; k < kExactLights; ++k) {
+            if (candidateWeight > topWeight[k]) {
+                uint index = top[k];
+                float w = topWeight[k];
+                top[k] = candidate;
+                topWeight[k] = candidateWeight;
+                candidate = index;
+                candidateWeight = w;
+            }
+        }
+        if (candidateWeight <= 0.0)
+            continue;
+        remainder += candidateWeight;
+        [unroll]
+        for (uint s = 0; s < kRemainderSamples; ++s) {
+            if (Random(seed) * remainder < candidateWeight) {
+                picked[s] = candidate;
+                pickedWeight[s] = candidateWeight;
+            }
+        }
+    }
+    [unroll]
+    for (uint k = 0; k < kExactLights; ++k) {
+        if (topWeight[k] <= 0.0)
+            break;
+        float3 toLight;
+        float distance;
+        float3 light = SetLightIrradiance(set, top[k], position, normal, toLight, distance);
+        bool attached = IsAttachedLight(set, top[k]);
+        exact += light * Transmittance(origin, toLight, ShadowRayLength(attached, distance), ShadowMask(attached));
+    }
+    float3 sampled = 0.0;
+    if (remainder > 0.0) {
+        [unroll]
+        for (uint s = 0; s < kRemainderSamples; ++s) {
+            float3 toLight;
+            float distance;
+            float3 light = SetLightIrradiance(set, picked[s], position, normal, toLight, distance);
+            bool attached = IsAttachedLight(set, picked[s]);
+            float transmittance = Transmittance(origin, toLight, ShadowRayLength(attached, distance), ShadowMask(attached));
+            sampled += ClampSample(light * (transmittance * remainder / (pickedWeight[s] * kRemainderSamples)));
+        }
+    }
+    exactOutput[pixel] = float4(exact, sunVisibility);
+    remainderOutput[pixel] = float4(sampled, 1.0);
+    if (g_frame.probeView != kNoView && all(uint2(pixel) == uint2(g_frame.probePixel & 0xFFFF, g_frame.probePixel >> 16))) {
+        RWByteAddressBuffer probe = ResourceDescriptorHeap[g_frame.probeView];
+        HitInfo hit;
+        bool blocked = TraceHit(origin, g_frame.sunDirection, 65536.0, g_frame.traceMask, hit);
+        probe.Store4(0, uint4(blocked ? hit.instance : kNoView, hit.primitive, asuint(hit.t), asuint(sunVisibility)));
+        probe.Store4(16, uint4(asuint(origin), 0));
+    }
+}

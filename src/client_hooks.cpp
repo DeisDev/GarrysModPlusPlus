@@ -36,6 +36,8 @@ void __fastcall HookDrawTranslucentRenderables(void* view, bool inSkybox, bool s
     if (!shadowDepth)
         effects::OnViewOpaqueEnd(inSkybox);
     g_drawTranslucentRenderables(view, inSkybox, shadowDepth);
+    if (!shadowDepth)
+        effects::OnViewTranslucentEnd();
 }
 
 bool Install(HMODULE clientModule, const char* label, const char* name, void* hook, void** original)

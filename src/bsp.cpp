@@ -36,12 +36,11 @@ constexpr int kLumpWorldLightsHdr = 54;
 constexpr int32_t kSurfSky2D = 0x0002;
 constexpr int32_t kSurfSky = 0x0004;
 constexpr int32_t kSurfWarp = 0x0008;
-constexpr int32_t kSurfTrans = 0x0010;
 constexpr int32_t kSurfTrigger = 0x0040;
 constexpr int32_t kSurfNoDraw = 0x0080;
 constexpr int32_t kSurfHint = 0x0100;
 constexpr int32_t kSurfSkip = 0x0200;
-constexpr int32_t kSkippedSurfaces = kSurfSky2D | kSurfSky | kSurfWarp | kSurfTrans | kSurfTrigger | kSurfNoDraw | kSurfHint | kSurfSkip;
+constexpr int32_t kSkippedSurfaces = kSurfSky2D | kSurfSky | kSurfWarp | kSurfTrigger | kSurfNoDraw | kSurfHint | kSurfSkip;
 
 constexpr int32_t kStaticPropLumpId = ('s' << 24) | ('p' << 16) | ('r' << 8) | 'p';
 constexpr size_t kStaticPropNameLength = 128;
@@ -365,7 +364,12 @@ bool AddDisplacement(Mesh& mesh, const Lumps& lumps, const Face& face, const Dis
             uint32_t b = a + 1;
             uint32_t c = a + post;
             uint32_t d = c + 1;
-            mesh.indices.insert(mesh.indices.end(), {a, b, d, a, d, c});
+            // The engine alternates the diagonal by vertex index (CCoreDispInfo::GetTriangleIndicesForDispBBox); on
+            // curved displacements the other split lies a few units off the drawn surface and shadows it.
+            if ((i * post + j) % 2 == 1)
+                mesh.indices.insert(mesh.indices.end(), {a, c, b, b, c, d});
+            else
+                mesh.indices.insert(mesh.indices.end(), {a, c, d, a, d, b});
             mesh.triangleAlbedo.insert(mesh.triangleAlbedo.end(), {albedo, albedo});
             mesh.triangleMaterials.insert(mesh.triangleMaterials.end(), {material, material});
         }
@@ -419,6 +423,24 @@ struct AreaLocator {
         Leaf leaf;
         std::memcpy(&leaf, leafBytes.data() + leafIndex * leafStride, sizeof(leaf));
         return leaf.areaFlags & 0x1FF;
+    }
+
+    // The bounds of an area's leaves; false when it has none.
+    bool Bounds(int area, Float3& mins, Float3& maxs) const
+    {
+        bool found = false;
+        for (size_t offset = 0; offset + sizeof(Leaf) <= leafBytes.size(); offset += leafStride) {
+            Leaf leaf;
+            std::memcpy(&leaf, leafBytes.data() + offset, sizeof(leaf));
+            if ((leaf.areaFlags & 0x1FF) != area || leaf.contents != 0)
+                continue;
+            const Float3 low = {static_cast<float>(leaf.mins[0]), static_cast<float>(leaf.mins[1]), static_cast<float>(leaf.mins[2])};
+            const Float3 high = {static_cast<float>(leaf.maxs[0]), static_cast<float>(leaf.maxs[1]), static_cast<float>(leaf.maxs[2])};
+            mins = found ? Float3{std::min(mins.x, low.x), std::min(mins.y, low.y), std::min(mins.z, low.z)} : low;
+            maxs = found ? Float3{std::max(maxs.x, high.x), std::max(maxs.y, high.y), std::max(maxs.z, high.z)} : high;
+            found = true;
+        }
+        return found;
     }
 };
 
@@ -476,7 +498,7 @@ void ReadVisibility(std::span<const std::byte> file, const Header& header, Visib
     for (size_t offset = 0; offset < static_cast<size_t>(leafLump.length); offset += leafStride) {
         Leaf leaf;
         std::memcpy(&leaf, file.data() + leafLump.offset + offset, sizeof(leaf));
-        leaves.push_back({leaf.cluster < clusterCount ? leaf.cluster : -1,
+        leaves.push_back({leaf.cluster < clusterCount ? leaf.cluster : -1, leaf.areaFlags & 0x1FF,
             {static_cast<float>(leaf.mins[0]), static_cast<float>(leaf.mins[1]), static_cast<float>(leaf.mins[2])},
             {static_cast<float>(leaf.maxs[0]), static_cast<float>(leaf.maxs[1]), static_cast<float>(leaf.maxs[2])}});
     }
@@ -497,6 +519,37 @@ void ReadVisibility(std::span<const std::byte> file, const Header& header, Visib
     visibility.nodes = std::move(tree);
     visibility.leaves = std::move(leaves);
 }
+
+}
+
+bool InBounds(Float3 point, Float3 mins, Float3 maxs)
+{
+    return point.x >= mins.x && point.y >= mins.y && point.z >= mins.z && point.x <= maxs.x && point.y <= maxs.y && point.z <= maxs.z;
+}
+
+bool WorldGeometry::InSkybox(Float3 point) const
+{
+    if (skyArea < 0)
+        return false;
+    if (InBounds(point, skyMins, skyMaxs))
+        return true;
+    const int32_t leaf = visibility.LeafAt(point);
+    return leaf >= 0 && static_cast<size_t>(leaf) < visibility.leaves.size() && visibility.leaves[leaf].area == skyArea;
+}
+
+int32_t Visibility::LeafAt(Float3 point) const
+{
+    if (nodes.empty())
+        return -1;
+    int32_t node = 0;
+    for (size_t steps = 0; node >= 0 && steps <= nodes.size(); ++steps) {
+        const BspNode& current = nodes[node];
+        node = current.children[point.x * current.normal.x + point.y * current.normal.y + point.z * current.normal.z - current.distance >= 0.0f ? 0 : 1];
+    }
+    return node < 0 ? -node - 1 : -1;
+}
+
+namespace {
 
 std::optional<AreaLocator> MakeAreaLocator(std::span<const std::byte> file, const Header& header)
 {
@@ -684,7 +737,11 @@ bool LoadWorld(std::span<const std::byte> file, WorldGeometry& world, std::strin
     // occlude the main view's rays, so faces and props in the sky camera's area are kept apart.
     const std::optional<AreaLocator> areas = MakeAreaLocator(file, header);
     const std::optional<Float3> skyCamera = SkyCameraOrigin(file, header);
-    const int skyArea = areas && skyCamera ? areas->AreaAt(*skyCamera) : -1;
+    int skyArea = areas && skyCamera ? areas->AreaAt(*skyCamera) : -1;
+    if (skyArea >= 0 && !areas->Bounds(skyArea, world.skyMins, world.skyMaxs))
+        skyArea = -1;
+    world.skyArea = skyArea;
+    const auto inSkybox = [&](Float3 point) { return skyArea >= 0 && (InBounds(point, world.skyMins, world.skyMaxs) || areas->AreaAt(point) == skyArea); };
     auto planes = LumpArray<Plane>(file, header, kLumpPlanes);
     const Model& worldModel = (*models)[0];
     std::vector<Float3> polygon;
@@ -702,7 +759,7 @@ bool LoadWorld(std::span<const std::byte> file, WorldGeometry& world, std::strin
             Float3 normal = (*planes)[face.planeNum].normal;
             if (face.side != 0)
                 normal = Scale(normal, -1.0f);
-            if (areas->AreaAt(Add(center, normal)) == skyArea) {
+            if (inSkybox(Add(center, normal))) {
                 if (face.dispinfo >= 0 && static_cast<size_t>(face.dispinfo) < lumps.dispinfos.size())
                     AddDisplacement(world.skybox, lumps, face, lumps.dispinfos[face.dispinfo], polygon);
                 else
@@ -738,12 +795,10 @@ bool LoadWorld(std::span<const std::byte> file, WorldGeometry& world, std::strin
     ReadStaticProps(file, header, world);
     if (skyArea >= 0) {
         for (const StaticProp& prop : world.props) {
-            if (areas->AreaAt({prop.transform[0][3], prop.transform[1][3], prop.transform[2][3]}) == skyArea)
+            if (inSkybox({prop.transform[0][3], prop.transform[1][3], prop.transform[2][3]}))
                 world.skyboxProps.push_back(prop);
         }
-        std::erase_if(world.props, [&](const StaticProp& prop) {
-            return areas->AreaAt({prop.transform[0][3], prop.transform[1][3], prop.transform[2][3]}) == skyArea;
-        });
+        std::erase_if(world.props, [&](const StaticProp& prop) { return inSkybox({prop.transform[0][3], prop.transform[1][3], prop.transform[2][3]}); });
     }
     if (world.mesh.indices.empty()) {
         error = "the world model has no drawable faces";

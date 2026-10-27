@@ -22,7 +22,11 @@ public:
         ID3D12Resource* diffuseAlbedo;
         ID3D12Resource* specularAlbedo;
         ID3D12Resource* roughness;
+        ID3D12Resource* specularHitDistance;
         ID3D12Resource* output;
+        // Row-major, for row vectors (v' = v M); the hit distances need them.
+        const float* worldToView;
+        const float* viewToClip;
         UINT width;
         UINT height;
         // How far this frame's image is shifted by the jitter, in render pixels (x right, y down).

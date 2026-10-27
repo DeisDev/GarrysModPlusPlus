@@ -31,7 +31,8 @@ struct SkinnedEntity {
 };
 
 // Animated shadow casters: skins vertices on the CPU each frame and refits one BLAS per entity and
-// frame slot, so frames still in flight keep their own copy.
+// frame slot, so frames still in flight keep their own copy. Each entity moves to its next slot every frame it
+// is recorded, which keeps last frame's vertices for motion vectors.
 class SkinnedCasters {
 public:
     void Initialize(ID3D12Device5* device, DescriptorHeap& descriptors)
@@ -40,7 +41,9 @@ public:
         m_descriptors = &descriptors;
     }
     bool PrepareModel(SkinnedModel& model);
-    void Record(ID3D12GraphicsCommandList4* list, UINT slot, const std::vector<SkinnedEntity>& entities, std::vector<SceneInstance>& instances);
+    // Each entity's slot is reused every Scene::kFrameSlots calls with it, so the caller must wait for the frame
+    // that many calls back before recording.
+    void Record(ID3D12GraphicsCommandList4* list, const std::vector<SkinnedEntity>& entities, std::vector<SceneInstance>& instances);
     void Clear();
 
 private:
@@ -56,6 +59,9 @@ private:
         std::shared_ptr<SkinnedModel> model;
         std::array<SlotState, Scene::kFrameSlots> slots;
         uint64_t lastSeen = 0;
+        UINT slot = 0;
+        // The Record call with entities that last included this entity.
+        uint64_t lastRecord = 0;
     };
 
     Microsoft::WRL::ComPtr<ID3D12Resource> CreateBuffer(UINT64 size, D3D12_HEAP_TYPE heap, D3D12_RESOURCE_FLAGS flags, D3D12_RESOURCE_STATES state);
@@ -66,6 +72,7 @@ private:
     DescriptorHeap* m_descriptors = nullptr;
     std::unordered_map<int, EntityState> m_states;
     uint64_t m_frame = 0;
+    uint64_t m_records = 0;
 };
 
 }

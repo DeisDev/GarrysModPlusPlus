@@ -13,6 +13,8 @@ namespace {
 // On-disk layouts from the Source SDK 2013 studio.h / optimize.h (32-bit pointer slots, packed VTX).
 constexpr int32_t kMdlId = 'I' | ('D' << 8) | ('S' << 16) | ('T' << 24);
 constexpr int32_t kVvdId = 'I' | ('D' << 8) | ('S' << 16) | ('V' << 24);
+constexpr size_t kHeaderHullMin = 104;
+constexpr size_t kHeaderViewMin = 128;
 constexpr size_t kHeaderNumBones = 156;
 constexpr size_t kHeaderBoneIndex = 160;
 constexpr size_t kBoneSize = 216;
@@ -206,6 +208,27 @@ int BoneCount(std::span<const std::byte> mdlBytes)
     return mdl.At<int32_t>(kHeaderNumBones).value_or(0);
 }
 
+bool ReadBounds(std::span<const std::byte> mdlBytes, bsp::Float3& mins, bsp::Float3& maxs)
+{
+    Reader mdl(mdlBytes);
+    bool found = false;
+    for (size_t offset : {kHeaderHullMin, kHeaderViewMin}) {
+        auto low = mdl.At<bsp::Float3>(offset);
+        auto high = mdl.At<bsp::Float3>(offset + sizeof(bsp::Float3));
+        if (!low || !high || (low->x == high->x && low->y == high->y && low->z == high->z))
+            continue;
+        if (!found) {
+            mins = *low;
+            maxs = *high;
+            found = true;
+            continue;
+        }
+        mins = {std::min(mins.x, low->x), std::min(mins.y, low->y), std::min(mins.z, low->z)};
+        maxs = {std::max(maxs.x, high->x), std::max(maxs.y, high->y), std::max(maxs.z, high->z)};
+    }
+    return found;
+}
+
 bool ReadPoseToBone(std::span<const std::byte> mdlBytes, std::vector<Matrix3x4>& poseToBone)
 {
     Reader mdl(mdlBytes);
@@ -388,6 +411,74 @@ std::string MaterialTexture(std::string_view vmt, std::string_view key)
     if (path.size() > 4 && path.ends_with(".vtf"))
         path.resize(path.size() - 4);
     return "materials/" + path + ".vtf";
+}
+
+// A .phy file: a phyheader_t (SDK public/phyfile.h), then per solid its byte size and an IVP compact surface,
+// after a 28-byte "VPHY" header in the current format. The surface's 48-byte header ends in "IVPS"; its convex
+// pieces (ledges) follow back to back, each a 16-byte header (point array offset from the piece, client data,
+// flags, triangle count) and 16-byte triangles whose three edges start at the points indexed by the low 16 bits
+// of their last three dwords. The pieces share one array of points (x, y, z, w) in metres on IVP's axes.
+bool ReadCollisionPieces(std::span<const std::byte> phyBytes, std::vector<std::vector<bsp::Float3>>& pieces, std::string& error)
+{
+    constexpr size_t kVphyHeaderSize = 28;
+    constexpr size_t kSurfaceHeaderSize = 48;
+    constexpr size_t kLedgeHeaderSize = 16;
+    constexpr size_t kTriangleSize = 16;
+    constexpr size_t kPointSize = 16;
+    constexpr float kInchesPerMetre = 1.0f / 0.0254f;
+    Reader phy(phyBytes);
+    auto headerSize = phy.At<int32_t>(0);
+    auto solidCount = phy.At<int32_t>(8);
+    if (!headerSize || !solidCount || *headerSize < 16 || *solidCount < 1) {
+        error = "PHY header is invalid";
+        return false;
+    }
+    auto solidSize = phy.At<int32_t>(*headerSize);
+    const size_t solid = static_cast<size_t>(*headerSize) + 4;
+    if (!solidSize || *solidSize <= 0 || solid + *solidSize > phyBytes.size()) {
+        error = "PHY solid is truncated";
+        return false;
+    }
+    const size_t end = solid + *solidSize;
+    const bool vphy = phyBytes.size() >= solid + 4 && std::memcmp(phyBytes.data() + solid, "VPHY", 4) == 0;
+    const size_t surface = solid + (vphy ? kVphyHeaderSize : 0);
+    if (surface + kSurfaceHeaderSize > end || std::memcmp(phyBytes.data() + surface + kSurfaceHeaderSize - 4, "IVPS", 4) != 0) {
+        error = "PHY solid is not an IVP compact surface";
+        return false;
+    }
+    std::vector<std::vector<uint16_t>> indices;
+    size_t points = 0;
+    for (size_t ledge = surface + kSurfaceHeaderSize; points == 0 || ledge < points;) {
+        auto pointOffset = phy.At<int32_t>(ledge);
+        auto triangles = phy.At<uint16_t>(ledge + 12);
+        if (!pointOffset || !triangles || *triangles == 0 || ledge + kLedgeHeaderSize + *triangles * kTriangleSize > end) {
+            error = "PHY convex piece is truncated";
+            return false;
+        }
+        if (points == 0)
+            points = ledge + *pointOffset;
+        std::vector<uint16_t>& piece = indices.emplace_back();
+        for (size_t t = 0; t < *triangles; ++t) {
+            for (size_t e = 0; e < 3; ++e)
+                piece.push_back(*phy.At<uint16_t>(ledge + kLedgeHeaderSize + t * kTriangleSize + 4 + e * 4));
+        }
+        ledge += kLedgeHeaderSize + *triangles * kTriangleSize;
+    }
+    pieces.clear();
+    for (std::vector<uint16_t>& piece : indices) {
+        std::sort(piece.begin(), piece.end());
+        piece.erase(std::unique(piece.begin(), piece.end()), piece.end());
+        std::vector<bsp::Float3>& out = pieces.emplace_back();
+        for (uint16_t index : piece) {
+            auto point = phy.At<bsp::Float3>(points + index * kPointSize);
+            if (!point || points + (index + 1) * kPointSize > end) {
+                error = "PHY point index is out of range";
+                return false;
+            }
+            out.push_back({point->x * kInchesPerMetre, point->z * kInchesPerMetre, -point->y * kInchesPerMetre});
+        }
+    }
+    return true;
 }
 
 std::optional<bsp::Float3> TextureReflectivity(std::span<const std::byte> vtfHeader)

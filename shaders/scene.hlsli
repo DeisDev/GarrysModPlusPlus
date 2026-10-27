@@ -3,9 +3,9 @@
 
 #include "common.hlsli"
 
-// Mirrors Scene::InstanceRecord in src/scene.cpp: descriptor indices of raw buffers. A model's alpha-tested
-// triangles follow its opaque ones in a second BLAS geometry; `alpha` holds one Scene::PackAlpha entry for each,
-// `materials` a material table index per triangle.
+// Mirrors Scene::InstanceRecord in src/scene.cpp: descriptor indices of raw buffers. A model's alpha-tested and
+// translucent triangles follow its opaque ones in a second BLAS geometry; `alpha` holds one Scene::PackAlpha or
+// Scene::PackTranslucent entry for each, `materials` a material table index per triangle.
 struct InstanceRecord
 {
     uint positions;
@@ -15,7 +15,10 @@ struct InstanceRecord
     uint alpha;
     uint opaqueTriangles;
     uint materials;
-    uint padding;
+    // Last frame's vertex positions of a skinned model, or kNoView when they are `positions`.
+    uint previousPositions;
+    // Last frame's object-to-world transform.
+    float4 previousTransform[3];
 };
 
 // Mirrors GpuLight in src/scene.cpp (bsp::Light, VRAD units and falloff).
@@ -32,7 +35,10 @@ struct Light
     float constantAttn;
     float linearAttn;
     float quadraticAttn;
-    float3 padding;
+    // Byte offset in the lights buffer of the convex hulls that block the light (HullBlocks), and their number.
+    uint hullOffset;
+    uint hullCount;
+    float padding;
 };
 
 static const uint kLightSurface = 0;
@@ -65,7 +71,7 @@ struct HitSurface
 InstanceRecord LoadInstance(uint instance)
 {
     ByteAddressBuffer records = ResourceDescriptorHeap[g_frame.instancesView];
-    return records.Load<InstanceRecord>(instance * 32);
+    return records.Load<InstanceRecord>(instance * 80);
 }
 
 float3 UnpackAlbedo(uint packed)
@@ -73,19 +79,41 @@ float3 UnpackAlbedo(uint packed)
     return float3(packed & 0xFF, (packed >> 8) & 0xFF, (packed >> 16) & 0xFF) * (1.0 / 255.0);
 }
 
-// Whether a candidate in a model's alpha-tested geometry is solid where the ray crosses it.
-bool AlphaTestPasses(uint instance, uint alphaPrimitive, float2 barycentrics)
+// Scene::PackTranslucent's flag, and its texture view when the opacity is constant.
+static const uint kTranslucentFlag = 0x80000000u;
+static const uint kNoAlphaTexture = 0xFFFFFFu;
+
+// Opacity where a ray crosses a candidate in a model's non-opaque geometry: 0 or 1 for alpha-tested triangles,
+// texture alpha times $alpha for translucent ones (`translucent`).
+float CandidateOpacity(uint instance, uint alphaPrimitive, float2 barycentrics, out bool translucent)
 {
     InstanceRecord record = LoadInstance(instance);
     ByteAddressBuffer alpha = ResourceDescriptorHeap[record.alpha];
-    ByteAddressBuffer indices = ResourceDescriptorHeap[record.indices];
-    ByteAddressBuffer uvs = ResourceDescriptorHeap[record.uvs];
     uint packed = alpha.Load(alphaPrimitive * 4);
-    uint3 index = indices.Load3((record.opaqueTriangles + alphaPrimitive) * 12);
-    float2 uv0 = uvs.Load<float2>(index.x * 8);
-    float2 uv = uv0 + barycentrics.x * (uvs.Load<float2>(index.y * 8) - uv0) + barycentrics.y * (uvs.Load<float2>(index.z * 8) - uv0);
-    Texture2D<float4> texture = ResourceDescriptorHeap[packed & 0xFFFFFF];
-    return texture.SampleLevel(g_pointWrap, uv, 0.0).a >= (packed >> 24) * (1.0 / 255.0);
+    translucent = (packed & kTranslucentFlag) != 0;
+    float value = ((packed >> 24) & 0x7F) * (1.0 / 127.0);
+    float textureAlpha = 1.0;
+    if ((packed & 0xFFFFFF) != kNoAlphaTexture) {
+        ByteAddressBuffer indices = ResourceDescriptorHeap[record.indices];
+        ByteAddressBuffer uvs = ResourceDescriptorHeap[record.uvs];
+        uint3 index = indices.Load3((record.opaqueTriangles + alphaPrimitive) * 12);
+        float2 uv0 = uvs.Load<float2>(index.x * 8);
+        float2 uv = uv0 + barycentrics.x * (uvs.Load<float2>(index.y * 8) - uv0) + barycentrics.y * (uvs.Load<float2>(index.z * 8) - uv0);
+        Texture2D<float4> texture = ResourceDescriptorHeap[packed & 0xFFFFFF];
+        textureAlpha = texture.SampleLevel(g_pointWrap, uv, 0.0).a;
+    }
+    if (translucent)
+        return saturate(textureAlpha * value);
+    return textureAlpha >= value ? 1.0 : 0.0;
+}
+
+// Rays other than shadow rays stop at candidates at least this opaque.
+static const float kSolidOpacity = 0.5;
+
+bool CandidateIsSolid(uint instance, uint alphaPrimitive, float2 barycentrics)
+{
+    bool translucent;
+    return CandidateOpacity(instance, alphaPrimitive, barycentrics, translucent) >= kSolidOpacity;
 }
 
 // A committed triangle hit: the instance, the triangle's index in its model, and where on it.
@@ -110,13 +138,13 @@ bool TraceHit(float3 origin, float3 direction, float tMax, uint mask, out HitInf
     ray.TMax = tMax;
     query.TraceRayInline(g_scene, RAY_FLAG_NONE, mask, ray);
     while (query.Proceed()) {
-        if (AlphaTestPasses(query.CandidateInstanceID(), query.CandidatePrimitiveIndex(), query.CandidateTriangleBarycentrics()))
+        if (CandidateIsSolid(query.CandidateInstanceID(), query.CandidatePrimitiveIndex(), query.CandidateTriangleBarycentrics()))
             query.CommitNonOpaqueTriangleHit();
     }
     if (query.CommittedStatus() != COMMITTED_TRIANGLE_HIT)
         return false;
     hit.instance = query.CommittedInstanceID();
-    // Geometry 1 is the alpha-tested one; with no opaque triangles the alpha-tested geometry is 0 and starts at 0.
+    // Geometry 1 is the non-opaque one; with no opaque triangles the non-opaque geometry is 0 and starts at 0.
     hit.primitive = query.CommittedPrimitiveIndex() + (query.CommittedGeometryIndex() != 0 ? LoadInstance(hit.instance).opaqueTriangles : 0);
     hit.barycentrics = query.CommittedTriangleBarycentrics();
     hit.t = query.CommittedRayT();
@@ -182,10 +210,41 @@ struct Material
     uint selfIllumMask;
     float envmapContrast;
     float envmapSaturation;
-    float2 padding;
+    uint flags;
+    float padding;
 };
 
 static const uint kNoMaterial = 0xFFFFFFFFu;
+// Material flags (Scene::kMaterialUnlit): the surface shows its albedo as it is.
+static const uint kMaterialUnlit = 1;
+
+// The material flags of a hit triangle, 0 without a material.
+uint MaterialFlags(HitInfo hit)
+{
+    InstanceRecord record = LoadInstance(hit.instance);
+    if (record.materials == kNoView)
+        return 0;
+    ByteAddressBuffer materials = ResourceDescriptorHeap[record.materials];
+    uint index = materials.Load(hit.primitive * 4);
+    if (index == kNoMaterial)
+        return 0;
+    ByteAddressBuffer table = ResourceDescriptorHeap[g_frame.materialsView];
+    return table.Load(index * 48 + 40);
+}
+
+// The triangle a G-buffer pixel shows, from shaders/primary.hlsl; false where none matches.
+bool VisibleHit(int2 pixel, out HitInfo hit)
+{
+    hit = (HitInfo)0;
+    Texture2D<uint4> visibility = ResourceDescriptorHeap[g_frame.visibilityView];
+    uint4 visible = visibility.Load(int3(pixel, 0));
+    if (visible.x == kNoView)
+        return false;
+    hit.instance = visible.x;
+    hit.primitive = visible.y;
+    hit.barycentrics = asfloat(visible.zw);
+    return true;
+}
 static const uint kMaskOff = 0xFFFFFFFFu;
 
 // A hit triangle's material, or false when its model has none. `uvPerUnit` is how far its texture coordinates
@@ -236,10 +295,12 @@ float MaskValue(uint mask, float2 uv, float footprint)
     return (mask & (1u << 26)) != 0 ? 1.0 - value : value;
 }
 
-bool Occluded(float3 origin, float3 direction, float tMax, uint mask)
+// The share of light that gets from `origin` to tMax along a ray: 0 past anything solid, otherwise the product of
+// what each translucent surface crossed lets through.
+float Transmittance(float3 origin, float3 direction, float tMax, uint mask)
 {
     if (mask == 0)
-        return false;
+        return 1.0;
     RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER> query;
     RayDesc ray;
     ray.Origin = origin;
@@ -247,16 +308,21 @@ bool Occluded(float3 origin, float3 direction, float tMax, uint mask)
     ray.TMin = 0.5;
     ray.TMax = tMax;
     query.TraceRayInline(g_scene, RAY_FLAG_NONE, mask, ray);
+    float transmittance = 1.0;
     while (query.Proceed()) {
-        if (AlphaTestPasses(query.CandidateInstanceID(), query.CandidatePrimitiveIndex(), query.CandidateTriangleBarycentrics()))
+        bool translucent;
+        float opacity = CandidateOpacity(query.CandidateInstanceID(), query.CandidatePrimitiveIndex(), query.CandidateTriangleBarycentrics(), translucent);
+        if (translucent)
+            transmittance *= 1.0 - opacity;
+        if ((!translucent && opacity > 0.0) || transmittance < 0.01)
             query.CommitNonOpaqueTriangleHit();
     }
-    return query.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
+    return query.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? 0.0 : transmittance;
 }
 
 float SunVisibility(float3 origin)
 {
-    return Occluded(origin, g_frame.sunDirection, 65536.0, g_frame.traceMask) ? 0.0 : 1.0;
+    return Transmittance(origin, g_frame.sunDirection, 65536.0, g_frame.traceMask);
 }
 
 // Sunlight reaching a hit surface, with its shadow ray starting at `origin`.
@@ -354,6 +420,37 @@ Light LoadLight(uint index)
     return dynamicLights.Load<Light>((index - g_frame.lightCount) * 80);
 }
 
+// Whether the straight path from a map light to a point crosses one of the light's convex hulls: the static prop
+// meshes VRAD shadowed it with (FixtureHulls in src/effects.cpp). Points inside a hull with the light stay lit.
+bool HullBlocks(Light light, float3 position)
+{
+    ByteAddressBuffer lights = ResourceDescriptorHeap[g_frame.lightsView];
+    float3 path = position - light.origin;
+    // Paths that only touch a hull, within half a unit, pass.
+    float margin = 0.5 / max(length(path), 1.0);
+    uint offset = light.hullOffset;
+    for (uint h = 0; h < light.hullCount; ++h) {
+        uint planeCount = lights.Load(offset);
+        offset += 16;
+        float enter = 0.0;
+        float leave = 1.0;
+        for (uint p = 0; p < planeCount; ++p, offset += 16) {
+            float4 plane = lights.Load<float4>(offset);
+            float start = dot(plane.xyz, light.origin) - plane.w - 0.1;
+            float rate = dot(plane.xyz, path);
+            if (rate > 1e-6)
+                leave = min(leave, -start / rate);
+            else if (rate < -1e-6)
+                enter = max(enter, -start / rate);
+            else if (start > 0.0)
+                leave = -1.0;
+        }
+        if (leave - enter > margin && (enter > margin || leave < 1.0 - margin))
+            return true;
+    }
+    return false;
+}
+
 // Unshadowed irradiance from a light, following VRAD's GatherSampleStandardLightSSE. `toLight` and
 // `distance` describe the shadow ray.
 float3 LightIrradiance(Light light, float3 position, float3 normal, out float3 toLight, out float distance)
@@ -395,6 +492,8 @@ float3 LightIrradiance(Light light, float3 position, float3 normal, out float3 t
     // The engine stops lighting at the radius VRAD computed; fade the last part so the cut does not show.
     if (light.radius > 0.0)
         falloff *= saturate((light.radius - distance) / (0.2 * light.radius));
+    if (light.hullCount != 0 && HullBlocks(light, position))
+        return 0.0;
     return light.intensity * (lambert * falloff) * g_frame.lightScale;
 }
 
@@ -432,6 +531,79 @@ float3 ProjectorIrradiance(Projector projector, float3 position, float3 normal, 
     float attenuation = saturate(dot(projector.attenuation, float3(1.0, 1.0 / distance, 1.0 / (distance * distance))));
     float endFalloff = saturate((distance - projector.farZ) / (-0.4 * projector.farZ));
     return cookie * projector.color * (attenuation * lambert * endFalloff);
+}
+
+// The lights that can reach a point, in one index space: its cluster's map lights, then the engine's dynamic
+// lights, then the projected lights.
+struct LightSet
+{
+    LightRanges ranges;
+    uint mapLights;
+    uint pointLights;
+    uint count;
+};
+
+LightSet LightSetAt(float3 position, float3 normal)
+{
+    LightSet set;
+    set.ranges = LightsAt(position, normal);
+    set.mapLights = LightRangeCount(set.ranges);
+    set.pointLights = set.mapLights + g_frame.dynamicLightCount;
+    set.count = set.pointLights + g_frame.projectorCount;
+    return set;
+}
+
+// Dynamic and projected lights are the ones attached to players and weapons.
+bool IsAttachedLight(LightSet set, uint i) { return i >= set.mapLights; }
+
+// Unshadowed irradiance from the i-th light of a LightSet.
+float3 SetLightIrradiance(LightSet set, uint i, float3 position, float3 normal, out float3 toLight, out float distance)
+{
+    if (i >= set.pointLights)
+        return ProjectorIrradiance(LoadProjector(i - set.pointLights), position, normal, toLight, distance);
+    uint index = i >= set.mapLights ? g_frame.lightCount + i - set.mapLights : LightRangeIndex(set.ranges, i);
+    return LightIrradiance(LoadLight(index), position, normal, toLight, distance);
+}
+
+static const uint kLightCandidates = 8;
+
+// One light of a LightSet by resampled importance sampling: up to kLightCandidates lights drawn uniformly (every
+// light when there are no more), one of them kept in proportion to its unshadowed luminance. `irradiance` is its
+// unshadowed light divided by the probability of the pick; false when no candidate can light the point.
+bool SampleLight(LightSet set, float3 position, float3 normal, inout uint seed, out float3 irradiance, out float3 toLight, out float distance,
+    out bool attached)
+{
+    irradiance = 0.0;
+    toLight = 0.0;
+    distance = 0.0;
+    attached = false;
+    if (set.count == 0)
+        return false;
+    bool exhaustive = set.count <= kLightCandidates;
+    uint draws = exhaustive ? set.count : kLightCandidates;
+    // Uniform draws weigh each candidate by count / draws, which cancels out of the pick itself.
+    float drawWeight = exhaustive ? 1.0 : float(set.count) / float(draws);
+    float total = 0.0;
+    float pickedWeight = 0.0;
+    uint picked = 0;
+    for (uint d = 0; d < draws; ++d) {
+        uint i = exhaustive ? d : min(uint(Random(seed) * set.count), set.count - 1);
+        float3 candidateToLight;
+        float candidateDistance;
+        float weight = Luminance(SetLightIrradiance(set, i, position, normal, candidateToLight, candidateDistance));
+        if (weight <= 0.0)
+            continue;
+        total += weight;
+        if (Random(seed) * total < weight) {
+            picked = i;
+            pickedWeight = weight;
+        }
+    }
+    if (total <= 0.0)
+        return false;
+    irradiance = SetLightIrradiance(set, picked, position, normal, toLight, distance) * (total * drawWeight / pickedWeight);
+    attached = IsAttachedLight(set, picked);
+    return true;
 }
 
 #endif

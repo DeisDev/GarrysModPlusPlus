@@ -246,7 +246,7 @@ void DrawPerformance(const Statistics& statistics)
 
     ImGui::SeparatorText(Text(TextId::SectionGpuPasses));
     TextLine(TextId::StatLightingTime, statistics.lightingMs);
-    const TextId passes[] = {TextId::PassSceneUpdate, TextId::PassSurface, TextId::PassIndirectTrace, TextId::PassAccumulation,
+    const TextId passes[] = {TextId::PassSceneUpdate, TextId::PassSurface, TextId::PassVolume, TextId::PassDirectLight, TextId::PassIndirectTrace, TextId::PassAccumulation,
         TextId::PassDenoiser, TextId::PassReflections, TextId::PassLighting, TextId::PassResolve};
     static_assert(std::size(passes) == static_cast<size_t>(GpuPass::Count));
     for (size_t i = 0; i < std::size(passes); ++i)
@@ -258,7 +258,7 @@ void DrawGeneralTab(Settings& settings)
     ImGui::Checkbox(Text(TextId::RealtimeLighting), &settings.realtimeLighting);
     const TextId views[] = {TextId::ViewFinal, TextId::ViewAlbedo, TextId::ViewNormals, TextId::ViewCoverage, TextId::ViewDirectLight,
         TextId::ViewIndirectLight, TextId::ViewIndirectRaw, TextId::ViewSunVisibility, TextId::ViewGameFlashlight,
-        TextId::ViewReflections};
+        TextId::ViewReflections, TextId::ViewMotionVectors, TextId::ViewAmbientOcclusion};
     static_assert(std::size(views) == static_cast<size_t>(DebugView::Count));
     int view = static_cast<int>(settings.debugView);
     if (ImGui::BeginCombo(Text(TextId::DebugView), Text(views[view]))) {
@@ -296,7 +296,10 @@ void DrawLightingTab(Settings& settings)
     if (BeginOptionTable("indirect")) {
         ToggleRow(TextId::IndirectLight, settings.indirectLight, &settings.indirectIntensity, 4.0f);
         ToggleRow(TextId::Denoiser, settings.denoiser, nullptr, 0.0f);
+        ToggleRow(TextId::AmbientOcclusion, settings.ambientOcclusion, &settings.aoIntensity, 1.0f);
         ToggleRow(TextId::Reflections, settings.reflections, &settings.reflectionIntensity, 4.0f);
+        ToggleRow(TextId::TranslucentLighting, settings.translucentLighting, nullptr, 0.0f);
+        ToggleRow(TextId::VolumetricLight, settings.volumetricLight, &settings.volumetricIntensity, 4.0f);
         ImGui::EndTable();
     }
 }

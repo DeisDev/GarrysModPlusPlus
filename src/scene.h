@@ -1,6 +1,7 @@
 #pragma once
 
 #include "bsp.h"
+#include "convex_hull.h"
 #include "descriptor_heap.h"
 #include "engine_interfaces.h"
 
@@ -23,8 +24,8 @@ constexpr UINT kLocalPlayerMask = 0x08;
 // The 3D skybox's scaled-down scene, which only the skybox view's rays meet.
 constexpr UINT kSkyboxMask = 0x10;
 
-// Triangles for Scene::AddModel. Alpha-tested triangles come last, from `opaqueTriangles` on; each has an entry
-// in `alphaTriangles` (Scene::PackAlpha), and then the model needs `uvs`.
+// Triangles for Scene::AddModel. Alpha-tested and translucent triangles come last, from `opaqueTriangles` on; each
+// has an entry in `alphaTriangles` (Scene::PackAlpha or Scene::PackTranslucent), and then the model needs `uvs`.
 struct ModelGeometry {
     std::span<const bsp::Float3> positions;
     std::span<const uint32_t> indices;
@@ -47,7 +48,16 @@ struct GpuMaterial {
     // $envmapcontrast blends the reflection towards its square, $envmapsaturation towards its grey.
     float envmapContrast;
     float envmapSaturation;
-    float padding[2];
+    // Scene::kMaterialUnlit.
+    uint32_t flags;
+    float padding;
+};
+
+// A convex hull that blocks a map light (index into bsp::WorldGeometry::lights) wherever the straight path from
+// the light to a point crosses it.
+struct LightHull {
+    uint32_t light;
+    std::vector<hull::Plane> planes;
 };
 
 struct SceneInstance {
@@ -57,6 +67,11 @@ struct SceneInstance {
     UINT positionsView = DescriptorHeap::kInvalid;
     UINT mask = 0;
     float transform[3][4];
+    // Where the instance was last frame, for motion vectors: its transform when `previousKnown`, and a skinned
+    // model's vertex positions when the view is valid.
+    bool previousKnown = false;
+    float previousTransform[3][4];
+    UINT previousPositionsView = DescriptorHeap::kInvalid;
 };
 
 struct SceneFrame {
@@ -76,8 +91,9 @@ public:
     struct GpuLight;
 
     bool Initialize(ID3D12Device5* device, ID3D12CommandQueue* queue, DescriptorHeap& descriptors);
-    // The map's lights and sun come from `world`; its triangles from `worldGeometry`.
-    bool LoadMap(const std::string& name, const bsp::WorldGeometry& world, const ModelGeometry& worldGeometry);
+    // The map's lights and sun come from `world`, with the hulls that block some lights; its triangles from
+    // `worldGeometry`.
+    bool LoadMap(const std::string& name, const bsp::WorldGeometry& world, std::span<const LightHull> lightHulls, const ModelGeometry& worldGeometry);
     // Builds a BLAS for the geometry and returns its model id, or -1 when the geometry is empty or fails.
     int AddModel(const ModelGeometry& geometry);
     // A texture for alpha tests and material masks: VTF mips in their stored layout, largest first. Returns its
@@ -85,8 +101,14 @@ public:
     UINT AddTexture(DXGI_FORMAT format, UINT width, UINT height, std::span<const std::span<const std::byte>> mips);
     // An entry of ModelGeometry::alphaTriangles: the alpha texture and the alpha test reference (0-1).
     static uint32_t PackAlpha(UINT textureView, float reference);
+    // An entry of ModelGeometry::alphaTriangles for a translucent surface: its opacity is the texture's alpha (1
+    // with DescriptorHeap::kInvalid) times `opacity`. Shadow rays pass through what is left; other rays stop at
+    // surfaces at least half opaque.
+    static uint32_t PackTranslucent(UINT textureView, float opacity);
 
     static constexpr uint32_t kNoMaterial = 0xFFFFFFFF;
+    // GpuMaterial::flags: UnlitGeneric and its relatives show their albedo unlit.
+    static constexpr uint32_t kMaterialUnlit = 1;
     static constexpr uint32_t kMaskOff = 0xFFFFFFFF;
     // A mask from one channel (0-3: r, g, b, a) of a texture, optionally inverted; kInvalid as the texture
     // makes it constant 1.
@@ -94,7 +116,8 @@ public:
     // Adds a material for ModelGeometry::triangleMaterials and returns its index, or kNoMaterial when full.
     uint32_t AddMaterial(const GpuMaterial& material);
     UINT MaterialsView() const { return m_materialsView; }
-    // A model's BLAS geometry: its opaque triangles, then its alpha-tested ones. Returns the number of descs used.
+    // A model's BLAS geometry: its opaque triangles, then its alpha-tested and translucent ones. Returns the number of
+    // descs used.
     static UINT GeometryDescs(D3D12_GPU_VIRTUAL_ADDRESS vertices, UINT vertexCount, D3D12_GPU_VIRTUAL_ADDRESS indices, UINT triangles,
         UINT opaqueTriangles, D3D12_RAYTRACING_GEOMETRY_DESC (&descs)[2]);
     // Static props, and the 3D skybox's geometry with kSkyboxMask; a mask of 0 means kStaticPropMask.
@@ -121,6 +144,12 @@ public:
         UINT clusterCount = 0;
     };
     const LightLists& Lights() const { return m_lightLists; }
+
+    // The model and mask of an instance of the last RecordFrame.
+    std::pair<int, UINT> InstanceInfo(UINT instance) const
+    {
+        return instance < m_recorded.size() ? m_recorded[instance] : std::pair<int, UINT>{-1, 0};
+    }
 
     // Records a TLAS build for this frame into `list`; the caller waits for `slot`'s previous use first.
     SceneFrame RecordFrame(ID3D12GraphicsCommandList4* list, UINT slot, std::span<const SceneInstance> dynamic);
@@ -187,6 +216,7 @@ private:
     UINT m_materialsView = DescriptorHeap::kInvalid;
     UINT m_materialCount = 0;
     std::vector<SceneInstance> m_staticInstances;
+    std::vector<std::pair<int, UINT>> m_recorded;
     bool m_hasSkybox = false;
     std::vector<engine::DynamicLight> m_dynamicLights;
     std::array<FrameTlas, kFrameSlots> m_frames;

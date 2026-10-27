@@ -3,7 +3,7 @@
 
 // Every compute pass shares this layout. Textures and buffers are reached through descriptor heap indices
 // in g_frame and g_pass.
-#define ROOT_SIGNATURE "RootFlags(CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED), CBV(b0), SRV(t0), RootConstants(num32BitConstants = 8, b1), " \
+#define ROOT_SIGNATURE "RootFlags(CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED), CBV(b0), SRV(t0), RootConstants(num32BitConstants = 12, b1), " \
     "StaticSampler(s0, filter = FILTER_MIN_MAG_MIP_LINEAR, addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP), "     "StaticSampler(s1, filter = FILTER_MIN_MAG_MIP_POINT, addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP), "     "StaticSampler(s2, filter = FILTER_MIN_MAG_MIP_LINEAR, addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP)"
 
 // Mirrors gmodpp::FrameConstants in src/effects.h.
@@ -64,22 +64,46 @@ struct FrameConstants
     uint clusterCount;
     // 1 for the first-person viewmodel's run.
     uint viewmodel;
+    // Written by shaders/primary.hlsl.
+    uint visibilityView;
+    uint motionView;
+    uint previousDistanceView;
+    uint pixelFlagsView;
+    // Developer probe (Lighting::RequestProbe): the pixel (x | y << 16) and the buffer it reports to, or kNoView.
+    uint probePixel;
+    uint probeView;
+    // The irradiance volume's first cell and probe spacing (shaders/probes.hlsl).
+    int3 probeOrigin;
+    float probeSpacing;
+    // Ray-traced ambient occlusion (shaders/ao.hlsl), or kNoView, and how much of it darkens indirect light.
+    uint aoView;
+    float aoIntensity;
+    // Half-resolution in-scattered light (shaders/volumetrics.hlsl), or kNoView, and the haze's density per unit.
+    uint volumetricView;
+    float volumetricDensity;
 };
 
-// Per-pass descriptor indices and parameters.
+// Per-pass descriptor indices and parameters; mirrors Lighting::PassArgs in src/lighting.h.
 struct PassConstants
 {
     uint input0;
     uint input1;
     uint input2;
+    uint input3;
+    uint input4;
     uint output0;
     uint output1;
-    uint step;
     uint output2;
-    uint padding;
+    uint output3;
+    uint step;
+    uint2 padding;
 };
 
 static const uint kNoView = 0xFFFFFFFFu;
+
+// Pixel flags from shaders/primary.hlsl: a scene triangle matches the G-buffer there, and its material is unlit.
+static const uint kPixelHit = 1;
+static const uint kPixelUnlit = 2;
 
 ConstantBuffer<FrameConstants> g_frame : register(b0);
 ConstantBuffer<PassConstants> g_pass : register(b1);
@@ -133,6 +157,17 @@ float3 Decode(float3 color)
 }
 
 float Luminance(float3 color) { return dot(color, float3(0.2126, 0.7152, 0.0722)); }
+
+// Rays that reach surfaces right next to a light see its falloff blow up. One sample brighter than this many
+// times white on screen is scaled down to it, so it cannot leave a firefly for the denoisers.
+static const float kMaxSampleBrightness = 8.0;
+
+float3 ClampSample(float3 color)
+{
+    float limit = kMaxSampleBrightness / max(g_frame.tonemapScale, 1e-3);
+    float luminance = Luminance(color);
+    return luminance > limit ? color * (limit / luminance) : color;
+}
 
 uint Hash(uint x)
 {

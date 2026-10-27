@@ -257,6 +257,7 @@ GMODPP_DEVICE_HOOK(StretchRect, (IDirect3DDevice9* self, IDirect3DSurface9* src,
 
 using SetVertexShaderFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, IDirect3DVertexShader9*);
 using SetTextureFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, DWORD, IDirect3DBaseTexture9*);
+using SetSamplerStateFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, DWORD, D3DSAMPLERSTATETYPE, DWORD);
 
 HRESULT STDMETHODCALLTYPE HookSetVertexShader(IDirect3DDevice9* self, IDirect3DVertexShader9* shader)
 {
@@ -281,6 +282,13 @@ HRESULT STDMETHODCALLTYPE HookSetTexture(IDirect3DDevice9* self, DWORD stage, ID
     if (IsGameDevice(self))
         gbuffer::OnTexture(stage, texture);
     return Original<SetTextureFn>(self, kSlotDeviceSetTexture)(self, stage, texture);
+}
+
+HRESULT STDMETHODCALLTYPE HookSetSamplerState(IDirect3DDevice9* self, DWORD sampler, D3DSAMPLERSTATETYPE type, DWORD value)
+{
+    if (IsGameDevice(self))
+        gbuffer::OnSamplerState(sampler, type, value);
+    return Original<SetSamplerStateFn>(self, kSlotDeviceSetSamplerState)(self, sampler, type, value);
 }
 
 using SetViewportFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, const D3DVIEWPORT9*);
@@ -327,6 +335,12 @@ HRESULT GameDraw(IDirect3DDevice9* self, const char* name, UINT count, Draw draw
     const gbuffer::DrawAction action = gbuffer::BeforeDraw(self);
     if (action == gbuffer::DrawAction::Skip)
         return D3D_OK;
+    if (action == gbuffer::DrawAction::Forward) {
+        gbuffer::BeginForwardDraw(self);
+        HRESULT hr = draw();
+        gbuffer::EndForwardDraw(self);
+        return hr;
+    }
     if (action != gbuffer::DrawAction::RedirectToLight)
         return draw();
     gbuffer::BeginLightRedirect(self);
@@ -416,6 +430,7 @@ void OnGameDeviceCreated(IDirect3DDevice9* device, HWND focusWindow, const D3DPR
     Patch(device, kSlotDeviceSetVertexShader, reinterpret_cast<void*>(&HookSetVertexShader));
     Patch(device, kSlotDeviceCreateVertexShader, reinterpret_cast<void*>(&HookCreateVertexShader));
     Patch(device, kSlotDeviceSetTexture, reinterpret_cast<void*>(&HookSetTexture));
+    Patch(device, kSlotDeviceSetSamplerState, reinterpret_cast<void*>(&HookSetSamplerState));
     Patch(device, kSlotDeviceSetRenderTarget, reinterpret_cast<void*>(&HookSetRenderTarget));
     Patch(device, kSlotDeviceDrawPrimitiveUP, reinterpret_cast<void*>(&HookDrawPrimitiveUP));
     Patch(device, kSlotDeviceDrawIndexedPrimitiveUP, reinterpret_cast<void*>(&HookDrawIndexedPrimitiveUP));

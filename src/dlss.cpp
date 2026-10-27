@@ -140,6 +140,9 @@ bool RayReconstruction::Evaluate(ID3D12GraphicsCommandList* list, DlssMode mode,
     eval.pInRoughness = inputs.roughness;
     eval.pInDiffuseAlbedo = inputs.diffuseAlbedo;
     eval.pInSpecularAlbedo = inputs.specularAlbedo;
+    eval.pInSpecularHitDistance = inputs.specularHitDistance;
+    eval.pInWorldToViewMatrix = const_cast<float*>(inputs.worldToView);
+    eval.pInViewToClipMatrix = const_cast<float*>(inputs.viewToClip);
     eval.InJitterOffsetX = inputs.jitterX;
     eval.InJitterOffsetY = inputs.jitterY;
     eval.InRenderSubrectDimensions = {inputs.width, inputs.height};

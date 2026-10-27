@@ -13,6 +13,8 @@ void OnPresent();
 // Called from client.dll around each view's opaque pass (DrawWorld until DrawTranslucentRenderables).
 void OnViewOpaqueBegin();
 void OnViewOpaqueEnd(bool inSkybox);
+// After DrawTranslucentRenderables: ends the forward lighting of the view's translucent surfaces.
+void OnViewTranslucentEnd();
 // The viewmodel is drawn with its own depth range (viewport z 0..0.1); its capture follows that range.
 void OnViewport(const D3DVIEWPORT9& viewport);
 

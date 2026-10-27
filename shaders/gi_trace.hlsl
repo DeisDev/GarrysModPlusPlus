@@ -1,13 +1,16 @@
 #include "scene.hlsli"
 
 // One cosine-weighted diffuse bounce per pixel. The result is an irradiance estimate: a sky miss returns
-// the sky irradiance, a hit returns its albedo times the light reaching it (sun, one random local light and
-// indirect light: last frame's result where the hit is on screen, otherwise one more traced bounce).
-// input0: last frame's filtered indirect irradiance, or none; output0: raw estimate; step: samples per pixel.
+// the sky irradiance, a hit returns its albedo times the light reaching it. Where the hit was on screen last
+// frame that is last frame's whole irradiance there (exact direct plus denoised light); elsewhere it is the sun,
+// one local light picked by SampleLight and one more traced bounce.
+// The sampled remainder of the direct light (direct.hlsl) is added, so the denoiser handles both.
+// input0: last frame's denoised light, or none; input1: sampled direct remainder; input2: last frame's exact direct
+// light; output0: raw estimate; step: samples per pixel.
 
 static const float kMaxDistance = 16384.0;
 
-float3 PreviousIndirect(float3 position, float3 normal)
+float3 PreviousIrradiance(float3 position, float3 normal)
 {
     if (g_frame.historyValid == 0 || g_pass.input0 == kNoView)
         return -1.0;
@@ -22,8 +25,9 @@ float3 PreviousIndirect(float3 position, float3 normal)
     float distance = length(position - g_frame.prevEyePosition);
     if (surface.w <= 0.0 || abs(surface.w - distance) > 4.0 + distance * 0.02 || dot(surface.xyz, normal) < 0.7)
         return -1.0;
-    Texture2D<float4> indirect = ResourceDescriptorHeap[g_pass.input0];
-    return indirect.Load(int3(pixel, 0)).rgb;
+    Texture2D<float4> denoised = ResourceDescriptorHeap[g_pass.input0];
+    Texture2D<float4> direct = ResourceDescriptorHeap[g_pass.input2];
+    return denoised.Load(int3(pixel, 0)).rgb + direct.Load(int3(pixel, 0)).rgb;
 }
 
 // Indirect light at an off-screen hit: one more diffuse bounce that sees the sky or a sunlit surface.
@@ -38,27 +42,18 @@ float3 SecondBounce(HitSurface hit, float3 origin, inout uint seed)
 
 float3 HitIrradiance(HitSurface hit, inout uint seed)
 {
+    float3 previous = PreviousIrradiance(hit.position, hit.normal);
+    if (previous.x >= 0.0)
+        return previous;
     float3 origin = hit.position + hit.normal * 1.0;
     float3 irradiance = SunIrradiance(hit, origin);
-    // One light picked uniformly among the map lights that can reach the hit, dynamic and projected lights.
-    LightRanges ranges = LightsAt(hit.position, hit.normal);
-    uint mapLights = LightRangeCount(ranges);
-    uint lightCount = mapLights + g_frame.dynamicLightCount;
-    uint candidates = lightCount + g_frame.projectorCount;
-    if (candidates > 0) {
-        uint index = min(uint(Random(seed) * candidates), candidates - 1);
-        bool attached = index >= mapLights;
-        float3 toLight;
-        float distance;
-        float3 light = index >= lightCount ? ProjectorIrradiance(LoadProjector(index - lightCount), hit.position, hit.normal, toLight, distance)
-            : LightIrradiance(LoadLight(attached ? g_frame.lightCount + index - mapLights : LightRangeIndex(ranges, index)), hit.position, hit.normal,
-                  toLight, distance);
-        if (any(light > 0.0) && !Occluded(origin, toLight, ShadowRayLength(attached, distance), ShadowMask(attached)))
-            irradiance += light * candidates;
-    }
-    float3 previous = PreviousIndirect(hit.position, hit.normal);
-    irradiance += previous.x >= 0.0 ? previous : SecondBounce(hit, origin, seed);
-    return irradiance;
+    float3 light;
+    float3 toLight;
+    float distance;
+    bool attached;
+    if (SampleLight(LightSetAt(hit.position, hit.normal), hit.position, hit.normal, seed, light, toLight, distance, attached))
+        irradiance += light * Transmittance(origin, toLight, ShadowRayLength(attached, distance), ShadowMask(attached));
+    return irradiance + SecondBounce(hit, origin, seed);
 }
 
 [RootSignature(ROOT_SIGNATURE)]
@@ -84,9 +79,10 @@ void main(uint3 id : SV_DispatchThreadID)
         float3 direction = CosineSample(normal, Random(seed), Random(seed));
         HitSurface hit;
         if (TraceClosest(origin, direction, kMaxDistance, g_frame.traceMask, hit))
-            estimate += hit.albedo * HitIrradiance(hit, seed);
+            estimate += ClampSample(hit.albedo * HitIrradiance(hit, seed));
         else
             estimate += g_frame.skyColor;
     }
-    output[pixel] = float4(estimate / samples, 1.0);
+    Texture2D<float4> remainder = ResourceDescriptorHeap[g_pass.input1];
+    output[pixel] = float4(estimate / samples + remainder.Load(int3(pixel, 0)).rgb, 1.0);
 }

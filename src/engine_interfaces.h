@@ -38,6 +38,13 @@ struct DynamicLight {
 // The engine's active dynamic lights (IVEfx::CL_GetActiveDLights).
 void ActiveDynamicLights(std::vector<DynamicLight>& lights);
 
+// IVEngineClient::ComputeLighting(point, normal or null, clamp to 1, colour out, ambient cube out or null), which
+// GetLightForPoint also calls through the vtable; particles and client effects light themselves with it.
+using ComputeLightingFn = void(__fastcall*)(void* engine, const float* point, const float* normal, bool clamp, float* color, float* boxColors);
+
+// The engine's ComputeLighting, or null before the engine is ready.
+ComputeLightingFn ComputeLightingFunction();
+
 // Sets INT_RENDERPARM_ENABLE_FIXED_LIGHTING, which selects the stock shaders' LIGHTING_PREVIEW combos
 // (2 = G-buffer outputs). Returns false when the material system is unavailable.
 bool SetFixedLighting(int mode);

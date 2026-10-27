@@ -12,7 +12,9 @@
 #include <wrl/client.h>
 
 #include <array>
+#include <optional>
 #include <span>
+#include <utility>
 #include <vector>
 
 namespace gmodpp {
@@ -73,6 +75,30 @@ struct FrameConstants {
     uint32_t leafClustersView;
     uint32_t clusterCount;
     uint32_t viewmodel;
+    uint32_t visibilityView;
+    uint32_t motionView;
+    uint32_t previousDistanceView;
+    uint32_t pixelFlagsView;
+    uint32_t probePixel;
+    uint32_t probeView;
+    int32_t probeOrigin[3];
+    float probeSpacing;
+    uint32_t aoView;
+    float aoIntensity;
+    uint32_t volumetricView;
+    float volumetricDensity;
+};
+
+// What blocks the sun at a pixel of the main view (Lighting::RequestProbe).
+struct ProbeResult {
+    // Scene instance, or DescriptorHeap::kInvalid when the sun is visible.
+    uint32_t instance;
+    uint32_t triangle;
+    float distance;
+    float sunVisibility;
+    float origin[3];
+    int model;
+    uint32_t mask;
 };
 
 // The game's D3D9 resources one view rendered: its colour target, which keeps what the G-buffer does not
@@ -94,6 +120,8 @@ struct ViewInputs {
     // How far the view's image is shifted by the jitter, in render pixels (x right, y down).
     float jitterX = 0.0f;
     float jitterY = 0.0f;
+    // Where the main view's irradiance volume goes for the game's forward-lit draws (gbuffer::ProbeTextures).
+    std::array<IDirect3DVolumeTexture9*, 3> probes = {};
 };
 
 // Lights a view's G-buffer on the D3D12 queue the game shares and writes the result back into its colour
@@ -108,7 +136,21 @@ public:
     // view is lit at the output resolution instead.
     bool RayReconstructionSize(UINT outputWidth, UINT outputHeight, UINT& width, UINT& height);
     void WaitForGpu();
-    void InvalidateHistory() { m_historyValid = false; }
+    void InvalidateHistory()
+    {
+        m_historyValid = false;
+        m_probeHistoryValid = false;
+    }
+    // Whether the last main view filled the irradiance volume, and the volume's first cell.
+    bool VolumeReady() const { return m_volumeReady; }
+    std::array<int, 3> VolumeOrigin() const { return m_probeOrigin; }
+    // Developer tool: the next main view reports what blocks the sun at a pixel (TakeProbe).
+    void RequestProbe(UINT x, UINT y)
+    {
+        m_probeRequested = true;
+        m_probePixel = x | y << 16;
+    }
+    std::optional<ProbeResult> TakeProbe() { return std::exchange(m_probe, std::nullopt); }
 
 private:
     struct Texture {
@@ -117,14 +159,31 @@ private:
         UINT uav = DescriptorHeap::kInvalid;
         D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     };
-    enum class Pass { Surface, GiTrace, GiTemporal, GiFilter, Lighting, TemporalAntiAliasing, Sharpen, Reflections, DlssInputs, DlssResolve, Count };
+    enum class Pass { Surface, Primary, Probes, Ao, Volumetrics, Direct, GiTrace, GiTemporal, GiFilter, Lighting, TemporalAntiAliasing, Sharpen, Reflections, ReflectionTemporal, DlssInputs, DlssResolve, Count };
+    // Mirrors PassConstants in shaders/common.hlsli: descriptor indices (none by default) and a parameter.
+    struct PassArgs {
+        UINT input0 = DescriptorHeap::kInvalid;
+        UINT input1 = DescriptorHeap::kInvalid;
+        UINT input2 = DescriptorHeap::kInvalid;
+        UINT input3 = DescriptorHeap::kInvalid;
+        UINT input4 = DescriptorHeap::kInvalid;
+        UINT output0 = DescriptorHeap::kInvalid;
+        UINT output1 = DescriptorHeap::kInvalid;
+        UINT output2 = DescriptorHeap::kInvalid;
+        UINT output3 = DescriptorHeap::kInvalid;
+        UINT step = 0;
+        UINT padding[2] = {};
+    };
     // Render-resolution copies of the G-buffer for Ray Reconstruction, written together by Pass::DlssInputs.
-    enum RayReconstructionInput { RrColor, RrDepth, RrNormal, RrFlags, RrLight, RrAlbedo, RrEmissive, RrMotion, RrInputCount };
+    enum RayReconstructionInput { RrColor, RrDepth, RrNormal, RrFlags, RrLight, RrAlbedo, RrEmissive, RrInputCount };
 
     bool EnsureTargets(UINT width, UINT height);
-    bool CreateTarget(Texture& texture, UINT width, UINT height, DXGI_FORMAT format);
+    bool CreateTarget(Texture& texture, UINT width, UINT height, DXGI_FORMAT format, UINT depth = 0);
+    void DispatchGroups(Pass pass, const PassArgs& args, UINT x, UINT y, UINT z);
+    // Hands the slot's copy of the irradiance volume to light_queries.
+    void PublishVolume(UINT slot);
     void Use(Texture& texture, D3D12_RESOURCE_STATES state);
-    void Dispatch(Pass pass, const std::array<UINT, 8>& constants);
+    void Dispatch(Pass pass, const PassArgs& args);
     bool FillConstants(FrameConstants& constants, const Scene& scene, const ViewInputs& inputs);
     void ReturnResources(std::span<IDirect3DResource9* const> resources, UINT count);
     UINT WriteProjectors(UINT slot, std::span<const gbuffer::ProjectedLight> projected, std::span<ID3D12Resource* const> cookies, UINT cookieViews);
@@ -156,12 +215,46 @@ private:
 
     Microsoft::WRL::ComPtr<ID3D12Resource> m_colorCopy;
     std::array<Texture, 2> m_surface;
+    // Written by shaders/primary.hlsl.
+    Texture m_visibility;
+    Texture m_motion;
+    Texture m_previousDistance;
+    Texture m_pixelFlags;
+    // Exact direct light of the main view's current and last frame (shaders/direct.hlsl), and its sampled remainder.
+    std::array<Texture, 2> m_direct;
+    Texture m_directRemainder;
     Texture m_giRaw;
     std::array<Texture, 2> m_giHistory;
+    std::array<Texture, 2> m_giMoments;
     std::array<Texture, 2> m_giFiltered;
+    // The denoised light the main view used last frame, which indirect rays reuse; kInvalid when there is none.
+    Texture* m_lastDenoised = nullptr;
     // Shaded colour; the main view alternates between the two so the reflections pass can read last frame's.
     std::array<Texture, 2> m_lit;
     Texture m_reflections;
+    // Ambient occlusion accumulated over frames (occlusion, sample count) and blurred.
+    std::array<Texture, 2> m_aoHistory;
+    Texture m_ao;
+    // Volumetric light at half resolution: this frame's march and the accumulation of the last two frames.
+    Texture m_volumetricMarch;
+    std::array<Texture, 2> m_volumetricHistory;
+    bool m_volumetricHistoryValid = false;
+    // Irradiance volume (shaders/probes.hlsl): red, green and blue coefficients and cells of the last two frames,
+    // and the filled volume copied to the game's textures.
+    std::array<std::array<Texture, 4>, 2> m_probeHistory;
+    std::array<Texture, 3> m_probeVolume;
+    std::array<int, 3> m_probeOrigin = {};
+    bool m_probeHistoryValid = false;
+    bool m_volumeReady = false;
+    // Copies of the filled volume per frame slot, read once the slot's frame is done for the engine's lighting
+    // queries (light_queries).
+    std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, kSlots> m_volumeReadback;
+    std::array<D3D12_PLACED_SUBRESOURCE_FOOTPRINT, 3> m_volumeFootprints = {};
+    std::array<std::array<int, 3>, kSlots> m_volumeReadbackOrigin = {};
+    std::array<bool, kSlots> m_volumeReadbackPending = {};
+    std::vector<uint16_t> m_volumeTexels;
+    // Accumulated reflections of the main view (shaders/reflection_temporal.hlsl).
+    std::array<Texture, 2> m_reflectionHistory;
     std::array<Texture, 2> m_taaHistory;
     // Indirect light of the viewmodel, filtered without history so the main view's buffers stay intact.
     std::array<Texture, 2> m_viewmodelIndirect;
@@ -171,6 +264,9 @@ private:
     UINT m_rrInputUavs = DescriptorHeap::kInvalid;
     Texture m_rrSpecularAlbedo;
     Texture m_rrRoughness;
+    Texture m_rrHitDistance;
+    float m_worldToView[16] = {};
+    float m_viewToClip[16] = {};
     Texture m_rrOutput;
     RayReconstruction m_rayReconstruction;
     DlssMode m_rrSizeMode = DlssMode::Count;
@@ -188,6 +284,7 @@ private:
     float m_prevEye[3] = {};
     bool m_historyValid = false;
     bool m_taaHistoryValid = false;
+    bool m_reflectionHistoryValid = false;
     uint64_t m_lastMainFrame = 0;
     uint64_t m_mainRuns = 0;
 
@@ -202,6 +299,12 @@ private:
     std::array<bool, kSlots> m_slotWasMain = {};
     uint64_t m_run = 0;
     bool m_loggedFormats = false;
+    bool m_probeRequested = false;
+    UINT m_probePixel = 0;
+    std::optional<ProbeResult> m_probe;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_probeBuffer;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_probeReadback;
+    UINT m_probeUav = DescriptorHeap::kInvalid;
     bool m_failed = false;
 };
 

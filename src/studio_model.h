@@ -33,6 +33,9 @@ using Matrix3x4 = std::array<std::array<float, 4>, 3>;
 // Number of bones in the model; models with more than one bone are skinned.
 int BoneCount(std::span<const std::byte> mdl);
 
+// The box around the model's collision hull and view bounds, or false when the header sets neither.
+bool ReadBounds(std::span<const std::byte> mdl, bsp::Float3& mins, bsp::Float3& maxs);
+
 // Each bone's poseToBone matrix (bind pose to bone space).
 bool ReadPoseToBone(std::span<const std::byte> mdl, std::vector<Matrix3x4>& poseToBone);
 
@@ -42,6 +45,10 @@ bool ReadMaterialPaths(std::span<const std::byte> mdl, std::vector<std::vector<s
 // Builds LOD0 triangles of body group 0, skipping meshes whose (skin 0) texture is marked in `skipTexture`.
 bool BuildGeometry(std::span<const std::byte> mdl, std::span<const std::byte> vvd, std::span<const std::byte> vtx,
     const std::vector<bool>& skipTexture, Geometry& geometry, std::string& error);
+
+// The convex pieces of a .phy collision model's first solid, each as its points in model space (inches, Source
+// axes); the pieces are convex hulls of these points.
+bool ReadCollisionPieces(std::span<const std::byte> phy, std::vector<std::vector<bsp::Float3>>& pieces, std::string& error);
 
 // The value of a VMT key, matched without regard to case, or nothing when the key is absent.
 std::optional<std::string> MaterialValue(std::string_view vmt, std::string_view key);

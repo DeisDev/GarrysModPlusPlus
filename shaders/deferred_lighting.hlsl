@@ -1,11 +1,21 @@
 #include "scene.hlsli"
 
-// Final shading: albedo times (traced sun + traced local lights + denoised indirect light) plus
-// self-illumination, plus the light the game's flashlight passes added, written in the encoding the game
-// uses for lit colours. Pixels without
+// Final shading: albedo times (direct light + denoised light) plus self-illumination, reflections and the light
+// the game's flashlight passes added, written in the encoding the game uses for lit colours. Pixels without
 // G-buffer data keep the game's forward colour.
-// input0: denoised indirect irradiance, or none for the sky's light; input1: raw indirect estimate (debug view); input2: reflections and
-// self-illumination (shaders/reflections.hlsl), or none; output0: shaded colour, encoded or (outputLinear) linear.
+// input0: denoised light (indirect plus the sampled direct remainder), or none for the sky's light; input1: raw
+// estimate (debug view); input2: reflections and self-illumination (shaders/reflections.hlsl), or none; input3:
+// exact direct light (rgb) and sun visibility (a) from shaders/direct.hlsl; input4: sampled direct remainder
+// (debug view); output0: shaded colour, encoded or (outputLinear) linear.
+
+// Light scattered by the haze between the eye and the pixel (shaders/volumetrics.hlsl), after the tonemap scale.
+float3 VolumetricLight(int2 pixel)
+{
+    if (g_frame.volumetricView == kNoView)
+        return 0.0;
+    Texture2D<float4> volumetric = ResourceDescriptorHeap[g_frame.volumetricView];
+    return volumetric.SampleLevel(g_linearClamp, (float2(pixel) + 0.5) * g_frame.invSize, 0.0).rgb * g_frame.tonemapScale;
+}
 
 // Source's range fog (CalcRangeFog and BlendPixelFog in common_ps_fxc.h), applied after the tonemap scale.
 float3 ApplyFog(float3 color, float3 position)
@@ -15,85 +25,6 @@ float3 ApplyFog(float3 color, float3 position)
     float viewDepth = mul(g_frame.viewProj, float4(position, 1.0)).w;
     float fog = saturate(min(g_frame.fogParams.z, viewDepth * g_frame.fogParams.w - g_frame.fogParams.x));
     return lerp(color, g_frame.fogColor, fog * fog);
-}
-
-// Shadow rays per pixel for map and dynamic lights when more lights than this matter there.
-static const uint kShadowSamples = 4;
-
-float3 PointLight(LightRanges ranges, uint mapLights, uint i, float3 position, float3 normal, out float3 toLight, out float distance)
-{
-    uint index = i >= mapLights ? g_frame.lightCount + i - mapLights : LightRangeIndex(ranges, i);
-    return LightIrradiance(LoadLight(index), position, normal, toLight, distance);
-}
-
-float3 DirectIrradiance(float3 position, float3 normal, float distanceToEye, inout uint seed, out float sunVisibility)
-{
-    float3 origin = position + normal * (g_frame.normalBias * (1.0 + distanceToEye * 0.002));
-    float3 irradiance = 0.0;
-    sunVisibility = 0.0;
-    float lambert = saturate(dot(normal, g_frame.sunDirection));
-    if (g_frame.sunEnabled != 0.0 && lambert > 0.0) {
-        sunVisibility = SunVisibility(origin);
-        irradiance += g_frame.sunColor * lambert * sunVisibility;
-    }
-    // Shadow rays go to each light that matters or, when more than kShadowSamples do, to that many picked in
-    // proportion to their light in one pass (weighted reservoir sampling) and weighted to keep the sum unbiased.
-    LightRanges ranges = LightsAt(position, normal);
-    uint mapLights = LightRangeCount(ranges);
-    uint lights = mapLights + g_frame.dynamicLightCount;
-    float total = 0.0;
-    uint visible = 0;
-    uint first[kShadowSamples];
-    uint picked[kShadowSamples];
-    float pickedWeight[kShadowSamples];
-    [unroll]
-    for (uint s = 0; s < kShadowSamples; ++s) {
-        first[s] = 0;
-        picked[s] = 0;
-        pickedWeight[s] = 1.0;
-    }
-    for (uint i = 0; i < lights; ++i) {
-        float3 toLight;
-        float distance;
-        float weight = Luminance(PointLight(ranges, mapLights, i, position, normal, toLight, distance));
-        if (weight <= VisibleIrradiance())
-            continue;
-        [unroll]
-        for (uint s = 0; s < kShadowSamples; ++s) {
-            if (s == visible)
-                first[s] = i;
-        }
-        ++visible;
-        total += weight;
-        [unroll]
-        for (uint s = 0; s < kShadowSamples; ++s) {
-            if (Random(seed) * total < weight) {
-                picked[s] = i;
-                pickedWeight[s] = weight;
-            }
-        }
-    }
-    bool exact = visible <= kShadowSamples;
-    [unroll]
-    for (uint s = 0; s < kShadowSamples; ++s) {
-        if (s >= visible)
-            break;
-        uint i = exact ? first[s] : picked[s];
-        float3 toLight;
-        float distance;
-        float3 light = PointLight(ranges, mapLights, i, position, normal, toLight, distance);
-        bool attached = i >= mapLights;
-        if (!Occluded(origin, toLight, ShadowRayLength(attached, distance), ShadowMask(attached)))
-            irradiance += exact ? light : light * (total / (pickedWeight[s] * kShadowSamples));
-    }
-    for (uint p = 0; p < g_frame.projectorCount; ++p) {
-        float3 toLight;
-        float distance;
-        float3 light = ProjectorIrradiance(LoadProjector(p), position, normal, toLight, distance);
-        if (Luminance(light) > VisibleIrradiance() && !Occluded(origin, toLight, ShadowRayLength(true, distance), ShadowMask(true)))
-            irradiance += light;
-    }
-    return irradiance;
 }
 
 [RootSignature(ROOT_SIGNATURE)]
@@ -113,7 +44,8 @@ void main(uint3 id : SV_DispatchThreadID)
         return;
     }
     if (!covered) {
-        output[pixel] = g_frame.outputLinear != 0 ? float4(Decode(color.rgb), color.a) : color;
+        float3 sky = Decode(color.rgb) + VolumetricLight(pixel);
+        output[pixel] = float4(g_frame.outputLinear != 0 ? sky : Encode(sky), color.a);
         return;
     }
     Texture2D<float4> albedos = ResourceDescriptorHeap[g_frame.albedoView];
@@ -137,30 +69,51 @@ void main(uint3 id : SV_DispatchThreadID)
     Texture2D<float4> lightTexture = ResourceDescriptorHeap[g_frame.lightView];
     float3 flashlight = Decode(lightTexture.Load(int3(pixel, 0)).rgb);
     float3 position = WorldPositionFromDepth(pixel, DepthAt(pixel));
-    float sunVisibility;
-    uint seed = PixelSeed(pixel, 0x2Du);
-    float3 direct = DirectIrradiance(LitPosition(position), surface.xyz, surface.w, seed, sunVisibility);
+    Texture2D<float4> directTexture = ResourceDescriptorHeap[g_pass.input3];
+    float4 directLight = directTexture.Load(int3(pixel, 0));
+    float3 direct = directLight.rgb;
     float3 indirect = g_frame.skyColor;
     if (g_pass.input0 != kNoView) {
         Texture2D<float4> indirectTexture = ResourceDescriptorHeap[g_pass.input0];
         indirect = indirectTexture.Load(int3(pixel, 0)).rgb;
     }
     indirect *= g_frame.indirectScale;
+    float ambientOcclusion = 1.0;
+    if (g_frame.aoView != kNoView) {
+        Texture2D<float> ao = ResourceDescriptorHeap[g_frame.aoView];
+        ambientOcclusion = ao.Load(int3(pixel, 0));
+        indirect *= lerp(1.0, ambientOcclusion, g_frame.aoIntensity);
+    }
 
     float3 result;
     switch (g_frame.debugView) {
-    case 4: result = Encode(direct * g_frame.tonemapScale * 0.5); break;
+    case 4: {
+        Texture2D<float4> remainder = ResourceDescriptorHeap[g_pass.input4];
+        result = Encode((direct + remainder.Load(int3(pixel, 0)).rgb) * g_frame.tonemapScale * 0.5);
+        break;
+    }
     case 5: result = Encode(indirect * g_frame.tonemapScale); break;
     case 6: {
         Texture2D<float4> raw = ResourceDescriptorHeap[g_pass.input1];
         result = Encode(raw.Load(int3(pixel, 0)).rgb * g_frame.tonemapScale);
         break;
     }
-    case 7: result = sunVisibility; break;
+    case 7: result = directLight.a; break;
     case 8: result = Encode(flashlight); break;
     case 9: result = Encode(added * g_frame.tonemapScale); break;
+    case 11: result = ambientOcclusion; break;
+    case 10: {
+        // Red and green: motion towards last frame (a tenth of a pixel per step); blue: unlit material.
+        Texture2D<float2> motion = ResourceDescriptorHeap[g_frame.motionView];
+        Texture2D<uint> pixelFlags = ResourceDescriptorHeap[g_frame.pixelFlagsView];
+        result = float3(saturate(0.5 + motion.Load(int3(pixel, 0)) * 0.05), (pixelFlags.Load(int3(pixel, 0)) & kPixelUnlit) != 0 ? 1.0 : 0.0);
+        break;
+    }
     default: {
-        float3 shaded = ApplyFog((albedo * (direct + indirect) + emissive + added) * g_frame.tonemapScale, position) + flashlight;
+        Texture2D<uint> pixelFlags = ResourceDescriptorHeap[g_frame.pixelFlagsView];
+        bool unlit = (pixelFlags.Load(int3(pixel, 0)) & kPixelUnlit) != 0;
+        float3 light = unlit ? 1.0 : direct + indirect;
+        float3 shaded = ApplyFog((albedo * light + emissive + added) * g_frame.tonemapScale, position) + flashlight + VolumetricLight(pixel);
         result = g_frame.outputLinear != 0 ? shaded : Encode(shaded);
         break;
     }

@@ -30,5 +30,6 @@ const int kSlotDeviceSetPixelShaderConstantF = SLOT(IDirect3DDevice9, SetPixelSh
 const int kSlotDeviceSetRenderState = SLOT(IDirect3DDevice9, SetRenderState);
 const int kSlotDeviceCreateVertexShader = SLOT(IDirect3DDevice9, CreateVertexShader);
 const int kSlotDeviceSetTexture = SLOT(IDirect3DDevice9, SetTexture);
+const int kSlotDeviceSetSamplerState = SLOT(IDirect3DDevice9, SetSamplerState);
 const int kSlotDeviceExPresentEx = SLOT(IDirect3DDevice9Ex, PresentEx);
 const int kSlotDeviceExResetEx = SLOT(IDirect3DDevice9Ex, ResetEx);

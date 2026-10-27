@@ -48,6 +48,7 @@ struct BspNode {
 struct BspLeaf {
     // -1 for solid leaves.
     int32_t cluster;
+    int32_t area;
     Float3 mins, maxs;
 };
 
@@ -67,6 +68,9 @@ struct Visibility {
         const size_t row = (clusterCount + 7) / 8;
         return (pvs[from * row + (to >> 3)] & (1u << (to & 7))) != 0;
     }
+
+    // The index in `leaves` of the leaf holding a point, or -1 without visibility data.
+    int32_t LeafAt(Float3 point) const;
 };
 
 struct StaticProp {
@@ -105,7 +109,17 @@ struct WorldGeometry {
     // only rays of the skybox view meet it.
     Mesh skybox;
     std::vector<StaticProp> skyboxProps;
+    // The sky camera's area (BspLeaf::area), or -1, and the bounds of its leaves.
+    int32_t skyArea = -1;
+    Float3 skyMins = {};
+    Float3 skyMaxs = {};
+
+    // Whether a point belongs to the 3D skybox: in its area, or inside its bounds (points on its faces can fall
+    // into solid leaves of no area).
+    bool InSkybox(Float3 point) const;
 };
+
+bool InBounds(Float3 point, Float3 mins, Float3 maxs);
 
 // Returns false with a reason in `error` when the data is not a supported Source BSP.
 bool LoadWorld(std::span<const std::byte> file, WorldGeometry& world, std::string& error);
