@@ -132,9 +132,9 @@ struct Float2 {
     float y;
 };
 
-// Whether the texel square [x, x + 1] x [y, y + 1] meets the triangle (separating axes of the triangle's edges;
+// Whether the square [x, x + size] x [y, y + size] meets the triangle (separating axes of the triangle's edges;
 // the square's own axes are covered by the caller's bounding box).
-bool TexelMeets(const Float2 (&t)[3], float x, float y)
+bool SquareMeets(const Float2 (&t)[3], float x, float y, float size)
 {
     const float area = (t[1].x - t[0].x) * (t[2].y - t[0].y) - (t[1].y - t[0].y) * (t[2].x - t[0].x);
     if (area == 0.0f)
@@ -146,9 +146,9 @@ bool TexelMeets(const Float2 (&t)[3], float x, float y)
         const float ny = (p.x - q.x) * area;
         // Inside the triangle the edge function has the sign of the area; a square entirely on the other side is apart.
         const float c0 = (x - p.x) * nx + (y - p.y) * ny;
-        const float c1 = (x + 1.0f - p.x) * nx + (y - p.y) * ny;
-        const float c2 = (x - p.x) * nx + (y + 1.0f - p.y) * ny;
-        const float c3 = (x + 1.0f - p.x) * nx + (y + 1.0f - p.y) * ny;
+        const float c1 = (x + size - p.x) * nx + (y - p.y) * ny;
+        const float c2 = (x - p.x) * nx + (y + size - p.y) * ny;
+        const float c3 = (x + size - p.x) * nx + (y + size - p.y) * ny;
         if (c0 > 0.0f && c1 > 0.0f && c2 > 0.0f && c3 > 0.0f)
             return false;
     }
@@ -160,13 +160,14 @@ struct Test {
     bool translucent;
 };
 
-// The state of a micro-triangle with these corners in texel space: known where every texel it touches agrees.
+// The state of a micro-triangle with these corners in texel space: known where every texel that bilinear filtering
+// reads inside it agrees. A texel takes part in the filtered alpha within half a texel around its own square.
 State Classify(const AlphaImage& image, const Float2 (&corners)[3], const Test& test)
 {
-    const float minX = std::floor(std::min({corners[0].x, corners[1].x, corners[2].x}));
-    const float maxX = std::floor(std::max({corners[0].x, corners[1].x, corners[2].x}));
-    const float minY = std::floor(std::min({corners[0].y, corners[1].y, corners[2].y}));
-    const float maxY = std::floor(std::max({corners[0].y, corners[1].y, corners[2].y}));
+    const float minX = std::floor(std::min({corners[0].x, corners[1].x, corners[2].x}) - 0.5f);
+    const float maxX = std::floor(std::max({corners[0].x, corners[1].x, corners[2].x}) + 0.5f);
+    const float minY = std::floor(std::min({corners[0].y, corners[1].y, corners[2].y}) - 0.5f);
+    const float maxY = std::floor(std::max({corners[0].y, corners[1].y, corners[2].y}) + 0.5f);
     if ((maxX - minX + 1.0f) * (maxY - minY + 1.0f) > static_cast<float>(kMaxTexels))
         return kUnknownTransparent;
     int opaque = 0;
@@ -176,7 +177,7 @@ State Classify(const AlphaImage& image, const Float2 (&corners)[3], const Test& 
     const int height = static_cast<int>(image.height);
     for (float y = minY; y <= maxY; y += 1.0f) {
         for (float x = minX; x <= maxX; x += 1.0f) {
-            if (!TexelMeets(corners, x, y))
+            if (!SquareMeets(corners, x - 0.5f, y - 0.5f, 2.0f))
                 continue;
             const int tx = ((static_cast<int>(x) % width) + width) % width;
             const int ty = ((static_cast<int>(y) % height) + height) % height;

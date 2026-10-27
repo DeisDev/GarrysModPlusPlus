@@ -20,7 +20,7 @@ float Trace(int2 pixel, float4 surface)
     for (uint r = 0; r < g_frame.aoRays; ++r) {
         float3 direction = AboveSurface(CosineSample(surface.xyz, Random(seed), Random(seed)), geometricNormal);
         HitInfo hit;
-        open += TraceHit(origin, direction, kRadius, g_frame.indirectMask & ~kLocalPlayerMask, hit, g_frame.indirectRayFlags) ? saturate(hit.t / kRadius) : 1.0;
+        open += TraceHit(origin, direction, kRadius, g_frame.indirectMask, hit, g_frame.indirectRayFlags) ? saturate(hit.t / kRadius) : 1.0;
     }
     return open / g_frame.aoRays;
 }
@@ -70,6 +70,7 @@ float Blur(int2 pixel, float4 surface)
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID)
 {
+    id.xy = DispatchPixel(id.xy);
     if (any(id.xy >= g_frame.size))
         return;
     int2 pixel = int2(id.xy);

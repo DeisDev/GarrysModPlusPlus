@@ -65,7 +65,9 @@ D3D12_GPU_DESCRIPTOR_HANDLE DescriptorHeap::Gpu(UINT index) const
     return handle;
 }
 
-UINT DescriptorHeap::CreateRawView(ID3D12Resource* buffer)
+UINT DescriptorHeap::CreateRawView(ID3D12Resource* buffer) { return CreateRawView(buffer, 0, buffer->GetDesc().Width); }
+
+UINT DescriptorHeap::CreateRawView(ID3D12Resource* buffer, UINT64 offset, UINT64 size)
 {
     UINT index = Allocate();
     if (index == kInvalid)
@@ -74,9 +76,24 @@ UINT DescriptorHeap::CreateRawView(ID3D12Resource* buffer)
     srv.Format = DXGI_FORMAT_R32_TYPELESS;
     srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
     srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    srv.Buffer.NumElements = static_cast<UINT>(buffer->GetDesc().Width / 4);
+    srv.Buffer.FirstElement = offset / 4;
+    srv.Buffer.NumElements = static_cast<UINT>(size / 4);
     srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
     m_device->CreateShaderResourceView(buffer, &srv, Cpu(index));
+    return index;
+}
+
+UINT DescriptorHeap::CreateRawUav(ID3D12Resource* buffer)
+{
+    UINT index = Allocate();
+    if (index == kInvalid)
+        return kInvalid;
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
+    uav.Format = DXGI_FORMAT_R32_TYPELESS;
+    uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    uav.Buffer.NumElements = static_cast<UINT>(buffer->GetDesc().Width / 4);
+    uav.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+    m_device->CreateUnorderedAccessView(buffer, nullptr, &uav, Cpu(index));
     return index;
 }
 

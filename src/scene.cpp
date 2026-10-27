@@ -335,6 +335,8 @@ int Scene::AddModel(const ModelGeometry& geometry)
     m_list->Reset(m_allocator.Get(), nullptr);
     std::vector<ComPtr<ID3D12Resource>> staging;
     Model model;
+    model.vertexCount = static_cast<UINT>(geometry.positions.size());
+    model.triangleCount = triangles;
     model.opaqueTriangles = triangles - alphaTriangles;
     model.positions = UploadToDefault(geometry.positions.data(), geometry.positions.size_bytes(), staging);
     model.indices = UploadToDefault(geometry.indices.data(), geometry.indices.size_bytes(), staging);
@@ -706,6 +708,14 @@ bool Scene::EnsureFrameCapacity(FrameTlas& frame, UINT count)
     m_device->CreateShaderResourceView(frame.records.Get(), &srv, m_descriptors->Cpu(recordsView));
     frame.capacity = capacity;
     return true;
+}
+
+std::optional<Scene::ModelBuffers> Scene::Buffers(int model) const
+{
+    if (model < 0 || static_cast<size_t>(model) >= m_models.size())
+        return std::nullopt;
+    const Model& m = m_models[model];
+    return ModelBuffers{m.positionsView, m.indices->GetGPUVirtualAddress(), m.vertexCount, m.triangleCount, m.opaqueTriangles};
 }
 
 void Scene::SetStaticInstances(std::vector<SceneInstance> instances)

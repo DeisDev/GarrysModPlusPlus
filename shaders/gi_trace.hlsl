@@ -3,7 +3,8 @@
 // Cosine-weighted diffuse bounces per pixel. The result is an irradiance estimate: a sky miss returns
 // the sky irradiance, a hit returns its albedo times the light reaching it. Where the hit was on screen last
 // frame that is last frame's whole irradiance there (exact direct plus denoised light); elsewhere it is the sun,
-// one local light picked by SampleLight and g_frame.indirectBounces - 1 more traced bounces.
+// one local light picked by SampleLight and g_frame.indirectBounces - 1 more traced bounces, or, for the viewmodel's
+// many rays, the main view's irradiance volume.
 // The sampled remainder of the direct light (direct.hlsl) is added, so the denoiser handles both.
 // input0: last frame's denoised light, or none; input1: sampled direct remainder; input2: last frame's exact direct
 // light; output0: raw estimate; step: samples per pixel.
@@ -50,11 +51,33 @@ float3 FurtherBounces(HitSurface hit, float3 origin, inout uint seed)
     return irradiance;
 }
 
+// The main view's filled irradiance volume at a point, or -1 where there is none.
+float3 VolumeIrradiance(float3 position, float3 normal)
+{
+    if (g_frame.probeRedView == kNoView)
+        return -1.0;
+    static const float3 kGrid = float3(32.0, 32.0, 16.0);
+    float3 window = (position / g_frame.probeSpacing - 0.5) - float3(g_frame.probeOrigin);
+    if (any(window < 0.0) || any(window > kGrid - 1.0))
+        return -1.0;
+    float3 uvw = position / (g_frame.probeSpacing * kGrid);
+    Texture3D<float4> red = ResourceDescriptorHeap[g_frame.probeRedView];
+    Texture3D<float4> green = ResourceDescriptorHeap[g_frame.probeGreenView];
+    Texture3D<float4> blue = ResourceDescriptorHeap[g_frame.probeBlueView];
+    float4 r = red.SampleLevel(g_linearWrap, uvw, 0.0);
+    float4 g = green.SampleLevel(g_linearWrap, uvw, 0.0);
+    float4 b = blue.SampleLevel(g_linearWrap, uvw, 0.0);
+    return max(float3(r.x + dot(r.yzw, normal), g.x + dot(g.yzw, normal), b.x + dot(b.yzw, normal)), 0.0);
+}
+
 float3 HitIrradiance(HitSurface hit, inout uint seed)
 {
     float3 previous = PreviousIrradiance(hit.position, hit.normal);
     if (previous.x >= 0.0)
         return previous;
+    float3 volume = VolumeIrradiance(hit.position, hit.normal);
+    if (volume.x >= 0.0)
+        return volume;
     float3 origin = hit.position + hit.normal * 1.0;
     float3 irradiance = SunIrradiance(hit, origin, g_frame.bounceMask);
     float3 light;
@@ -70,6 +93,7 @@ float3 HitIrradiance(HitSurface hit, inout uint seed)
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID)
 {
+    id.xy = DispatchPixel(id.xy);
     if (any(id.xy >= g_frame.size))
         return;
     int2 pixel = int2(id.xy);

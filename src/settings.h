@@ -120,8 +120,10 @@ struct Statistics {
     std::array<float, kFrameHistory> frameMs = {};
     size_t frameCount = 0;
     size_t nextFrame = 0;
+    // All views; passMs are the main view's passes and otherViewsMs the 3D skybox's and viewmodel's whole runs.
     double lightingMs = 0.0;
     std::array<double, static_cast<size_t>(GpuPass::Count)> passMs = {};
+    double otherViewsMs = 0.0;
     uint32_t mapLights = 0;
     uint32_t dynamicLights = 0;
     uint32_t projectedLights = 0;

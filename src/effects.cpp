@@ -14,6 +14,7 @@
 #include "settings.h"
 #include "skinned_casters.h"
 #include "studio_model.h"
+#include "swaying_props.h"
 
 #include <wrl/client.h>
 
@@ -73,13 +74,16 @@ struct ModelEntry {
     std::shared_ptr<SkinnedModel> skinned;
     // Where the model is, in its own space: brush models (`*N`) keep their faces away from their origin.
     bsp::Float3 center = {};
+    // Its vertices' sway when some of its materials sway in the wind.
+    std::shared_ptr<SwayingModel> swaying;
 };
 
 struct MaterialInfo {
     // Translucent surfaces (glass, foliage) let part of the light through; alpha-tested ones (foliage, fences) are
-    // cut by their alpha. Additive ones are light effects (beams, glows) that block nothing.
+    // cut by their alpha. Clear ones block nothing: additive light effects (beams, glows) and Refract glass, which
+    // VBSP makes a non-solid window brush that VRAD's shadows ignore (FindMiptex, AddBrushToRaytraceEnvironment).
     bool translucent = false;
-    bool additive = false;
+    bool clear = false;
     bool alphaTest = false;
     float alphaReference = kDefaultAlphaReference;
     // $alpha.
@@ -88,6 +92,8 @@ struct MaterialInfo {
     bsp::Float3 reflectivity = kDefaultReflectivity;
     // Reflections and self-illumination, for Scene::AddMaterial.
     uint32_t sceneMaterial = Scene::kNoMaterial;
+    // Index of its $treesway parameters in State::swayMaterials.
+    uint32_t swayMaterial = SwayingModel::kNoSway;
 };
 
 // What Scene::AddModel needs beyond positions, indices and albedo; alpha-tested triangles are moved last.
@@ -118,6 +124,7 @@ struct State {
     std::string failedMap;
     std::unordered_map<std::string, ModelEntry> models;
     std::unordered_map<std::string, std::optional<MaterialInfo>> materials;
+    std::vector<SwayMaterial> swayMaterials;
     // Textures uploaded for alpha tests and material masks, by VTF path.
     std::unordered_map<std::string, SceneTexture> textures;
     std::vector<std::string> mapMaterials;
@@ -134,7 +141,7 @@ struct State {
     // The map's 3D skybox test (BSP tree, leaf areas and bounds), to keep its entities out of the main view's rays.
     bsp::WorldGeometry skyboxTest;
     bool viewmodelCapture = false;
-    // How far this frame's image is shifted, in render pixels (x right, y down), for Ray Reconstruction.
+    // How far this frame's image is shifted, in render pixels (x right, y down).
     float pixelOffset[2] = {};
     D3DVIEWPORT9 viewmodelViewport = {};
     const std::vector<SkinnedEntity> noSkinnedEntities;
@@ -233,6 +240,43 @@ bsp::Float3 MaterialColor(std::string_view vmt, std::string_view key, bsp::Float
     else if (count != 3)
         return fallback;
     return {v[0] * scale, v[1] * scale, v[2] * scale};
+}
+
+float MaterialFloat(std::string_view vmt, std::string_view key, float fallback)
+{
+    const std::optional<std::string> value = studio::MaterialValue(vmt, key);
+    float result = fallback;
+    if (value && std::from_chars(value->data(), value->data() + value->size(), result).ec != std::errc())
+        result = fallback;
+    return result;
+}
+
+// A material's $treesway parameters, with the defaults VertexLitGeneric's InitParams gives missing ones
+// (vertexlitgeneric_dx9_helper.cpp).
+std::optional<SwayMaterial> MaterialSway(std::string_view vmt)
+{
+    const std::optional<std::string> mode = studio::MaterialValue(vmt, "$treesway");
+    if (!mode || mode->empty() || (mode->front() != '1' && mode->front() != '2'))
+        return std::nullopt;
+    SwayMaterial sway;
+    sway.mode = mode->front() == '2' ? 2u : 1u;
+    sway.height = MaterialFloat(vmt, "$treeswayheight", sway.height);
+    sway.startHeight = MaterialFloat(vmt, "$treeswaystartheight", sway.startHeight);
+    sway.radius = MaterialFloat(vmt, "$treeswayradius", sway.radius);
+    sway.startRadius = MaterialFloat(vmt, "$treeswaystartradius", sway.startRadius);
+    sway.speed = MaterialFloat(vmt, "$treeswayspeed", sway.speed);
+    sway.strength = MaterialFloat(vmt, "$treeswaystrength", sway.strength);
+    sway.scrumbleFrequency = MaterialFloat(vmt, "$treeswayscrumblefrequency", sway.scrumbleFrequency);
+    sway.scrumbleStrength = MaterialFloat(vmt, "$treeswayscrumblestrength", sway.scrumbleStrength);
+    sway.highWindSpeedMultiplier = MaterialFloat(vmt, "$treeswayspeedhighwindmultiplier", sway.highWindSpeedMultiplier);
+    sway.scrumbleFalloffExp = MaterialFloat(vmt, "$treeswayscrumblefalloffexp", sway.scrumbleFalloffExp);
+    sway.falloffExp = MaterialFloat(vmt, "$treeswayfalloffexp", sway.falloffExp);
+    sway.scrumbleSpeed = MaterialFloat(vmt, "$treeswayscrumblespeed", sway.scrumbleSpeed);
+    sway.speedLerpStart = MaterialFloat(vmt, "$treeswayspeedlerpstart", sway.speedLerpStart);
+    sway.speedLerpEnd = MaterialFloat(vmt, "$treeswayspeedlerpend", sway.speedLerpEnd);
+    const std::optional<std::string> fixedWind = studio::MaterialValue(vmt, "$treeswaystatic");
+    sway.staticWind = fixedWind && !fixedWind->empty() && fixedWind->front() != '0' ? 1u : 0u;
+    return sway;
 }
 
 // The shader a VMT names (its first token), in lower case.
@@ -351,7 +395,7 @@ const std::optional<MaterialInfo>& MaterialFor(const std::string& vmtPath)
             entry->opacity = std::clamp(value, 0.0f, 1.0f);
     }
     entry->translucent = enabled("$translucent") || entry->opacity < 1.0f;
-    entry->additive = enabled("$additive");
+    entry->clear = enabled("$additive") || shader == "refract";
     entry->alphaTest = enabled("$alphatest");
     if (std::optional<std::string> reference = studio::MaterialValue(text, "$alphatestreference")) {
         float value = 0.0f;
@@ -365,14 +409,18 @@ const std::optional<MaterialInfo>& MaterialFor(const std::string& vmtPath)
             entry->reflectivity = *reflectivity;
     }
     entry->sceneMaterial = SceneMaterial(text, entry->baseTexture, IsUnlitShader(shader));
+    if (const std::optional<SwayMaterial> sway = MaterialSway(text)) {
+        entry->swayMaterial = static_cast<uint32_t>(g_state.swayMaterials.size());
+        g_state.swayMaterials.push_back(*sway);
+    }
     return entry;
 }
 
 // The alpha-test or translucency entry of a material's triangles, kOpaqueTriangle, or kDroppedTriangle for
-// additive materials.
+// clear materials.
 uint32_t TriangleAlphaFor(const MaterialInfo& material)
 {
-    if (material.additive)
+    if (material.clear)
         return kDroppedTriangle;
     if (!material.alphaTest && !material.translucent)
         return kOpaqueTriangle;
@@ -494,15 +542,17 @@ const ModelEntry& ModelFor(const std::string& mdlPath)
         std::vector<uint32_t> textureAlbedo(texturePaths.size(), PackAlbedo(kDefaultReflectivity));
         std::vector<uint32_t> textureAlpha(texturePaths.size(), kOpaqueTriangle);
         std::vector<uint32_t> textureMaterial(texturePaths.size(), Scene::kNoMaterial);
+        std::vector<uint32_t> textureSway(texturePaths.size(), SwayingModel::kNoSway);
         for (size_t t = 0; t < texturePaths.size(); ++t) {
             for (const std::string& vmtPath : texturePaths[t]) {
                 const std::optional<MaterialInfo>& material = MaterialFor(vmtPath);
                 if (!material)
                     continue;
-                skip[t] = material->additive;
+                skip[t] = material->clear;
                 textureAlbedo[t] = PackAlbedo(material->reflectivity);
                 textureAlpha[t] = TriangleAlphaFor(*material);
                 textureMaterial[t] = material->sceneMaterial;
+                textureSway[t] = material->swayMaterial;
                 break;
             }
         }
@@ -519,6 +569,19 @@ const ModelEntry& ModelFor(const std::string& mdlPath)
                 triangles.materials.push_back(texture < textureMaterial.size() ? textureMaterial[texture] : Scene::kNoMaterial);
             entry.sceneModel = g_state.scene.AddModel({geometry.positions, geometry.indices, triangleAlbedo, triangles.opaqueTriangles, geometry.uvs,
                 triangles.alphaTriangles, triangles.materials});
+            if (entry.sceneModel >= 0 && std::any_of(textureSway.begin(), textureSway.end(), [](uint32_t sway) { return sway != SwayingModel::kNoSway; })) {
+                auto swaying = std::make_shared<SwayingModel>();
+                swaying->sceneModel = entry.sceneModel;
+                swaying->vertexMaterials.assign(geometry.positions.size(), SwayingModel::kNoSway);
+                for (size_t t = 0; t < geometry.triangleTextures.size(); ++t) {
+                    const uint16_t texture = geometry.triangleTextures[t];
+                    for (size_t corner = 0; corner < 3; ++corner) {
+                        if (texture < textureSway.size() && textureSway[texture] != SwayingModel::kNoSway)
+                            swaying->vertexMaterials[geometry.indices[t * 3 + corner]] = textureSway[texture];
+                    }
+                }
+                entry.swaying = std::move(swaying);
+            }
             if (entry.sceneModel >= 0 && studio::BoneCount(mdl) > 1) {
                 auto skinned = std::make_shared<SkinnedModel>();
                 skinned->opaqueTriangles = triangles.opaqueTriangles;
@@ -669,6 +732,7 @@ void ClearScene()
 {
     g_state.lighting->WaitForGpu();
     g_state.lighting->Skinned().Clear();
+    g_state.lighting->Sway().Clear();
     g_state.lighting->InvalidateHistory();
     g_state.scene.Clear();
     light_queries::Clear();
@@ -679,6 +743,7 @@ void ClearScene()
     g_state.textures.clear();
     // Scene material indices and texture views are reset with the scene.
     g_state.materials.clear();
+    g_state.swayMaterials.clear();
 }
 
 void UpdateScene()
@@ -720,17 +785,25 @@ void UpdateScene()
             g_state.skyboxTest.skyMins = world.skyMins;
             g_state.skyboxTest.skyMaxs = world.skyMaxs;
             std::vector<SceneInstance> instances;
+            std::vector<SwayingProp> swayingProps;
             const auto addProps = [&](const std::vector<bsp::StaticProp>& props, UINT mask) {
                 for (const bsp::StaticProp& prop : props) {
-                    SceneInstance& instance = instances.emplace_back();
-                    instance.model = ModelFor(world.propModels[prop.model]).sceneModel;
+                    const ModelEntry& model = ModelFor(world.propModels[prop.model]);
+                    SceneInstance instance;
+                    instance.model = model.sceneModel;
                     instance.mask = mask == 0 && prop.noShadow ? kShadowlessPropMask : mask;
                     instance.flags = prop.ignoreNormals ? kInstanceIgnoreNormals : 0;
                     std::memcpy(instance.transform, prop.transform, sizeof(instance.transform));
+                    // The 3D skybox's scaled-down props sway too little to matter.
+                    if (model.swaying && mask != kSkyboxMask)
+                        swayingProps.push_back({model.swaying, instance});
+                    else
+                        instances.push_back(instance);
                 }
             };
             addProps(world.props, 0);
-            const size_t worldProps = std::count_if(instances.begin(), instances.end(), [](const SceneInstance& instance) { return instance.model >= 0; });
+            const size_t worldProps = swayingProps.size() +
+                std::count_if(instances.begin(), instances.end(), [](const SceneInstance& instance) { return instance.model >= 0; });
             if (!world.skybox.indices.empty()) {
                 TriangleData skyboxTriangles;
                 SceneInstance& skybox = instances.emplace_back();
@@ -748,6 +821,10 @@ void UpdateScene()
                 world.props.size(), world.lights.size(), world.sun.present ? "present" : "missing", world.sun.direction.x, world.sun.direction.y,
                 world.sun.direction.z, world.sun.color.x, world.sun.color.y, world.sun.color.z, world.sun.ambient.x, world.sun.ambient.y,
                 world.sun.ambient.z);
+            if (!g_state.lighting->Sway().SetProps(g_state.scene, g_state.swayMaterials, swayingProps)) {
+                for (const SwayingProp& prop : swayingProps)
+                    instances.push_back(prop.instance);
+            }
             g_state.scene.SetStaticInstances(std::move(instances));
             if (GetRenderer()->SupportsOpacityMicromaps()) {
                 const auto [triangles, micromaps] = g_state.scene.MicromapCounts();
@@ -1024,8 +1101,10 @@ void OnViewOpaqueBegin()
         jitterY = -g_state.pixelOffset[1] * 2.0f / static_cast<float>(renderHeight);
     } else if (GetSettings().antiAliasing == AntiAliasing::Temporal) {
         const uint32_t sample = static_cast<uint32_t>(g_state.frame % kJitterSamples) + 1;
-        jitterX = (Halton(sample, 2) - 0.5f) * 2.0f / static_cast<float>(desc.Width);
-        jitterY = -(Halton(sample, 3) - 0.5f) * 2.0f / static_cast<float>(desc.Height);
+        g_state.pixelOffset[0] = Halton(sample, 2) - 0.5f;
+        g_state.pixelOffset[1] = Halton(sample, 3) - 0.5f;
+        jitterX = g_state.pixelOffset[0] * 2.0f / static_cast<float>(desc.Width);
+        jitterY = -g_state.pixelOffset[1] * 2.0f / static_cast<float>(desc.Height);
     }
     gbuffer::SetJitter(jitterX, jitterY);
     gbuffer::Begin(device);

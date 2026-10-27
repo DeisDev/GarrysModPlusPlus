@@ -16,6 +16,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Ray tracing quality presets (Low, Medium, High, Ultra) and settings for shadow rays, indirect rays and bounces, ambient occlusion rays, light volume rays, volumetric light steps and foliage shadows.
 - Opacity micromaps make ray tracing through grass, leaves and fences faster on GPUs that support them, with an option for faster, approximate alpha tests in indirect light.
 - The ambient occlusion pass has its own GPU time in the menu and log.
+- Shadows of swaying grass, leaves and trees (`$treesway`) now move with them.
+- The menu and log show the GPU time of the 3D skybox and viewmodel, which the lighting total now includes.
 
 ### Changed
 
@@ -27,6 +29,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Values in `gmodpp_settings.ini` are limited to the ranges the menu offers.
 - Grassy areas render faster: later indirect light bounces pass through grass, and alpha tests read less data.
 - The DirectX 12 Agility SDK runtime is installed to `bin/win64/D3D12`; without it, opacity micromaps are unavailable.
+- Spot light pools have soft edges like the map's baked lighting instead of a hard line.
+- The ray-traced flashlight and other projected lights fall off with distance like real light beyond the range where they reach full strength.
+- Maps with many lights render faster: lights are evaluated faster, the light volume is traced in parallel, and the viewmodel is lit faster.
 
 ### Fixed
 
@@ -41,3 +46,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fixed grass and other foliage turning black where it faces away from the light.
 - Fixed ghost copies of nearby objects appearing in the sky with DLSS Ray Reconstruction.
 - Fixed bright lines along the edges of walls, floors and ceilings, and along grooves in normal-mapped floors.
+- Fixed window glass (Refract materials) blocking sunlight and daylight, which left rooms dark.
+- Fixed dark spots in the player's shadow around the feet.
+- Fixed the flashlight turning props, foliage and trees white.
+- Fixed glass seen through small gaps (such as between stair steps) flickering.
+- Fixed fog using the wrong colour, and the 3D skybox getting no fog on some maps.
+- Fixed shadows of leaves and other alpha-tested surfaces looking like square blocks.

@@ -29,6 +29,7 @@ float SourceVariance(Texture2D<float4> source, int2 pixel, float spatialVariance
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID)
 {
+    id.xy = DispatchPixel(id.xy);
     if (any(id.xy >= g_frame.size))
         return;
     int2 pixel = int2(id.xy);

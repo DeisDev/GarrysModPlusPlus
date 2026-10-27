@@ -113,6 +113,7 @@ constexpr std::array<const char*, static_cast<size_t>(TextId::Count)> kEnglish =
     "Opacity micromaps are not available on this system.",
     "Opacity micromaps: {} triangles, {} maps",
     "Ambient occlusion: {:.2f} ms",
+    "3D skybox and viewmodel: {:.2f} ms",
 };
 
 }

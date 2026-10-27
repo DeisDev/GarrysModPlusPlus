@@ -253,6 +253,7 @@ void DrawPerformance(const Statistics& statistics)
     static_assert(std::size(passes) == static_cast<size_t>(GpuPass::Count));
     for (size_t i = 0; i < std::size(passes); ++i)
         TextLine(passes[i], statistics.passMs[i]);
+    TextLine(TextId::PassOtherViews, statistics.otherViewsMs);
 }
 
 void DrawGeneralTab(Settings& settings)

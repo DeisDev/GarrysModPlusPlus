@@ -69,6 +69,7 @@ constexpr DWORD kDefaultColorWrite = 0x0F;
 constexpr DWORD kColorWriteRgb = D3DCOLORWRITEENABLE_RED | D3DCOLORWRITEENABLE_GREEN | D3DCOLORWRITEENABLE_BLUE;
 constexpr UINT kLightScaleRegister = 30;
 constexpr UINT kFogColorRegister = 29;
+constexpr UINT kVertexFogRegister = 16;
 constexpr UINT kTrackedRegisters = 32;
 constexpr UINT kTrackedVertexRegisters = 256;
 constexpr DWORD kTextureStages = 16;
@@ -101,8 +102,6 @@ struct FlashlightRegisters {
 
 struct ShaderInfo {
     ShaderKind kind = ShaderKind::Other;
-    // Register of g_FogParams in shaders that apply fog, or -1.
-    int fogRegister = -1;
     FlashlightRegisters flashlight;
     // Its replacement writes self-illumination to the emissive target.
     bool emissive = false;
@@ -193,6 +192,10 @@ struct State {
     std::unordered_map<IDirect3DPixelShader9*, ShaderInfo> shaders;
     std::unordered_map<IDirect3DVertexShader9*, FlashlightRegisters> vertexShaders;
     FlashlightRegisters boundVertex;
+    // Each tree sway vertex shader's g_vMiscParams2 register (y time, zw wind), and the bound shader's or -1.
+    std::unordered_map<IDirect3DVertexShader9*, int> swayRegisters;
+    int boundSwayRegister = -1;
+    SwayClock swayClock;
     std::array<std::array<float, 4>, kTrackedVertexRegisters> vertexConstants = {};
     std::array<IDirect3DBaseTexture9*, kTextureStages> textures = {};
     std::vector<ProjectedLight> projected;
@@ -208,8 +211,6 @@ struct State {
     std::array<std::array<float, 4>, kTrackedRegisters> constants = {};
     // Fog of the main view and of the 3D skybox, which has its own.
     std::array<Fog, 2> fog;
-    bool lastViewWasSkybox = false;
-    bool fogWindow = false;
     bool depthTest = true;
     bool blending = false;
     DWORD sourceBlend = D3DBLEND_ONE;
@@ -373,21 +374,12 @@ void CaptureProjectedLight()
     }
 }
 
-int FogRegister(const std::vector<bytecode::Constant>& constants)
-{
-    for (const bytecode::Constant& c : constants) {
-        if (c.name == "g_FogParams" && c.set == bytecode::RegisterSet::Float4 && c.index < kTrackedRegisters)
-            return static_cast<int>(c.index);
-    }
-    return -1;
-}
-
-void Register(IDirect3DPixelShader9* shader, ShaderKind kind, int fogRegister, IDirect3DPixelShader9* substitute,
+void Register(IDirect3DPixelShader9* shader, ShaderKind kind, IDirect3DPixelShader9* substitute,
     const FlashlightRegisters& flashlight = {}, bool emissive = false, IDirect3DPixelShader9* forward = nullptr, std::array<UINT, 3> probeSamplers = {},
     std::array<UINT, kForwardConstantCount> forwardUniforms = {}, int detailMode = -1)
 {
     // Shader addresses are reused after the game releases one, so every creation overwrites the old entry.
-    g_state.shaders[shader] = {kind, fogRegister, flashlight, emissive, forward, probeSamplers, forwardUniforms, detailMode};
+    g_state.shaders[shader] = {kind, flashlight, emissive, forward, probeSamplers, forwardUniforms, detailMode};
     if (forward == nullptr || forward != g_state.forwardVariants[shader].Get())
         g_state.forwardVariants.erase(shader);
     if (substitute != nullptr)
@@ -511,7 +503,7 @@ HRESULT CreatePixelShader(IDirect3DDevice9* device, const DWORD* code, IDirect3D
                 if (++g_state.forwardFailures <= 5)
                     log::Info("G-buffer: a preview shader gets no forward-lit variant: {}", reason);
             }
-            Register(*shader, ShaderKind::GBuffer, -1, nullptr, {}, false, forward.Get(), samplers, uniforms);
+            Register(*shader, ShaderKind::GBuffer, nullptr, {}, false, forward.Get(), samplers, uniforms);
             if (forward)
                 g_state.forwardVariants[*shader] = std::move(forward);
             ++g_state.patchedShaders;
@@ -524,11 +516,11 @@ HRESULT CreatePixelShader(IDirect3DDevice9* device, const DWORD* code, IDirect3D
     if (FAILED(hr))
         return hr;
     if (HasConstant(constants, "ShadowSampler") && HasConstant(constants, "g_ShadowColor")) {
-        Register(*shader, ShaderKind::ProjectedShadow, -1, nullptr);
+        Register(*shader, ShaderKind::ProjectedShadow, nullptr);
         return hr;
     }
     if (IsFlashlightPass(constants)) {
-        Register(*shader, ShaderKind::Flashlight, -1, nullptr, FlashlightRegistersOf(constants, kTrackedRegisters));
+        Register(*shader, ShaderKind::Flashlight, nullptr, FlashlightRegistersOf(constants, kTrackedRegisters));
         return hr;
     }
     IDirect3DPixelShader9* substitute = nullptr;
@@ -558,7 +550,7 @@ HRESULT CreatePixelShader(IDirect3DDevice9* device, const DWORD* code, IDirect3D
         ++g_state.replacedShaders;
         ++GetStatistics().replacedShaders;
     }
-    Register(*shader, substitute != nullptr ? ShaderKind::GBuffer : ShaderKind::Other, FogRegister(constants), substitute, {},
+    Register(*shader, substitute != nullptr ? ShaderKind::GBuffer : ShaderKind::Other, substitute, {},
         substitute != nullptr && (selfIllum != SelfIllum::None || detailMode == 5), forward, kModelProbeSamplers, kModelForwardUniforms, detailMode);
     return hr;
 }
@@ -618,15 +610,11 @@ void BindTargets(IDirect3DDevice9* device, Targets targets)
 
 DrawAction BeforeDraw(IDirect3DDevice9* device)
 {
-    // Depth-tested forward shaders that fog after a view's opaque pass (its translucent surfaces) show that
-    // view's fog settings, which the deferred pass applies itself. The HUD and other 2D draws do not count.
-    if (g_state.fogWindow && g_state.depthTest && g_state.bound.fogRegister >= 0) {
-        // Forward draws follow a view's opaque pass, so they belong to the view that ended last.
-        Fog& fog = g_state.fog[g_state.lastViewWasSkybox ? 1 : 0];
-        fog.params = g_state.constants[g_state.bound.fogRegister];
-        const auto& color = g_state.constants[kFogColorRegister];
-        fog.color = {color[0], color[1], color[2]};
-        fog.known = true;
+    if (g_state.boundSwayRegister >= 0) {
+        const auto& params = g_state.vertexConstants[g_state.boundSwayRegister];
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        g_state.swayClock = {params[1], {params[2], params[3]}, now.QuadPart, true};
     }
     if (g_state.forwardActive && g_state.bound.forward != nullptr)
         return DrawAction::Forward;
@@ -655,10 +643,12 @@ DrawAction BeforeDraw(IDirect3DDevice9* device)
     if (g_state.bound.kind == ShaderKind::ProjectedShadow)
         return DrawAction::Skip;
     // Additive passes (emissive glows, sprites) add light rather than surface colour, so they go to the light
-    // target, which is added after lighting without being lit again.
+    // target, which is added after lighting without being lit again. VertexLitGeneric has no lighting preview
+    // variant of its flashlight pass, so the game draws those with no pixel shader (fixed-function white); the
+    // flashlight already reaches those models through the projected light the other passes captured.
     if (g_state.bound.kind == ShaderKind::Other && g_state.blending && g_state.destinationBlend == D3DBLEND_ONE &&
         (g_state.sourceBlend == D3DBLEND_ONE || g_state.sourceBlend == D3DBLEND_SRCALPHA))
-        return DrawAction::RedirectToLight;
+        return g_state.requested != nullptr ? DrawAction::RedirectToLight : DrawAction::Skip;
     if (g_state.bound.kind == ShaderKind::Flashlight) {
         CaptureProjectedLight();
         return GetSettings().flashlightMode == FlashlightMode::Game ? DrawAction::RedirectToLight : DrawAction::Skip;
@@ -718,6 +708,8 @@ HRESULT CreateVertexShader(IDirect3DDevice9* device, const DWORD* code, IDirect3
     const size_t tokens = code != nullptr ? bytecode::TokenCount(code) : 0;
     const std::vector<bytecode::Constant> constants = tokens != 0 ? bytecode::ConstantTable(std::span<const DWORD>(code, tokens)) : std::vector<bytecode::Constant>{};
     g_state.vertexShaders[*shader] = FlashlightRegistersOf(constants, kTrackedVertexRegisters);
+    if (HasConstant(constants, "g_vMiscParams4"))
+        g_state.swayRegisters[*shader] = RegisterOf(constants, {"g_vMiscParams2"}, bytecode::RegisterSet::Float4, kTrackedVertexRegisters);
     return hr;
 }
 
@@ -725,6 +717,8 @@ void OnVertexShader(IDirect3DVertexShader9* shader)
 {
     auto info = g_state.vertexShaders.find(shader);
     g_state.boundVertex = info != g_state.vertexShaders.end() ? info->second : FlashlightRegisters{};
+    const auto sway = g_state.swayRegisters.find(shader);
+    g_state.boundSwayRegister = sway != g_state.swayRegisters.end() ? sway->second : -1;
 }
 
 void OnVertexShaderConstants(UINT start, const float* data, UINT count)
@@ -875,6 +869,8 @@ void EndForwardDraw(IDirect3DDevice9* device)
 
 std::span<const ProjectedLight> ProjectedLights() { return g_state.lastProjected; }
 
+const SwayClock& LastSwayClock() { return g_state.swayClock; }
+
 void OnRenderState(D3DRENDERSTATETYPE state, DWORD value)
 {
     TrackedState* tracked = state == D3DRS_SRGBWRITEENABLE ? &g_state.srgbWrite : state == D3DRS_COLORWRITEENABLE2 ? &g_state.emissiveWrites : nullptr;
@@ -915,7 +911,6 @@ bool Begin(IDirect3DDevice9* device)
     g_state.gameTarget = g_state.colorTarget.Get();
     g_state.boundTargets = Targets::Game;
     g_state.active = true;
-    g_state.fogWindow = false;
     ++g_state.sections;
     // The view's projection was set before the capture began; send it again so it picks up the jitter.
     device->SetVertexShaderConstantF(kModelViewProjection, g_state.vertexConstants[kModelViewProjection].data(), kProjectionRegisters);
@@ -934,8 +929,16 @@ void End(IDirect3DDevice9* device, ViewKind kind)
 {
     if (!g_state.active)
         return;
-    g_state.lastViewWasSkybox = kind == ViewKind::Skybox;
-    g_state.fogWindow = kind != ViewKind::Viewmodel;
+    if (kind != ViewKind::Viewmodel) {
+        // Every lit shader's vertex fog constant holds the view's range fog (cFogParams: end / range, 1,
+        // 1 - max density, 1 / range) and pixel c29 its colour, even in the preview shaders that do not fog.
+        const auto& range = g_state.vertexConstants[kVertexFogRegister];
+        const auto& color = g_state.constants[kFogColorRegister];
+        Fog& fog = g_state.fog[kind == ViewKind::Skybox ? 1 : 0];
+        fog.params = {range[0] - 1.0f, 0.0f, 1.0f - range[2], range[3]};
+        fog.color = {color[0], color[1], color[2]};
+        fog.known = true;
+    }
     if (kind == ViewKind::Main) {
         const std::pair<uint32_t, size_t> projection = {std::min<uint32_t>(g_state.flashlightDraws, 1), g_state.projected.size()};
         if (projection != g_state.loggedProjection) {

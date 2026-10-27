@@ -25,6 +25,7 @@ float3 DepthNormal(int2 pixel, float depth, float3 position)
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID)
 {
+    id.xy = DispatchPixel(id.xy);
     if (any(id.xy >= g_frame.size))
         return;
     int2 pixel = int2(id.xy);

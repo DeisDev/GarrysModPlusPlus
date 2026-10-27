@@ -3,6 +3,7 @@
 #include <d3d9.h>
 
 #include <array>
+#include <cstdint>
 #include <optional>
 #include <span>
 #include <vector>
@@ -89,8 +90,17 @@ struct ProjectedLight {
 // Projected lights seen in the last main view.
 std::span<const ProjectedLight> ProjectedLights();
 
-// Source's range fog as the view's forward shaders last used it: params are g_FogParams (x start over
-// range, z max density, w 1 / range), color is g_LinearFogColor.
+// The time and wind the game last drew a swaying ($treesway) model with, and when (QueryPerformanceCounter ticks).
+struct SwayClock {
+    float time = 0.0f;
+    float wind[2] = {};
+    int64_t ticks = 0;
+    bool known = false;
+};
+const SwayClock& LastSwayClock();
+
+// Source's range fog of the view's last opaque pass, in its pixel shaders' terms: params are g_FogParams (x start
+// over range, z max density, w 1 / range), color is g_LinearFogColor.
 struct Fog {
     std::array<float, 4> params = {};
     std::array<float, 3> color = {};

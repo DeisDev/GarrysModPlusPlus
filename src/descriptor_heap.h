@@ -24,8 +24,12 @@ public:
     D3D12_CPU_DESCRIPTOR_HANDLE Cpu(UINT index) const;
     D3D12_GPU_DESCRIPTOR_HANDLE Gpu(UINT index) const;
 
-    // Creates a raw (ByteAddressBuffer) view of a whole buffer and returns its index, or kInvalid.
+    // Creates a raw (ByteAddressBuffer) view of a whole buffer, or of `size` bytes from `offset` (both multiples of
+    // 16), and returns its index, or kInvalid.
     UINT CreateRawView(ID3D12Resource* buffer);
+    UINT CreateRawView(ID3D12Resource* buffer, UINT64 offset, UINT64 size);
+    // A RWByteAddressBuffer view of a whole buffer.
+    UINT CreateRawUav(ID3D12Resource* buffer);
 
 private:
     ID3D12Device* m_device = nullptr;

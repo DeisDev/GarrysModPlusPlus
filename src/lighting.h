@@ -5,6 +5,7 @@
 #include "scene.h"
 #include "settings.h"
 #include "skinned_casters.h"
+#include "swaying_props.h"
 
 #include <d3d12.h>
 #include <d3d9.h>
@@ -98,6 +99,10 @@ struct FrameConstants {
     uint32_t indirectMask;
     uint32_t bounceMask;
     uint32_t indirectRayFlags;
+    uint32_t dispatchOriginView;
+    uint32_t probeRedView;
+    uint32_t probeGreenView;
+    uint32_t probeBlueView;
 };
 
 // What blocks the sun at a pixel of the main view (Lighting::RequestProbe).
@@ -143,6 +148,7 @@ public:
     bool Initialize(Renderer& renderer, IDirect3DDevice9* device);
     void Run(const ViewInputs& inputs, Scene& scene, std::span<const SceneInstance> dynamic, const std::vector<SkinnedEntity>& skinned);
     SkinnedCasters& Skinned() { return m_skinned; }
+    SwayingProps& Sway() { return m_sway; }
     // The resolution the main view's ray tracing runs at when DLSS Ray Reconstruction is in use; false when the
     // view is lit at the output resolution instead.
     bool RayReconstructionSize(UINT outputWidth, UINT outputHeight, UINT& width, UINT& height);
@@ -171,7 +177,7 @@ private:
         D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     };
     // DirectWide is Direct for more exact lights or shared shadow rays than the High preset's.
-    enum class Pass { Surface, Primary, Probes, Ao, Volumetrics, Direct, GiTrace, GiTemporal, GiFilter, Lighting, TemporalAntiAliasing, Sharpen, Reflections, ReflectionTemporal, DlssInputs, DlssResolve, DirectWide, Count };
+    enum class Pass { Surface, Primary, Probes, Ao, Volumetrics, Direct, GiTrace, GiTemporal, GiFilter, Lighting, TemporalAntiAliasing, Sharpen, Reflections, ReflectionTemporal, DlssInputs, DlssResolve, DirectWide, Sway, TranslucentDepth, ViewRect, Count };
     // Mirrors PassConstants in shaders/common.hlsli: descriptor indices (none by default) and a parameter.
     struct PassArgs {
         UINT input0 = DescriptorHeap::kInvalid;
@@ -193,12 +199,15 @@ private:
     bool EnsureTargets(UINT width, UINT height);
     bool CreateTarget(Texture& texture, UINT width, UINT height, DXGI_FORMAT format, UINT depth = 0);
     void DispatchGroups(Pass pass, const PassArgs& args, UINT x, UINT y, UINT z);
+    // Moves the swaying props near the eye to this frame's sway (SwayingProps).
+    void UpdateSway(const Scene& scene, UINT slot, const float (&eye)[3], D3D12_GPU_VIRTUAL_ADDRESS frameConstants);
     // Hands the slot's copy of the irradiance volume to light_queries.
     void PublishVolume(UINT slot);
     void Use(Texture& texture, D3D12_RESOURCE_STATES state);
     void Dispatch(Pass pass, const PassArgs& args);
     bool FillConstants(FrameConstants& constants, const Scene& scene, const ViewInputs& inputs);
     void ReturnResources(std::span<IDirect3DResource9* const> resources, UINT count);
+    bool EnsureDepthPipeline(DXGI_FORMAT format);
     UINT WriteProjectors(UINT slot, std::span<const gbuffer::ProjectedLight> projected, std::span<ID3D12Resource* const> cookies, UINT cookieViews);
 
     Renderer* m_renderer = nullptr;
@@ -228,6 +237,16 @@ private:
     bool m_useMicromaps = false;
     Microsoft::WRL::ComPtr<ID3D12RootSignature> m_compositeRoot;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_compositePipeline;
+    // The composite of the viewmodel's run, which skips what its G-buffer does not cover.
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> m_compositeCoveredPipeline;
+    // The viewmodel's run dispatches its passes over a rectangle around its G-buffer (shaders/view_rect.hlsl).
+    Microsoft::WRL::ComPtr<ID3D12CommandSignature> m_dispatchSignature;
+    Texture m_viewRect;
+    bool m_rectDispatch = false;
+    // Writes m_translucentDepth into the game's depth buffer, for its format.
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> m_depthPipeline;
+    DXGI_FORMAT m_depthPipelineFormat = DXGI_FORMAT_UNKNOWN;
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_dsvHeap;
 
     Microsoft::WRL::ComPtr<ID3D12Resource> m_colorCopy;
     std::array<Texture, 2> m_surface;
@@ -277,6 +296,8 @@ private:
     // Indirect light of the viewmodel, filtered without history so the main view's buffers stay intact.
     std::array<Texture, 2> m_viewmodelIndirect;
     Texture m_resolved;
+    // The main view's depth for its translucent surfaces (shaders/translucent_depth.hlsl).
+    Texture m_translucentDepth;
     std::array<Texture, RrInputCount> m_rrInputs;
     // Consecutive UAVs of m_rrInputs.
     UINT m_rrInputUavs = DescriptorHeap::kInvalid;
@@ -297,6 +318,11 @@ private:
     UINT m_gridHeight = 0;
 
     SkinnedCasters m_skinned;
+    SwayingProps m_sway;
+    // The sway time and wind of the last main view, for its swaying props' motion vectors.
+    bool m_swayKnown = false;
+    float m_swayTime = 0.0f;
+    float m_swayWind[2] = {};
     std::vector<SceneInstance> m_frameInstances;
     float m_prevViewProj[4][4] = {};
     float m_prevEye[3] = {};
@@ -312,6 +338,8 @@ private:
     double m_timestampPeriodMs = 0.0;
     std::array<double, static_cast<size_t>(GpuPass::Count)> m_passMsTotal = {};
     uint32_t m_gpuSamples = 0;
+    // GPU time of the 3D skybox's and viewmodel's runs since the last report.
+    double m_otherViewsMsTotal = 0.0;
     uint32_t m_timingReports = 0;
     uint32_t m_cameraFailures = 0;
     std::array<bool, kSlots> m_slotWasMain = {};

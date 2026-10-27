@@ -9,6 +9,8 @@
 
 #include <g_aoCS.h>
 #include <g_aoOmmCS.h>
+#include <g_compositeCoveredPS.h>
+#include <g_compositeDepthPS.h>
 #include <g_compositePS.h>
 #include <g_compositeVS.h>
 #include <g_deferredLightingCS.h>
@@ -22,6 +24,8 @@
 #include <g_giTemporalCS.h>
 #include <g_giTraceCS.h>
 #include <g_giTraceOmmCS.h>
+#include <g_translucentDepthCS.h>
+#include <g_viewRectCS.h>
 #include <g_primaryCS.h>
 #include <g_primaryOmmCS.h>
 #include <g_probesCS.h>
@@ -30,6 +34,7 @@
 #include <g_reflectionsCS.h>
 #include <g_reflectionsOmmCS.h>
 #include <g_surfaceCS.h>
+#include <g_swayCS.h>
 #include <g_taaCS.h>
 #include <g_taaSharpenCS.h>
 #include <g_volumetricsCS.h>
@@ -64,9 +69,25 @@ struct GpuProjector {
     float color[3];
     uint32_t cookieView;
     float attenuation[3];
-    float padding;
+    float fullDistance;
 };
 static_assert(sizeof(GpuProjector) == 112);
+
+// Where Source's attenuation c + l/d + q/d² first reaches full strength (1), or 0 when it never falls below it
+// or never reaches it.
+float FullStrengthDistance(const std::array<float, 3>& attenuation)
+{
+    const auto [c, l, q] = attenuation;
+    if (c >= 1.0f)
+        return 0.0f;
+    // With x = 1/d: q x² + l x + (c - 1) = 0.
+    float x = 0.0f;
+    if (q > 0.0f)
+        x = (-l + std::sqrt(l * l - 4.0f * q * (c - 1.0f))) / (2.0f * q);
+    else if (l > 0.0f)
+        x = (1.0f - c) / l;
+    return x > 0.0f ? 1.0f / x : 0.0f;
+}
 constexpr UINT kTraceMask = kWorldMask | kStaticPropMask | kShadowlessPropMask | kDynamicMask | kLocalPlayerMask;
 // The viewmodel is drawn inside the local player's body, which would shadow it.
 constexpr UINT kViewmodelTraceMask = kTraceMask & ~kLocalPlayerMask;
@@ -201,6 +222,17 @@ DXGI_FORMAT ColorViewFormat(DXGI_FORMAT format)
     }
 }
 
+DXGI_FORMAT DepthStencilFormat(DXGI_FORMAT format)
+{
+    switch (format) {
+    case DXGI_FORMAT_R24G8_TYPELESS: return DXGI_FORMAT_D24_UNORM_S8_UINT;
+    case DXGI_FORMAT_R32G8X24_TYPELESS: return DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+    case DXGI_FORMAT_R32_TYPELESS: return DXGI_FORMAT_D32_FLOAT;
+    case DXGI_FORMAT_R16_TYPELESS: return DXGI_FORMAT_D16_UNORM;
+    default: return format;
+    }
+}
+
 DXGI_FORMAT DepthViewFormat(DXGI_FORMAT format)
 {
     switch (format) {
@@ -256,6 +288,10 @@ bool Lighting::Initialize(Renderer& renderer, IDirect3DDevice9* device)
     if (SUCCEEDED(hr)) {
         D3D12_DESCRIPTOR_HEAP_DESC desc = {D3D12_DESCRIPTOR_HEAP_TYPE_RTV, kSlots};
         hr = m_device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&m_rtvHeap));
+    }
+    if (SUCCEEDED(hr)) {
+        D3D12_DESCRIPTOR_HEAP_DESC desc = {D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1};
+        hr = m_device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&m_dsvHeap));
     }
     if (SUCCEEDED(hr)) {
         m_constants = CreateBuffer(m_device, D3D12_HEAP_TYPE_UPLOAD, kConstantsStride * kConstantsPerSlot * kSlots, D3D12_RESOURCE_STATE_GENERIC_READ);
@@ -322,7 +358,7 @@ bool Lighting::Initialize(Renderer& renderer, IDirect3DDevice9* device)
         hr = m_device->CreateRootSignature(0, g_surfaceCS, sizeof(g_surfaceCS), IID_PPV_ARGS(&m_computeRoot));
     const bool micromaps = renderer.SupportsOpacityMicromaps();
     const std::span<const BYTE> shaders[] = {g_surfaceCS, g_primaryCS, g_probesCS, g_aoCS, g_volumetricsCS, g_directCS, g_giTraceCS, g_giTemporalCS,
-        g_giFilterCS, g_deferredLightingCS, g_taaCS, g_taaSharpenCS, g_reflectionsCS, g_reflectionTemporalCS, g_dlssInputsCS, g_dlssResolveCS, g_directWideCS};
+        g_giFilterCS, g_deferredLightingCS, g_taaCS, g_taaSharpenCS, g_reflectionsCS, g_reflectionTemporalCS, g_dlssInputsCS, g_dlssResolveCS, g_directWideCS, g_swayCS, g_translucentDepthCS, g_viewRectCS};
     static_assert(std::size(shaders) == static_cast<size_t>(Pass::Count));
     for (size_t i = 0; i < m_pipelines.size() && SUCCEEDED(hr); ++i) {
         D3D12_COMPUTE_PIPELINE_STATE_DESC desc = {};
@@ -357,6 +393,35 @@ bool Lighting::Initialize(Renderer& renderer, IDirect3DDevice9* device)
         desc.RTVFormats[0] = DXGI_FORMAT_B8G8R8A8_UNORM;
         desc.SampleDesc.Count = 1;
         hr = m_device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&m_compositePipeline));
+        if (SUCCEEDED(hr)) {
+            desc.PS = {g_compositeCoveredPS, sizeof(g_compositeCoveredPS)};
+            hr = m_device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&m_compositeCoveredPipeline));
+        }
+    }
+    if (SUCCEEDED(hr)) {
+        D3D12_INDIRECT_ARGUMENT_DESC argument = {D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH};
+        D3D12_COMMAND_SIGNATURE_DESC desc = {sizeof(D3D12_DISPATCH_ARGUMENTS), 1, &argument, 0};
+        hr = m_device->CreateCommandSignature(&desc, nullptr, IID_PPV_ARGS(&m_dispatchSignature));
+    }
+    if (SUCCEEDED(hr)) {
+        D3D12_HEAP_PROPERTIES heap = {D3D12_HEAP_TYPE_DEFAULT};
+        D3D12_RESOURCE_DESC desc = {};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        desc.Width = 64;
+        desc.Height = 1;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = 1;
+        desc.SampleDesc.Count = 1;
+        desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        hr = m_device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+            IID_PPV_ARGS(&m_viewRect.resource));
+        if (SUCCEEDED(hr)) {
+            m_viewRect.srv = m_descriptors->CreateRawView(m_viewRect.resource.Get());
+            m_viewRect.uav = m_descriptors->CreateRawUav(m_viewRect.resource.Get());
+            if (m_viewRect.srv == DescriptorHeap::kInvalid || m_viewRect.uav == DescriptorHeap::kInvalid)
+                hr = E_OUTOFMEMORY;
+        }
     }
     if (SUCCEEDED(hr)) {
         m_slotViews = m_descriptors->Reserve(kSlots * kViewsPerSlot);
@@ -394,6 +459,7 @@ bool Lighting::Initialize(Renderer& renderer, IDirect3DDevice9* device)
     m_fenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     m_rtvIncrement = m_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     m_skinned.Initialize(m_device, *m_descriptors);
+    m_sway.Initialize(m_device, *m_descriptors);
     for (UINT i = 0; i < RrInputCount; ++i)
         m_rrInputs[i].uav = m_rrInputUavs + i;
     GetStatistics().rayReconstructionAvailable = m_rayReconstruction.Initialize(m_device, ModuleDirectory(), GetOptions().gameDirectory);
@@ -494,6 +560,7 @@ bool Lighting::EnsureTargets(UINT width, UINT height)
     for (Texture& texture : m_viewmodelIndirect)
         ok = ok && CreateTarget(texture, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT);
     ok = ok && CreateTarget(m_resolved, width, height, DXGI_FORMAT_R8G8B8A8_UNORM);
+    ok = ok && CreateTarget(m_translucentDepth, width, height, DXGI_FORMAT_R32_FLOAT);
     // Ray Reconstruction's inputs use the top-left render-size part of these.
     constexpr DXGI_FORMAT kRrFormats[] = {DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R16G16B16A16_FLOAT,
         DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16G16B16A16_FLOAT};
@@ -527,7 +594,10 @@ void Lighting::Dispatch(Pass pass, const PassArgs& args)
     static_assert(sizeof(PassArgs) == 12 * sizeof(UINT));
     m_list->SetPipelineState(m_pipelines[static_cast<size_t>(pass)].Get());
     m_list->SetComputeRoot32BitConstants(2, sizeof(PassArgs) / sizeof(UINT), &args, 0);
-    m_list->Dispatch((m_gridWidth + 7) / 8, (m_gridHeight + 7) / 8, 1);
+    if (m_rectDispatch)
+        m_list->ExecuteIndirect(m_dispatchSignature.Get(), 1, m_viewRect.resource.Get(), 16, nullptr, 0);
+    else
+        m_list->Dispatch((m_gridWidth + 7) / 8, (m_gridHeight + 7) / 8, 1);
 }
 
 void Lighting::DispatchGroups(Pass pass, const PassArgs& args, UINT x, UINT y, UINT z)
@@ -536,6 +606,65 @@ void Lighting::DispatchGroups(Pass pass, const PassArgs& args, UINT x, UINT y, U
     m_list->SetPipelineState(m_useMicromaps && micromapPipeline != nullptr ? micromapPipeline : m_pipelines[static_cast<size_t>(pass)].Get());
     m_list->SetComputeRoot32BitConstants(2, sizeof(PassArgs) / sizeof(UINT), &args, 0);
     m_list->Dispatch(x, y, z);
+}
+
+bool Lighting::EnsureDepthPipeline(DXGI_FORMAT format)
+{
+    if (m_depthPipeline && m_depthPipelineFormat == format)
+        return true;
+    m_depthPipeline.Reset();
+    m_depthPipelineFormat = format;
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = {};
+    desc.pRootSignature = m_compositeRoot.Get();
+    desc.VS = {g_compositeVS, sizeof(g_compositeVS)};
+    desc.PS = {g_compositeDepthPS, sizeof(g_compositeDepthPS)};
+    desc.SampleMask = UINT_MAX;
+    desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    desc.RasterizerState.DepthClipEnable = TRUE;
+    desc.DepthStencilState.DepthEnable = TRUE;
+    desc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+    desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    desc.DSVFormat = format;
+    desc.SampleDesc.Count = 1;
+    if (FAILED(m_device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&m_depthPipeline)))) {
+        log::Info("Lighting: creating the depth pipeline for format {} failed; translucent surfaces keep the jittered depth", static_cast<int>(format));
+        return false;
+    }
+    return true;
+}
+
+void Lighting::UpdateSway(const Scene& scene, UINT slot, const float (&eye)[3], D3D12_GPU_VIRTUAL_ADDRESS frameConstants)
+{
+    const gbuffer::SwayClock& clock = gbuffer::LastSwayClock();
+    if (m_sway.Empty() || !clock.known)
+        return;
+    // The game's sway time runs with real time; it is extrapolated for frames that drew no swaying model.
+    LARGE_INTEGER now;
+    LARGE_INTEGER frequency;
+    QueryPerformanceCounter(&now);
+    QueryPerformanceFrequency(&frequency);
+    const float time = clock.time + static_cast<float>(static_cast<double>(now.QuadPart - clock.ticks) / static_cast<double>(frequency.QuadPart));
+    if (!m_swayKnown) {
+        m_swayTime = time;
+        std::copy_n(clock.wind, 2, m_swayWind);
+        log::Info("Lighting: swaying props follow the game's wind ({:.2f} {:.2f}) from time {:.2f}", clock.wind[0], clock.wind[1], time);
+    }
+    if (const std::optional<SwayingProps::Jobs> jobs = m_sway.BeginUpdate(m_list.Get(), scene, slot, eye, time, m_swayTime, clock.wind, m_swayWind)) {
+        ID3D12DescriptorHeap* heaps[] = {m_descriptors->Heap()};
+        m_list->SetDescriptorHeaps(1, heaps);
+        m_list->SetComputeRootSignature(m_computeRoot.Get());
+        m_list->SetComputeRootConstantBufferView(0, frameConstants);
+        // The pass traces nothing, so the scene's root slot holds any valid address.
+        m_list->SetComputeRootShaderResourceView(1, frameConstants);
+        DispatchGroups(Pass::Sway, {.input0 = jobs->jobsView, .input1 = jobs->materialsView, .output0 = jobs->currentUav, .output1 = jobs->previousUav},
+            jobs->groupsX, jobs->count, 1);
+        m_sway.FinishUpdate(m_list.Get(), scene);
+    }
+    m_swayKnown = true;
+    m_swayTime = time;
+    std::copy_n(clock.wind, 2, m_swayWind);
 }
 
 void Lighting::PublishVolume(UINT slot)
@@ -637,6 +766,11 @@ bool Lighting::FillConstants(FrameConstants& constants, const Scene& scene, cons
     constants.volumeRays = static_cast<uint32_t>(settings.volumeRays);
     constants.volumetricSteps = static_cast<uint32_t>(settings.volumetricSteps);
     constants.indirectRayFlags = m_useMicromaps && settings.fastAlphaTests ? D3D12_RAY_FLAG_FORCE_OMM_2_STATE : D3D12_RAY_FLAG_NONE;
+    constants.dispatchOriginView = inputs.kind == gbuffer::ViewKind::Viewmodel ? m_viewRect.srv : kInvalidView;
+    const bool volumeLight = inputs.kind == gbuffer::ViewKind::Viewmodel && m_volumeReady;
+    constants.probeRedView = volumeLight ? m_probeVolume[0].srv : kInvalidView;
+    constants.probeGreenView = volumeLight ? m_probeVolume[1].srv : kInvalidView;
+    constants.probeBlueView = volumeLight ? m_probeVolume[2].srv : kInvalidView;
     constants.depthMin = inputs.depthMin;
     constants.depthScale = inputs.depthMax - inputs.depthMin;
     const gbuffer::Fog& fog = gbuffer::ViewFog(inputs.kind);
@@ -685,6 +819,7 @@ UINT Lighting::WriteProjectors(UINT slot, std::span<const gbuffer::ProjectedLigh
         for (int c = 0; c < 3; ++c)
             gpu.color[c] = light.color[c] * scale;
         std::memcpy(gpu.attenuation, light.attenuation.data(), sizeof(gpu.attenuation));
+        gpu.fullDistance = FullStrengthDistance(light.attenuation);
         gpu.cookieView = kInvalidView;
         if (i < cookies.size() && cookies[i] != nullptr) {
             const D3D12_RESOURCE_DESC desc = cookies[i]->GetDesc();
@@ -739,7 +874,12 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
         m_volumeReadbackPending[slot] = false;
         PublishVolume(slot);
     }
-    // Timings of the main view that last used this slot; skybox runs reuse the markers but are not counted.
+    // Timings of the view that last used this slot: the main view's per pass, the others' whole runs.
+    if (m_slotFenceValues[slot] != 0 && !m_slotWasMain[slot]) {
+        const uint64_t* markers = m_timestampValues + slot * kMarkers;
+        if (markers[kPassCount] > markers[0])
+            m_otherViewsMsTotal += static_cast<double>(markers[kPassCount] - markers[0]) * m_timestampPeriodMs;
+    }
     if (m_slotFenceValues[slot] != 0 && m_slotWasMain[slot]) {
         const uint64_t* markers = m_timestampValues + slot * kMarkers;
         if (markers[kPassCount] > markers[0]) {
@@ -752,6 +892,9 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
                     statistics.passMs[pass] = m_passMsTotal[pass] / m_gpuSamples;
                     statistics.lightingMs += statistics.passMs[pass];
                 }
+                statistics.otherViewsMs = m_otherViewsMsTotal / m_gpuSamples;
+                statistics.lightingMs += statistics.otherViewsMs;
+                m_otherViewsMsTotal = 0.0;
                 m_passMsTotal = {};
                 m_gpuSamples = 0;
                 if (++m_timingReports % (GetOptions().devMode ? 1 : 10) == 0) {
@@ -762,10 +905,10 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
                         frameMs += statistics.frameMs[(statistics.nextFrame + statistics.frameMs.size() - i) % statistics.frameMs.size()];
                     const auto& p = statistics.passMs;
                     log::Info("Lighting: {:.3f} ms GPU per frame ({}x{} traced at {}x{}; scene {:.2f}, surface {:.2f}, volume {:.2f}, direct {:.2f}, "
-                              "ao {:.2f}, indirect {:.2f}, accumulation {:.2f}, denoiser {:.2f}, reflections {:.2f}, lighting {:.2f}, resolve {:.2f}); "
-                              "frame time {:.2f} ms, tonemap scale {:.3f}",
+                              "ao {:.2f}, indirect {:.2f}, accumulation {:.2f}, denoiser {:.2f}, reflections {:.2f}, lighting {:.2f}, resolve {:.2f}; "
+                              "3D skybox and viewmodel {:.2f}); frame time {:.2f} ms, tonemap scale {:.3f}",
                         statistics.lightingMs, m_width, m_height, statistics.renderWidth, statistics.renderHeight, p[0], p[1], p[2], p[3], p[4],
-                        p[5], p[6], p[7], p[8], p[9], p[10], frames ? frameMs / frames : 0.0, gbuffer::TonemapScale());
+                        p[5], p[6], p[7], p[8], p[9], p[10], statistics.otherViewsMs, frames ? frameMs / frames : 0.0, gbuffer::TonemapScale());
                 }
             }
         }
@@ -967,6 +1110,9 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
 
     m_frameInstances.assign(dynamic.begin(), dynamic.end());
     m_skinned.Record(m_list.Get(), scene, skinned, m_frameInstances);
+    if (main)
+        UpdateSway(scene, slot, constants.eyePosition, slotConstantsGpu);
+    m_sway.Append(m_frameInstances);
     const SceneFrame frame = scene.RecordFrame(m_list.Get(), slot, m_frameInstances, m_useMicromaps);
     constants.instancesView = frame.instancesView;
     constants.dynamicLightsView = frame.dynamicLightsView;
@@ -987,8 +1133,9 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
         constants.traceMask = inputs.kind == gbuffer::ViewKind::Viewmodel ? kViewmodelTraceMask : kTraceMask;
     const FoliageShadows foliage = GetSettings().foliageShadows;
     constants.sunShadowMask = foliage == FoliageShadows::Off ? constants.traceMask & ~kShadowlessPropMask : constants.traceMask;
-    constants.indirectMask = foliage == FoliageShadows::SunAndIndirect ? constants.traceMask : constants.traceMask & ~kShadowlessPropMask;
-    constants.bounceMask = constants.traceMask & ~kShadowlessPropMask;
+    const UINT indirectMask = constants.traceMask & ~kLocalPlayerMask;
+    constants.indirectMask = foliage == FoliageShadows::SunAndIndirect ? indirectMask : indirectMask & ~kShadowlessPropMask;
+    constants.bounceMask = indirectMask & ~kShadowlessPropMask;
 
     auto bindCompute = [&](D3D12_GPU_VIRTUAL_ADDRESS frameConstants) {
         ID3D12DescriptorHeap* heaps[] = {m_descriptors->Heap()};
@@ -1029,6 +1176,18 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
         m_gridWidth = renderWidth;
         m_gridHeight = renderHeight;
     }
+    // The viewmodel covers a small part of the screen; its passes run over a rectangle around it.
+    if (inputs.kind == gbuffer::ViewKind::Viewmodel) {
+        Use(m_viewRect, write);
+        const D3D12_RESOURCE_BARRIER between = {D3D12_RESOURCE_BARRIER_TYPE_UAV, D3D12_RESOURCE_BARRIER_FLAG_NONE, {.UAV = {m_viewRect.resource.Get()}}};
+        DispatchGroups(Pass::ViewRect, {.output0 = m_viewRect.uav, .step = 0}, 1, 1, 1);
+        m_list->ResourceBarrier(1, &between);
+        Dispatch(Pass::ViewRect, {.output0 = m_viewRect.uav, .step = 1});
+        m_list->ResourceBarrier(1, &between);
+        DispatchGroups(Pass::ViewRect, {.output0 = m_viewRect.uav, .step = 2}, 1, 1, 1);
+        Use(m_viewRect, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        m_rectDispatch = true;
+    }
     mark();
     Use(m_surface[current], write);
     Dispatch(Pass::Surface, {.output0 = m_surface[current].uav});
@@ -1048,16 +1207,17 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
             Use(texture, read);
         for (Texture& texture : next)
             Use(texture, write);
-        const UINT groups[3] = {gbuffer::kProbeGrid[0] / 4, gbuffer::kProbeGrid[1] / 4, gbuffer::kProbeGrid[2] / 4};
+        // A thread group of 32 per probe to trace, a thread per probe to fill (shaders/probes.hlsl).
+        const UINT probes = gbuffer::kProbeGrid[0] * gbuffer::kProbeGrid[1] * gbuffer::kProbeGrid[2];
         DispatchGroups(Pass::Probes, {.input0 = last[0].srv, .input1 = last[1].srv, .input2 = last[2].srv, .input3 = last[3].srv,
             .input4 = m_probeHistoryValid ? 1u : 0u, .output0 = next[0].uav, .output1 = next[1].uav, .output2 = next[2].uav, .output3 = next[3].uav,
-            .step = 0}, groups[0], groups[1], groups[2]);
+            .step = 0}, probes, 1, 1);
         for (Texture& texture : next)
             Use(texture, read);
         for (Texture& texture : m_probeVolume)
             Use(texture, write);
         DispatchGroups(Pass::Probes, {.input0 = next[0].srv, .input1 = next[1].srv, .input2 = next[2].srv, .input3 = next[3].srv,
-            .output0 = m_probeVolume[0].uav, .output1 = m_probeVolume[1].uav, .output2 = m_probeVolume[2].uav, .step = 1}, groups[0], groups[1], groups[2]);
+            .output0 = m_probeVolume[0].uav, .output1 = m_probeVolume[1].uav, .output2 = m_probeVolume[2].uav, .step = 1}, probes / 32, 1, 1);
         for (size_t i = 0; i < probeTargets.size(); ++i) {
             Use(m_probeVolume[i], D3D12_RESOURCE_STATE_COPY_SOURCE);
             D3D12_RESOURCE_BARRIER barrier = Transition(probeTargets[i].Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -1116,6 +1276,10 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
         mark();
         mark();
     } else if (!main) {
+        if (constants.probeRedView != kInvalidView) {
+            for (Texture& texture : m_probeVolume)
+                Use(texture, read);
+        }
         Use(m_giRaw, write);
         trace.step = kViewmodelIndirectSamples;
         Dispatch(Pass::GiTrace, trace);
@@ -1261,18 +1425,61 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
         output = &m_resolved;
     }
     m_taaHistoryValid = main ? output == &m_resolved && !rayReconstruction : m_taaHistoryValid;
+    // The game draws the view's translucent surfaces next, tested against this depth, which edges keep jittered.
+    const D3D12_RESOURCE_DESC depthDesc = depth->GetDesc();
+    const bool stableDepth = main && output == &m_resolved && (depthDesc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) != 0 &&
+        EnsureDepthPipeline(DepthStencilFormat(depthDesc.Format));
+    if (stableDepth) {
+        // The jitter in output pixels. It moves an edge up to half a render pixel (scale / 2) either way, so a pixel the
+        // edge can cross may see the other side's samples up to `scale` pixels away.
+        const float scale = static_cast<float>(m_width) / static_cast<float>(renderWidth);
+        const float shift[2] = {inputs.jitterX * scale, inputs.jitterY * scale};
+        Use(m_translucentDepth, write);
+        Dispatch(Pass::TranslucentDepth, {.input0 = std::bit_cast<UINT>(shift[0]), .input1 = std::bit_cast<UINT>(shift[1]), .output0 = m_translucentDepth.uav,
+            .step = static_cast<UINT>(std::floor(scale)) + 1});
+        Use(m_translucentDepth, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    }
     Use(*output, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
     D3D12_VIEWPORT viewport = {0.0f, 0.0f, static_cast<float>(m_width), static_cast<float>(m_height), 0.0f, 1.0f};
     D3D12_RECT scissor = {0, 0, static_cast<LONG>(m_width), static_cast<LONG>(m_height)};
+    m_rectDispatch = false;
     m_list->SetGraphicsRootSignature(m_compositeRoot.Get());
-    m_list->SetPipelineState(m_compositePipeline.Get());
+    // The viewmodel's run lit only a rectangle, so its composite keeps to the pixels its G-buffer covers.
+    const bool covered = inputs.kind == gbuffer::ViewKind::Viewmodel;
+    const D3D12_RESOURCE_STATES pixelRead = read | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    if (covered) {
+        const D3D12_RESOURCE_BARRIER barrier = Transition(flags, read, pixelRead);
+        m_list->ResourceBarrier(1, &barrier);
+    }
+    m_list->SetPipelineState(covered ? m_compositeCoveredPipeline.Get() : m_compositePipeline.Get());
     m_list->SetGraphicsRootDescriptorTable(0, m_descriptors->Gpu(output->srv));
+    if (covered)
+        m_list->SetGraphicsRootDescriptorTable(1, m_descriptors->Gpu(constants.flagsView));
     m_list->RSSetViewports(1, &viewport);
     m_list->RSSetScissorRects(1, &scissor);
     m_list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
     m_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     m_list->DrawInstanced(3, 1, 0, 0);
+    if (covered) {
+        const D3D12_RESOURCE_BARRIER barrier = Transition(flags, pixelRead, read);
+        m_list->ResourceBarrier(1, &barrier);
+    }
+    if (stableDepth) {
+        D3D12_RESOURCE_BARRIER barrier = Transition(depth, read, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+        m_list->ResourceBarrier(1, &barrier);
+        D3D12_DEPTH_STENCIL_VIEW_DESC dsvDesc = {};
+        dsvDesc.Format = m_depthPipelineFormat;
+        dsvDesc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+        const D3D12_CPU_DESCRIPTOR_HANDLE dsv = m_dsvHeap->GetCPUDescriptorHandleForHeapStart();
+        m_device->CreateDepthStencilView(depth, &dsvDesc, dsv);
+        m_list->OMSetRenderTargets(0, nullptr, FALSE, &dsv);
+        m_list->SetPipelineState(m_depthPipeline.Get());
+        m_list->SetGraphicsRootDescriptorTable(0, m_descriptors->Gpu(m_translucentDepth.srv));
+        m_list->DrawInstanced(3, 1, 0, 0);
+        barrier = Transition(depth, D3D12_RESOURCE_STATE_DEPTH_WRITE, read);
+        m_list->ResourceBarrier(1, &barrier);
+    }
 
     D3D12_RESOURCE_BARRIER restore[] = {
         Transition(color, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COMMON),

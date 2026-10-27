@@ -6,14 +6,14 @@
 // are stored at cell modulo the grid size, so the grid scrolls with the camera without moving data; a probe
 // whose cell changed starts over.
 //
-// Trace (step 0, input4: 1 when last frame's volume may be used): every frame a share of the probes traces
-// g_frame.volumeRays rays. A hit returns its albedo times the
+// Trace (step 0, input4: 1 when last frame's volume may be used; a thread group per probe, its threads sharing the
+// rays): every frame a share of the probes traces g_frame.volumeRays rays. A hit returns its albedo times the
 // light reaching it (sun, one light picked by SampleLight, and last frame's volume as indirect light), a miss
 // the sky. Probes that mostly see back faces are inside geometry and marked invalid.
 // input0-2: last frame's red, green and blue coefficients; input3: last frame's cells (xyz) and validity (w);
 // output0-2, output3: this frame's.
 //
-// Fill (step 1): invalid probes take the average of their valid neighbours, so light does not leak in from
+// Fill (step 1, a thread per probe): invalid probes take the average of their valid neighbours, so light does not leak in from
 // inside walls, and every probe adds the direct light at it: the sun and the kProbeLights strongest point lights,
 // each with a shadow ray (projected lights are left to the game). Only the output has it, as hits add their own
 // direct light. input0-3: this frame's coefficients and cells; output0-2: the volume the game samples.
@@ -25,6 +25,17 @@ static const float kHistoryWeight = 0.85;
 static const float kInsideFraction = 0.3;
 static const float kMaxDistance = 16384.0;
 static const uint kProbeLights = 4;
+static const uint kProbeThreads = 32;
+static const uint kProbeCount = kProbeGrid.x * kProbeGrid.y * kProbeGrid.z;
+
+// Each thread's sums of its rays: radiance (xyz) and back faces met (w), then radiance times direction per channel.
+groupshared float4 g_rayTotals[kProbeThreads];
+groupshared float3 g_raySh[kProbeThreads][3];
+
+uint3 ProbeId(uint probe)
+{
+    return uint3(probe % kProbeGrid.x, (probe / kProbeGrid.x) % kProbeGrid.y, probe / (kProbeGrid.x * kProbeGrid.y));
+}
 
 uint3 Texel(int3 cell)
 {
@@ -61,7 +72,7 @@ bool HitBackFace(HitInfo hit, float3 direction)
     return dot(normal, direction) < 0.0;
 }
 
-void Trace(uint3 id)
+void Trace(uint3 id, uint thread)
 {
     int3 cell = g_frame.probeOrigin + int3(id);
     uint3 texel = Texel(cell);
@@ -77,22 +88,25 @@ void Trace(uint3 id)
     int4 previousCell = cells[texel];
     bool fresh = any(previousCell.xyz != cell) || previousCell.w < 0 || g_pass.input4 == 0;
     if (!fresh && (texel.x + texel.y * 3 + texel.z * 7 + g_frame.frameIndex) % kUpdatePeriod != 0) {
-        redOut[texel] = previous[0];
-        greenOut[texel] = previous[1];
-        blueOut[texel] = previous[2];
-        cellsOut[texel] = previousCell;
+        if (thread == 0) {
+            redOut[texel] = previous[0];
+            greenOut[texel] = previous[1];
+            blueOut[texel] = previous[2];
+            cellsOut[texel] = previousCell;
+        }
         return;
     }
     float3 position = (float3(cell) + 0.5) * g_frame.probeSpacing;
-    uint seed = Hash(texel.x + texel.y * 64u + texel.z * 4096u + Hash(g_frame.frameIndex * 0x9E3779B9u + 0x7Bu));
+    uint probeSeed = Hash(texel.x + texel.y * 64u + texel.z * 4096u + Hash(g_frame.frameIndex * 0x9E3779B9u + 0x7Bu));
     float3 a = 0.0;
     float3 b[3] = {(float3)0.0, (float3)0.0, (float3)0.0};
     uint backFaces = 0;
-    for (uint r = 0; r < g_frame.volumeRays; ++r) {
+    for (uint r = thread; r < g_frame.volumeRays; r += kProbeThreads) {
+        uint seed = Hash(probeSeed + r);
         float3 direction = UniformSphere((r + Random(seed)) / g_frame.volumeRays, Random(seed));
         float3 radiance = g_frame.skyColor;
         HitInfo hit;
-        if (TraceHit(position, direction, kMaxDistance, g_frame.indirectMask & ~kLocalPlayerMask, hit)) {
+        if (TraceHit(position, direction, kMaxDistance, g_frame.indirectMask, hit)) {
             if (HitBackFace(hit, direction)) {
                 ++backFaces;
                 radiance = 0.0;
@@ -114,7 +128,24 @@ void Trace(uint3 id)
         b[1] += radiance.g * direction;
         b[2] += radiance.b * direction;
     }
-    a /= g_frame.volumeRays;
+    g_rayTotals[thread] = float4(a, backFaces);
+    g_raySh[thread][0] = b[0];
+    g_raySh[thread][1] = b[1];
+    g_raySh[thread][2] = b[2];
+    GroupMemoryBarrierWithGroupSync();
+    if (thread != 0)
+        return;
+    float4 totals = 0.0;
+    for (uint t = 0; t < kProbeThreads; ++t) {
+        totals += g_rayTotals[t];
+        if (t != 0) {
+            b[0] += g_raySh[t][0];
+            b[1] += g_raySh[t][1];
+            b[2] += g_raySh[t][2];
+        }
+    }
+    a = totals.xyz / g_frame.volumeRays;
+    backFaces = uint(totals.w);
     float4 sampled[3] = {float4(a.r, b[0] * (2.0 / g_frame.volumeRays)), float4(a.g, b[1] * (2.0 / g_frame.volumeRays)), float4(a.b, b[2] * (2.0 / g_frame.volumeRays))};
     float weight = fresh ? 0.0 : kHistoryWeight;
     redOut[texel] = lerp(sampled[0], previous[0], weight);
@@ -224,13 +255,11 @@ void Fill(uint3 id)
 }
 
 [RootSignature(ROOT_SIGNATURE)]
-[numthreads(4, 4, 4)]
-void main(uint3 id : SV_DispatchThreadID)
+[numthreads(kProbeThreads, 1, 1)]
+void main(uint3 group : SV_GroupID, uint thread : SV_GroupIndex, uint3 id : SV_DispatchThreadID)
 {
-    if (any(id >= kProbeGrid))
-        return;
     if (g_pass.step == 0)
-        Trace(id);
-    else
-        Fill(id);
+        Trace(ProbeId(group.x), thread);
+    else if (id.x < kProbeCount)
+        Fill(ProbeId(id.x));
 }

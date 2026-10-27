@@ -109,6 +109,7 @@ enum class TextId {
     MicromapsUnavailable,
     StatMicromaps,
     PassAmbientOcclusion,
+    PassOtherViews,
     Count
 };
 

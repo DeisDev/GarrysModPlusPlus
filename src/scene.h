@@ -10,6 +10,7 @@
 #include <wrl/client.h>
 
 #include <array>
+#include <optional>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -21,7 +22,7 @@ namespace gmodpp {
 constexpr UINT kWorldMask = 0x01;
 constexpr UINT kStaticPropMask = 0x02;
 constexpr UINT kDynamicMask = 0x04;
-// The local player's own body sits around the camera; viewmodel rays leave it out (see Lighting).
+// The local player's own body sits around the camera; viewmodel and indirect rays leave it out (see Lighting).
 constexpr UINT kLocalPlayerMask = 0x08;
 // The 3D skybox's scaled-down scene, which only the skybox view's rays meet.
 constexpr UINT kSkyboxMask = 0x10;
@@ -136,6 +137,15 @@ public:
     // ALLOW_DISABLE_OMMS, as RecordFrame may disable their micromaps.
     bool LinkMicromaps(int model, D3D12_RAYTRACING_GEOMETRY_DESC& alphaGeometry, D3D12_RAYTRACING_GEOMETRY_TRIANGLES_DESC& triangles,
         D3D12_RAYTRACING_GEOMETRY_OMM_LINKAGE_DESC& linkage) const;
+    // A model's geometry, for copies of its BLAS with moved vertices (SwayingProps).
+    struct ModelBuffers {
+        UINT positionsView;
+        D3D12_GPU_VIRTUAL_ADDRESS indices;
+        UINT vertexCount;
+        UINT triangleCount;
+        UINT opaqueTriangles;
+    };
+    std::optional<ModelBuffers> Buffers(int model) const;
     // Static props, and the 3D skybox's geometry with kSkyboxMask; a mask of 0 means kStaticPropMask.
     void SetStaticInstances(std::vector<SceneInstance> instances);
     bool HasSkybox() const { return m_hasSkybox; }
@@ -192,6 +202,8 @@ private:
         UINT uvsView = DescriptorHeap::kInvalid;
         UINT alphaView = DescriptorHeap::kInvalid;
         UINT materialsView = DescriptorHeap::kInvalid;
+        UINT vertexCount = 0;
+        UINT triangleCount = 0;
         UINT opaqueTriangles = 0;
     };
     struct Texture {

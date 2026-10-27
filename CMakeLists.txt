@@ -99,6 +99,7 @@ endforeach()
 add_shader(shaders/direct.hlsl main cs_6_6 g_directWideCS -D WIDE_LIGHT_SETS=1)
 add_shader(shaders/direct.hlsl main cs_6_9 g_directWideOmmCS -D WIDE_LIGHT_SETS=1 -D OPACITY_MICROMAPS=1)
 add_shader(shaders/reflection_temporal.hlsl main cs_6_6 g_reflectionTemporalCS)
+add_shader(shaders/sway.hlsl main cs_6_6 g_swayCS)
 add_shader(shaders/dlss_inputs.hlsl main cs_6_6 g_dlssInputsCS)
 add_shader(shaders/dlss_resolve.hlsl main cs_6_6 g_dlssResolveCS)
 add_shader(shaders/gi_temporal.hlsl main cs_6_6 g_giTemporalCS)
@@ -108,6 +109,10 @@ add_shader(shaders/taa.hlsl main cs_6_6 g_taaCS)
 add_shader(shaders/taa_sharpen.hlsl main cs_6_6 g_taaSharpenCS)
 add_shader(shaders/composite.hlsl VSMain vs_6_0 g_compositeVS)
 add_shader(shaders/composite.hlsl PSMain ps_6_0 g_compositePS)
+add_shader(shaders/composite.hlsl DepthPS ps_6_0 g_compositeDepthPS)
+add_shader(shaders/composite.hlsl CoveredPS ps_6_0 g_compositeCoveredPS)
+add_shader(shaders/view_rect.hlsl main cs_6_6 g_viewRectCS)
+add_shader(shaders/translucent_depth.hlsl main cs_6_6 g_translucentDepthCS)
 add_d3d9_shader(shaders/forward_snippet.hlsl main g_forwardSnippetPS)
 add_d3d9_shader(shaders/forward_snippet.hlsl main g_forwardSnippetPS2 PROFILE ps_2_b /D FORWARD_PS2=1)
 # G-buffer replacements (g_gbuffer*) and their forward-lit variants (g_forward*).
@@ -170,6 +175,7 @@ add_library(gmodpp_d3d9 SHARED
     src/opacity_micromaps.cpp
     src/scene.cpp
     src/skinned_casters.cpp
+    src/swaying_props.cpp
     src/settings.cpp
     src/ui_text.cpp
     src/overlay.cpp

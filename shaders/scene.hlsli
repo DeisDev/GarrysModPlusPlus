@@ -70,7 +70,8 @@ struct Projector
     float3 color;
     uint cookieView;
     float3 attenuation;
-    float padding;
+    // Where the attenuation first reaches full strength, or 0 to keep Source's curve everywhere.
+    float fullDistance;
 };
 
 static const uint kNoCookie = 0xFFFFFFFFu;
@@ -108,7 +109,8 @@ struct AlphaTriangle
 };
 
 // Opacity where a ray crosses a candidate in a model's non-opaque geometry: 0 or 1 for alpha-tested triangles,
-// texture alpha times $alpha for translucent ones (`translucent`).
+// texture alpha times $alpha for translucent ones (`translucent`). The alpha is filtered as the game's alpha tests
+// filter it; unfiltered, the low-resolution alpha's texels showed as square blocks in leaf shadows.
 float CandidateOpacity(uint instance, uint alphaPrimitive, float2 barycentrics, out bool translucent)
 {
     ByteAddressBuffer alpha = ResourceDescriptorHeap[LoadInstance(instance).alpha];
@@ -120,7 +122,7 @@ float CandidateOpacity(uint instance, uint alphaPrimitive, float2 barycentrics, 
     if ((packed & 0xFFFFFF) != kNoAlphaTexture) {
         float2 uv = entry.uv0 + barycentrics.x * (entry.uv1 - entry.uv0) + barycentrics.y * (entry.uv2 - entry.uv0);
         Texture2D<float4> texture = ResourceDescriptorHeap[packed & 0xFFFFFF];
-        textureAlpha = texture.SampleLevel(g_pointWrap, uv, 0.0).a;
+        textureAlpha = texture.SampleLevel(g_linearWrap, uv, 0.0).a;
     }
     if (translucent)
         return saturate(textureAlpha * value);
@@ -511,6 +513,9 @@ bool HullBlocks(Light light, float3 position)
     return false;
 }
 
+// Half the width, in world units, over which spot light cones fade at least: about one luxel of a finely lit floor.
+static const float kSpotEdgeBlur = 8.0;
+
 // Unshadowed irradiance from a light, following VRAD's GatherSampleStandardLightSSE. `toLight` and
 // `distance` describe the shadow ray.
 float3 LightIrradiance(Light light, float3 position, float3 normal, out float3 toLight, out float distance)
@@ -538,11 +543,17 @@ float3 LightIrradiance(Light light, float3 position, float3 normal, out float3 t
         falloff = 1.0 / max(light.constantAttn + light.linearAttn * falloffDistance + light.quadraticAttn * falloffDistance * falloffDistance, 1e-4);
         if (light.type == kLightSpot) {
             float spot = -dot(toLight, light.normal);
-            if (spot <= light.stopdot2)
+            // Lightmaps blur the cone's edge over their luxels; without that, cones whose inner and outer angles
+            // (nearly) match end in a hard line. The fringe spans at least kSpotEdgeBlur units on either side.
+            float edge = 0.5 * (light.stopdot + light.stopdot2);
+            float spread = sqrt(saturate(1.0 - edge * edge)) * kSpotEdgeBlur / distance;
+            float outer = max(min(light.stopdot2, edge - spread), -1.0);
+            float inner = min(max(light.stopdot, edge + spread), 1.0);
+            if (spot <= outer)
                 return 0.0;
             falloff *= spot;
-            if (spot <= light.stopdot) {
-                float fringe = saturate((spot - light.stopdot2) / max(light.stopdot - light.stopdot2, 1e-4));
+            if (spot <= inner) {
+                float fringe = saturate((spot - outer) / max(inner - outer, 1e-4));
                 if (light.exponent != 0.0 && light.exponent != 1.0)
                     fringe = pow(fringe, light.exponent);
                 falloff *= fringe;
@@ -564,7 +575,8 @@ Projector LoadProjector(uint index)
 }
 
 // Unshadowed irradiance from a projected light, following DoFlashlight in common_flashlight_fxc.h; without a
-// cookie texture the frustum gets a round spot.
+// cookie texture the frustum gets a round spot. Source's falloff (1/d for the flashlight) is replaced by the
+// physical inverse square beyond the distance where it reaches full strength; closer, it stays capped as in Source.
 float3 ProjectorIrradiance(Projector projector, float3 position, float3 normal, out float3 toLight, out float distance)
 {
     float4 world = float4(position, 1.0);
@@ -589,6 +601,8 @@ float3 ProjectorIrradiance(Projector projector, float3 position, float3 normal, 
         cookie = smoothstep(0.5, 0.35, length(coords.xy - 0.5));
     }
     float attenuation = saturate(dot(projector.attenuation, float3(1.0, 1.0 / distance, 1.0 / (distance * distance))));
+    if (projector.fullDistance > 0.0 && distance > projector.fullDistance)
+        attenuation = (projector.fullDistance * projector.fullDistance) / (distance * distance);
     float endFalloff = saturate((distance - projector.farZ) / (-0.4 * projector.farZ));
     return cookie * projector.color * (attenuation * lambert * endFalloff);
 }

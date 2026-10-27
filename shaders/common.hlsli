@@ -4,7 +4,7 @@
 // Every compute pass shares this layout. Textures and buffers are reached through descriptor heap indices
 // in g_frame and g_pass.
 #define ROOT_SIGNATURE "RootFlags(CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED), CBV(b0), SRV(t0), RootConstants(num32BitConstants = 12, b1), " \
-    "StaticSampler(s0, filter = FILTER_MIN_MAG_MIP_LINEAR, addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP), "     "StaticSampler(s1, filter = FILTER_MIN_MAG_MIP_POINT, addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP), "     "StaticSampler(s2, filter = FILTER_MIN_MAG_MIP_LINEAR, addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP)"
+    "StaticSampler(s0, filter = FILTER_MIN_MAG_MIP_LINEAR, addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP), "     "StaticSampler(s2, filter = FILTER_MIN_MAG_MIP_LINEAR, addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP)"
 
 // Mirrors gmodpp::FrameConstants in src/effects.h.
 struct FrameConstants
@@ -91,12 +91,20 @@ struct FrameConstants
     uint volumeRays;
     uint volumetricSteps;
     // traceMask without what may not block each kind of ray: sun shadows, the first indirect bounce (and ambient
-    // occlusion), and later bounces (shadowless props, by FoliageShadows).
+    // occlusion), and later bounces (shadowless props, by FoliageShadows). Indirect rays never meet the local player,
+    // whose hidden first-person body would darken the ground under it.
     uint sunShadowMask;
     uint indirectMask;
     uint bounceMask;
     // Ray flags added to indirect light and ambient occlusion rays.
     uint indirectRayFlags;
+    // The corner of the rectangle a view's passes are dispatched over (shaders/view_rect.hlsl), or kNoView.
+    uint dispatchOriginView;
+    // The main view's filled irradiance volume (red, green, blue coefficients; shaders/probes.hlsl) for the viewmodel's
+    // run, or kNoView.
+    uint probeRedView;
+    uint probeGreenView;
+    uint probeBlueView;
 };
 
 // Per-pass descriptor indices and parameters; mirrors Lighting::PassArgs in src/lighting.h.
@@ -128,8 +136,17 @@ ConstantBuffer<FrameConstants> g_frame : register(b0);
 ConstantBuffer<PassConstants> g_pass : register(b1);
 RaytracingAccelerationStructure g_scene : register(t0);
 SamplerState g_linearClamp : register(s0);
-SamplerState g_pointWrap : register(s1);
 SamplerState g_linearWrap : register(s2);
+
+// The pixel of a pass's thread: views whose G-buffer covers part of the screen (the viewmodel) dispatch their passes
+// over a rectangle around it only.
+uint2 DispatchPixel(uint2 id)
+{
+    if (g_frame.dispatchOriginView == kNoView)
+        return id;
+    ByteAddressBuffer origin = ResourceDescriptorHeap[g_frame.dispatchOriginView];
+    return id + origin.Load2(32);
+}
 
 float3 WorldPositionFromDepth(int2 pixel, float depth)
 {
