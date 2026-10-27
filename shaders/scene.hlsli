@@ -132,10 +132,12 @@ float CandidateOpacity(uint instance, uint alphaPrimitive, float2 barycentrics, 
 // Rays other than shadow rays stop at candidates at least this opaque.
 static const float kSolidOpacity = 0.5;
 
-bool CandidateIsSolid(uint instance, uint alphaPrimitive, float2 barycentrics)
+// With `gbufferSurface`, translucent candidates never stop the ray: the game draws them after the G-buffer.
+bool CandidateIsSolid(uint instance, uint alphaPrimitive, float2 barycentrics, bool gbufferSurface = false)
 {
     bool translucent;
-    return CandidateOpacity(instance, alphaPrimitive, barycentrics, translucent) >= kSolidOpacity;
+    float opacity = CandidateOpacity(instance, alphaPrimitive, barycentrics, translucent);
+    return opacity >= kSolidOpacity && !(gbufferSurface && translucent);
 }
 
 // A committed triangle hit: the instance, the triangle's index in its model, and where on it.
@@ -149,8 +151,8 @@ struct HitInfo
 };
 
 // The closest triangle along a ray, or false when it reaches tMax. `rayFlags` is RAY_FLAG_NONE or
-// g_frame.indirectRayFlags.
-bool TraceHit(float3 origin, float3 direction, float tMax, uint mask, out HitInfo hit, uint rayFlags = RAY_FLAG_NONE)
+// g_frame.indirectRayFlags; `gbufferSurface` looks for the surface the G-buffer shows (CandidateIsSolid).
+bool TraceHit(float3 origin, float3 direction, float tMax, uint mask, out HitInfo hit, uint rayFlags = RAY_FLAG_NONE, bool gbufferSurface = false)
 {
     hit = (HitInfo)0;
     SCENE_RAY_QUERY(RAY_FLAG_NONE) query;
@@ -161,7 +163,7 @@ bool TraceHit(float3 origin, float3 direction, float tMax, uint mask, out HitInf
     ray.TMax = tMax;
     query.TraceRayInline(g_scene, rayFlags, mask, ray);
     while (query.Proceed()) {
-        if (CandidateIsSolid(query.CandidateInstanceID(), query.CandidatePrimitiveIndex(), query.CandidateTriangleBarycentrics()))
+        if (CandidateIsSolid(query.CandidateInstanceID(), query.CandidatePrimitiveIndex(), query.CandidateTriangleBarycentrics(), gbufferSurface))
             query.CommitNonOpaqueTriangleHit();
     }
     if (query.CommittedStatus() != COMMITTED_TRIANGLE_HIT)

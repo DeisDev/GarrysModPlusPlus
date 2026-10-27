@@ -10,6 +10,7 @@
 #include "log.h"
 #include "mod.h"
 #include "renderer.h"
+#include "ropes.h"
 #include "scene.h"
 #include "settings.h"
 #include "skinned_casters.h"
@@ -131,9 +132,14 @@ struct State {
     uint32_t modelErrors = 0;
     std::vector<entities::ModelEntity> entities;
     std::vector<SceneInstance> dynamicInstances;
-    // Last main view's transform of each rigid dynamic entity, by entity index, for motion vectors.
-    std::unordered_map<int, std::array<std::array<float, 4>, 3>> previousTransforms;
-    std::unordered_map<int, std::array<std::array<float, 4>, 3>> currentTransforms;
+    // Last main view's transform of each rigid dynamic entity (by entity index) and rope segment (RopeSegmentKey),
+    // for motion vectors.
+    std::unordered_map<int64_t, std::array<std::array<float, 4>, 3>> previousTransforms;
+    std::unordered_map<int64_t, std::array<std::array<float, 4>, 3>> currentTransforms;
+    std::vector<entities::Rope> ropes;
+    // The rope prism's scene model for each rope material, or -1 for materials that cast no shadow.
+    std::unordered_map<std::string, int> ropeModels;
+    bool loggedRopes = false;
     std::vector<SkinnedEntity> skinnedEntities;
     std::vector<studio::Matrix3x4> bones;
     std::vector<engine::DynamicLight> dynamicLights;
@@ -744,6 +750,8 @@ void ClearScene()
     // Scene material indices and texture views are reset with the scene.
     g_state.materials.clear();
     g_state.swayMaterials.clear();
+    g_state.ropeModels.clear();
+    g_state.loggedRopes = false;
 }
 
 void UpdateScene()
@@ -838,6 +846,70 @@ void UpdateScene()
     g_state.failedMap = level;
 }
 
+// The rope prism with a rope material's albedo, or -1 for clear materials (additive beams and lasers), which cast no
+// shadow.
+int RopeModelFor(const std::string& material)
+{
+    if (auto cached = g_state.ropeModels.find(material); cached != g_state.ropeModels.end())
+        return cached->second;
+    std::string path = material;
+    std::replace(path.begin(), path.end(), '\\', '/');
+    std::transform(path.begin(), path.end(), path.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (!path.starts_with("materials/"))
+        path = "materials/" + path;
+    if (!path.ends_with(".vmt"))
+        path += ".vmt";
+    const std::optional<MaterialInfo>& info = MaterialFor(path);
+    int& model = g_state.ropeModels[material];
+    model = -1;
+    if (info && info->clear)
+        return model;
+    const ropes::Prism prism = ropes::UnitPrism();
+    const std::vector<uint32_t> albedo(prism.indices.size() / 3, PackAlbedo(info ? info->reflectivity : kDefaultReflectivity));
+    model = g_state.scene.AddModel({prism.positions, prism.indices, albedo, static_cast<UINT>(albedo.size()), {}, {}, {}});
+    return model;
+}
+
+// Never an entity index, which stays below 2^16.
+int64_t RopeSegmentKey(int rope, size_t segment) { return static_cast<int64_t>(rope) << 16 | static_cast<int64_t>(segment + 1); }
+
+// Keeps a dynamic instance's transform for the next main view and gives it the last one.
+void TrackMotion(SceneInstance& instance, int64_t key)
+{
+    auto& current = g_state.currentTransforms[key];
+    std::memcpy(current.data(), instance.transform, sizeof(current));
+    if (auto previous = g_state.previousTransforms.find(key); previous != g_state.previousTransforms.end()) {
+        std::memcpy(instance.previousTransform, previous->second.data(), sizeof(instance.previousTransform));
+        instance.previousKnown = true;
+    }
+}
+
+// Ropes are drawn from their simulated nodes; each segment of a rope's curve is an instance of its prism.
+void CollectRopes()
+{
+    entities::CollectRopes(g_state.ropes);
+    for (const entities::Rope& rope : g_state.ropes) {
+        const int model = RopeModelFor(rope.material);
+        if (model < 0)
+            continue;
+        const std::vector<bsp::Float3> curve = ropes::Curve(rope);
+        const UINT mask = g_state.skyboxTest.InSkybox(curve.front()) ? kSkyboxMask : kDynamicMask;
+        for (size_t s = 0; s + 1 < curve.size(); ++s) {
+            SceneInstance instance;
+            instance.model = model;
+            instance.mask = mask;
+            if (!ropes::SegmentTransform(curve[s], curve[s + 1], rope.width * 0.5f, instance.transform))
+                continue;
+            TrackMotion(instance, RopeSegmentKey(rope.index, s));
+            g_state.dynamicInstances.push_back(instance);
+        }
+    }
+    if (!g_state.ropes.empty() && !g_state.loggedRopes) {
+        g_state.loggedRopes = true;
+        log::Info("Scene: {} ropes cast shadows", g_state.ropes.size());
+    }
+}
+
 void CollectEntities()
 {
     g_state.dynamicInstances.clear();
@@ -865,13 +937,9 @@ void CollectEntities()
         instance.model = model.sceneModel;
         instance.mask = mask;
         std::memcpy(instance.transform, entity.transform, sizeof(instance.transform));
-        auto& current = g_state.currentTransforms[entity.index];
-        std::memcpy(current.data(), entity.transform, sizeof(current));
-        if (auto previous = g_state.previousTransforms.find(entity.index); previous != g_state.previousTransforms.end()) {
-            std::memcpy(instance.previousTransform, previous->second.data(), sizeof(instance.previousTransform));
-            instance.previousKnown = true;
-        }
+        TrackMotion(instance, entity.index);
     }
+    CollectRopes();
     std::swap(g_state.previousTransforms, g_state.currentTransforms);
 }
 
@@ -1073,6 +1141,19 @@ void OnViewport(const D3DVIEWPORT9& viewport)
     gbuffer::SetJitter(0.0f, 0.0f);
     g_state.viewmodelViewport = viewport;
     g_state.viewmodelCapture = gbuffer::Begin(g_state.device);
+}
+
+void OnBeforeStretchRect(IDirect3DSurface9* source)
+{
+    if (!g_state.viewmodelCapture || source == nullptr)
+        return;
+    // Bloom copies the back buffer before the next viewport change; without the lit viewmodel in it, the glow of
+    // what lies behind the viewmodel is added over it.
+    ComPtr<IDirect3DSurface9> backBuffer;
+    if (FAILED(g_state.device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backBuffer)) || backBuffer.Get() != source)
+        return;
+    g_state.viewmodelCapture = false;
+    FinishCapture(gbuffer::ViewKind::Viewmodel);
 }
 
 void OnViewOpaqueBegin()

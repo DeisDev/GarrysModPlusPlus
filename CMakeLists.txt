@@ -176,6 +176,7 @@ add_library(gmodpp_d3d9 SHARED
     src/scene.cpp
     src/skinned_casters.cpp
     src/swaying_props.cpp
+    src/ropes.cpp
     src/settings.cpp
     src/ui_text.cpp
     src/overlay.cpp

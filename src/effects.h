@@ -17,5 +17,7 @@ void OnViewOpaqueEnd(bool inSkybox);
 void OnViewTranslucentEnd();
 // The viewmodel is drawn with its own depth range (viewport z 0..0.1); its capture follows that range.
 void OnViewport(const D3DVIEWPORT9& viewport);
+// Before the game copies `source` (StretchRect); post-processing copies the back buffer straight after the viewmodel.
+void OnBeforeStretchRect(IDirect3DSurface9* source);
 
 }

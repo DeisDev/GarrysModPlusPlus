@@ -50,8 +50,9 @@ void main(uint3 id : SV_DispatchThreadID)
     if (surface.w > 0.0 && g_frame.traceMask != 0) {
         float3 view = normalize(position - g_frame.eyePosition);
         HitInfo hit;
-        // The eye is inside the local player's body.
-        if (TraceHit(g_frame.eyePosition, view, surface.w + 8.0 + surface.w * 0.02, g_frame.traceMask & ~kLocalPlayerMask, hit) &&
+        // The eye is inside the local player's body. Glass a few units in front of a surface would otherwise give it
+        // the glass's material.
+        if (TraceHit(g_frame.eyePosition, view, surface.w + 8.0 + surface.w * 0.02, g_frame.traceMask & ~kLocalPlayerMask, hit, RAY_FLAG_NONE, true) &&
             abs(hit.t - surface.w) <= 4.0 + surface.w * 0.02) {
             visible = uint4(hit.instance, hit.primitive, asuint(hit.barycentrics));
             pixelFlags = kPixelHit | ((MaterialFlags(hit) & kMaterialUnlit) != 0 ? kPixelUnlit : 0u) |

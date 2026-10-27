@@ -251,9 +251,20 @@ GMODPP_DEVICE_HOOK(Clear, (IDirect3DDevice9* self, DWORD count, const D3DRECT* r
     (self, count, rects, flags, color, z, stencil), trace::Line("Clear rects {} flags {:#x} color {:#010x} z {} stencil {}", count, flags, color, z, stencil))
 GMODPP_DEVICE_HOOK(BeginScene, (IDirect3DDevice9* self), (self), trace::Line("BeginScene"))
 GMODPP_DEVICE_HOOK(EndScene, (IDirect3DDevice9* self), (self), trace::Line("EndScene"))
-GMODPP_DEVICE_HOOK(StretchRect, (IDirect3DDevice9* self, IDirect3DSurface9* src, const RECT* srcRect, IDirect3DSurface9* dst, const RECT* dstRect, D3DTEXTUREFILTERTYPE filter),
-    (self, src, srcRect, dst, dstRect, filter), trace::Line("StretchRect {} -> {}", trace::Describe(src), trace::Describe(dst)))
 #undef GMODPP_DEVICE_HOOK
+
+using StretchRectFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, IDirect3DSurface9*, const RECT*, IDirect3DSurface9*, const RECT*, D3DTEXTUREFILTERTYPE);
+
+HRESULT STDMETHODCALLTYPE HookStretchRect(IDirect3DDevice9* self, IDirect3DSurface9* src, const RECT* srcRect, IDirect3DSurface9* dst, const RECT* dstRect,
+    D3DTEXTUREFILTERTYPE filter)
+{
+    if (IsGameDevice(self)) {
+        if (trace::Active())
+            trace::Line("StretchRect {} -> {}", trace::Describe(src), trace::Describe(dst));
+        effects::OnBeforeStretchRect(src);
+    }
+    return Original<StretchRectFn>(self, kSlotDeviceStretchRect)(self, src, srcRect, dst, dstRect, filter);
+}
 
 using SetVertexShaderFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, IDirect3DVertexShader9*);
 using SetTextureFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, DWORD, IDirect3DBaseTexture9*);
@@ -434,12 +445,12 @@ void OnGameDeviceCreated(IDirect3DDevice9* device, HWND focusWindow, const D3DPR
     Patch(device, kSlotDeviceSetRenderTarget, reinterpret_cast<void*>(&HookSetRenderTarget));
     Patch(device, kSlotDeviceDrawPrimitiveUP, reinterpret_cast<void*>(&HookDrawPrimitiveUP));
     Patch(device, kSlotDeviceDrawIndexedPrimitiveUP, reinterpret_cast<void*>(&HookDrawIndexedPrimitiveUP));
+    Patch(device, kSlotDeviceStretchRect, reinterpret_cast<void*>(&HookStretchRect));
     if (GetOptions().devMode) {
         Patch(device, kSlotDeviceSetDepthStencilSurface, reinterpret_cast<void*>(&HookSetDepthStencilSurface));
         Patch(device, kSlotDeviceClear, reinterpret_cast<void*>(&HookClear));
         Patch(device, kSlotDeviceBeginScene, reinterpret_cast<void*>(&HookBeginScene));
         Patch(device, kSlotDeviceEndScene, reinterpret_cast<void*>(&HookEndScene));
-        Patch(device, kSlotDeviceStretchRect, reinterpret_cast<void*>(&HookStretchRect));
     }
 
     IDirect3DDevice9Ex* deviceEx = nullptr;

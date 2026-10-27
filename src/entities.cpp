@@ -4,6 +4,9 @@
 
 #include <windows.h>
 
+#include <algorithm>
+#include <cmath>
+#include <cstddef>
 #include <cstring>
 
 namespace gmodpp::entities {
@@ -29,6 +32,29 @@ constexpr int kModelTypeStudio = 3;
 constexpr int kSetupBonesSlot = 16;
 constexpr int kEngineTimeSlot = 14;
 constexpr int kBoneUsedByAnything = 0x0007FF00;
+constexpr int kGetClientNetworkableSlot = 4;
+constexpr int kGetClientClassSlot = 2;
+constexpr size_t kClientClassName = 16;
+constexpr int kModelInfoGetModelSlot = 1;
+
+// C_RopeKeyframe in GMod's client.dll (DT_RopeKeyframe, DrawModel and OnDataChanged, confirmed in Ghidra). Between the
+// networked m_iRopeMaterialModelIndex and m_nSegments lie CRopePhysics<10> m_RopePhysics (SDK public/rope_physics.h:
+// node pointer, node count, then the nodes, each m_vPos, m_vPrevPos and the drawn m_vPredicted) and m_LightValues.
+constexpr char kRopeClass[] = "CRopeKeyframe";
+constexpr size_t kRopeMaterialIndex = 0x16fc;
+constexpr size_t kRopeNodePointer = 0x1710;
+constexpr size_t kRopeNodeCount = 0x1718;
+constexpr size_t kRopeNodes = 0x1750;
+constexpr size_t kRopeNodeSize = 36;
+constexpr size_t kRopeNodePredicted = 24;
+constexpr size_t kRopeSubdiv = 0x19f8;
+constexpr size_t kRopeWidth = 0x1a0c;
+constexpr int kRopeMaxNodes = 10;
+// m_Subdiv 255 takes the rope_subdiv convar (default 2); the game clamps it below MAX_ROPE_SUBDIVS (8).
+constexpr int kRopeSubdivFromConvar = 255;
+constexpr int kRopeDefaultSubdiv = 2;
+constexpr int kRopeMaxSubdiv = 7;
+constexpr float kWorldLimit = 65536.0f;
 
 void* g_entityList = nullptr;
 void* g_modelInfo = nullptr;
@@ -47,6 +73,14 @@ template <class Fn>
 Fn Slot(void* object, int slot)
 {
     return reinterpret_cast<Fn>((*static_cast<void***>(object))[slot]);
+}
+
+template <class T>
+T Field(const void* object, size_t offset)
+{
+    T value;
+    std::memcpy(&value, static_cast<const std::byte*>(object) + offset, sizeof(T));
+    return value;
 }
 
 }
@@ -97,6 +131,48 @@ void Collect(std::vector<ModelEntity>& entities)
         out.renderable = renderable;
         out.model = name;
         std::memcpy(out.transform, transform, sizeof(out.transform));
+    }
+}
+
+void CollectRopes(std::vector<Rope>& ropes)
+{
+    ropes.clear();
+    if (!Ready())
+        return;
+    const int highest = Slot<int(__fastcall*)(void*)>(g_entityList, kGetHighestEntityIndexSlot)(g_entityList);
+    for (int index = 1; index <= highest; ++index) {
+        void* entity = Slot<void*(__fastcall*)(void*, int)>(g_entityList, kGetClientEntitySlot)(g_entityList, index);
+        if (entity == nullptr)
+            continue;
+        void* networkable = Slot<void*(__fastcall*)(void*)>(entity, kGetClientNetworkableSlot)(entity);
+        const void* clientClass = networkable != nullptr ? Slot<const void*(__fastcall*)(void*)>(networkable, kGetClientClassSlot)(networkable) : nullptr;
+        if (clientClass == nullptr || std::strcmp(Field<const char*>(clientClass, kClientClassName), kRopeClass) != 0)
+            continue;
+        void* renderable = Slot<void*(__fastcall*)(void*)>(entity, kGetClientRenderableSlot)(entity);
+        if (renderable == nullptr || !Slot<bool(__fastcall*)(void*)>(renderable, kShouldDrawSlot)(renderable))
+            continue;
+        // The node pointer points at the nodes inside the entity only where the layout above holds.
+        const int nodes = Field<int>(entity, kRopeNodeCount);
+        if (Field<const std::byte*>(entity, kRopeNodePointer) != static_cast<const std::byte*>(entity) + kRopeNodes || nodes < 2 || nodes > kRopeMaxNodes)
+            continue;
+        Rope rope;
+        rope.index = index;
+        rope.width = Field<float>(entity, kRopeWidth);
+        const int subdiv = Field<uint8_t>(entity, kRopeSubdiv);
+        rope.subdivisions = std::min(subdiv == kRopeSubdivFromConvar ? kRopeDefaultSubdiv : subdiv, kRopeMaxSubdiv);
+        bool valid = std::isfinite(rope.width) && rope.width > 0.0f;
+        for (int n = 0; n < nodes && valid; ++n) {
+            const std::array<float, 3> node = Field<std::array<float, 3>>(entity, kRopeNodes + static_cast<size_t>(n) * kRopeNodeSize + kRopeNodePredicted);
+            for (float v : node)
+                valid = valid && std::isfinite(v) && std::fabs(v) < kWorldLimit;
+            rope.nodes.push_back(node);
+        }
+        const void* model = Slot<const void*(__fastcall*)(void*, int)>(g_modelInfo, kModelInfoGetModelSlot)(g_modelInfo, Field<int>(entity, kRopeMaterialIndex));
+        const char* material = model != nullptr ? Slot<const char*(__fastcall*)(void*, const void*)>(g_modelInfo, kGetModelNameSlot)(g_modelInfo, model) : nullptr;
+        if (!valid || material == nullptr)
+            continue;
+        rope.material = material;
+        ropes.push_back(std::move(rope));
     }
 }
 

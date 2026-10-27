@@ -18,6 +18,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - The ambient occlusion pass has its own GPU time in the menu and log.
 - Shadows of swaying grass, leaves and trees (`$treesway`) now move with them.
 - The menu and log show the GPU time of the 3D skybox and viewmodel, which the lighting total now includes.
+- Ropes and cables, such as power lines, cast shadows.
 
 ### Changed
 
@@ -52,3 +53,5 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fixed glass seen through small gaps (such as between stair steps) flickering.
 - Fixed fog using the wrong colour, and the 3D skybox getting no fog on some maps.
 - Fixed shadows of leaves and other alpha-tested surfaces looking like square blocks.
+- Fixed objects right behind window glass showing a mirror image like a cubemap.
+- Fixed the held weapon looking see-through in front of bright areas.
