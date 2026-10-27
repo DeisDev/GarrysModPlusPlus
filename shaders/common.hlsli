@@ -101,9 +101,11 @@ struct PassConstants
 
 static const uint kNoView = 0xFFFFFFFFu;
 
-// Pixel flags from shaders/primary.hlsl: a scene triangle matches the G-buffer there, and its material is unlit.
+// Pixel flags from shaders/primary.hlsl: a scene triangle matches the G-buffer there, its material is unlit, and its
+// instance is lit without regard to its normals.
 static const uint kPixelHit = 1;
 static const uint kPixelUnlit = 2;
+static const uint kPixelIgnoreNormals = 4;
 
 ConstantBuffer<FrameConstants> g_frame : register(b0);
 ConstantBuffer<PassConstants> g_pass : register(b1);
@@ -206,6 +208,14 @@ float3 CosineSample(float3 n, float u1, float u2)
     float r = sqrt(u1);
     float phi = 6.28318530718 * u2;
     return normalize(t * (r * cos(phi)) + b * (r * sin(phi)) + n * sqrt(max(1.0 - u1, 0.0)));
+}
+
+float3 UniformSphere(float u1, float u2)
+{
+    float z = 1.0 - 2.0 * u1;
+    float r = sqrt(max(1.0 - z * z, 0.0));
+    float phi = 6.28318530718 * u2;
+    return float3(r * cos(phi), r * sin(phi), z);
 }
 
 #endif

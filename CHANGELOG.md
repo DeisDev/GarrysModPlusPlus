@@ -17,9 +17,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Changed
 
 - Shadows of many lights are less noisy: the strongest lights are always traced, and the rest are denoised.
-- Reflections are steadier and no longer sparkle.
+- Reflections are steadier and sparkle less.
 - Skin materials support more detail texture blend modes.
 - Lights inside lamp models are blocked by the lamp the way the map's baked lighting was, so rooms are no longer brighter than intended.
+- Grass and other props the map marks as casting no shadows now cast shadows from the sun.
+- Values in `gmodpp_settings.ini` are limited to the ranges the menu offers.
 
 ### Fixed
 
@@ -29,3 +31,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fixed foliage, fences and glass casting no shadows.
 - Fixed black shadow streaks on displacement terrain such as the gm_construct hill.
 - Fixed bullet holes and other darkening decals disappearing with real-time lighting.
+- Fixed maps saved with compressed data getting no real-time lighting.
+- Fixed walls and floors whose material tints their lighting (`$color2`) looking too bright.
+- Fixed grass and other foliage turning black where it faces away from the light.
+- Fixed ghost copies of nearby objects appearing in the sky with DLSS Ray Reconstruction.

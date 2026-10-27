@@ -174,7 +174,7 @@ bool BeginOptionTable(const char* id)
 }
 
 // One table row: an optional on/off box (a plain label without one) and an optional intensity slider.
-void ToggleRow(TextId label, bool* enabled, float* intensity, float maximum)
+void ToggleRow(TextId label, bool* enabled, Settings& settings, float Settings::* intensity)
 {
     ImGui::TableNextRow();
     ImGui::TableNextColumn();
@@ -185,23 +185,25 @@ void ToggleRow(TextId label, bool* enabled, float* intensity, float maximum)
         ImGui::TextUnformatted(Text(label));
     ImGui::TableNextColumn();
     if (intensity != nullptr) {
+        const SettingRange range = RangeOf(intensity);
         ImGui::SetNextItemWidth(-FLT_MIN);
-        ImGui::SliderFloat("##intensity", intensity, 0.0f, maximum, "%.2f");
+        ImGui::SliderFloat("##intensity", &(settings.*intensity), range.minimum, range.maximum, "%.2f");
     }
     ImGui::PopID();
 }
 
-void ToggleRow(TextId label, bool& enabled, float* intensity, float maximum) { ToggleRow(label, &enabled, intensity, maximum); }
+void ToggleRow(TextId label, bool& enabled, Settings& settings, float Settings::* intensity) { ToggleRow(label, &enabled, settings, intensity); }
 
-void SliderRow(TextId label, float& value, float minimum, float maximum)
+void SliderRow(TextId label, Settings& settings, float Settings::* field)
 {
     ImGui::TableNextRow();
     ImGui::TableNextColumn();
     ImGui::TextUnformatted(Text(label));
     ImGui::TableNextColumn();
     ImGui::PushID(static_cast<int>(label));
+    const SettingRange range = RangeOf(field);
     ImGui::SetNextItemWidth(-FLT_MIN);
-    ImGui::SliderFloat("##value", &value, minimum, maximum, "%.2f");
+    ImGui::SliderFloat("##value", &(settings.*field), range.minimum, range.maximum, "%.2f");
     ImGui::PopID();
 }
 
@@ -276,11 +278,11 @@ void DrawLightingTab(Settings& settings)
 {
     ImGui::SeparatorText(Text(TextId::SectionLights));
     if (BeginOptionTable("lights")) {
-        ToggleRow(TextId::Sun, settings.sun, &settings.sunIntensity, 4.0f);
-        ToggleRow(TextId::SkyIntensity, nullptr, &settings.skyIntensity, 4.0f);
-        ToggleRow(TextId::MapLights, settings.mapLights, &settings.lightIntensity, 4.0f);
-        ToggleRow(TextId::DynamicLights, settings.dynamicLights, nullptr, 0.0f);
-        ToggleRow(TextId::ProjectedLights, settings.projectedLights, &settings.projectedIntensity, 8.0f);
+        ToggleRow(TextId::Sun, settings.sun, settings, &Settings::sunIntensity);
+        ToggleRow(TextId::SkyIntensity, nullptr, settings, &Settings::skyIntensity);
+        ToggleRow(TextId::MapLights, settings.mapLights, settings, &Settings::lightIntensity);
+        ToggleRow(TextId::DynamicLights, settings.dynamicLights, settings, nullptr);
+        ToggleRow(TextId::ProjectedLights, settings.projectedLights, settings, &Settings::projectedIntensity);
         ImGui::TableNextRow();
         ImGui::TableNextColumn();
         ImGui::TextUnformatted(Text(TextId::Flashlights));
@@ -294,12 +296,12 @@ void DrawLightingTab(Settings& settings)
     }
     ImGui::SeparatorText(Text(TextId::SectionIndirect));
     if (BeginOptionTable("indirect")) {
-        ToggleRow(TextId::IndirectLight, settings.indirectLight, &settings.indirectIntensity, 4.0f);
-        ToggleRow(TextId::Denoiser, settings.denoiser, nullptr, 0.0f);
-        ToggleRow(TextId::AmbientOcclusion, settings.ambientOcclusion, &settings.aoIntensity, 1.0f);
-        ToggleRow(TextId::Reflections, settings.reflections, &settings.reflectionIntensity, 4.0f);
-        ToggleRow(TextId::TranslucentLighting, settings.translucentLighting, nullptr, 0.0f);
-        ToggleRow(TextId::VolumetricLight, settings.volumetricLight, &settings.volumetricIntensity, 4.0f);
+        ToggleRow(TextId::IndirectLight, settings.indirectLight, settings, &Settings::indirectIntensity);
+        ToggleRow(TextId::Denoiser, settings.denoiser, settings, nullptr);
+        ToggleRow(TextId::AmbientOcclusion, settings.ambientOcclusion, settings, &Settings::aoIntensity);
+        ToggleRow(TextId::Reflections, settings.reflections, settings, &Settings::reflectionIntensity);
+        ToggleRow(TextId::TranslucentLighting, settings.translucentLighting, settings, nullptr);
+        ToggleRow(TextId::VolumetricLight, settings.volumetricLight, settings, &Settings::volumetricIntensity);
         ImGui::EndTable();
     }
 }
@@ -339,8 +341,8 @@ void DrawImageTab(Settings& settings)
                 ImGui::EndCombo();
             }
         } else {
-            SliderRow(TextId::HistoryWeight, settings.taaHistoryWeight, 0.5f, 0.98f);
-            SliderRow(TextId::Sharpening, settings.sharpening, 0.0f, 1.0f);
+            SliderRow(TextId::HistoryWeight, settings, &Settings::taaHistoryWeight);
+            SliderRow(TextId::Sharpening, settings, &Settings::sharpening);
         }
         ImGui::EndTable();
     }

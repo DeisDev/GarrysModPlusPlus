@@ -185,11 +185,31 @@ foreach(entry IN LISTS DLSS_SDK_FILES)
 endforeach()
 set(DLSS_FEATURE_DLL "${DLSS_SDK_DIR}/lib/Windows_x86_64/rel/nvngx_dlssd.dll")
 
+# LZMA SDK decoder (public domain) for maps with compressed lumps, each file pinned by hash.
+set(LZMA_SDK_VERSION 26.04)
+set(LZMA_SDK_DIR "${CMAKE_CURRENT_BINARY_DIR}/_deps/lzma-${LZMA_SDK_VERSION}")
+set(LZMA_SDK_FILES
+    "7zTypes.h|a5d03b8cb65cd3a2a56bde46dd68fb356d2ebacd9d70283e7d4d20b4e0a64713"
+    "Compiler.h|d5e42be77d26beaa8c81d3e62ef99fc5685736cfc079779fdb9154d05fa8bc4a"
+    "Precomp.h|c8903f2e36a771a272d8981e1e9ffed5ba16ca3d2f3dca6d1414d2340a6829d0"
+    "LzmaDec.h|3aaf07b4ae4173a2d103179455dc7089b5ddbc7fc3db3c0e40964a7499c69266"
+    "LzmaDec.c|4e6ec665a6df01f1722e2b2fc36dc5e3aa7c3890e0f8cb11c6a07c9a01f3309b"
+)
+foreach(entry IN LISTS LZMA_SDK_FILES)
+    string(REPLACE "|" ";" parts "${entry}")
+    list(GET parts 0 file)
+    list(GET parts 1 hash)
+    file(DOWNLOAD "https://raw.githubusercontent.com/ip7z/7zip/${LZMA_SDK_VERSION}/C/${file}" "${LZMA_SDK_DIR}/${file}"
+        EXPECTED_HASH SHA256=${hash} TLS_VERIFY ON)
+endforeach()
+add_library(lzma_dec STATIC "${LZMA_SDK_DIR}/LzmaDec.c")
+target_include_directories(lzma_dec PUBLIC "${LZMA_SDK_DIR}")
+
 set_target_properties(gmodpp_d3d9 PROPERTIES OUTPUT_NAME d3d9)
 target_include_directories(gmodpp_d3d9 PRIVATE "${SHADER_OUTPUT_DIR}" "${DLSS_SDK_DIR}/include")
 target_compile_definitions(gmodpp_d3d9 PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
 target_compile_options(gmodpp_d3d9 PRIVATE /W4 /permissive- /utf-8)
-target_link_libraries(gmodpp_d3d9 PRIVATE d3d12 dxgi dxguid minhook imgui "${DLSS_SDK_DIR}/lib/Windows_x86_64/x64/nvsdk_ngx_s.lib")
+target_link_libraries(gmodpp_d3d9 PRIVATE d3d12 dxgi dxguid minhook imgui lzma_dec "${DLSS_SDK_DIR}/lib/Windows_x86_64/x64/nvsdk_ngx_s.lib")
 
 if(GMOD_DIR)
     add_custom_target(deploy

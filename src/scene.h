@@ -23,6 +23,12 @@ constexpr UINT kDynamicMask = 0x04;
 constexpr UINT kLocalPlayerMask = 0x08;
 // The 3D skybox's scaled-down scene, which only the skybox view's rays meet.
 constexpr UINT kSkyboxMask = 0x10;
+// Static props the map marks as casting no shadows (often foliage). They shadow the sun but not local lights, so a
+// lamp model marked this way still lets its own light out as VRAD did.
+constexpr UINT kShadowlessPropMask = 0x20;
+
+// SceneInstance::flags, read by shaders from the instance record.
+constexpr uint32_t kInstanceIgnoreNormals = 0x01;
 
 // Triangles for Scene::AddModel. Alpha-tested and translucent triangles come last, from `opaqueTriangles` on; each
 // has an entry in `alphaTriangles` (Scene::PackAlpha or Scene::PackTranslucent), and then the model needs `uvs`.
@@ -66,6 +72,8 @@ struct SceneInstance {
     D3D12_GPU_VIRTUAL_ADDRESS blas = 0;
     UINT positionsView = DescriptorHeap::kInvalid;
     UINT mask = 0;
+    // kInstanceIgnoreNormals.
+    uint32_t flags = 0;
     float transform[3][4];
     // Where the instance was last frame, for motion vectors: its transform when `previousKnown`, and a skinned
     // model's vertex positions when the view is valid.

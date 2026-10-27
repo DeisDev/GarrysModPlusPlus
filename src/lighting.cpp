@@ -57,7 +57,7 @@ struct GpuProjector {
     float padding;
 };
 static_assert(sizeof(GpuProjector) == 112);
-constexpr UINT kTraceMask = kWorldMask | kStaticPropMask | kDynamicMask | kLocalPlayerMask;
+constexpr UINT kTraceMask = kWorldMask | kStaticPropMask | kShadowlessPropMask | kDynamicMask | kLocalPlayerMask;
 // The viewmodel is drawn inside the local player's body, which would shadow it.
 constexpr UINT kViewmodelTraceMask = kTraceMask & ~kLocalPlayerMask;
 constexpr UINT kFilterSteps[] = {1, 2, 4, 8, 16};

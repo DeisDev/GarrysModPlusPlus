@@ -6,7 +6,7 @@
 // motion covers moving objects as well as the camera; pixels without a matching triangle follow the camera.
 // output0: visibility (instance, triangle, barycentrics; instance kNoView where nothing matches the G-buffer);
 // output1: motion in pixels towards last frame's position; output2: last frame's distance from the eye;
-// output3: kPixelHit and kPixelUnlit flags.
+// output3: kPixelHit, kPixelUnlit and kPixelIgnoreNormals flags.
 
 float3 InterpolatedPosition(uint positionsView, uint3 index, float2 barycentrics)
 {
@@ -50,7 +50,8 @@ void main(uint3 id : SV_DispatchThreadID)
         if (TraceHit(g_frame.eyePosition, view, surface.w + 8.0 + surface.w * 0.02, g_frame.traceMask & ~kLocalPlayerMask, hit) &&
             abs(hit.t - surface.w) <= 4.0 + surface.w * 0.02) {
             visible = uint4(hit.instance, hit.primitive, asuint(hit.barycentrics));
-            pixelFlags = kPixelHit | ((MaterialFlags(hit) & kMaterialUnlit) != 0 ? kPixelUnlit : 0u);
+            pixelFlags = kPixelHit | ((MaterialFlags(hit) & kMaterialUnlit) != 0 ? kPixelUnlit : 0u) |
+                ((LoadInstance(hit.instance).flags & kInstanceIgnoreNormals) != 0 ? kPixelIgnoreNormals : 0u);
             previous = position + HitMotion(hit);
         }
     }

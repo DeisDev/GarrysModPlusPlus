@@ -3,9 +3,12 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <format>
 #include <optional>
+
+#include <LzmaDec.h>
 
 namespace gmodpp::bsp {
 
@@ -44,8 +47,12 @@ constexpr int32_t kSkippedSurfaces = kSurfSky2D | kSurfSky | kSurfWarp | kSurfTr
 
 constexpr int32_t kStaticPropLumpId = ('s' << 24) | ('p' << 16) | ('r' << 8) | 'p';
 constexpr size_t kStaticPropNameLength = 128;
+constexpr uint32_t kStaticPropIgnoreNormals = 0x08;
 constexpr uint32_t kStaticPropNoShadow = 0x10;
 constexpr float kDegreesToRadians = 3.14159265358979f / 180.0f;
+
+constexpr uint32_t kLzmaId = 'L' | ('Z' << 8) | ('M' << 16) | ('A' << 24);
+constexpr uint16_t kGameLumpCompressed = 0x0001;
 
 
 #pragma pack(push, 1)
@@ -168,6 +175,21 @@ struct WorldLight {
     int32_t texinfo;
     int32_t owner;
 };
+
+struct GameLump {
+    int32_t id;
+    uint16_t flags;
+    uint16_t version;
+    int32_t offset;
+    int32_t length;
+};
+
+struct LzmaHeader {
+    uint32_t id;
+    uint32_t actualSize;
+    uint32_t lzmaSize;
+    uint8_t properties[LZMA_PROPS_SIZE];
+};
 #pragma pack(pop)
 
 static_assert(sizeof(Header) == 1036);
@@ -181,6 +203,8 @@ static_assert(sizeof(Texdata) == 32);
 static_assert(sizeof(DispVert) == 20);
 static_assert(sizeof(DispInfo) == 176);
 static_assert(sizeof(WorldLight) == 88);
+static_assert(sizeof(GameLump) == 16);
+static_assert(sizeof(LzmaHeader) == 17);
 
 constexpr size_t kWorldLightV1Size = 100;
 constexpr size_t kLeafV0Size = 56;
@@ -191,8 +215,6 @@ std::optional<std::span<const T>> LumpArray(std::span<const std::byte> file, con
 {
     const Lump& lump = header.lumps[index];
     if (lump.offset < 0 || lump.length < 0 || static_cast<size_t>(lump.offset) + lump.length > file.size() || lump.length % stride != 0)
-        return std::nullopt;
-    if (lump.fourCC != 0)
         return std::nullopt;
     return std::span<const T>(reinterpret_cast<const T*>(file.data() + lump.offset), lump.length / stride);
 }
@@ -474,11 +496,10 @@ void ReadVisibility(std::span<const std::byte> file, const Header& header, Visib
         return;
     const Lump& leafLump = header.lumps[kLumpLeafs];
     const size_t leafStride = leafLump.version == 0 ? kLeafV0Size : kLeafV1Size;
-    if (leafLump.fourCC != 0 || leafLump.length <= 0 || static_cast<size_t>(leafLump.offset) + leafLump.length > file.size() ||
-        leafLump.length % leafStride != 0)
+    if (leafLump.length <= 0 || static_cast<size_t>(leafLump.offset) + leafLump.length > file.size() || leafLump.length % leafStride != 0)
         return;
     const Lump& visLump = header.lumps[kLumpVisibility];
-    if (visLump.fourCC != 0 || visLump.length < static_cast<int32_t>(sizeof(int32_t)) ||
+    if (visLump.length < static_cast<int32_t>(sizeof(int32_t)) ||
         static_cast<size_t>(visLump.offset) + visLump.length > file.size())
         return;
     const std::span<const std::byte> vis = file.subspan(visLump.offset, visLump.length);
@@ -557,7 +578,7 @@ std::optional<AreaLocator> MakeAreaLocator(std::span<const std::byte> file, cons
     auto nodes = LumpArray<Node>(file, header, kLumpNodes);
     const Lump& leafLump = header.lumps[kLumpLeafs];
     const size_t leafStride = leafLump.version == 0 ? kLeafV0Size : kLeafV1Size;
-    if (!planes || !nodes || nodes->empty() || leafLump.fourCC != 0 || leafLump.length <= 0 ||
+    if (!planes || !nodes || nodes->empty() || leafLump.length <= 0 ||
         static_cast<size_t>(leafLump.offset) + leafLump.length > file.size() || leafLump.length % leafStride != 0)
         return std::nullopt;
     return AreaLocator{*planes, *nodes, file.subspan(leafLump.offset, leafLump.length), leafStride};
@@ -608,7 +629,7 @@ void ReadStaticProps(std::span<const std::byte> file, const Header& header, Worl
         auto length = ReadAt<int32_t>(file, entry + 12);
         if (!id || *id != kStaticPropLumpId || !flags || !version || !offset || !length)
             continue;
-        if ((*flags & 1) != 0 || *offset < 0 || *length <= 0 || static_cast<size_t>(*offset) + *length > file.size())
+        if (*offset < 0 || *length <= 0 || static_cast<size_t>(*offset) + *length > file.size())
             return;
         std::span<const std::byte> data = file.subspan(*offset, *length);
         size_t cursor = 0;
@@ -640,11 +661,11 @@ void ReadStaticProps(std::span<const std::byte> file, const Header& header, Worl
                                                              : ReadAt<uint32_t>(data, prop + 64);
             if (!origin || !angles || !model || *model >= world.propModels.size())
                 continue;
-            if (propFlags && (*propFlags & kStaticPropNoShadow) != 0)
-                continue;
             StaticProp staticProp;
             staticProp.model = *model;
             PropTransform(*origin, *angles, staticProp.transform);
+            staticProp.noShadow = (propFlags.value_or(0) & kStaticPropNoShadow) != 0;
+            staticProp.ignoreNormals = (propFlags.value_or(0) & kStaticPropIgnoreNormals) != 0;
             world.props.push_back(staticProp);
         }
         return;
@@ -656,7 +677,7 @@ void ReadLights(std::span<const std::byte> file, const Header& header, WorldGeom
     for (int lumpIndex : {kLumpWorldLightsHdr, kLumpWorldLights}) {
         const Lump& lump = header.lumps[lumpIndex];
         size_t stride = lump.version == 1 ? kWorldLightV1Size : sizeof(WorldLight);
-        if (lump.length <= 0 || lump.fourCC != 0 || static_cast<size_t>(lump.offset) + lump.length > file.size() || lump.length % stride != 0)
+        if (lump.length <= 0 || static_cast<size_t>(lump.offset) + lump.length > file.size() || lump.length % stride != 0)
             continue;
         for (size_t offset = 0; offset < static_cast<size_t>(lump.length); offset += stride) {
             const std::byte* entry = file.data() + lump.offset + offset;
@@ -689,6 +710,82 @@ void ReadLights(std::span<const std::byte> file, const Header& header, WorldGeom
     }
 }
 
+void* LzmaAlloc(ISzAllocPtr, size_t size) { return std::malloc(size); }
+void LzmaFree(ISzAllocPtr, void* address) { std::free(address); }
+const ISzAlloc kLzmaAllocator = {LzmaAlloc, LzmaFree};
+
+// Appends the decoded contents of a Source LZMA block (lzma_header_t in the SDK's lzmaDecoder.h), 4-byte aligned.
+std::optional<int32_t> AppendDecompressed(std::span<const std::byte> block, int32_t size, std::vector<std::byte>& out)
+{
+    const std::optional<LzmaHeader> lzma = ReadAt<LzmaHeader>(block, 0);
+    const size_t offset = (out.size() + 3) & ~size_t{3};
+    if (!lzma || lzma->id != kLzmaId || size <= 0 || lzma->actualSize != static_cast<uint32_t>(size) ||
+        lzma->lzmaSize > block.size() - sizeof(LzmaHeader) || offset + size > static_cast<size_t>(INT32_MAX))
+        return std::nullopt;
+    out.resize(offset + size);
+    SizeT outSize = static_cast<SizeT>(size);
+    SizeT inSize = lzma->lzmaSize;
+    ELzmaStatus status;
+    if (LzmaDecode(reinterpret_cast<Byte*>(out.data() + offset), &outSize, reinterpret_cast<const Byte*>(block.data() + sizeof(LzmaHeader)), &inSize,
+            lzma->properties, LZMA_PROPS_SIZE, LZMA_FINISH_END, &status, &kLzmaAllocator) != SZ_OK ||
+        outSize != static_cast<SizeT>(size))
+        return std::nullopt;
+    return static_cast<int32_t>(offset);
+}
+
+// Any lump, and each game lump, may be LZMA-compressed. Such a map is copied into out with those lumps appended
+// decoded and the header and game lump directory pointed at them, so the readers above only see plain lumps.
+// out stays empty when nothing is compressed.
+bool DecompressLumps(std::span<const std::byte> file, const Header& header, std::vector<std::byte>& out, std::string& error)
+{
+    const auto append = [&](std::span<const std::byte> block, int32_t size) {
+        if (out.empty())
+            out.assign(file.begin(), file.end());
+        return AppendDecompressed(block, size, out);
+    };
+
+    Header decoded = header;
+    for (int i = 0; i < kLumpCount; ++i) {
+        Lump& lump = decoded.lumps[i];
+        if (lump.fourCC == 0)
+            continue;
+        std::optional<int32_t> offset;
+        if (lump.offset >= 0 && lump.length >= 0 && static_cast<size_t>(lump.offset) + lump.length <= file.size())
+            offset = append(file.subspan(lump.offset, lump.length), lump.fourCC);
+        if (!offset) {
+            error = std::format("lump {} could not be decompressed", i);
+            return false;
+        }
+        lump.offset = *offset;
+        lump.length = lump.fourCC;
+        lump.fourCC = 0;
+    }
+    if (!out.empty())
+        std::memcpy(out.data(), &decoded, sizeof(decoded));
+
+    // Game lump offsets are absolute in the original file; a compressed one's length is its decoded size.
+    const Lump& games = decoded.lumps[kLumpGameLump];
+    const auto current = [&] { return out.empty() ? file : std::span<const std::byte>(out); };
+    const std::optional<int32_t> count = games.offset >= 0 ? ReadAt<int32_t>(current(), games.offset) : std::nullopt;
+    for (int32_t i = 0; count && i < *count && sizeof(int32_t) + (i + 1) * sizeof(GameLump) <= static_cast<size_t>(games.length); ++i) {
+        const size_t entryOffset = games.offset + sizeof(int32_t) + i * sizeof(GameLump);
+        std::optional<GameLump> entry = ReadAt<GameLump>(current(), entryOffset);
+        if (!entry || (entry->flags & kGameLumpCompressed) == 0 || entry->length == 0)
+            continue;
+        std::optional<int32_t> offset;
+        if (entry->offset >= 0 && static_cast<size_t>(entry->offset) < file.size())
+            offset = append(file.subspan(entry->offset), entry->length);
+        if (!offset) {
+            error = std::format("game lump {} could not be decompressed", i);
+            return false;
+        }
+        entry->offset = *offset;
+        entry->flags &= ~kGameLumpCompressed;
+        std::memcpy(out.data() + entryOffset, &*entry, sizeof(GameLump));
+    }
+    return true;
+}
+
 }
 
 bool LoadWorld(std::span<const std::byte> file, WorldGeometry& world, std::string& error)
@@ -707,6 +804,13 @@ bool LoadWorld(std::span<const std::byte> file, WorldGeometry& world, std::strin
         error = std::format("unsupported BSP version {}", header.version);
         return false;
     }
+    std::vector<std::byte> decompressed;
+    if (!DecompressLumps(file, header, decompressed, error))
+        return false;
+    if (!decompressed.empty()) {
+        file = decompressed;
+        std::memcpy(&header, file.data(), sizeof(header));
+    }
 
     auto vertices = LumpArray<Float3>(file, header, kLumpVertexes);
     auto surfedges = LumpArray<int32_t>(file, header, kLumpSurfedges);
@@ -718,7 +822,7 @@ bool LoadWorld(std::span<const std::byte> file, WorldGeometry& world, std::strin
     auto dispinfos = LumpArray<DispInfo>(file, header, kLumpDispInfo);
     auto dispVerts = LumpArray<DispVert>(file, header, kLumpDispVerts);
     if (!vertices || !surfedges || !edges || !faces || !texinfos || !texdatas || !models || models->empty() || !dispinfos || !dispVerts) {
-        error = "a required lump is missing, compressed or malformed";
+        error = "a required lump is missing or malformed";
         return false;
     }
 

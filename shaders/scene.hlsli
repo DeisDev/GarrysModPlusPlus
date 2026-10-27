@@ -19,7 +19,13 @@ struct InstanceRecord
     uint previousPositions;
     // Last frame's object-to-world transform.
     float4 previousTransform[3];
+    // kInstanceIgnoreNormals.
+    uint flags;
+    uint3 padding;
 };
+
+// kInstanceIgnoreNormals in src/scene.h.
+static const uint kInstanceIgnoreNormals = 0x01;
 
 // Mirrors GpuLight in src/scene.cpp (bsp::Light, VRAD units and falloff).
 struct Light
@@ -71,7 +77,7 @@ struct HitSurface
 InstanceRecord LoadInstance(uint instance)
 {
     ByteAddressBuffer records = ResourceDescriptorHeap[g_frame.instancesView];
-    return records.Load<InstanceRecord>(instance * 80);
+    return records.Load<InstanceRecord>(instance * 96);
 }
 
 float3 UnpackAlbedo(uint packed)
@@ -396,17 +402,29 @@ static const float kAttachedLightClearance = 48.0;
 static const uint kLocalPlayerMask = 0x08;
 // kSkyboxMask in src/scene.h.
 static const uint kSkyboxMask = 0x10;
+// kShadowlessPropMask in src/scene.h.
+static const uint kShadowlessPropMask = 0x20;
 
 float ShadowRayLength(bool attachedLight, float distance)
 {
     return attachedLight ? distance - min(kAttachedLightClearance, distance * 0.5) : distance - 1.0;
 }
 
-// Dynamic and projected lights are mostly the local player's own (flashlight, muzzle flashes), which the game
-// never shadows with the player's body.
+// Shadow rays of local lights. Dynamic and projected lights are mostly the local player's own (flashlight, muzzle
+// flashes), which the game never shadows with the player's body.
 uint ShadowMask(bool attachedLight)
 {
-    return attachedLight ? g_frame.traceMask & ~kLocalPlayerMask : g_frame.traceMask;
+    uint mask = g_frame.traceMask & ~kShadowlessPropMask;
+    return attachedLight ? mask & ~kLocalPlayerMask : mask;
+}
+
+// VRAD lights props that ignore normals (STATIC_PROP_IGNORE_NORMALS) as if every light met them at CONSTANT_DOT;
+// a zero normal stands for them.
+static const float kIgnoredNormalLambert = 0.35;
+
+float Lambert(float3 normal, float3 toLight)
+{
+    return any(normal != 0.0) ? saturate(dot(normal, toLight)) : kIgnoredNormalLambert;
 }
 
 // Map lights first, then the engine's dynamic lights.
@@ -459,7 +477,7 @@ float3 LightIrradiance(Light light, float3 position, float3 normal, out float3 t
     float distanceSquared = max(dot(delta, delta), 1e-4);
     distance = sqrt(distanceSquared);
     toLight = delta / distance;
-    float lambert = saturate(dot(normal, toLight));
+    float lambert = Lambert(normal, toLight);
     if (lambert <= 0.0 || (light.radius > 0.0 && distance > light.radius))
         return 0.0;
     float falloffDistance = max(distance, 1.0);
@@ -518,7 +536,7 @@ float3 ProjectorIrradiance(Projector projector, float3 position, float3 normal, 
     float3 coords = projected.xyz / projected.w;
     if (any(coords < 0.0) || any(coords > 1.0))
         return 0.0;
-    float lambert = saturate(dot(normal, toLight));
+    float lambert = Lambert(normal, toLight);
     if (lambert <= 0.0)
         return 0.0;
     float3 cookie;

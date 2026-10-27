@@ -42,6 +42,10 @@ int DetailBlendMode(std::span<const DWORD> code, UINT index, UINT factorRegister
 // Replaces every `def` literal equal to `from` with `to`; returns how many were replaced.
 int ReplaceDefLiteral(std::span<DWORD> code, float from, float to);
 
+// A pixel shader (ps_3_0 or ps_2_b) whose oC0.rgb is multiplied by c[tintRegister].rgb / c[scaleRegister].y; nothing
+// when it does not write oC0, has too few free temporary registers or cannot be walked.
+std::optional<std::vector<DWORD>> TintColorOutput(std::span<const DWORD> shader, UINT tintRegister, UINT scaleRegister);
+
 inline constexpr UINT kForwardUniforms = 7;
 
 struct ForwardPatch {

@@ -28,10 +28,12 @@ void main(uint3 id : SV_DispatchThreadID)
     float3 position = LitPosition(WorldPositionFromDepth(pixel, DepthAt(pixel)));
     float3 origin = position + normal * (g_frame.normalBias * (1.0 + surface.w * 0.002));
     uint seed = PixelSeed(pixel, 0x2Du);
+    Texture2D<uint> pixelFlags = ResourceDescriptorHeap[g_frame.pixelFlagsView];
+    float3 lightNormal = (pixelFlags.Load(int3(pixel, 0)) & kPixelIgnoreNormals) != 0 ? 0.0 : normal;
 
     float3 exact = 0.0;
     float sunVisibility = 0.0;
-    float lambert = saturate(dot(normal, g_frame.sunDirection));
+    float lambert = Lambert(lightNormal, g_frame.sunDirection);
     if (g_frame.sunEnabled != 0.0 && lambert > 0.0) {
         sunVisibility = SunVisibility(origin);
         exact += g_frame.sunColor * lambert * sunVisibility;
@@ -56,7 +58,7 @@ void main(uint3 id : SV_DispatchThreadID)
     for (uint i = 0; i < set.count; ++i) {
         float3 toLight;
         float distance;
-        float weight = Luminance(SetLightIrradiance(set, i, position, normal, toLight, distance));
+        float weight = Luminance(SetLightIrradiance(set, i, position, lightNormal, toLight, distance));
         if (weight <= VisibleIrradiance())
             continue;
         // Insert into the strongest lights; whatever drops out (this light or a displaced one) joins the remainder.
@@ -90,7 +92,7 @@ void main(uint3 id : SV_DispatchThreadID)
             break;
         float3 toLight;
         float distance;
-        float3 light = SetLightIrradiance(set, top[k], position, normal, toLight, distance);
+        float3 light = SetLightIrradiance(set, top[k], position, lightNormal, toLight, distance);
         bool attached = IsAttachedLight(set, top[k]);
         exact += light * Transmittance(origin, toLight, ShadowRayLength(attached, distance), ShadowMask(attached));
     }
@@ -100,7 +102,7 @@ void main(uint3 id : SV_DispatchThreadID)
         for (uint s = 0; s < kRemainderSamples; ++s) {
             float3 toLight;
             float distance;
-            float3 light = SetLightIrradiance(set, picked[s], position, normal, toLight, distance);
+            float3 light = SetLightIrradiance(set, picked[s], position, lightNormal, toLight, distance);
             bool attached = IsAttachedLight(set, picked[s]);
             float transmittance = Transmittance(origin, toLight, ShadowRayLength(attached, distance), ShadowMask(attached));
             sampled += ClampSample(light * (transmittance * remainder / (pickedWeight[s] * kRemainderSamples)));

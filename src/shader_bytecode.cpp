@@ -432,6 +432,53 @@ std::optional<ForwardPatch> AppendForwardLighting(std::span<const DWORD> shader,
     return patch;
 }
 
+std::optional<std::vector<DWORD>> TintColorOutput(std::span<const DWORD> shader, UINT tintRegister, UINT scaleRegister)
+{
+    const DWORD version = shader.empty() ? 0 : shader[0];
+    if ((version != kPixelShader30 && version != kPixelShader2x) || shader.back() != kEndToken)
+        return std::nullopt;
+    std::vector<DWORD> code(shader.begin(), shader.end());
+    int maxTemp = -1;
+    const bool ok = ForEachInstruction(code, [&](size_t at, size_t length) {
+        ForEachRegister(code, at, length, [&](DWORD& token, bool) {
+            if (RegisterType(token) == D3DSPR_TEMP)
+                maxTemp = std::max(maxTemp, static_cast<int>(RegisterNumber(token)));
+        });
+    });
+    const DWORD color = static_cast<DWORD>(maxTemp + 1);
+    const DWORD tint = color + 1;
+    if (!ok || tint >= kTempRegisters)
+        return std::nullopt;
+    bool writesOutput = false;
+    ForEachInstruction(code, [&](size_t at, size_t length) {
+        if (IsDeclaration(Opcode(code[at])) || length == 0)
+            return;
+        DWORD& destination = code[at + 1];
+        if (RegisterType(destination) == D3DSPR_COLOROUT && RegisterNumber(destination) == 0) {
+            destination = WithRegister(destination, D3DSPR_TEMP, color);
+            writesOutput = true;
+        }
+    });
+    if (!writesOutput)
+        return std::nullopt;
+
+    const auto instruction = [](DWORD opcode, DWORD length) { return opcode | (length << D3DSI_INSTLENGTH_SHIFT); };
+    const auto destination = [](DWORD type, DWORD number, DWORD mask) { return WithRegister(0x80000000 | mask, type, number); };
+    const auto source = [](DWORD type, DWORD number, DWORD swizzle) { return WithRegister(0x80000000 | swizzle, type, number); };
+    constexpr DWORD kRgb = D3DSP_WRITEMASK_0 | D3DSP_WRITEMASK_1 | D3DSP_WRITEMASK_2;
+    code.pop_back();
+    code.insert(code.end(), {
+        instruction(D3DSIO_RCP, 2), destination(D3DSPR_TEMP, tint, D3DSP_WRITEMASK_0), source(D3DSPR_CONST, scaleRegister, D3DSP_REPLICATEGREEN),
+        instruction(D3DSIO_MUL, 3), destination(D3DSPR_TEMP, tint, kRgb), source(D3DSPR_CONST, tintRegister, D3DSP_NOSWIZZLE),
+            source(D3DSPR_TEMP, tint, D3DSP_REPLICATERED),
+        instruction(D3DSIO_MUL, 3), destination(D3DSPR_TEMP, color, kRgb), source(D3DSPR_TEMP, color, D3DSP_NOSWIZZLE),
+            source(D3DSPR_TEMP, tint, D3DSP_NOSWIZZLE),
+        instruction(D3DSIO_MOV, 2), destination(D3DSPR_COLOROUT, 0, D3DSP_WRITEMASK_ALL), source(D3DSPR_TEMP, color, D3DSP_NOSWIZZLE),
+        kEndToken,
+    });
+    return code;
+}
+
 int DetailBlendMode(std::span<const DWORD> code, UINT index, UINT factorRegister, size_t lateGap)
 {
     if (ModulatesSampleBy2x(code, index))

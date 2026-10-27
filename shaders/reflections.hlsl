@@ -15,10 +15,10 @@ static const float kMaxDistance = 16384.0;
 static const float kSkyHitDistance = 65504.0;
 
 // Last frame's colour at a screen position, before the tonemap scale; the surface there must be `distance`
-// from last frame's eye (0 for the sky).
+// from last frame's eye (0 for the sky). Debug views wrote their debug image instead, so they trace every hit.
 float3 PreviousColor(float4 clip, float distance)
 {
-    if (g_frame.historyValid == 0 || clip.w <= 0.0)
+    if (g_frame.historyValid == 0 || g_frame.debugView != 0 || clip.w <= 0.0)
         return -1.0;
     float2 uv = float2(clip.x / clip.w * 0.5 + 0.5, 0.5 - clip.y / clip.w * 0.5);
     if (any(uv < 0.0) || any(uv >= 1.0))

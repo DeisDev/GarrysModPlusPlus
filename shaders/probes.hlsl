@@ -49,15 +49,8 @@ float3 VolumeIrradiance(float3 position, float3 normal)
     return max(float3(r.x + dot(r.yzw, normal), g.x + dot(g.yzw, normal), b.x + dot(b.yzw, normal)), 0.0);
 }
 
-float3 UniformSphere(float u1, float u2)
-{
-    float z = 1.0 - 2.0 * u1;
-    float r = sqrt(max(1.0 - z * z, 0.0));
-    float phi = 6.28318530718 * u2;
-    return float3(r * cos(phi), r * sin(phi), z);
-}
-
-// Whether the ray met the back of the triangle it hit.
+// Whether the ray met the back of the triangle it hit. Source's triangles are clockwise seen from the front, so the
+// cross product of their edges points out of the back.
 bool HitBackFace(HitInfo hit, float3 direction)
 {
     InstanceRecord record = LoadInstance(hit.instance);
@@ -66,7 +59,7 @@ bool HitBackFace(HitInfo hit, float3 direction)
     uint3 index = indices.Load3(hit.primitive * 12);
     float3 p0 = positions.Load<float3>(index.x * 12);
     float3 normal = mul((float3x3)hit.objectToWorld, cross(positions.Load<float3>(index.y * 12) - p0, positions.Load<float3>(index.z * 12) - p0));
-    return dot(normal, direction) > 0.0;
+    return dot(normal, direction) < 0.0;
 }
 
 void Trace(uint3 id)

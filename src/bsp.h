@@ -76,6 +76,10 @@ struct Visibility {
 struct StaticProp {
     uint32_t model;
     float transform[3][4];
+    // Hammer's "Disable shadows" (STATIC_PROP_NO_SHADOW): VRAD let all light through the prop.
+    bool noShadow = false;
+    // STATIC_PROP_IGNORE_NORMALS: VRAD lit the prop the same from every direction, as foliage usually is.
+    bool ignoreNormals = false;
 };
 
 struct Mesh {

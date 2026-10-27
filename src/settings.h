@@ -53,7 +53,7 @@ struct Settings {
     float projectedIntensity = 1.0f;
     float reflectionIntensity = 1.0f;
     // How much ambient occlusion darkens indirect light, which already holds the larger-scale occlusion.
-    float aoIntensity = 0.5f;
+    float aoIntensity = 1.0f;
     // Scales the haze's density.
     float volumetricIntensity = 1.0f;
     AntiAliasing antiAliasing = AntiAliasing::Temporal;
@@ -66,6 +66,13 @@ struct Settings {
 };
 
 Settings& GetSettings();
+
+// The range the menu's slider offers for a float setting; values read from the settings file are clamped to it.
+struct SettingRange {
+    float minimum;
+    float maximum;
+};
+SettingRange RangeOf(float Settings::* field);
 
 // Plain key=value text; unknown keys are ignored and missing ones keep their current value.
 bool LoadSettings(const std::filesystem::path& path, Settings& settings);

@@ -23,6 +23,8 @@ struct Scene::InstanceRecord {
     uint32_t materials;
     uint32_t previousPositions;
     float previousTransform[3][4];
+    uint32_t flags;
+    uint32_t padding[3];
 };
 static_assert(sizeof(GpuMaterial) == 48);
 
@@ -603,7 +605,7 @@ void Scene::SetStaticInstances(std::vector<SceneInstance> instances)
 
 SceneFrame Scene::RecordFrame(ID3D12GraphicsCommandList4* list, UINT slot, std::span<const SceneInstance> dynamic)
 {
-    static_assert(sizeof(InstanceRecord) == 80);
+    static_assert(sizeof(InstanceRecord) == 96);
     FrameTlas& frame = m_frames[slot % kFrameSlots];
     const UINT count = static_cast<UINT>(1 + m_staticInstances.size() + dynamic.size());
     if (!EnsureFrameCapacity(frame, count))
@@ -628,7 +630,7 @@ SceneFrame Scene::RecordFrame(ID3D12GraphicsCommandList4* list, UINT slot, std::
         instance.AccelerationStructure = blas;
         InstanceRecord& record = frame.mappedRecords[written];
         record = {source.positionsView != DescriptorHeap::kInvalid ? source.positionsView : model.positionsView, model.indicesView, model.albedoView,
-            model.uvsView, model.alphaView, model.opaqueTriangles, model.materialsView, source.previousPositionsView, {}};
+            model.uvsView, model.alphaView, model.opaqueTriangles, model.materialsView, source.previousPositionsView, {}, source.flags, {}};
         std::memcpy(record.previousTransform, source.previousKnown ? source.previousTransform : instance.Transform, sizeof(record.previousTransform));
         m_recorded.emplace_back(source.model, mask);
         ++written;

@@ -80,6 +80,9 @@ constexpr UINT kProjectionRegisters = 8;
 // Hammer's lighting preview assumes gamma-space textures and converts with pow(x, 2.2); the game samples
 // them as sRGB already, so the conversion is turned into pow(x, 1).
 constexpr float kPreviewGamma = 2.2f;
+// LightmappedGeneric's g_TintValuesAndLightmapScale: $color times $color2 times the lightmap scale, which
+// cLightScale.y also holds. The game multiplies its lightmap by it; the lighting preview leaves it out of the albedo.
+constexpr UINT kLightmapTintRegister = 12;
 
 // ProjectedShadow: Source's render-to-texture prop shadows, which would darken the albedo; ray-traced shadows
 // replace them.
@@ -184,6 +187,7 @@ struct State {
     // Skin shaders seen with each detail blend mode (-1 counted at 7).
     std::array<uint32_t, 8> detailModes = {};
     uint32_t forwardFailures = 0;
+    uint32_t tintFailures = 0;
     uint32_t forwardDraws = 0;
     uint32_t forwardLogged = 0;
     std::unordered_map<IDirect3DPixelShader9*, ShaderInfo> shaders;
@@ -481,6 +485,12 @@ HRESULT CreatePixelShader(IDirect3DDevice9* device, const DWORD* code, IDirect3D
     if (bytecode::WritesColorOutput(original, kNormalTarget) && bytecode::WritesColorOutput(original, kFlagsTarget)) {
         std::vector<DWORD> patched(original.begin(), original.end());
         bytecode::ReplaceDefLiteral(patched, kPreviewGamma, 1.0f);
+        if (HasRegister(constants, "g_TintValuesAndLightmapScale", bytecode::RegisterSet::Float4, kLightmapTintRegister)) {
+            if (std::optional<std::vector<DWORD>> tinted = bytecode::TintColorOutput(patched, kLightmapTintRegister, kLightScaleRegister))
+                patched = std::move(*tinted);
+            else if (++g_state.tintFailures <= 5)
+                log::Info("G-buffer: a LightmappedGeneric preview shader keeps its albedo without $color and $color2");
+        }
         HRESULT hr = create(device, patched.data(), shader);
         if (SUCCEEDED(hr)) {
             // The same shader lights translucent surfaces after the capture once the snippet takes its outputs.

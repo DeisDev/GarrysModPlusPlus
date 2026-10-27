@@ -559,6 +559,8 @@ std::vector<LightHull> FixtureHulls(const bsp::WorldGeometry& world)
     size_t failedHulls = 0;
     std::string failedModels;
     for (const bsp::StaticProp& prop : world.props) {
+        if (prop.noShadow)
+            continue;
         PropModel& model = models[prop.model];
         const std::string& path = world.propModels[prop.model];
         const std::string base = path.size() > 4 ? path.substr(0, path.size() - 4) : path;
@@ -722,7 +724,8 @@ void UpdateScene()
                 for (const bsp::StaticProp& prop : props) {
                     SceneInstance& instance = instances.emplace_back();
                     instance.model = ModelFor(world.propModels[prop.model]).sceneModel;
-                    instance.mask = mask;
+                    instance.mask = mask == 0 && prop.noShadow ? kShadowlessPropMask : mask;
+                    instance.flags = prop.ignoreNormals ? kInstanceIgnoreNormals : 0;
                     std::memcpy(instance.transform, prop.transform, sizeof(instance.transform));
                 }
             };

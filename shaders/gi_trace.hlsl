@@ -72,13 +72,18 @@ void main(uint3 id : SV_DispatchThreadID)
     float3 normal = surface.xyz;
     float3 position = LitPosition(WorldPositionFromDepth(pixel, DepthAt(pixel)));
     uint seed = PixelSeed(id.xy, 0x51u);
-    float3 origin = position + normal * (g_frame.normalBias * (1.0 + surface.w * 0.002));
+    float bias = g_frame.normalBias * (1.0 + surface.w * 0.002);
+    float3 origin = position + normal * bias;
+    // Props that ignore normals gather light from every direction, as VRAD lit them; rays through their thin
+    // surfaces start on the far side.
+    Texture2D<uint> pixelFlags = ResourceDescriptorHeap[g_frame.pixelFlagsView];
+    bool ignoreNormals = (pixelFlags.Load(int3(pixel, 0)) & kPixelIgnoreNormals) != 0;
     uint samples = max(g_pass.step, 1u);
     float3 estimate = 0.0;
     for (uint s = 0; s < samples; ++s) {
-        float3 direction = CosineSample(normal, Random(seed), Random(seed));
+        float3 direction = ignoreNormals ? UniformSphere(Random(seed), Random(seed)) : CosineSample(normal, Random(seed), Random(seed));
         HitSurface hit;
-        if (TraceClosest(origin, direction, kMaxDistance, g_frame.traceMask, hit))
+        if (TraceClosest(ignoreNormals ? position + direction * bias : origin, direction, kMaxDistance, g_frame.traceMask, hit))
             estimate += ClampSample(hit.albedo * HitIrradiance(hit, seed));
         else
             estimate += g_frame.skyColor;

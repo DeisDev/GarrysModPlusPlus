@@ -14,7 +14,11 @@ float3 VolumetricLight(int2 pixel)
     if (g_frame.volumetricView == kNoView)
         return 0.0;
     Texture2D<float4> volumetric = ResourceDescriptorHeap[g_frame.volumetricView];
-    return volumetric.SampleLevel(g_linearClamp, (float2(pixel) + 0.5) * g_frame.invSize, 0.0).rgb * g_frame.tonemapScale;
+    // The half-resolution grid fills only part of the texture when Ray Reconstruction renders below the output size.
+    float2 textureSize;
+    volumetric.GetDimensions(textureSize.x, textureSize.y);
+    float2 position = min((float2(pixel) + 0.5) * 0.5, float2((g_frame.size + 1) / 2) - 0.5);
+    return volumetric.SampleLevel(g_linearClamp, position / textureSize, 0.0).rgb * g_frame.tonemapScale;
 }
 
 // Source's range fog (CalcRangeFog and BlendPixelFog in common_ps_fxc.h), applied after the tonemap scale.

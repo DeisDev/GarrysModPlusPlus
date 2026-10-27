@@ -24,6 +24,7 @@ Enum EnumValue(double value, Enum fallback)
 struct NamedField {
     const char* name;
     Field field;
+    SettingRange range = {};
 };
 
 bool g_dirty = false;
@@ -39,25 +40,35 @@ constexpr NamedField kFields[] = {
     {"indirect_light", &Settings::indirectLight},
     {"denoiser", &Settings::denoiser},
     {"ambient_occlusion", &Settings::ambientOcclusion},
-    {"ao_intensity", &Settings::aoIntensity},
+    {"ao_intensity", &Settings::aoIntensity, {0.0f, 1.0f}},
     {"reflections", &Settings::reflections},
     {"translucent_lighting", &Settings::translucentLighting},
     {"volumetric_light", &Settings::volumetricLight},
-    {"volumetric_intensity", &Settings::volumetricIntensity},
+    {"volumetric_intensity", &Settings::volumetricIntensity, {0.0f, 4.0f}},
     {"fog", &Settings::fog},
     {"flashlight_mode", &Settings::flashlightMode},
-    {"sun_intensity", &Settings::sunIntensity},
-    {"sky_intensity", &Settings::skyIntensity},
-    {"light_intensity", &Settings::lightIntensity},
-    {"indirect_intensity", &Settings::indirectIntensity},
-    {"projected_intensity", &Settings::projectedIntensity},
-    {"reflection_intensity", &Settings::reflectionIntensity},
+    {"sun_intensity", &Settings::sunIntensity, {0.0f, 4.0f}},
+    {"sky_intensity", &Settings::skyIntensity, {0.0f, 4.0f}},
+    {"light_intensity", &Settings::lightIntensity, {0.0f, 4.0f}},
+    {"indirect_intensity", &Settings::indirectIntensity, {0.0f, 4.0f}},
+    {"projected_intensity", &Settings::projectedIntensity, {0.0f, 8.0f}},
+    {"reflection_intensity", &Settings::reflectionIntensity, {0.0f, 4.0f}},
     {"anti_aliasing", &Settings::antiAliasing},
     {"dlss_mode", &Settings::dlssMode},
-    {"taa_history_weight", &Settings::taaHistoryWeight},
-    {"sharpening", &Settings::sharpening},
+    {"taa_history_weight", &Settings::taaHistoryWeight, {0.5f, 0.98f}},
+    {"sharpening", &Settings::sharpening, {0.0f, 1.0f}},
 };
 
+}
+
+SettingRange RangeOf(float Settings::* field)
+{
+    for (const NamedField& named : kFields) {
+        const auto* member = std::get_if<float Settings::*>(&named.field);
+        if (member != nullptr && *member == field)
+            return named.range;
+    }
+    return {};
 }
 
 Settings& GetSettings()
@@ -94,7 +105,7 @@ bool LoadSettings(const std::filesystem::path& path, Settings& settings)
                     if constexpr (std::is_same_v<Value, bool>)
                         settings.*member = value != 0.0;
                     else if constexpr (std::is_same_v<Value, float>)
-                        settings.*member = static_cast<float>(value);
+                        settings.*member = std::clamp(static_cast<float>(value), named.range.minimum, named.range.maximum);
                     else if constexpr (std::is_same_v<Value, FlashlightMode>)
                         settings.*member = value == 1.0 ? FlashlightMode::Game : FlashlightMode::RayTraced;
                     else
