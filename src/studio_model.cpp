@@ -239,6 +239,23 @@ bool ReadBounds(std::span<const std::byte> mdlBytes, bsp::Float3& mins, bsp::Flo
     return found;
 }
 
+int BoneIndex(std::span<const std::byte> mdlBytes, std::string_view name)
+{
+    Reader mdl(mdlBytes);
+    auto numBones = mdl.At<int32_t>(kHeaderNumBones);
+    auto boneIndex = mdl.At<int32_t>(kHeaderBoneIndex);
+    if (!numBones || !boneIndex)
+        return -1;
+    for (int32_t b = 0; b < *numBones; ++b) {
+        const size_t bone = *boneIndex + static_cast<size_t>(b) * kBoneSize;
+        auto nameOffset = mdl.At<int32_t>(bone);
+        auto boneName = nameOffset ? mdl.String(bone + *nameOffset) : std::nullopt;
+        if (boneName && *boneName == name)
+            return b;
+    }
+    return -1;
+}
+
 bool ReadPoseToBone(std::span<const std::byte> mdlBytes, std::vector<Matrix3x4>& poseToBone)
 {
     Reader mdl(mdlBytes);

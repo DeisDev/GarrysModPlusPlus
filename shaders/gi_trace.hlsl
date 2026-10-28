@@ -4,7 +4,7 @@
 // the sky irradiance, a hit returns its albedo times the light reaching it. Where the hit was on screen last
 // frame that is last frame's whole irradiance there (exact direct plus denoised light); elsewhere it is the sun,
 // one local light picked by SampleLight and g_frame.indirectBounces - 1 more traced bounces, or, for the viewmodel's
-// many rays, the main view's irradiance volume.
+// many rays, the main view's irradiance volume and the projected lights.
 // The sampled remainder of the direct light (direct.hlsl) is added, so the denoiser handles both.
 // input0: last frame's denoised light, or none; input1: sampled direct remainder; input2: last frame's exact direct
 // light; output0: raw estimate; step: samples per pixel.
@@ -70,22 +70,38 @@ float3 VolumeIrradiance(float3 position, float3 normal)
     return max(float3(r.x + dot(r.yzw, normal), g.x + dot(g.yzw, normal), b.x + dot(b.yzw, normal)), 0.0);
 }
 
+// The projected lights (flashlights) at a hit, which the irradiance volume leaves out.
+float3 ProjectorLight(HitSurface hit, float3 origin)
+{
+    float3 irradiance = 0.0;
+    for (uint p = 0; p < g_frame.projectorCount; ++p) {
+        Projector projector = LoadProjector(p);
+        float3 toLight;
+        float distance;
+        float3 light = ProjectorIrradiance(projector, hit.position, hit.normal, toLight, distance);
+        if (Luminance(light) > 0.0)
+            irradiance += light * Transmittance(origin, toLight, ShadowRayLength(ProjectorClearance(projector), distance), ShadowMask(true));
+    }
+    return irradiance;
+}
+
 float3 HitIrradiance(HitSurface hit, inout uint seed)
 {
     float3 previous = PreviousIrradiance(hit.position, hit.normal);
     if (previous.x >= 0.0)
         return previous;
+    float3 origin = hit.position + hit.normal * 1.0;
     float3 volume = VolumeIrradiance(hit.position, hit.normal);
     if (volume.x >= 0.0)
-        return volume;
-    float3 origin = hit.position + hit.normal * 1.0;
+        return volume + ProjectorLight(hit, origin);
     float3 irradiance = SunIrradiance(hit, origin, g_frame.bounceMask);
     float3 light;
     float3 toLight;
     float distance;
-    bool attached;
-    if (SampleLight(LightSetAt(hit.position, hit.normal), hit.position, hit.normal, seed, light, toLight, distance, attached))
-        irradiance += light * Transmittance(origin, toLight, ShadowRayLength(attached, distance), ShadowMask(attached));
+    uint picked;
+    LightSet set = LightSetAt(hit.position, hit.normal);
+    if (SampleLight(set, hit.position, hit.normal, seed, light, toLight, distance, picked))
+        irradiance += light * LightTransmittance(set, picked, origin, toLight, distance);
     return irradiance + FurtherBounces(hit, origin, seed);
 }
 

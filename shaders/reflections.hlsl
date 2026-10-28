@@ -54,9 +54,10 @@ float3 ReflectedRadiance(float3 origin, float3 direction, float3 ambient, inout 
     float3 light;
     float3 toLight;
     float distance;
-    bool attached;
-    if (SampleLight(LightSetAt(hit.position, hit.normal), hit.position, hit.normal, seed, light, toLight, distance, attached))
-        irradiance += light * Transmittance(shadowOrigin, toLight, ShadowRayLength(attached, distance), ShadowMask(attached));
+    uint picked;
+    LightSet set = LightSetAt(hit.position, hit.normal);
+    if (SampleLight(set, hit.position, hit.normal, seed, light, toLight, distance, picked))
+        irradiance += light * LightTransmittance(set, picked, shadowOrigin, toLight, distance);
     return ClampSample(hit.albedo * irradiance);
 }
 

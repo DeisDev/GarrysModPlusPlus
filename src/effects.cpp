@@ -39,6 +39,8 @@ namespace {
 
 constexpr UINT kMapPollInterval = 30;
 constexpr int kMaxBones = 256;
+// The bone weapons' world models are merged onto (their root bone) and players hold them by.
+constexpr char kRightHandBone[] = "ValveBiped.Bip01_R_Hand";
 constexpr bsp::Float3 kDefaultReflectivity = {0.5f, 0.5f, 0.5f};
 constexpr float kDefaultAlphaReference = 0.5f;
 // Alpha and mask textures are read from a mip no larger than this; shadows and reflections need no more detail.
@@ -74,9 +76,13 @@ struct ModelEntry {
     bsp::Float3 center = {};
     // Its vertices' sway when some of its materials sway in the wind.
     std::shared_ptr<SwayingModel> swaying;
-    // A single-bone model's bind pose to its bone. Weapons are merged onto their holder's hand bone, so where an
-    // attached one is drawn follows that bone, not its entity's transform.
+    // A single-bone model's bind pose to its bone. It is drawn where its sequence puts that bone, not by its entity's
+    // transform: the bone may turn away from its bind pose (models/nova/chair_plastic01 faces the other way), and
+    // weapons are merged onto their holder's hand bone.
     std::optional<studio::Matrix3x4> rootPoseToBone;
+    // Its kRightHandBone, if it has one: a holder's hand, or where a weapon merged onto that hand is held.
+    int rightHand = -1;
+    std::optional<studio::Matrix3x4> rightHandPoseToBone;
 };
 
 struct MaterialInfo {
@@ -589,8 +595,13 @@ const ModelEntry& ModelFor(const std::string& mdlPath)
                 entry.swaying = std::move(swaying);
             }
             std::vector<studio::Matrix3x4> poseToBone;
-            if (entry.sceneModel >= 0 && studio::BoneCount(mdl) == 1 && studio::ReadPoseToBone(mdl, poseToBone))
-                entry.rootPoseToBone = poseToBone[0];
+            if (entry.sceneModel >= 0 && studio::ReadPoseToBone(mdl, poseToBone)) {
+                if (poseToBone.size() == 1)
+                    entry.rootPoseToBone = poseToBone[0];
+                entry.rightHand = studio::BoneIndex(mdl, kRightHandBone);
+                if (entry.rightHand >= 0 && static_cast<size_t>(entry.rightHand) < poseToBone.size())
+                    entry.rightHandPoseToBone = poseToBone[entry.rightHand];
+            }
             if (entry.sceneModel >= 0 && studio::BoneCount(mdl) > 1) {
                 auto skinned = std::make_shared<SkinnedModel>();
                 skinned->opaqueTriangles = triangles.opaqueTriangles;
@@ -901,6 +912,24 @@ void CollectRopes()
     }
 }
 
+// In first person the local player's weapons show their view models (c_ or v_), which are rigged to the camera, so the
+// held one's world model is placed in the player's hand as Source merges it onto the holder's hand bone.
+void AddHeldWeapon(const entities::ModelEntity& weapon, const studio::Matrix3x4& hand)
+{
+    const std::string worldModel = entities::WeaponWorldModel(weapon);
+    if (worldModel.empty())
+        return;
+    const ModelEntry& model = ModelFor(worldModel);
+    if (model.sceneModel < 0 || !model.rightHandPoseToBone)
+        return;
+    const studio::Matrix3x4 transform = studio::Multiply(hand, *model.rightHandPoseToBone);
+    SceneInstance& instance = g_state.dynamicInstances.emplace_back();
+    instance.model = model.sceneModel;
+    instance.mask = kLocalPlayerMask;
+    std::memcpy(instance.transform, transform.data(), sizeof(instance.transform));
+    TrackMotion(instance, weapon.index);
+}
+
 void CollectEntities()
 {
     g_state.dynamicInstances.clear();
@@ -910,14 +939,25 @@ void CollectEntities()
     const int localPlayer = engine::LocalPlayerIndex();
     const auto player = std::find_if(g_state.entities.begin(), g_state.entities.end(), [&](const entities::ModelEntity& e) { return e.index == localPlayer; });
     const void* playerRenderable = player != g_state.entities.end() ? player->renderable : nullptr;
+    std::optional<studio::Matrix3x4> playerHand;
+    if (player != g_state.entities.end()) {
+        const ModelEntry& body = ModelFor(player->model);
+        g_state.bones.resize(kMaxBones);
+        if (body.rightHand >= 0 && body.rightHand < kMaxBones &&
+            entities::SetupBones(player->renderable, reinterpret_cast<float (*)[3][4]>(g_state.bones.data()), kMaxBones))
+            playerHand = g_state.bones[body.rightHand];
+    }
     for (const entities::ModelEntity& entity : g_state.entities) {
-        if (IsFirstPersonModel(entity.model))
+        // What the local player holds goes with its body, so the viewmodel's rays never meet its weapon.
+        const bool carried = entity.index == localPlayer || (entity.parent != nullptr && entity.parent == playerRenderable);
+        if (IsFirstPersonModel(entity.model)) {
+            if (carried && playerHand)
+                AddHeldWeapon(entity, *playerHand);
             continue;
+        }
         const ModelEntry& model = ModelFor(entity.model);
         if (model.sceneModel < 0)
             continue;
-        // What the local player holds goes with its body, so the viewmodel's rays never meet its weapon.
-        const bool carried = entity.index == localPlayer || (entity.parent != nullptr && entity.parent == playerRenderable);
         const UINT mask = carried ? kLocalPlayerMask : InSkybox(entity, model.center) ? kSkyboxMask : kDynamicMask;
         if (model.skinned) {
             g_state.bones.resize(kMaxBones);
@@ -929,7 +969,7 @@ void CollectEntities()
         }
         studio::Matrix3x4 transform;
         std::memcpy(transform.data(), entity.transform, sizeof(transform));
-        if (entity.parent != nullptr && model.rootPoseToBone) {
+        if (model.rootPoseToBone) {
             g_state.bones.resize(kMaxBones);
             if (!entities::SetupBones(entity.renderable, reinterpret_cast<float (*)[3][4]>(g_state.bones.data()), kMaxBones))
                 continue;

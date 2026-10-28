@@ -260,7 +260,7 @@ void DrawGeneralTab(Settings& settings)
 {
     ImGui::Checkbox(Text(TextId::RealtimeLighting), &settings.realtimeLighting);
     const TextId views[] = {TextId::ViewFinal, TextId::ViewAlbedo, TextId::ViewNormals, TextId::ViewCoverage, TextId::ViewDirectLight,
-        TextId::ViewIndirectLight, TextId::ViewIndirectRaw, TextId::ViewSunVisibility, TextId::ViewGameFlashlight,
+        TextId::ViewIndirectLight, TextId::ViewIndirectRaw, TextId::ViewSunVisibility, TextId::ViewAdditiveLight,
         TextId::ViewReflections, TextId::ViewMotionVectors, TextId::ViewAmbientOcclusion};
     static_assert(std::size(views) == static_cast<size_t>(DebugView::Count));
     int view = static_cast<int>(settings.debugView);
@@ -284,15 +284,6 @@ void DrawLightingTab(Settings& settings)
         ToggleRow(TextId::MapLights, settings.mapLights, settings, &Settings::lightIntensity);
         ToggleRow(TextId::DynamicLights, settings.dynamicLights, settings, nullptr);
         ToggleRow(TextId::ProjectedLights, settings.projectedLights, settings, &Settings::projectedIntensity);
-        ImGui::TableNextRow();
-        ImGui::TableNextColumn();
-        ImGui::TextUnformatted(Text(TextId::Flashlights));
-        ImGui::TableNextColumn();
-        int mode = static_cast<int>(settings.flashlightMode);
-        ImGui::RadioButton(Text(TextId::FlashlightRayTraced), &mode, static_cast<int>(FlashlightMode::RayTraced));
-        ImGui::SameLine();
-        ImGui::RadioButton(Text(TextId::FlashlightGame), &mode, static_cast<int>(FlashlightMode::Game));
-        settings.flashlightMode = static_cast<FlashlightMode>(mode);
         ImGui::EndTable();
     }
     ImGui::SeparatorText(Text(TextId::SectionIndirect));

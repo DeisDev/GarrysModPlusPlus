@@ -208,7 +208,8 @@ private:
     bool FillConstants(FrameConstants& constants, const Scene& scene, const ViewInputs& inputs);
     void ReturnResources(std::span<IDirect3DResource9* const> resources, UINT count);
     bool EnsureDepthPipeline(DXGI_FORMAT format);
-    UINT WriteProjectors(UINT slot, std::span<const gbuffer::ProjectedLight> projected, std::span<ID3D12Resource* const> cookies, UINT cookieViews);
+    UINT WriteProjectors(UINT slot, std::span<const gbuffer::ProjectedLight> projected, std::span<ID3D12Resource* const> cookies, UINT cookieViews,
+        const FrameConstants& constants);
 
     Renderer* m_renderer = nullptr;
     ID3D12Device5* m_device = nullptr;

@@ -14,8 +14,8 @@ namespace gmodpp {
 
 namespace {
 
-using Field = std::variant<bool Settings::*, float Settings::*, int Settings::*, DebugView Settings::*, FlashlightMode Settings::*,
-    AntiAliasing Settings::*, DlssMode Settings::*, QualityPreset Settings::*, FoliageShadows Settings::*>;
+using Field = std::variant<bool Settings::*, float Settings::*, int Settings::*, DebugView Settings::*, AntiAliasing Settings::*, DlssMode Settings::*,
+    QualityPreset Settings::*, FoliageShadows Settings::*>;
 
 template <class Enum>
 Enum EnumValue(double value, Enum fallback)
@@ -48,7 +48,6 @@ constexpr NamedField kFields[] = {
     {"volumetric_light", &Settings::volumetricLight},
     {"volumetric_intensity", &Settings::volumetricIntensity, {0.0f, 4.0f}},
     {"fog", &Settings::fog},
-    {"flashlight_mode", &Settings::flashlightMode},
     {"sun_intensity", &Settings::sunIntensity, {0.0f, 4.0f}},
     {"sky_intensity", &Settings::skyIntensity, {0.0f, 4.0f}},
     {"light_intensity", &Settings::lightIntensity, {0.0f, 4.0f}},
@@ -164,8 +163,6 @@ bool LoadSettings(const std::filesystem::path& path, Settings& settings)
                         settings.*member = std::clamp(static_cast<float>(value), named.range.minimum, named.range.maximum);
                     else if constexpr (std::is_same_v<Value, int>)
                         settings.*member = static_cast<int>(std::clamp(std::round(value), static_cast<double>(named.range.minimum), static_cast<double>(named.range.maximum)));
-                    else if constexpr (std::is_same_v<Value, FlashlightMode>)
-                        settings.*member = value == 1.0 ? FlashlightMode::Game : FlashlightMode::RayTraced;
                     else
                         settings.*member = EnumValue(value, Settings{}.*member);
                 },

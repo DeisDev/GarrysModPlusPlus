@@ -147,6 +147,8 @@ constexpr DWORD kProbeSamplerValues[] = {D3DTADDRESS_WRAP, D3DTADDRESS_WRAP, D3D
 // Direct3D 9's initial values of those states.
 constexpr DWORD kDefaultSamplerValues[] = {D3DTADDRESS_WRAP, D3DTADDRESS_WRAP, D3DTADDRESS_WRAP, D3DTEXF_POINT, D3DTEXF_POINT, D3DTEXF_NONE, FALSE};
 constexpr size_t kTrackedSamplerStates = std::size(kProbeSamplerStates);
+constexpr size_t kSrgbTextureState = 6;
+static_assert(kProbeSamplerStates[kSrgbTextureState] == D3DSAMP_SRGBTEXTURE);
 
 // A render state as the device has it and as the game last set it.
 struct TrackedState {
@@ -355,8 +357,10 @@ void CaptureProjectedLight()
     light.attenuation = {attenuation[0], attenuation[1], attenuation[2]};
     light.farZ = attenuation[3];
     light.color = {color[0], color[1], color[2]};
-    if (ps.cookie >= 0)
+    if (ps.cookie >= 0) {
         light.cookie = g_state.textures[ps.cookie];
+        light.cookieSrgb = g_state.samplerStates[ps.cookie][kSrgbTextureState] != FALSE;
+    }
     for (const ProjectedLight& existing : g_state.projected) {
         if (existing.origin == light.origin && existing.worldToTexture == light.worldToTexture)
             return;
@@ -365,10 +369,11 @@ void CaptureProjectedLight()
         if (g_state.sections % 600 == 0) {
             const auto& m = light.worldToTexture;
             log::Info("G-buffer: projected light from {} constants: origin ({:.1f} {:.1f} {:.1f}) far {:.1f} attenuation ({:.2f} {:.2f} {:.2f}) color "
-                      "({:.3f} {:.3f} {:.3f}) rows ({:.3f} {:.3f} {:.3f} {:.1f}) ({:.3f} {:.3f} {:.3f} {:.1f}) ({:.3f} {:.3f} {:.3f} {:.1f}) ({:.3f} {:.3f} {:.3f} {:.1f})",
+                      "({:.3f} {:.3f} {:.3f}) cookie sRGB {} rows ({:.3f} {:.3f} {:.3f} {:.1f}) ({:.3f} {:.3f} {:.3f} {:.1f}) ({:.3f} {:.3f} {:.3f} {:.1f}) "
+                      "({:.3f} {:.3f} {:.3f} {:.1f})",
                 ps.worldToTexture >= 0 ? "pixel" : "vertex", light.origin[0], light.origin[1], light.origin[2], light.farZ, light.attenuation[0],
-                light.attenuation[1], light.attenuation[2], light.color[0], light.color[1], light.color[2], m[0][0], m[0][1], m[0][2], m[0][3], m[1][0],
-                m[1][1], m[1][2], m[1][3], m[2][0], m[2][1], m[2][2], m[2][3], m[3][0], m[3][1], m[3][2], m[3][3]);
+                light.attenuation[1], light.attenuation[2], light.color[0], light.color[1], light.color[2], light.cookieSrgb, m[0][0], m[0][1], m[0][2], m[0][3],
+                m[1][0], m[1][1], m[1][2], m[1][3], m[2][0], m[2][1], m[2][2], m[2][3], m[3][0], m[3][1], m[3][2], m[3][3]);
         }
         g_state.projected.push_back(std::move(light));
     }
@@ -649,9 +654,11 @@ DrawAction BeforeDraw(IDirect3DDevice9* device)
     if (g_state.bound.kind == ShaderKind::Other && g_state.blending && g_state.destinationBlend == D3DBLEND_ONE &&
         (g_state.sourceBlend == D3DBLEND_ONE || g_state.sourceBlend == D3DBLEND_SRCALPHA))
         return g_state.requested != nullptr ? DrawAction::RedirectToLight : DrawAction::Skip;
+    // Flashlight passes are lit by ray tracing from the light they describe. Their light cannot be kept: VertexLitGeneric
+    // has none in the lighting preview, and light added to a surface would show through props drawn over it later.
     if (g_state.bound.kind == ShaderKind::Flashlight) {
         CaptureProjectedLight();
-        return GetSettings().flashlightMode == FlashlightMode::Game ? DrawAction::RedirectToLight : DrawAction::Skip;
+        return DrawAction::Skip;
     }
     if (gbuffer && g_state.bound.detailMode >= 0)
         SetDetailMode(device);
@@ -664,8 +671,8 @@ DrawAction BeforeDraw(IDirect3DDevice9* device)
     return DrawAction::Draw;
 }
 
-// Flashlight and projected-texture passes add albedo * light on top of the base pass. Sending them to their
-// own target keeps the G-buffer albedo clean; the lighting pass adds the result back.
+// Additive passes add light on top of the base pass. Sending them to their own target keeps the G-buffer albedo
+// clean; the lighting pass adds the result back.
 void BeginLightRedirect(IDirect3DDevice9* device)
 {
     OwnCall([&] {

@@ -72,9 +72,14 @@ struct Projector
     float3 attenuation;
     // Where the attenuation first reaches full strength, or 0 to keep Source's curve everywhere.
     float fullDistance;
+    // kProjectorLocalFlashlight.
+    uint flags;
+    uint3 padding;
 };
 
 static const uint kNoCookie = 0xFFFFFFFFu;
+// The local player's own flashlight (Lighting::WriteProjectors), whose holder the shadow mask already leaves out.
+static const uint kProjectorLocalFlashlight = 0x01;
 
 struct HitSurface
 {
@@ -451,10 +456,10 @@ static const uint kSkyboxMask = 0x10;
 // kShadowlessPropMask in src/scene.h.
 static const uint kShadowlessPropMask = 0x20;
 
-float ShadowRayLength(bool attachedLight, float distance)
-{
-    return attachedLight ? distance - min(kAttachedLightClearance, distance * 0.5) : distance - 1.0;
-}
+// Other lights' shadow rays stop this far short of them.
+static const float kLightClearance = 1.0;
+
+float ShadowRayLength(float clearance, float distance) { return distance - min(clearance, distance * 0.5); }
 
 // Shadow rays of local lights. Dynamic and projected lights are mostly the local player's own (flashlight, muzzle
 // flashes), which the game never shadows with the player's body.
@@ -573,12 +578,22 @@ float3 LightIrradiance(Light light, float3 position, float3 normal, out float3 t
 Projector LoadProjector(uint index)
 {
     ByteAddressBuffer projectors = ResourceDescriptorHeap[g_frame.projectorsView];
-    return projectors.Load<Projector>(index * 112);
+    return projectors.Load<Projector>(index * 128);
 }
+
+float ProjectorClearance(Projector projector)
+{
+    return (projector.flags & kProjectorLocalFlashlight) != 0 ? kLightClearance : kAttachedLightClearance;
+}
+
+// Below this distance from its lamp the local flashlight brightens more slowly than the inverse square: a
+// reflector lamp's beam only forms beyond a few reflector widths.
+static const float kFlashlightNearField = 16.0;
 
 // Unshadowed irradiance from a projected light, following DoFlashlight in common_flashlight_fxc.h; without a
 // cookie texture the frustum gets a round spot. Source's falloff (1/d for the flashlight) is replaced by the
-// physical inverse square beyond the distance where it reaches full strength; closer, it stays capped as in Source.
+// physical inverse square beyond the distance where it reaches full strength; closer, it stays capped as in Source,
+// except for the local flashlight, whose lamp keeps brightening (kFlashlightNearField).
 float3 ProjectorIrradiance(Projector projector, float3 position, float3 normal, out float3 toLight, out float distance)
 {
     float4 world = float4(position, 1.0);
@@ -589,7 +604,8 @@ float3 ProjectorIrradiance(Projector projector, float3 position, float3 normal, 
     toLight = delta / distance;
     if (projected.w <= 0.0)
         return 0.0;
-    float3 coords = projected.xyz / projected.w;
+    // The depth range is left out: the local flashlight's apex was moved forward, past where its near plane began.
+    float2 coords = projected.xy / projected.w;
     if (any(coords < 0.0) || any(coords > 1.0))
         return 0.0;
     float lambert = Lambert(normal, toLight);
@@ -598,13 +614,16 @@ float3 ProjectorIrradiance(Projector projector, float3 position, float3 normal, 
     float3 cookie;
     if (projector.cookieView != kNoCookie) {
         Texture2D<float4> texture = ResourceDescriptorHeap[projector.cookieView];
-        cookie = texture.SampleLevel(g_linearClamp, coords.xy, 0.0).rgb;
+        cookie = texture.SampleLevel(g_linearClamp, coords, 0.0).rgb;
     } else {
-        cookie = smoothstep(0.5, 0.35, length(coords.xy - 0.5));
+        cookie = smoothstep(0.5, 0.35, length(coords - 0.5));
     }
     float attenuation = saturate(dot(projector.attenuation, float3(1.0, 1.0 / distance, 1.0 / (distance * distance))));
-    if (projector.fullDistance > 0.0 && distance > projector.fullDistance)
-        attenuation = (projector.fullDistance * projector.fullDistance) / (distance * distance);
+    float fullSquared = projector.fullDistance * projector.fullDistance;
+    if ((projector.flags & kProjectorLocalFlashlight) != 0 && projector.fullDistance > 0.0)
+        attenuation = (fullSquared + kFlashlightNearField * kFlashlightNearField) / (distance * distance + kFlashlightNearField * kFlashlightNearField);
+    else if (projector.fullDistance > 0.0 && distance > projector.fullDistance)
+        attenuation = fullSquared / (distance * distance);
     float endFalloff = saturate((distance - projector.farZ) / (-0.4 * projector.farZ));
     return cookie * projector.color * (attenuation * lambert * endFalloff);
 }
@@ -641,18 +660,26 @@ float3 SetLightIrradiance(LightSet set, uint i, float3 position, float3 normal, 
     return LightIrradiance(LoadLight(index), position, normal, toLight, distance);
 }
 
+// The share of the i-th light of a LightSet that reaches `origin`, `distance` away along `toLight`.
+float LightTransmittance(LightSet set, uint i, float3 origin, float3 toLight, float distance)
+{
+    bool attached = IsAttachedLight(set, i);
+    float clearance = !attached ? kLightClearance : i >= set.pointLights ? ProjectorClearance(LoadProjector(i - set.pointLights)) : kAttachedLightClearance;
+    return Transmittance(origin, toLight, ShadowRayLength(clearance, distance), ShadowMask(attached));
+}
+
 static const uint kLightCandidates = 8;
 
 // One light of a LightSet by resampled importance sampling: up to kLightCandidates lights drawn uniformly (every
-// light when there are no more), one of them kept in proportion to its unshadowed luminance. `irradiance` is its
-// unshadowed light divided by the probability of the pick; false when no candidate can light the point.
+// light when there are no more), one of them, `picked`, kept in proportion to its unshadowed luminance. `irradiance`
+// is its unshadowed light divided by the probability of the pick; false when no candidate can light the point.
 bool SampleLight(LightSet set, float3 position, float3 normal, inout uint seed, out float3 irradiance, out float3 toLight, out float distance,
-    out bool attached)
+    out uint picked)
 {
     irradiance = 0.0;
     toLight = 0.0;
     distance = 0.0;
-    attached = false;
+    picked = 0;
     if (set.count == 0)
         return false;
     bool exhaustive = set.count <= kLightCandidates;
@@ -661,7 +688,6 @@ bool SampleLight(LightSet set, float3 position, float3 normal, inout uint seed, 
     float drawWeight = exhaustive ? 1.0 : float(set.count) / float(draws);
     float total = 0.0;
     float pickedWeight = 0.0;
-    uint picked = 0;
     for (uint d = 0; d < draws; ++d) {
         uint i = exhaustive ? d : min(uint(Random(seed) * set.count), set.count - 1);
         float3 candidateToLight;
@@ -678,7 +704,6 @@ bool SampleLight(LightSet set, float3 position, float3 normal, inout uint seed, 
     if (total <= 0.0)
         return false;
     irradiance = SetLightIrradiance(set, picked, position, normal, toLight, distance) * (total * drawWeight / pickedWeight);
-    attached = IsAttachedLight(set, picked);
     return true;
 }
 

@@ -15,14 +15,12 @@ enum class DebugView : uint32_t {
     IndirectLight = 5,
     IndirectRaw = 6,
     SunVisibility = 7,
-    GameFlashlight = 8,
+    AdditiveLight = 8,
     Reflections = 9,
     MotionVectors = 10,
     AmbientOcclusion = 11,
     Count
 };
-
-enum class FlashlightMode : uint32_t { RayTraced = 0, Game = 1 };
 
 enum class AntiAliasing : uint32_t { Off = 0, Temporal = 1, RayReconstruction = 2, Count };
 
@@ -52,7 +50,6 @@ struct Settings {
     bool translucentLighting = true;
     bool volumetricLight = true;
     bool fog = true;
-    FlashlightMode flashlightMode = FlashlightMode::RayTraced;
     float sunIntensity = 1.0f;
     float skyIntensity = 1.0f;
     float lightIntensity = 1.0f;

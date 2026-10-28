@@ -68,8 +68,7 @@ IDirect3DTexture9* AlbedoTexture();
 IDirect3DTexture9* EmissiveTexture();
 IDirect3DTexture9* NormalTexture();
 IDirect3DTexture9* FlagsTexture();
-// Light added by flashlight and projected-texture passes, other additive passes and self-illuminated surfaces, in
-// the back buffer's encoding.
+// Light added by additive passes and self-illuminated surfaces, in the back buffer's encoding.
 IDirect3DTexture9* LightTexture();
 // The tonemap scale Source multiplies lit colours by (cLightScale.x, pixel shader c30).
 float TonemapScale();
@@ -85,6 +84,8 @@ struct ProjectedLight {
     std::array<float, 3> color;
     std::array<float, 3> attenuation;
     Microsoft::WRL::ComPtr<IDirect3DBaseTexture9> cookie;
+    // The game reads the cookie as sRGB (D3DSAMP_SRGBTEXTURE).
+    bool cookieSrgb = false;
 };
 
 // Projected lights seen in the last main view.

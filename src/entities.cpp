@@ -39,6 +39,10 @@ constexpr int kGetClientNetworkableSlot = 4;
 constexpr int kGetClientClassSlot = 2;
 constexpr size_t kClientClassName = 16;
 constexpr int kModelInfoGetModelSlot = 1;
+// C_BaseCombatWeapon's m_iViewModelIndex and m_iWorldModelIndex (their DT_BaseCombatWeapon RecvProps are built at
+// client.dll+0x27990, confirmed in Ghidra).
+constexpr size_t kWeaponViewModelIndex = 0x1c10;
+constexpr size_t kWeaponWorldModelIndex = 0x1c14;
 
 // C_RopeKeyframe in GMod's client.dll (DT_RopeKeyframe, DrawModel and OnDataChanged, confirmed in Ghidra). Between the
 // networked m_iRopeMaterialModelIndex and m_nSegments lie CRopePhysics<10> m_RopePhysics (SDK public/rope_physics.h:
@@ -131,6 +135,7 @@ void Collect(std::vector<ModelEntity>& entities)
             continue;
         ModelEntity& out = entities.emplace_back();
         out.index = index;
+        out.entity = entity;
         out.renderable = renderable;
         out.parent = Slot<void*(__fastcall*)(void*)>(renderable, kGetShadowParentSlot)(renderable);
         out.model = name;
@@ -178,6 +183,19 @@ void CollectRopes(std::vector<Rope>& ropes)
         rope.material = material;
         ropes.push_back(std::move(rope));
     }
+}
+
+std::string WeaponWorldModel(const ModelEntity& weapon)
+{
+    if (!Ready())
+        return {};
+    const auto modelAt = [](int index) { return Slot<const void*(__fastcall*)(void*, int)>(g_modelInfo, kModelInfoGetModelSlot)(g_modelInfo, index); };
+    const void* shown = Slot<const void*(__fastcall*)(void*)>(weapon.renderable, kGetModelSlot)(weapon.renderable);
+    if (shown == nullptr || modelAt(Field<int>(weapon.entity, kWeaponViewModelIndex)) != shown)
+        return {};
+    const void* world = modelAt(Field<int>(weapon.entity, kWeaponWorldModelIndex));
+    const char* name = world != nullptr ? Slot<const char*(__fastcall*)(void*, const void*)>(g_modelInfo, kGetModelNameSlot)(g_modelInfo, world) : nullptr;
+    return name != nullptr ? name : std::string{};
 }
 
 bool SetupBones(void* renderable, float (*boneToWorld)[3][4], int maxBones)

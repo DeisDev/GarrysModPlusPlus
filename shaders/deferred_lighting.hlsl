@@ -1,7 +1,7 @@
 #include "scene.hlsli"
 
 // Final shading: albedo times (direct light + denoised light) plus self-illumination, reflections and the light
-// the game's flashlight passes added, written in the encoding the game uses for lit colours. Pixels without
+// the game's additive passes added, written in the encoding the game uses for lit colours. Pixels without
 // G-buffer data keep the game's forward colour.
 // input0: denoised light (indirect plus the sampled direct remainder), or none for the sky's light; input1: raw
 // estimate (debug view); input2: reflections and self-illumination (shaders/reflections.hlsl), or none; input3:
@@ -72,7 +72,7 @@ void main(uint3 id : SV_DispatchThreadID)
         added = reflections.Load(int3(pixel, 0)).rgb;
     }
     Texture2D<float4> lightTexture = ResourceDescriptorHeap[g_frame.lightView];
-    float3 flashlight = Decode(lightTexture.Load(int3(pixel, 0)).rgb);
+    float3 additive = Decode(lightTexture.Load(int3(pixel, 0)).rgb);
     float3 position = WorldPositionFromDepth(pixel, DepthAt(pixel));
     Texture2D<float4> directTexture = ResourceDescriptorHeap[g_pass.input3];
     float4 directLight = directTexture.Load(int3(pixel, 0));
@@ -104,7 +104,7 @@ void main(uint3 id : SV_DispatchThreadID)
         break;
     }
     case 7: result = directLight.a; break;
-    case 8: result = Encode(flashlight); break;
+    case 8: result = Encode(additive); break;
     case 9: result = Encode(added * g_frame.tonemapScale); break;
     case 11: result = ambientOcclusion; break;
     case 10: {
@@ -118,7 +118,7 @@ void main(uint3 id : SV_DispatchThreadID)
         Texture2D<uint> pixelFlags = ResourceDescriptorHeap[g_frame.pixelFlagsView];
         bool unlit = (pixelFlags.Load(int3(pixel, 0)) & kPixelUnlit) != 0;
         float3 light = unlit ? 1.0 : direct + indirect;
-        float3 shaded = ApplyFog((albedo * light + emissive + added) * g_frame.tonemapScale, position) + flashlight + VolumetricLight(pixel);
+        float3 shaded = ApplyFog((albedo * light + emissive + added) * g_frame.tonemapScale, position) + additive + VolumetricLight(pixel);
         result = g_frame.outputLinear != 0 ? shaded : Encode(shaded);
         break;
     }

@@ -117,9 +117,10 @@ void Trace(uint3 id, uint thread)
                 float3 light;
                 float3 toLight;
                 float distance;
-                bool attached;
-                if (SampleLight(LightSetAt(surface.position, surface.normal), surface.position, surface.normal, seed, light, toLight, distance, attached))
-                    irradiance += light * Transmittance(origin, toLight, ShadowRayLength(attached, distance), ShadowMask(attached));
+                uint picked;
+                LightSet set = LightSetAt(surface.position, surface.normal);
+                if (SampleLight(set, surface.position, surface.normal, seed, light, toLight, distance, picked))
+                    irradiance += light * LightTransmittance(set, picked, origin, toLight, distance);
                 radiance = ClampSample(surface.albedo * irradiance);
             }
         }
@@ -200,8 +201,7 @@ void AddDirectLight(float3 position, inout float4 value[3])
         float3 toLight;
         float distance;
         float3 irradiance = LightIrradiance(light, position, normalize(light.origin - position), toLight, distance);
-        bool attached = IsAttachedLight(set, top[k]);
-        AddDirection(irradiance * Transmittance(position, toLight, ShadowRayLength(attached, distance), ShadowMask(attached)), toLight, value);
+        AddDirection(irradiance * LightTransmittance(set, top[k], position, toLight, distance), toLight, value);
     }
 }
 

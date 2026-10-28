@@ -163,8 +163,7 @@ void main(uint3 id : SV_DispatchThreadID)
         float3 toLight;
         float distance;
         float3 light = SetLightIrradiance(set, top[k], position, lightNormal, toLight, distance);
-        bool attached = IsAttachedLight(set, top[k]);
-        exact += light * Transmittance(origin, toLight, ShadowRayLength(attached, distance), ShadowMask(attached));
+        exact += light * LightTransmittance(set, top[k], origin, toLight, distance);
     }
     float3 sampled = 0.0;
     if (remainder > 0.0) {
@@ -175,8 +174,7 @@ void main(uint3 id : SV_DispatchThreadID)
             float3 toLight;
             float distance;
             float3 light = SetLightIrradiance(set, picked[s], position, lightNormal, toLight, distance);
-            bool attached = IsAttachedLight(set, picked[s]);
-            float transmittance = Transmittance(origin, toLight, ShadowRayLength(attached, distance), ShadowMask(attached));
+            float transmittance = LightTransmittance(set, picked[s], origin, toLight, distance);
             sampled += ClampSample(light * (transmittance * remainder / (pickedWeight[s] * g_frame.sampledLightRays)));
         }
     }

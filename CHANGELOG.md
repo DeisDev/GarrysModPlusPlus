@@ -34,6 +34,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Spot light pools have soft edges like the map's baked lighting instead of a hard line.
 - The ray-traced flashlight and other projected lights fall off with distance like real light beyond the range where they reach full strength.
 - Maps with many lights render faster: lights are evaluated faster, the light volume is traced in parallel, and the viewmodel is lit faster.
+- The flashlight shines from where you hold it instead of from up to 128 units behind you near walls, so its shadows no longer slide around as you walk.
+- Objects right in front of you now block your flashlight.
+- The flashlight's beam has a bright centre that fades out, as its texture intends, instead of a flat disc.
+- The flashlight lights things close to you more brightly than things far away, like a real flashlight.
+- The debug view that showed the game's flashlight pass now shows additive glows.
+
+### Removed
+
+- The "Game" flashlight option. It made props see-through and left them unlit by the flashlight.
 
 ### Fixed
 
@@ -57,3 +66,5 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fixed objects right behind window glass showing a mirror image like a cubemap.
 - Fixed the held weapon looking see-through in front of bright areas.
 - Fixed maps without fog turning black a short distance away, as on gm_publicindoorswimmingpool.
+- Fixed the flashlight's bounce light missing on the viewmodel where it comes from surfaces off screen.
+- Fixed some props, such as plastic chairs, casting shadows as if they were turned the other way.

@@ -70,8 +70,53 @@ struct GpuProjector {
     uint32_t cookieView;
     float attenuation[3];
     float fullDistance;
+    uint32_t flags;
+    uint32_t padding[3];
 };
-static_assert(sizeof(GpuProjector) == 112);
+static_assert(sizeof(GpuProjector) == 128);
+// kProjectorLocalFlashlight in shaders/scene.hlsli.
+constexpr uint32_t kProjectorLocalFlashlight = 0x01;
+
+// GMod's flashlight (CFlashlightEffect::UpdateLightNew) sits r_flashlightoffsety (-20) units below the eye along the
+// view's up axis and aims at the point r_flashlightfar ahead of the eye, but within 128 units of a wall it backs away
+// along its axis so that its texture does not shrink, and then shines through the player's body. A projector whose axis
+// follows the view this closely and passes the eye this near is taken to be it, and moved back to where it is held.
+constexpr float kFlashlightAxisAlignment = 0.99f;
+constexpr float kFlashlightEyeDistance = 32.0f;
+constexpr float kFlashlightMaxPullBack = 160.0f;
+
+float Dot(const float a[3], const float b[3]) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
+
+// How far the local player's flashlight was pulled back from where it is held, or nothing when the projector is not it.
+std::optional<float> FlashlightPullBack(const GpuProjector& projector, const float eye[3], const float viewForward[3])
+{
+    const float* axisRow = projector.worldToTexture[3];
+    const float length = std::sqrt(Dot(axisRow, axisRow));
+    if (length <= 0.0f)
+        return std::nullopt;
+    const float axis[3] = {axisRow[0] / length, axisRow[1] / length, axisRow[2] / length};
+    if (Dot(axis, viewForward) < kFlashlightAxisAlignment)
+        return std::nullopt;
+    const float toEye[3] = {eye[0] - projector.origin[0], eye[1] - projector.origin[1], eye[2] - projector.origin[2]};
+    const float along = Dot(toEye, axis);
+    const float off = std::sqrt(std::max(Dot(toEye, toEye) - along * along, 0.0f));
+    if (along < -1.0f || along > kFlashlightMaxPullBack || off > kFlashlightEyeDistance)
+        return std::nullopt;
+    return std::max(along, 0.0f);
+}
+
+// Moves a projector's apex `distance` along its axis, keeping its orientation and field of view: each texture
+// coordinate row is evaluated at the point that far behind.
+void AdvanceApex(GpuProjector& projector, float distance)
+{
+    const float* axisRow = projector.worldToTexture[3];
+    const float length = std::sqrt(Dot(axisRow, axisRow));
+    const float axis[3] = {axisRow[0] / length, axisRow[1] / length, axisRow[2] / length};
+    for (auto& row : projector.worldToTexture)
+        row[3] -= distance * Dot(row, axis);
+    for (int i = 0; i < 3; ++i)
+        projector.origin[i] += distance * axis[i];
+}
 
 // Where Source's attenuation c + l/d + q/d² first reaches full strength (1), or 0 when it never falls below it
 // or never reaches it.
@@ -219,6 +264,20 @@ DXGI_FORMAT ColorViewFormat(DXGI_FORMAT format)
     case DXGI_FORMAT_BC2_TYPELESS: return DXGI_FORMAT_BC2_UNORM;
     case DXGI_FORMAT_BC3_TYPELESS: return DXGI_FORMAT_BC3_UNORM;
     default: return format;
+    }
+}
+
+// The sRGB view of a texture the game samples with D3DSAMP_SRGBTEXTURE, or its plain view when there is none.
+DXGI_FORMAT SrgbViewFormat(DXGI_FORMAT format)
+{
+    switch (format) {
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS: return DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+    case DXGI_FORMAT_B8G8R8X8_TYPELESS: return DXGI_FORMAT_B8G8R8X8_UNORM_SRGB;
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS: return DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    case DXGI_FORMAT_BC1_TYPELESS: return DXGI_FORMAT_BC1_UNORM_SRGB;
+    case DXGI_FORMAT_BC2_TYPELESS: return DXGI_FORMAT_BC2_UNORM_SRGB;
+    case DXGI_FORMAT_BC3_TYPELESS: return DXGI_FORMAT_BC3_UNORM_SRGB;
+    default: return ColorViewFormat(format);
     }
 }
 
@@ -805,9 +864,13 @@ void Lighting::ReturnResources(std::span<IDirect3DResource9* const> resources, U
         m_device9On12->ReturnUnderlyingResource(resources[i], 1, &value, &fence);
 }
 
-UINT Lighting::WriteProjectors(UINT slot, std::span<const gbuffer::ProjectedLight> projected, std::span<ID3D12Resource* const> cookies, UINT cookieViews)
+UINT Lighting::WriteProjectors(UINT slot, std::span<const gbuffer::ProjectedLight> projected, std::span<ID3D12Resource* const> cookies, UINT cookieViews,
+    const FrameConstants& constants)
 {
     const float scale = GetSettings().projectedIntensity;
+    const float* forwardRow = constants.viewProj[3];
+    const float forwardLength = std::sqrt(Dot(forwardRow, forwardRow));
+    const float viewForward[3] = {forwardRow[0] / forwardLength, forwardRow[1] / forwardLength, forwardRow[2] / forwardLength};
     auto* out = reinterpret_cast<GpuProjector*>(m_projectorsMapped) + slot * kMaxProjectors;
     UINT count = 0;
     for (size_t i = 0; i < projected.size() && count < kMaxProjectors; ++i) {
@@ -820,11 +883,18 @@ UINT Lighting::WriteProjectors(UINT slot, std::span<const gbuffer::ProjectedLigh
             gpu.color[c] = light.color[c] * scale;
         std::memcpy(gpu.attenuation, light.attenuation.data(), sizeof(gpu.attenuation));
         gpu.fullDistance = FullStrengthDistance(light.attenuation);
+        gpu.flags = 0;
+        if (forwardLength > 0.0f) {
+            if (const std::optional<float> pullBack = FlashlightPullBack(gpu, constants.eyePosition, viewForward)) {
+                AdvanceApex(gpu, *pullBack);
+                gpu.flags = kProjectorLocalFlashlight;
+            }
+        }
         gpu.cookieView = kInvalidView;
         if (i < cookies.size() && cookies[i] != nullptr) {
             const D3D12_RESOURCE_DESC desc = cookies[i]->GetDesc();
             D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
-            srv.Format = ColorViewFormat(desc.Format);
+            srv.Format = light.cookieSrgb ? SrgbViewFormat(desc.Format) : ColorViewFormat(desc.Format);
             srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
             srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
             srv.Texture2D.MipLevels = desc.MipLevels;
@@ -970,7 +1040,7 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     m_flushQuery->GetData(nullptr, 0, D3DGETDATA_FLUSH);
 
     ID3D12CommandQueue* queue = m_renderer->Queue();
-    const bool projectedLights = inputs.kind != gbuffer::ViewKind::Skybox && GetSettings().projectedLights && GetSettings().flashlightMode == FlashlightMode::RayTraced;
+    const bool projectedLights = inputs.kind != gbuffer::ViewKind::Skybox && GetSettings().projectedLights;
     std::vector<IDirect3DResource9*> resources9 = {inputs.color, inputs.depth, inputs.normal, inputs.flags, inputs.light, inputs.albedo, inputs.emissive};
     std::vector<ComPtr<ID3D12Resource>> resources(resources9.size());
     for (UINT i = 0; i < resources.size(); ++i) {
@@ -1054,7 +1124,7 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     constants.albedoView = views + 5;
     constants.emissiveView = views + 6;
     if (projectedLights) {
-        constants.projectorCount = WriteProjectors(slot, inputs.projected, cookies, views + kInputViews);
+        constants.projectorCount = WriteProjectors(slot, inputs.projected, cookies, views + kInputViews, constants);
         constants.projectorsView = m_projectorViews[slot];
     }
     // The 3D skybox is drawn before the main view of the same frame, so it may use the surface the main

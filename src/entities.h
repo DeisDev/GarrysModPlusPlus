@@ -8,6 +8,7 @@ namespace gmodpp::entities {
 
 struct ModelEntity {
     int index;
+    void* entity;
     void* renderable;
     // The renderable of the entity it is attached to (its move parent), or null; a held weapon's is its owner's.
     void* parent;
@@ -35,6 +36,10 @@ void Collect(std::vector<ModelEntity>& entities);
 
 // Ropes the game draws whose simulation has placed their nodes.
 void CollectRopes(std::vector<Rope>& ropes);
+
+// The world model path of a weapon from Collect that shows its view model, as the local player's weapons do in first
+// person; empty otherwise. Only for entities known to be weapons.
+std::string WeaponWorldModel(const ModelEntity& weapon);
 
 // Bone-to-world matrices for a renderable from Collect; returns false when the entity has no bones.
 bool SetupBones(void* renderable, float (*boneToWorld)[3][4], int maxBones);
