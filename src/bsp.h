@@ -22,6 +22,9 @@ struct SunLight {
     Float3 direction = {};
     Float3 color = {};
     Float3 ambient = {};
+    // Light styles of the sun and the sky light (Light::style).
+    int32_t style = 0;
+    int32_t ambientStyle = 0;
 };
 
 enum class LightType : int32_t { Surface = 0, Point = 1, Spot = 2, Sky = 3, QuakeLight = 4, SkyAmbient = 5 };
@@ -36,6 +39,8 @@ struct Light {
     float constantAttn, linearAttn, quadraticAttn;
     // Visibility cluster holding the light, or -1.
     int32_t cluster;
+    // Light style: 0 for plain lights, 1-31 for animated patterns, 32 and up for switchable (named) lights.
+    int32_t style;
 };
 
 // A world BSP node; a negative child is leaf -child - 1.

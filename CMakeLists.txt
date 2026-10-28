@@ -65,6 +65,7 @@ function(add_shader source entry profile variable)
         OUTPUT "${output}"
         COMMAND "${DXC_EXECUTABLE}" -nologo -T ${profile} -E ${entry} -O3 -HV 2021 ${ARGN} -Fh "${output}" -Vn ${variable} "${CMAKE_CURRENT_SOURCE_DIR}/${source}"
         DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/${source}" "${CMAKE_CURRENT_SOURCE_DIR}/shaders/common.hlsli" "${CMAKE_CURRENT_SOURCE_DIR}/shaders/scene.hlsli"
+            "${CMAKE_CURRENT_SOURCE_DIR}/shaders/reflection.hlsli" "${CMAKE_CURRENT_SOURCE_DIR}/shaders/water.hlsli"
         COMMENT "Compiling ${source} (${entry})"
         VERBATIM
     )
@@ -115,6 +116,8 @@ add_shader(shaders/view_rect.hlsl main cs_6_6 g_viewRectCS)
 add_shader(shaders/translucent_depth.hlsl main cs_6_6 g_translucentDepthCS)
 add_d3d9_shader(shaders/forward_snippet.hlsl main g_forwardSnippetPS)
 add_d3d9_shader(shaders/forward_snippet.hlsl main g_forwardSnippetPS2 PROFILE ps_2_b /D FORWARD_PS2=1)
+add_d3d9_shader(shaders/water_surface.hlsl main g_waterSurfacePS PROFILE ps_2_b)
+add_d3d9_shader(shaders/water_surface.hlsl main g_waterSurfaceAlphaFogPS PROFILE ps_2_b /D REFRACT_ALPHA_FOG=1)
 # G-buffer replacements (g_gbuffer*) and their forward-lit variants (g_forward*).
 foreach(forward 0 1)
     if(forward)

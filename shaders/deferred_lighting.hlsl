@@ -1,4 +1,4 @@
-#include "scene.hlsli"
+#include "water.hlsli"
 
 // Final shading: albedo times (direct light + denoised light) plus self-illumination, reflections and the light
 // the game's additive passes added, written in the encoding the game uses for lit colours. Pixels without
@@ -6,7 +6,8 @@
 // input0: denoised light (indirect plus the sampled direct remainder), or none for the sky's light; input1: raw
 // estimate (debug view); input2: reflections and self-illumination (shaders/reflections.hlsl), or none; input3:
 // exact direct light (rgb) and sun visibility (a) from shaders/direct.hlsl; input4: sampled direct remainder
-// (debug view); output0: shaded colour, encoded or (outputLinear) linear.
+// (debug view); output0: shaded colour, encoded or (outputLinear) linear; output1, output2, output3 (or none): Ray
+// Reconstruction's specular albedo, roughness and hit distance guides, which water pixels overwrite.
 
 // Light scattered by the haze between the eye and the pixel (shaders/volumetrics.hlsl), after the tonemap scale.
 float3 VolumetricLight(int2 pixel)
@@ -28,7 +29,8 @@ float3 ApplyFog(float3 color, float3 position)
         return color;
     float viewDepth = mul(g_frame.viewProj, float4(position, 1.0)).w;
     float fog = saturate(min(g_frame.fogParams.z, viewDepth * g_frame.fogParams.w - g_frame.fogParams.x));
-    return lerp(color, g_frame.fogColor, fog * fog);
+    // fogParams.y: 1 under water, whose fog Source blends in linearly.
+    return lerp(color, g_frame.fogColor, g_frame.fogParams.y > 0.0 ? fog : fog * fog);
 }
 
 [RootSignature(ROOT_SIGNATURE)]
@@ -46,6 +48,23 @@ void main(uint3 id : SV_DispatchThreadID)
     bool covered = surface.w > 0.0;
     if (g_frame.debugView == 3) {
         output[pixel] = float4(covered ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0), color.a);
+        return;
+    }
+    Texture2D<float4> lightTexture = ResourceDescriptorHeap[g_frame.lightView];
+    float3 additive = g_frame.additiveAfterResolve != 0 ? 0.0 : Decode(lightTexture.Load(int3(pixel, 0)).rgb);
+    if (!covered && surface.w < 0.0) {
+        float3 position = WorldPositionFromDepth(pixel, DepthAt(pixel));
+        WaterResult water = ShadeWater(pixel, position, g_frame.previousLitView);
+        float3 shaded = ApplyFog(water.color * g_frame.tonemapScale, position) + VolumetricLight(pixel);
+        output[pixel] = float4(g_frame.outputLinear != 0 ? shaded : Encode(shaded), color.a);
+        if (g_pass.output1 != kNoView) {
+            RWTexture2D<float4> specular = ResourceDescriptorHeap[g_pass.output1];
+            RWTexture2D<float> roughness = ResourceDescriptorHeap[g_pass.output2];
+            RWTexture2D<float> hitDistance = ResourceDescriptorHeap[g_pass.output3];
+            specular[pixel] = float4(water.specularAlbedo, 1.0);
+            roughness[pixel] = 0.02;
+            hitDistance[pixel] = water.hitDistance;
+        }
         return;
     }
     if (!covered) {
@@ -71,8 +90,6 @@ void main(uint3 id : SV_DispatchThreadID)
         Texture2D<float4> reflections = ResourceDescriptorHeap[g_pass.input2];
         added = reflections.Load(int3(pixel, 0)).rgb;
     }
-    Texture2D<float4> lightTexture = ResourceDescriptorHeap[g_frame.lightView];
-    float3 additive = Decode(lightTexture.Load(int3(pixel, 0)).rgb);
     float3 position = WorldPositionFromDepth(pixel, DepthAt(pixel));
     Texture2D<float4> directTexture = ResourceDescriptorHeap[g_pass.input3];
     float4 directLight = directTexture.Load(int3(pixel, 0));
@@ -104,7 +121,7 @@ void main(uint3 id : SV_DispatchThreadID)
         break;
     }
     case 7: result = directLight.a; break;
-    case 8: result = Encode(additive); break;
+    case 8: result = Encode(Decode(lightTexture.Load(int3(pixel, 0)).rgb)); break;
     case 9: result = Encode(added * g_frame.tonemapScale); break;
     case 11: result = ambientOcclusion; break;
     case 10: {

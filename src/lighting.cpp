@@ -84,6 +84,11 @@ constexpr uint32_t kProjectorLocalFlashlight = 0x01;
 constexpr float kFlashlightAxisAlignment = 0.99f;
 constexpr float kFlashlightEyeDistance = 32.0f;
 constexpr float kFlashlightMaxPullBack = 160.0f;
+// In third person GMod's flashlight sits on the local player's model (the hand holding the weapon), which the view's
+// axis does not pass. A projector this close to the middle of the player's body (kPlayerCentreHeight above its feet) is
+// taken to be it; it stays where it is.
+constexpr float kPlayerCentreHeight = 36.0f;
+constexpr float kThirdPersonFlashlightReach = 56.0f;
 
 float Dot(const float a[3], const float b[3]) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
 
@@ -799,9 +804,11 @@ bool Lighting::FillConstants(FrameConstants& constants, const Scene& scene, cons
     constants.skyColor[1] = sun.ambient.y;
     constants.skyColor[2] = sun.ambient.z;
     const Settings& settings = GetSettings();
+    const float sunStyle = scene.LightStyle(sun.style);
+    const float skyStyle = scene.LightStyle(sun.ambientStyle);
     for (int i = 0; i < 3; ++i) {
-        constants.sunColor[i] *= settings.sun ? settings.sunIntensity : 0.0f;
-        constants.skyColor[i] *= settings.skyIntensity;
+        constants.sunColor[i] *= settings.sun ? settings.sunIntensity * sunStyle : 0.0f;
+        constants.skyColor[i] *= settings.skyIntensity * skyStyle;
     }
     constants.lightScale = settings.lightIntensity;
     constants.indirectScale = settings.indirectLight ? settings.indirectIntensity : 0.0f;
@@ -865,7 +872,7 @@ void Lighting::ReturnResources(std::span<IDirect3DResource9* const> resources, U
 }
 
 UINT Lighting::WriteProjectors(UINT slot, std::span<const gbuffer::ProjectedLight> projected, std::span<ID3D12Resource* const> cookies, UINT cookieViews,
-    const FrameConstants& constants)
+    const FrameConstants& constants, const std::optional<std::array<float, 3>>& localPlayer)
 {
     const float scale = GetSettings().projectedIntensity;
     const float* forwardRow = constants.viewProj[3];
@@ -889,6 +896,12 @@ UINT Lighting::WriteProjectors(UINT slot, std::span<const gbuffer::ProjectedLigh
                 AdvanceApex(gpu, *pullBack);
                 gpu.flags = kProjectorLocalFlashlight;
             }
+        }
+        if (gpu.flags == 0 && localPlayer) {
+            const float centre[3] = {(*localPlayer)[0], (*localPlayer)[1], (*localPlayer)[2] + kPlayerCentreHeight};
+            const float offset[3] = {gpu.origin[0] - centre[0], gpu.origin[1] - centre[1], gpu.origin[2] - centre[2]};
+            if (Dot(offset, offset) <= kThirdPersonFlashlightReach * kThirdPersonFlashlightReach)
+                gpu.flags = kProjectorLocalFlashlight;
         }
         gpu.cookieView = kInvalidView;
         if (i < cookies.size() && cookies[i] != nullptr) {
@@ -1124,7 +1137,7 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     constants.albedoView = views + 5;
     constants.emissiveView = views + 6;
     if (projectedLights) {
-        constants.projectorCount = WriteProjectors(slot, inputs.projected, cookies, views + kInputViews, constants);
+        constants.projectorCount = WriteProjectors(slot, inputs.projected, cookies, views + kInputViews, constants, inputs.localPlayer);
         constants.projectorsView = m_projectorViews[slot];
     }
     // The 3D skybox is drawn before the main view of the same frame, so it may use the surface the main
@@ -1133,6 +1146,7 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     const UINT previous = 1 - current;
     constants.surfaceView = m_surface[current].srv;
     constants.prevSurfaceView = m_surface[previous].srv;
+    constants.previousLitView = main && m_historyValid ? m_lit[previous].srv : kInvalidView;
     constants.visibilityView = m_visibility.srv;
     constants.motionView = m_motion.srv;
     constants.previousDistanceView = m_previousDistance.srv;
@@ -1186,6 +1200,7 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     const SceneFrame frame = scene.RecordFrame(m_list.Get(), slot, m_frameInstances, m_useMicromaps);
     constants.instancesView = frame.instancesView;
     constants.dynamicLightsView = frame.dynamicLightsView;
+    constants.lightStylesView = frame.lightStylesView;
     constants.dynamicLightCount = GetSettings().dynamicLights && inputs.kind != gbuffer::ViewKind::Skybox ? frame.dynamicLightCount : 0u;
     Statistics& statistics = GetStatistics();
     if (main) {
@@ -1217,6 +1232,14 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     bindCompute(slotConstantsGpu);
     m_gridWidth = m_width;
     m_gridHeight = m_height;
+    // Additive draws (glows, sprites) skip the temporal resolve, which would jitter them and, with Ray Reconstruction,
+    // denoise them at render resolution as if they were lit surfaces.
+    const bool temporalResolve = rayReconstruction || (main && GetSettings().antiAliasing == AntiAliasing::Temporal);
+    constants.additiveAfterResolve = temporalResolve ? 1u : 0u;
+    // The jitter's image shift in output pixels.
+    const float jitterScale = rayReconstruction ? static_cast<float>(m_width) / static_cast<float>(renderWidth) : 1.0f;
+    const UINT shiftX = std::bit_cast<UINT>(inputs.jitterX * jitterScale);
+    const UINT shiftY = std::bit_cast<UINT>(inputs.jitterY * jitterScale);
 
     const D3D12_RESOURCE_STATES read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     const D3D12_RESOURCE_STATES write = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
@@ -1453,9 +1476,28 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     if (shaded != nullptr)
         Use(*shaded, read);
     Use(m_giRaw, read);
+    if (constants.previousLitView != kInvalidView)
+        Use(m_lit[previous], read);
     Use(m_lit[current], write);
-    Dispatch(Pass::Lighting, {.input0 = shaded != nullptr ? shaded->srv : kInvalidView, .input1 = m_giRaw.srv, .input2 = reflections,
-        .input3 = direct.srv, .input4 = m_directRemainder.srv, .output0 = m_lit[current].uav});
+    PassArgs lighting = {.input0 = shaded != nullptr ? shaded->srv : kInvalidView, .input1 = m_giRaw.srv, .input2 = reflections, .input3 = direct.srv,
+        .input4 = m_directRemainder.srv, .output0 = m_lit[current].uav};
+    if (rayReconstruction) {
+        // Water pixels overwrite the reflection guides the reflections pass wrote.
+        Use(m_rrSpecularAlbedo, write);
+        Use(m_rrRoughness, write);
+        Use(m_rrHitDistance, write);
+        D3D12_RESOURCE_BARRIER guides[3] = {};
+        ID3D12Resource* guideResources[] = {m_rrSpecularAlbedo.resource.Get(), m_rrRoughness.resource.Get(), m_rrHitDistance.resource.Get()};
+        for (size_t i = 0; i < std::size(guides); ++i) {
+            guides[i].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+            guides[i].UAV.pResource = guideResources[i];
+        }
+        m_list->ResourceBarrier(static_cast<UINT>(std::size(guides)), guides);
+        lighting.output1 = m_rrSpecularAlbedo.uav;
+        lighting.output2 = m_rrRoughness.uav;
+        lighting.output3 = m_rrHitDistance.uav;
+    }
+    Dispatch(Pass::Lighting, lighting);
     mark();
     // The 3D skybox is drawn before the main view, which covers it again, so only the main view is resolved.
     Texture* output = &m_lit[current];
@@ -1480,7 +1522,7 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
         if (rayReconstructed) {
             Use(m_rrOutput, read);
             Use(m_resolved, write);
-            Dispatch(Pass::DlssResolve, {.input0 = m_rrOutput.srv, .output0 = m_resolved.uav});
+            Dispatch(Pass::DlssResolve, {.input0 = m_rrOutput.srv, .input1 = shiftX, .input2 = shiftY, .output0 = m_resolved.uav});
             output = &m_resolved;
         }
     } else if (main && GetSettings().antiAliasing == AntiAliasing::Temporal) {
@@ -1491,7 +1533,7 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
             .step = m_taaHistoryValid ? 1u : 0u});
         Use(m_taaHistory[current], read);
         Use(m_resolved, write);
-        Dispatch(Pass::Sharpen, {.input0 = m_taaHistory[current].srv, .output0 = m_resolved.uav});
+        Dispatch(Pass::Sharpen, {.input0 = m_taaHistory[current].srv, .input1 = shiftX, .input2 = shiftY, .output0 = m_resolved.uav});
         output = &m_resolved;
     }
     m_taaHistoryValid = main ? output == &m_resolved && !rayReconstruction : m_taaHistoryValid;

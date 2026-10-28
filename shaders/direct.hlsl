@@ -34,7 +34,7 @@ Light WaveReadLight(Light light, uint lane)
     result.quadraticAttn = WaveReadLaneAt(light.quadraticAttn, lane);
     result.hullOffset = WaveReadLaneAt(light.hullOffset, lane);
     result.hullCount = WaveReadLaneAt(light.hullCount, lane);
-    result.padding = 0.0;
+    result.style = WaveReadLaneAt(light.style, lane);
     return result;
 }
 

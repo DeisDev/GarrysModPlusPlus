@@ -6,7 +6,9 @@
 // Edge pixels take the depth of the scene seen through their unjittered centre instead, unless the ray meets something
 // nearer than the G-buffer shows within g_pass.step pixels (geometry the scene adds). The far side of a thin gap can lie
 // beyond every sample of this frame's jittered neighbourhood, so a farther hit is kept; where the scene lacks geometry
-// the G-buffer has, that misplaces only edge pixels.
+// the G-buffer has, that misplaces only edge pixels. Other pixels take the farthest G-buffer depth around their
+// unjittered centre. Every depth is pushed back a little (DepthBehind): the game redraws some surfaces unjittered with a
+// depth test (GMod's halos, such as the physics gun's on a held prop), and those draws must pass it.
 // input0, input1: the image's jitter shift in output pixels (x right, y down, as floats); output0: the depth.
 
 float EyeDistance(int2 pixel, float depth)
@@ -15,6 +17,32 @@ float EyeDistance(int2 pixel, float depth)
 }
 
 float Tolerance(float distance) { return 1.0 + 0.01 * distance; }
+
+// The depth at `centre` (in pixels of the jittered image) a little farther along its ray: well past the rounding of
+// a 24-bit depth buffer, yet too little to show translucent surfaces through what lies in front of them. Edge pixels
+// (`edge`) go farther: the ray-traced scene's triangles can differ slightly from the ones the game draws.
+float DepthBehind(float2 centre, float depth, bool edge = false)
+{
+    if (depth >= 1.0)
+        return depth;
+    float2 uv = centre * g_frame.invSize;
+    float4 world = mul(g_frame.invViewProj, float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, (depth - g_frame.depthMin) / g_frame.depthScale, 1.0));
+    float3 position = world.xyz / world.w;
+    float3 toPosition = position - g_frame.eyePosition;
+    float distance = length(toPosition);
+    position += toPosition / max(distance, 1e-4) * (edge ? 0.25 + distance * 2e-3 : 0.02 + distance * 2e-4);
+    float4 clip = mul(g_frame.viewProj, float4(position, 1.0));
+    return min(g_frame.depthMin + clip.z / clip.w * g_frame.depthScale, 1.0);
+}
+
+// The farthest G-buffer depth around a point between pixel centres. Within a surface it is at most a pixel's depth
+// slope farther than the point itself, and at small steps (a prop's ribs) it is the farther side, which the game's
+// unjittered redraw may show there.
+float DepthAround(float2 centre)
+{
+    int2 base = int2(floor(centre - 0.5));
+    return max(max(DepthAt(base), DepthAt(base + int2(1, 0))), max(DepthAt(base + int2(0, 1)), DepthAt(base + int2(1, 1))));
+}
 
 // The nearest surface the G-buffer can hold along a ray: translucent ones are drawn after it.
 bool TraceGBufferSurface(float3 origin, float3 direction, out float t)
@@ -55,13 +83,13 @@ void main(uint3 id : SV_DispatchThreadID)
         }
     }
     RWTexture2D<float> output = ResourceDescriptorHeap[g_pass.output0];
+    float2 centre = float2(pixel) + 0.5 + float2(asfloat(g_pass.input0), asfloat(g_pass.input1));
     float nearDistance = EyeDistance(pixel, nearest);
     float farDistance = EyeDistance(pixel, farthest);
     if (farDistance - nearDistance <= Tolerance(nearDistance) || g_frame.traceMask == 0) {
-        output[pixel] = depth;
+        output[pixel] = DepthBehind(centre, nearest >= 1.0 ? depth : DepthAround(centre));
         return;
     }
-    float2 centre = float2(pixel) + 0.5 + float2(asfloat(g_pass.input0), asfloat(g_pass.input1));
     float2 uv = centre * g_frame.invSize;
     float4 world = mul(g_frame.invViewProj, float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0.5, 1.0));
     float3 direction = normalize(world.xyz / world.w - g_frame.eyePosition);
@@ -73,5 +101,5 @@ void main(uint3 id : SV_DispatchThreadID)
         float4 clip = mul(g_frame.viewProj, float4(g_frame.eyePosition + direction * t, 1.0));
         traced = g_frame.depthMin + clip.z / clip.w * g_frame.depthScale;
     }
-    output[pixel] = distance >= nearDistance - Tolerance(nearDistance) ? traced : depth;
+    output[pixel] = DepthBehind(centre, distance >= nearDistance - Tolerance(nearDistance) ? traced : depth, true);
 }

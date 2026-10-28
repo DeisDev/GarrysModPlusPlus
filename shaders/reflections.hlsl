@@ -1,4 +1,4 @@
-#include "scene.hlsli"
+#include "reflection.hlsli"
 
 // Light the deferred pass adds on top of diffuse lighting, found from the material of the triangle each pixel
 // shows (shaders/primary.hlsl): mirror reflections of env_cubemap materials (envmap mask times $envmaptint, as
@@ -9,57 +9,6 @@
 // light, or none; output0: added radiance, before the tonemap scale, and the reflection's hit distance (0 without
 // one) for shaders/reflection_temporal.hlsl; output1, output2, output3 (or none):
 // specular albedo, roughness and specular hit distance guides for Ray Reconstruction.
-
-static const float kMaxDistance = 16384.0;
-// Ray Reconstruction's hit distance for reflections of the sky.
-static const float kSkyHitDistance = 65504.0;
-
-// Last frame's colour at a screen position, before the tonemap scale; the surface there must be `distance`
-// from last frame's eye (0 for the sky). Debug views wrote their debug image instead, so they trace every hit.
-float3 PreviousColor(float4 clip, float distance)
-{
-    if (g_frame.historyValid == 0 || g_frame.debugView != 0 || clip.w <= 0.0)
-        return -1.0;
-    float2 uv = float2(clip.x / clip.w * 0.5 + 0.5, 0.5 - clip.y / clip.w * 0.5);
-    if (any(uv < 0.0) || any(uv >= 1.0))
-        return -1.0;
-    int2 pixel = int2(uv * float2(g_frame.size));
-    float4 surface = SurfaceAt(g_frame.prevSurfaceView, pixel);
-    bool matches = distance > 0.0 ? surface.w > 0.0 && abs(surface.w - distance) <= 4.0 + distance * 0.02 : surface.w <= 0.0;
-    if (!matches)
-        return -1.0;
-    Texture2D<float4> previous = ResourceDescriptorHeap[g_pass.input0];
-    float3 color = previous.Load(int3(pixel, 0)).rgb;
-    return (g_frame.outputLinear != 0 ? color : Decode(color)) / g_frame.tonemapScale;
-}
-
-float3 ReflectedRadiance(float3 origin, float3 direction, float3 ambient, inout uint seed, out float hitDistance)
-{
-    HitSurface hit;
-    if (!TraceClosest(origin, direction, kMaxDistance, g_frame.traceMask, hit)) {
-        hitDistance = kSkyHitDistance;
-        // A direction at infinity: w = 0 projects it to where last frame showed that part of the sky.
-        float3 sky = PreviousColor(mul(g_frame.prevViewProj, float4(direction, 0.0)), 0.0);
-        return sky.x >= 0.0 ? sky : g_frame.skyColor;
-    }
-    hitDistance = length(hit.position - origin);
-    // Positions in the 3D skybox are in its own scaled-down space, which last frame's main view does not show.
-    if ((g_frame.traceMask & kSkyboxMask) == 0) {
-        float3 previous = PreviousColor(mul(g_frame.prevViewProj, float4(hit.position, 1.0)), length(hit.position - g_frame.prevEyePosition));
-        if (previous.x >= 0.0)
-            return previous;
-    }
-    float3 shadowOrigin = hit.position + hit.normal;
-    float3 irradiance = SunIrradiance(hit, shadowOrigin, g_frame.sunShadowMask) + ambient;
-    float3 light;
-    float3 toLight;
-    float distance;
-    uint picked;
-    LightSet set = LightSetAt(hit.position, hit.normal);
-    if (SampleLight(set, hit.position, hit.normal, seed, light, toLight, distance, picked))
-        irradiance += light * LightTransmittance(set, picked, shadowOrigin, toLight, distance);
-    return ClampSample(hit.albedo * irradiance);
-}
 
 void WriteGuides(int2 pixel, float3 specularAlbedo, float roughness, float hitDistance)
 {
@@ -121,7 +70,7 @@ void main(uint3 id : SV_DispatchThreadID)
         uint seed = PixelSeed(pixel, 0x8Fu);
         float hitDistance;
         // As LightmappedGeneric and VertexLitGeneric shape their cubemap term.
-        float3 specular = ReflectedRadiance(origin, AboveSurface(reflect(view, normal), geometricNormal), ambient * g_frame.indirectScale, seed, hitDistance) *
+        float3 specular = ReflectedRadiance(g_pass.input0, origin, AboveSurface(reflect(view, normal), geometricNormal), ambient * g_frame.indirectScale, seed, hitDistance) *
             material.envmapTint * reflectivity;
         specular = lerp(specular, specular * specular, material.envmapContrast);
         specular = lerp(dot(specular, float3(0.299, 0.587, 0.114)), specular, material.envmapSaturation);

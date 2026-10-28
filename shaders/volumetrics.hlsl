@@ -36,13 +36,18 @@ float4 March(int2 pixel)
     float4 surface = SurfaceAt(g_frame.surfaceView, full);
     float3 target = WorldPositionFromDepth(full, DepthAt(full));
     float3 toTarget = target - g_frame.eyePosition;
-    float rayLength = surface.w > 0.0 ? min(surface.w, kMaxDistance) : kSkyDistance;
+    // Water pixels (negative distance, shaders/surface.hlsl) scatter as far as the surface.
+    float rayLength = surface.w != 0.0 ? min(abs(surface.w), kMaxDistance) : kSkyDistance;
     float3 direction = toTarget / max(sqrt(dot(toTarget, toTarget)), 1e-3);
     uint seed = PixelSeed(full, 0xB1u);
     float step = rayLength / g_frame.volumetricSteps;
     float density = g_frame.volumetricDensity;
     float sunPhase = Phase(dot(direction, g_frame.sunDirection));
     float3 light = 0.0;
+    // Under water (fogParams.y, shaders/deferred_lighting.hlsl) the scattered light crosses the water to the eye and takes
+    // its colour; without that the air's haze washed the water's fog out to grey.
+    bool underwater = g_frame.fogEnabled != 0 && g_frame.fogParams.y > 0.0;
+    float3 waterTint = g_frame.fogColor / max(max(g_frame.fogColor.r, max(g_frame.fogColor.g, g_frame.fogColor.b)), 1e-4);
     for (uint s = 0; s < g_frame.volumetricSteps; ++s) {
         float t = (s + Random(seed)) * step;
         float3 position = g_frame.eyePosition + direction * t;
@@ -59,6 +64,8 @@ float4 March(int2 pixel)
                     Transmittance(position, toLight, ShadowRayLength(ProjectorClearance(projector), distance), ShadowMask(true));
         }
         // Radiance scattered from irradiance E is density * phase * pi * E in the units the lighting uses.
+        if (underwater)
+            scattered *= waterTint * (1.0 - saturate(min(g_frame.fogParams.z, t * g_frame.fogParams.w - g_frame.fogParams.x)));
         light += scattered * (3.14159265 * density * step * exp(-density * t));
     }
     return float4(ClampSample(light), rayLength);

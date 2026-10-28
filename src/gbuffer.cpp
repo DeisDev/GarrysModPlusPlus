@@ -22,6 +22,8 @@
 #include <g_forwardSkinSelfIllumPS.h>
 #include <g_forwardSnippetPS.h>
 #include <g_forwardSnippetPS2.h>
+#include <g_waterSurfaceAlphaFogPS.h>
+#include <g_waterSurfacePS.h>
 #include <g_gbufferBumpPS.h>
 #include <g_gbufferBumpSelfIllumFresnelPS.h>
 #include <g_gbufferBumpSelfIllumPS.h>
@@ -65,6 +67,8 @@ constexpr D3DFORMAT kLightFormat = D3DFMT_A8R8G8B8;
 constexpr DWORD kNormalTarget = 1;
 constexpr DWORD kEmissiveTarget = 2;
 constexpr DWORD kFlagsTarget = 3;
+// The Water shader's g_WaterFogColor (shaders/water_surface.hlsl).
+constexpr UINT kWaterFogColorRegister = 6;
 constexpr DWORD kDefaultColorWrite = 0x0F;
 constexpr DWORD kColorWriteRgb = D3DCOLORWRITEENABLE_RED | D3DCOLORWRITEENABLE_GREEN | D3DCOLORWRITEENABLE_BLUE;
 constexpr UINT kLightScaleRegister = 30;
@@ -87,7 +91,8 @@ constexpr UINT kLightmapTintRegister = 12;
 
 // ProjectedShadow: Source's render-to-texture prop shadows, which would darken the albedo; ray-traced shadows
 // replace them.
-enum class ShaderKind { Other, GBuffer, Flashlight, ProjectedShadow };
+// Water: the refracting combos of the Water shader, whose surface shaders/water_surface.hlsl writes into the G-buffer.
+enum class ShaderKind { Other, GBuffer, Flashlight, ProjectedShadow, Water };
 // The render targets a capture draw writes: the game's, the G-buffer, or the albedo alone (decals that multiply it).
 enum class Targets { Game, GBuffer, Albedo };
 
@@ -176,6 +181,10 @@ struct State {
     bool ownCall = false;
     D3DVIEWPORT9 viewport = {};
     Replacements replacements;
+    // shaders/water_surface.hlsl for combos that fog by depth and by the refraction's alpha.
+    std::array<ComPtr<IDirect3DPixelShader9>, 2> waterSurfaces;
+    // g_WaterFogColor of the last water surface drawn in this capture.
+    std::optional<std::array<float, 3>> waterFogColor;
     Replacements forwardReplacements;
     // Forward variants of the patched preview shaders, by the shader they replace.
     std::unordered_map<IDirect3DPixelShader9*, ComPtr<IDirect3DPixelShader9>> forwardVariants;
@@ -255,6 +264,16 @@ bool IsSkinShader(const std::vector<bytecode::Constant>& constants)
 bool HasRegister(const std::vector<bytecode::Constant>& constants, std::string_view name, bytecode::RegisterSet set, UINT index)
 {
     return std::any_of(constants.begin(), constants.end(), [&](const bytecode::Constant& c) { return c.name == name && c.set == set && c.index == index; });
+}
+
+// The Water shader's combos that refract (water_ps20b), with the inputs and registers shaders/water_surface.hlsl reads.
+// Flowing, lightmapped and textured water keep the game's shader.
+bool IsRefractingWater(const std::vector<bytecode::Constant>& constants)
+{
+    using bytecode::RegisterSet;
+    return HasRegister(constants, "RefractSampler", RegisterSet::Sampler, 0) && HasRegister(constants, "NormalSampler", RegisterSet::Sampler, 4) &&
+        HasRegister(constants, "g_ReflectRefractScale", RegisterSet::Float4, 5) && HasRegister(constants, "g_WaterFogColor", RegisterSet::Float4, 6) &&
+        !HasConstant(constants, "FlowmapSampler") && !HasConstant(constants, "LightmapSampler") && !HasConstant(constants, "BaseTextureSampler");
 }
 
 // The replacements read self-illumination from the registers the stock shaders use, so a shader whose
@@ -528,6 +547,14 @@ HRESULT CreatePixelShader(IDirect3DDevice9* device, const DWORD* code, IDirect3D
         Register(*shader, ShaderKind::Flashlight, nullptr, FlashlightRegistersOf(constants, kTrackedRegisters));
         return hr;
     }
+    if (IsRefractingWater(constants)) {
+        const bool alphaFog = !HasRegister(constants, "g_WaterFogParams", bytecode::RegisterSet::Float4, 7);
+        ComPtr<IDirect3DPixelShader9>& surface = g_state.waterSurfaces[alphaFog ? 1 : 0];
+        if (!surface && FAILED(create(device, reinterpret_cast<const DWORD*>(alphaFog ? g_waterSurfaceAlphaFogPS : g_waterSurfacePS), &surface)))
+            log::Info("G-buffer: the water surface shader could not be created; water keeps the game's shader");
+        Register(*shader, surface ? ShaderKind::Water : ShaderKind::Other, surface.Get());
+        return hr;
+    }
     IDirect3DPixelShader9* substitute = nullptr;
     IDirect3DPixelShader9* forward = nullptr;
     SelfIllum selfIllum = SelfIllum::None;
@@ -623,11 +650,21 @@ DrawAction BeforeDraw(IDirect3DDevice9* device)
     }
     if (g_state.forwardActive && g_state.bound.forward != nullptr)
         return DrawAction::Forward;
+    // VertexLitGeneric has no lighting preview variant of its flashlight pass, so on translucent models (window glass)
+    // the game draws it with no pixel shader, which comes out white.
+    if (g_state.forwardActive && g_state.requested == nullptr && g_state.blending && g_state.destinationBlend == D3DBLEND_ONE)
+        return DrawAction::Skip;
     if (!g_state.active)
         return DrawAction::Draw;
     // Preview shaders write unlit materials as surfaces to be lit. Those drawn without a depth test ($ignorez,
     // as 2D skybox faces often are) stay the colour they draw.
-    const bool gbuffer = g_state.bound.kind == ShaderKind::GBuffer && g_state.depthTest && g_state.gameTarget == g_state.colorTarget.Get();
+    const bool water = g_state.bound.kind == ShaderKind::Water && g_state.depthTest && g_state.gameTarget == g_state.colorTarget.Get();
+    if (water) {
+        const auto& waterFog = g_state.constants[kWaterFogColorRegister];
+        g_state.waterFogColor = std::array<float, 3>{waterFog[0], waterFog[1], waterFog[2]};
+    }
+    const bool gbuffer =
+        (g_state.bound.kind == ShaderKind::GBuffer || water) && g_state.depthTest && g_state.gameTarget == g_state.colorTarget.Get();
     if (g_state.bound.kind == ShaderKind::GBuffer && !gbuffer && !g_state.loggedOtherTarget) {
         g_state.loggedOtherTarget = true;
         log::Info("G-buffer: a G-buffer draw went to another render target during a capture; it is drawn there unlit");
@@ -819,6 +856,7 @@ void BeginForward(IDirect3DDevice9* device, const ForwardConstants& constants)
     c[5] = {constants.eye[0], constants.eye[1], constants.eye[2], constants.tonemapScale};
     c[6] = constants.fog.known ? constants.fog.params : std::array<float, 4>{};
     g_state.forwardActive = engine::SetFixedLighting(2);
+    engine::SetUnlitFilter(g_state.forwardActive);
     g_state.forwardDraws = 0;
     // The pixel shader bound now was chosen before forward lighting began.
     device->SetPixelShader(g_state.requested);
@@ -829,6 +867,7 @@ void EndForward(IDirect3DDevice9* device)
     if (!g_state.forwardActive)
         return;
     g_state.forwardActive = false;
+    engine::SetUnlitFilter(false);
     engine::SetFixedLighting(0);
     device->SetPixelShader(g_state.requested);
     if (g_state.forwardLogged < 3) {
@@ -914,6 +953,7 @@ bool Begin(IDirect3DDevice9* device)
              g_state.flagsSurface.Get(), g_state.lightSurface.Get()})
         device->ColorFill(target, nullptr, 0);
     g_state.colorTarget.Reset();
+    g_state.waterFogColor.reset();
     device->GetRenderTarget(0, &g_state.colorTarget);
     g_state.gameTarget = g_state.colorTarget.Get();
     g_state.boundTargets = Targets::Game;
@@ -945,8 +985,18 @@ void End(IDirect3DDevice9* device, ViewKind kind)
         const auto& range = g_state.vertexConstants[kVertexFogRegister];
         const auto& color = g_state.constants[kFogColorRegister];
         Fog& fog = g_state.fog[kind == ViewKind::Skybox ? 1 : 0];
-        fog.params = engine::FogEnabled() ? std::array<float, 4>{range[0] - 1.0f, 0.0f, 1.0f - range[2], range[3]} : std::array<float, 4>{};
+        const std::optional<engine::FogState> current = engine::CurrentFog();
+        fog.params = current && current->mode != 0 ? std::array<float, 4>{range[0] - 1.0f, 0.0f, 1.0f - range[2], range[3]} : std::array<float, 4>{};
         fog.color = {color[0], color[1], color[2]};
+        // Under water the view's fog is the water's: Source blends it in linearly (PIXEL_FOG_TYPE_HEIGHT), where its range
+        // fog over air squares the factor. The view is under water when its fog colour is the water surface's.
+        if (current && current->mode != 0 && g_state.waterFogColor) {
+            bool same = true;
+            for (int c = 0; c < 3; ++c)
+                same = same && std::fabs(std::pow(current->color[c] / 255.0f, 2.2f) - (*g_state.waterFogColor)[c]) < 0.01f;
+            if (same)
+                fog.params[1] = 1.0f;
+        }
         fog.known = true;
     }
     if (kind == ViewKind::Main) {

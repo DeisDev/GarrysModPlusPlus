@@ -690,15 +690,17 @@ void ReadLights(std::span<const std::byte> file, const Header& header, WorldGeom
                 world.sun.present = true;
                 world.sun.direction = Scale(light.normal, -1.0f);
                 world.sun.color = light.intensity;
+                world.sun.style = light.style;
                 break;
             case LightType::SkyAmbient:
                 world.sun.ambient = light.intensity;
+                world.sun.ambientStyle = light.style;
                 break;
             case LightType::Surface:
             case LightType::Point:
             case LightType::Spot:
                 world.lights.push_back({static_cast<LightType>(light.type), light.origin, light.intensity, light.normal, light.stopdot,
-                    light.stopdot2, light.exponent, light.radius, light.constantAttn, light.linearAttn, light.quadraticAttn, light.cluster});
+                    light.stopdot2, light.exponent, light.radius, light.constantAttn, light.linearAttn, light.quadraticAttn, light.cluster, light.style});
                 break;
             default:
                 break;

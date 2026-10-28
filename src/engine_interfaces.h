@@ -1,7 +1,9 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -49,8 +51,23 @@ ComputeLightingFn ComputeLightingFunction();
 // (2 = G-buffer outputs). Returns false when the material system is unavailable.
 bool SetFixedLighting(int mode);
 
-// Whether the view being drawn has fog (IMatRenderContext::GetFogMode is not MATERIAL_FOG_NONE); false when the
-// material system is unavailable.
-bool FogEnabled();
+// While enabled, each material the game binds switches fixed lighting between 2 and 0: unlit materials (UnlitGeneric
+// and its relatives) are drawn with their own shaders, the others with the G-buffer outputs. For the forward pass.
+void SetUnlitFilter(bool enabled);
+
+// The fog of the view being drawn (IMatRenderContext::GetFogMode and GetFogColor): its MaterialFogMode_t (0 without fog)
+// and its colour as the game sets it (gamma bytes).
+struct FogState {
+    int mode = 0;
+    std::array<unsigned char, 3> color = {};
+};
+std::optional<FogState> CurrentFog();
+
+// Light styles (switchable and animated lights): a map light of style s < kLightStyles shines at the style's current
+// value times its baked intensity, 1 for a lit switchable light, 0 for a dark one.
+inline constexpr size_t kLightStyles = 128;
+
+// The engine's current light style values; false when they could not be found.
+bool LightStyleValues(std::array<float, kLightStyles>& values);
 
 }

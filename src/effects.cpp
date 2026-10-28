@@ -149,6 +149,8 @@ struct State {
     std::vector<SkinnedEntity> skinnedEntities;
     std::vector<studio::Matrix3x4> bones;
     std::vector<engine::DynamicLight> dynamicLights;
+    // The local player's origin from the last main view's entities.
+    std::optional<std::array<float, 3>> localPlayer;
     std::vector<bsp::Mesh> brushModels;
     // The map's 3D skybox test (BSP tree, leaf areas and bounds), to keep its entities out of the main view's rays.
     bsp::WorldGeometry skyboxTest;
@@ -939,6 +941,9 @@ void CollectEntities()
     const int localPlayer = engine::LocalPlayerIndex();
     const auto player = std::find_if(g_state.entities.begin(), g_state.entities.end(), [&](const entities::ModelEntity& e) { return e.index == localPlayer; });
     const void* playerRenderable = player != g_state.entities.end() ? player->renderable : nullptr;
+    g_state.localPlayer.reset();
+    if (player != g_state.entities.end())
+        g_state.localPlayer = std::array<float, 3>{player->transform[0][3], player->transform[1][3], player->transform[2][3]};
     std::optional<studio::Matrix3x4> playerHand;
     if (player != g_state.entities.end()) {
         const ModelEntry& body = ModelFor(player->model);
@@ -1123,11 +1128,15 @@ void FinishCapture(gbuffer::ViewKind kind)
         break;
     }
     g_state.scene.SetDynamicLights(g_state.dynamicLights);
+    if (std::array<float, engine::kLightStyles> styles; engine::LightStyleValues(styles))
+        g_state.scene.SetLightStyles(styles);
     ViewInputs inputs{backBuffer.Get(), g_state.depthTexture.Get(), gbuffer::NormalTexture(), gbuffer::FlagsTexture(), gbuffer::LightTexture(),
         gbuffer::AlbedoTexture(), gbuffer::EmissiveTexture(), gbuffer::ProjectedLights(), kind, 0.0f, 1.0f, g_state.frame, g_state.pixelOffset[0],
         g_state.pixelOffset[1]};
-    if (kind == gbuffer::ViewKind::Main)
+    if (kind == gbuffer::ViewKind::Main) {
         inputs.probes = gbuffer::ProbeTextures();
+        inputs.localPlayer = g_state.localPlayer;
+    }
     if (kind == gbuffer::ViewKind::Viewmodel) {
         inputs.depthMin = g_state.viewmodelViewport.MinZ;
         inputs.depthMax = g_state.viewmodelViewport.MaxZ;
@@ -1152,7 +1161,7 @@ void FinishCapture(gbuffer::ViewKind kind)
             forward.eye = *eye;
         forward.tonemapScale = gbuffer::TonemapScale();
         const bsp::Float3& ambient = g_state.scene.Sun().ambient;
-        const float sky = GetSettings().skyIntensity;
+        const float sky = GetSettings().skyIntensity * g_state.scene.LightStyle(g_state.scene.Sun().ambientStyle);
         forward.fallback = {ambient.x * sky, ambient.y * sky, ambient.z * sky};
         forward.probeOrigin = g_state.lighting->VolumeOrigin();
         if (GetSettings().fog)

@@ -92,6 +92,8 @@ struct SceneFrame {
     UINT instancesView = DescriptorHeap::kInvalid;
     UINT dynamicLightsView = DescriptorHeap::kInvalid;
     UINT dynamicLightCount = 0;
+    // The light style values of Scene::SetLightStyles, as floats.
+    UINT lightStylesView = DescriptorHeap::kInvalid;
 };
 
 // Ray-tracing acceleration structures and the per-triangle data shaders need at a hit (positions, indices
@@ -152,6 +154,10 @@ public:
     bool HasSkybox() const { return m_hasSkybox; }
     // The engine's dynamic lights for the next RecordFrame.
     void SetDynamicLights(std::span<const engine::DynamicLight> lights) { m_dynamicLights.assign(lights.begin(), lights.end()); }
+    // The engine's light style values for the next RecordFrame; every style stays at 1 until they are set.
+    void SetLightStyles(const std::array<float, engine::kLightStyles>& values) { m_lightStyles = values; }
+    // The current value of a light style (bsp::Light::style).
+    float LightStyle(int32_t style) const { return style >= 0 && static_cast<size_t>(style) < m_lightStyles.size() ? m_lightStyles[style] : 1.0f; }
     void Clear();
 
     bool Ready() const { return m_worldModel >= 0; }
@@ -222,6 +228,9 @@ private:
         Microsoft::WRL::ComPtr<ID3D12Resource> dynamicLights;
         GpuLight* mappedDynamicLights = nullptr;
         UINT dynamicLightsView = DescriptorHeap::kInvalid;
+        Microsoft::WRL::ComPtr<ID3D12Resource> lightStyles;
+        float* mappedLightStyles = nullptr;
+        UINT lightStylesView = DescriptorHeap::kInvalid;
         Microsoft::WRL::ComPtr<ID3D12Resource> scratch;
         Microsoft::WRL::ComPtr<ID3D12Resource> tlas;
     };
@@ -235,6 +244,7 @@ private:
         D3D12_RAYTRACING_GEOMETRY_OMM_LINKAGE_DESC& linkage);
     bool EnsureFrameCapacity(FrameTlas& frame, UINT count);
     bool EnsureDynamicLights(FrameTlas& frame);
+    bool EnsureLightStyles(FrameTlas& frame);
     bool BuildLightLists(std::span<const bsp::Light> lights, const bsp::Visibility& visibility);
     // Bakes and records the build of a model's opacity micromap array and points its alpha geometry at it.
     bool AddMicromaps(Model& model, const ModelGeometry& geometry, D3D12_RAYTRACING_GEOMETRY_DESC& alphaGeometry,
@@ -267,6 +277,11 @@ private:
     std::vector<std::pair<int, UINT>> m_recorded;
     bool m_hasSkybox = false;
     std::vector<engine::DynamicLight> m_dynamicLights;
+    std::array<float, engine::kLightStyles> m_lightStyles = [] {
+        std::array<float, engine::kLightStyles> values;
+        values.fill(1.0f);
+        return values;
+    }();
     std::array<FrameTlas, kFrameSlots> m_frames;
     int m_worldModel = -1;
     std::string m_name;

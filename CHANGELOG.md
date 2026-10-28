@@ -20,6 +20,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - The menu and log show the GPU time of the 3D skybox and viewmodel, which the lighting total now includes.
 - Ropes and cables, such as power lines, cast shadows.
 - Held weapons, including your own, cast shadows and show in reflections, placed in the hand that holds them.
+- Light switches, toggled lights and animated lights (flicker, pulse, scripted day and night) now work with real-time lighting.
+- Water has ray-traced reflections over the game's refraction, a sun glint and a physical Fresnel term.
+- Underwater, the surface shows the world above through Snell's window and mirrors the water below beyond it, and sunlight scatters in the water's colour.
 
 ### Changed
 
@@ -39,6 +42,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - The flashlight's beam has a bright centre that fades out, as its texture intends, instead of a flat disc.
 - The flashlight lights things close to you more brightly than things far away, like a real flashlight.
 - The debug view that showed the game's flashlight pass now shows additive glows.
+- Glows, sprites and other additive effects are added after anti-aliasing and DLSS, so they no longer jitter or smear.
+- In third person, your own flashlight is treated like your first-person flashlight, so your body no longer blocks it.
 
 ### Removed
 
@@ -68,3 +73,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fixed maps without fog turning black a short distance away, as on gm_publicindoorswimmingpool.
 - Fixed the flashlight's bounce light missing on the viewmodel where it comes from surfaces off screen.
 - Fixed some props, such as plastic chairs, casting shadows as if they were turned the other way.
+- Fixed rain, snow and other unlit particles disappearing with real-time lighting.
+- Fixed the physics gun's glow on held objects flickering.
+- Fixed thin bright lines along the edges of white window frames, as on gm_skywatching.
+- Fixed window glass turning white in the flashlight.
+- Fixed the underwater fog being grey instead of the water's colour.

@@ -1,7 +1,8 @@
-#include "common.hlsli"
+#include "water.hlsli"
 
 // Resolves the G-buffer into one surface texture the lighting passes share: the world normal (with a depth
-// fallback) turned toward the camera and the distance to the eye.
+// fallback) turned toward the camera and the distance to the eye. Water (shaders/water.hlsli) has no G-buffer surface;
+// it gets the plane's normal and its distance negated, which every pass takes for no surface.
 
 // The step to the neighbour on the side of `pixel` (along `axis`) that lies in the pixel's own plane. Depth is linear
 // across a plane in screen space, so that side's second depth difference is zero; picking it keeps a pixel next
@@ -33,8 +34,10 @@ void main(uint3 id : SV_DispatchThreadID)
     Texture2D<float4> flags = ResourceDescriptorHeap[g_frame.flagsView];
     Texture2D<float4> gbufferNormal = ResourceDescriptorHeap[g_frame.gbufferNormalView];
     float depth = DepthAt(pixel);
-    if (flags.Load(int3(pixel, 0)).r < 0.5 || depth >= 1.0) {
-        output[pixel] = 0.0;
+    float4 coverage = flags.Load(int3(pixel, 0));
+    if (coverage.r < 0.5 || depth >= 1.0) {
+        float3 toWater = g_frame.eyePosition - WorldPositionFromDepth(pixel, depth);
+        output[pixel] = IsWater(coverage) && depth < 1.0 ? float4(0.0, 0.0, toWater.z >= 0.0 ? 1.0 : -1.0, -length(toWater)) : 0.0;
         return;
     }
     float3 position = WorldPositionFromDepth(pixel, depth);

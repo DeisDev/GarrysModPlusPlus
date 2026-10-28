@@ -103,6 +103,9 @@ struct FrameConstants {
     uint32_t probeRedView;
     uint32_t probeGreenView;
     uint32_t probeBlueView;
+    uint32_t lightStylesView;
+    uint32_t additiveAfterResolve;
+    uint32_t previousLitView;
 };
 
 // What blocks the sun at a pixel of the main view (Lighting::RequestProbe).
@@ -138,6 +141,8 @@ struct ViewInputs {
     float jitterY = 0.0f;
     // Where the main view's irradiance volume goes for the game's forward-lit draws (gbuffer::ProbeTextures).
     std::array<IDirect3DVolumeTexture9*, 3> probes = {};
+    // The local player's origin (its feet), when its model is known.
+    std::optional<std::array<float, 3>> localPlayer;
 };
 
 // Lights a view's G-buffer on the D3D12 queue the game shares and writes the result back into its colour
@@ -209,7 +214,7 @@ private:
     void ReturnResources(std::span<IDirect3DResource9* const> resources, UINT count);
     bool EnsureDepthPipeline(DXGI_FORMAT format);
     UINT WriteProjectors(UINT slot, std::span<const gbuffer::ProjectedLight> projected, std::span<ID3D12Resource* const> cookies, UINT cookieViews,
-        const FrameConstants& constants);
+        const FrameConstants& constants, const std::optional<std::array<float, 3>>& localPlayer);
 
     Renderer* m_renderer = nullptr;
     ID3D12Device5* m_device = nullptr;

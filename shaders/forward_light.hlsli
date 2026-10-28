@@ -21,7 +21,8 @@ float4 g_ProbeScale : FORWARD_CONSTANT(c220, c3);
 float4 g_ProbeWindow : FORWARD_CONSTANT(c221, c4);
 // xyz: eye position; w: the tonemap scale (cLightScale.x).
 float4 g_ForwardEye : FORWARD_CONSTANT(c222, c5);
-// Source's g_FogParams: x start over range, z maximum density, w 1 / range; zero without fog.
+// Source's g_FogParams: x start over range, z maximum density, w 1 / range; zero without fog. y: 1 under water, whose
+// fog is blended in linearly.
 float4 g_ForwardFog : FORWARD_CONSTANT(c223, c6);
 
 float4 SampleProbe(sampler3D probe, float3 uvw)
@@ -54,5 +55,5 @@ float4 ForwardLight(float4 albedo, float3 normal, float3 position, float3 emissi
     float3 color = (lerp(albedo.rgb, 1.0, g_ForwardFallback.w) * light + emissive) * g_ForwardEye.w;
     float fog = saturate(min(g_ForwardFog.z, length(position - g_ForwardEye.xyz) * g_ForwardFog.w - g_ForwardFog.x));
     // Debug views draw translucent surfaces opaque so their light shows.
-    return float4(lerp(color, g_ForwardFogColor.rgb, fog * fog), lerp(albedo.a, 1.0, g_ForwardFallback.w));
+    return float4(lerp(color, g_ForwardFogColor.rgb, g_ForwardFog.y > 0.0 ? fog : fog * fog), lerp(albedo.a, 1.0, g_ForwardFallback.w));
 }

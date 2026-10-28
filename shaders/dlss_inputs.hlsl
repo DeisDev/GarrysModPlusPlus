@@ -58,7 +58,8 @@ void main(uint3 id : SV_DispatchThreadID)
     normalOut[pixel] = normal.Load(load);
     flagsOut[pixel] = coverage;
     lightOut[pixel] = light.Load(load);
-    // Ray Reconstruction expects a neutral albedo where there is no surface.
-    albedoOut[pixel] = coverage.r > 0.0 ? albedo.Load(load) : float4(0.5, 0.5, 0.5, 1.0);
+    // Ray Reconstruction expects a neutral albedo where there is no surface. Water (flags g without r) keeps its
+    // refraction there (shaders/water.hlsli), which is also the colour Ray Reconstruction should keep sharp.
+    albedoOut[pixel] = coverage.r > 0.0 || coverage.g > 0.5 ? albedo.Load(load) : float4(0.5, 0.5, 0.5, 1.0);
     emissiveOut[pixel] = emissive.Load(load);
 }

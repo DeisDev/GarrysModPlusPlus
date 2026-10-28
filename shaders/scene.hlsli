@@ -52,8 +52,13 @@ struct Light
     // Byte offset in the lights buffer of the convex hulls that block the light (HullBlocks), and their number.
     uint hullOffset;
     uint hullCount;
-    float padding;
+    // Light style (switchable and animated lights), or kNoLightStyle.
+    uint style;
 };
+
+static const uint kNoLightStyle = 0xFFFFFFFFu;
+// engine::kLightStyles; lights of higher styles always shine fully, as in the engine.
+static const uint kLightStyles = 128;
 
 static const uint kLightSurface = 0;
 static const uint kLightPoint = 1;
@@ -483,7 +488,12 @@ Light LoadLight(uint index)
 {
     if (index < g_frame.lightCount) {
         ByteAddressBuffer lights = ResourceDescriptorHeap[g_frame.lightsView];
-        return lights.Load<Light>(index * 80);
+        Light light = lights.Load<Light>(index * 80);
+        if (g_frame.lightStylesView != kNoView && light.style < kLightStyles) {
+            ByteAddressBuffer styles = ResourceDescriptorHeap[g_frame.lightStylesView];
+            light.intensity *= asfloat(styles.Load(light.style * 4));
+        }
+        return light;
     }
     ByteAddressBuffer dynamicLights = ResourceDescriptorHeap[g_frame.dynamicLightsView];
     return dynamicLights.Load<Light>((index - g_frame.lightCount) * 80);

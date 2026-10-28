@@ -55,7 +55,11 @@ void main(uint3 id : SV_DispatchThreadID)
         if (TraceHit(g_frame.eyePosition, view, surface.w + 8.0 + surface.w * 0.02, g_frame.traceMask & ~kLocalPlayerMask, hit, RAY_FLAG_NONE, true) &&
             abs(hit.t - surface.w) <= 4.0 + surface.w * 0.02) {
             visible = uint4(hit.instance, hit.primitive, asuint(hit.barycentrics));
-            pixelFlags = kPixelHit | ((MaterialFlags(hit) & kMaterialUnlit) != 0 ? kPixelUnlit : 0u) |
+            // An unlit pixel shows its G-buffer albedo as it is, so the hit must be the surface the G-buffer shows: at a
+            // silhouette the ray can slip past it to an unlit surface just behind (gm_skywatching's black window backings
+            // turned the white window frames' edges into bright lines).
+            bool exact = abs(hit.t - surface.w) <= 0.5 + surface.w * 0.004;
+            pixelFlags = kPixelHit | (exact && (MaterialFlags(hit) & kMaterialUnlit) != 0 ? kPixelUnlit : 0u) |
                 ((LoadInstance(hit.instance).flags & kInstanceIgnoreNormals) != 0 ? kPixelIgnoreNormals : 0u);
             previous = position + HitMotion(hit);
             faceNormal = SurfaceOf(hit, g_frame.eyePosition, view).normal;

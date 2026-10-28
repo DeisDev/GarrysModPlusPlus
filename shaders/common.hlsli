@@ -105,6 +105,13 @@ struct FrameConstants
     uint probeRedView;
     uint probeGreenView;
     uint probeBlueView;
+    // Light style values (Scene::SetLightStyles) that scale map lights by their style, or kNoView.
+    uint lightStylesView;
+    // 1 when the game's additive passes (lightView) are added after the temporal resolve (AdditiveAfterResolve), so
+    // glows are neither jittered nor denoised.
+    uint additiveAfterResolve;
+    // The main view's shaded colour of last frame, for reflections of what was on screen (shaders/water.hlsli), or kNoView.
+    uint previousLitView;
 };
 
 // Per-pass descriptor indices and parameters; mirrors Lighting::PassArgs in src/lighting.h.
@@ -203,6 +210,20 @@ float3 ClampSample(float3 color)
     float limit = kMaxSampleBrightness / max(g_frame.tonemapScale, 1e-3);
     float luminance = Luminance(color);
     return luminance > limit ? color * (limit / luminance) : color;
+}
+
+// The game's additive passes at a surface pixel of the resolved image, linear. They were drawn with the frame's jitter, which
+// shifts the image by `shift` output pixels (x right, y down); sampling there puts them back in place.
+float3 AdditiveAfterResolve(int2 pixel, float2 shift)
+{
+    if (g_frame.additiveAfterResolve == 0)
+        return 0.0;
+    // Only surfaces take the additive passes; over the sky and water the capture's additive draws are not the game's.
+    Texture2D<float4> flags = ResourceDescriptorHeap[g_frame.flagsView];
+    if (flags.Load(int3(pixel, 0)).r < 0.5)
+        return 0.0;
+    Texture2D<float4> light = ResourceDescriptorHeap[g_frame.lightView];
+    return Decode(light.SampleLevel(g_linearClamp, (float2(pixel) + 0.5 + shift) * g_frame.invSize, 0.0).rgb);
 }
 
 uint Hash(uint x)

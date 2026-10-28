@@ -54,7 +54,8 @@ struct Scene::GpuLight {
     // Byte offset in the lights buffer of the light's hull records, and their number.
     uint32_t hullOffset;
     uint32_t hullCount;
-    float padding;
+    // bsp::Light::style, or kNoLightStyle.
+    uint32_t style;
 };
 static_assert(sizeof(Scene::GpuLight) == 80);
 // A hull record in the lights buffer: its plane count, then each plane as (normal, distance).
@@ -67,6 +68,7 @@ namespace {
 
 constexpr UINT kMaxDynamicLights = 32;
 constexpr uint32_t kDynamicLightType = 3;
+constexpr uint32_t kNoLightStyle = 0xFFFFFFFF;
 constexpr float kDegreesToRadians = 3.14159265358979f / 180.0f;
 // A light is binned as far as its irradiance can reach 1/1024 of white with up to 4x light intensity and a 4x
 // tonemap scale.
@@ -544,7 +546,7 @@ bool Scene::LoadMap(const std::string& name, const bsp::WorldGeometry& world, st
         GpuLight& gpu = lights.emplace_back();
         gpu = {{light.origin.x, light.origin.y, light.origin.z}, static_cast<uint32_t>(light.type), {light.intensity.x, light.intensity.y, light.intensity.z},
             light.radius, {light.normal.x, light.normal.y, light.normal.z}, light.stopdot, light.stopdot2, light.exponent, light.constantAttn,
-            light.linearAttn, light.quadraticAttn, {}};
+            light.linearAttn, light.quadraticAttn, 0, 0, static_cast<uint32_t>(light.style)};
     }
     std::vector<std::byte> hulls;
     for (size_t i = 0; i < lights.size(); ++i) {
@@ -673,6 +675,19 @@ bool Scene::EnsureDynamicLights(FrameTlas& frame)
     return frame.dynamicLightsView != DescriptorHeap::kInvalid;
 }
 
+bool Scene::EnsureLightStyles(FrameTlas& frame)
+{
+    if (frame.lightStyles)
+        return true;
+    frame.lightStyles = CreateBuffer(sizeof(m_lightStyles), D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+    if (!frame.lightStyles || FAILED(frame.lightStyles->Map(0, nullptr, reinterpret_cast<void**>(&frame.mappedLightStyles)))) {
+        frame.lightStyles.Reset();
+        return false;
+    }
+    frame.lightStylesView = m_descriptors->CreateRawView(frame.lightStyles.Get());
+    return frame.lightStylesView != DescriptorHeap::kInvalid;
+}
+
 bool Scene::EnsureFrameCapacity(FrameTlas& frame, UINT count)
 {
     if (frame.tlas && frame.capacity >= count)
@@ -783,9 +798,13 @@ SceneFrame Scene::RecordFrame(ID3D12GraphicsCommandList4* list, UINT slot, std::
             const bool spot = light.outerAngle > 0.0f;
             gpu = {{light.origin[0], light.origin[1], light.origin[2]}, kDynamicLightType, {light.color[0], light.color[1], light.color[2]},
                 light.radius, {light.direction[0], light.direction[1], light.direction[2]}, spot ? std::cos(light.innerAngle * kDegreesToRadians) : 0.0f,
-                spot ? std::cos(light.outerAngle * kDegreesToRadians) : -1.0f, spot ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f, {}};
+                spot ? std::cos(light.outerAngle * kDegreesToRadians) : -1.0f, spot ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f, 0, 0, kNoLightStyle};
         }
         result.dynamicLightsView = frame.dynamicLightsView;
+    }
+    if (EnsureLightStyles(frame)) {
+        std::memcpy(frame.mappedLightStyles, m_lightStyles.data(), sizeof(m_lightStyles));
+        result.lightStylesView = frame.lightStylesView;
     }
     return result;
 }

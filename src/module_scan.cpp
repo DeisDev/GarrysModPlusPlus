@@ -4,6 +4,7 @@
 
 #include <cstring>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace gmodpp {
@@ -97,6 +98,34 @@ void* FindFunctionReferencingString(HMODULE module, std::string_view text)
     if (found == 0)
         log::Info("Scan: no code references '{}'", text);
     return reinterpret_cast<void*>(found);
+}
+
+std::vector<const std::byte*> FindCodePattern(HMODULE module, std::string_view pattern)
+{
+    std::vector<int> bytes;
+    for (size_t i = 0; i < pattern.size();) {
+        if (pattern[i] == ' ') {
+            ++i;
+            continue;
+        }
+        const std::string_view token = pattern.substr(i, 2);
+        bytes.push_back(token == "??" ? -1 : std::stoi(std::string(token), nullptr, 16));
+        i += 2;
+    }
+    std::vector<const std::byte*> matches;
+    for (const Section& section : Sections(module)) {
+        if (!section.executable || section.bytes.size() < bytes.size())
+            continue;
+        const auto* code = reinterpret_cast<const uint8_t*>(section.bytes.data());
+        for (size_t i = 0; i + bytes.size() <= section.bytes.size(); ++i) {
+            size_t k = 0;
+            while (k < bytes.size() && (bytes[k] < 0 || code[i + k] == bytes[k]))
+                ++k;
+            if (k == bytes.size())
+                matches.push_back(section.bytes.data() + i);
+        }
+    }
+    return matches;
 }
 
 }
