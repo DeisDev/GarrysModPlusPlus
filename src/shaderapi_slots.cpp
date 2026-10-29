@@ -8,7 +8,12 @@
 // shaderapidx9.dll (vtable RVAs from the shim log, identities by decompiling):
 // - IShaderAPI has one method more at slot 99 (SetSamplerBorderAddress: sets the sampler's U, V and W address modes
 //   to D3DTADDRESS_BORDER), so SDK slot n >= 99 is GMod slot n + 1. Confirmed at 97, 98, 100, 104, 106, 139-141,
-//   178-184 and 247-256 (178 GetCurrentDynamicVBSize, 181 SetAnisotropicLevel, 184 CreateOcclusionQueryObject).
+//   178-184 and 247-253 (178 GetCurrentDynamicVBSize, 181 SetAnisotropicLevel, 184 CreateOcclusionQueryObject).
+// - GMod replaces the SDK's last three (CopyRenderTargetToScratchTexture, LockRect, UnlockRect) with its own: 254 sets
+//   the minification (true) or magnification filter every bound texture is sampled with, 0 for the texture's own
+//   (render.PushFilterMin/Mag; read by BindTexture at 0x18001fe60), 255 and 256 override the colour and alpha blend
+//   state (render.OverrideBlend; 0x180019bc0 and 0x180019c90 set D3DRS_ALPHABLENDENABLE, SRCBLEND, DESTBLEND and
+//   BLENDOP, or their alpha counterparts, from ShaderBlendFactor_t and ShaderBlendOp_t values).
 // - The vtables continue past these tables (IShaderAPI 289, IShaderDevice 41, IShaderDeviceMgr 17, IShaderShadow 57,
 //   IMaterialSystemHardwareConfig 78 entries): the implementation classes' own methods. Confirmed for the
 //   hardware config by slot 1 (HasStencilBuffer) calling slot 58 (StencilBufferBits), the setters at 60 and 70 and the
@@ -331,9 +336,9 @@ const SlotInfo kShaderApiSlots[] = {
     { "OverrideAlphaWriteEnable", "void", "bool bEnable, bool bAlphaWriteEnable" },
     { "OverrideColorWriteEnable", "void", "bool bOverrideEnable, bool bColorWriteEnable" },
     { "ClearBuffersObeyStencilEx", "void", "bool bClearColor, bool bClearAlpha, bool bClearDepth" },
-    { "CopyRenderTargetToScratchTexture", "void", "ShaderAPITextureHandle_t srcRt, ShaderAPITextureHandle_t dstTex, Rect_t *pSrcRect = NULL, Rect_t *pDstRect = NULL" },
-    { "LockRect", "void", "void** pOutBits, int* pOutPitch, ShaderAPITextureHandle_t texHandle, int mipmap, int x, int y, int w, int h, bool bWrite, bool bRead" },
-    { "UnlockRect", "void", "ShaderAPITextureHandle_t texHandle, int mipmap" },
+    { "OverrideTextureFilter", "void", "bool bMinification, int d3dFilter" },
+    { "OverrideBlend", "void", "bool bOverride, bool bBlendEnable, ShaderBlendFactor_t srcFactor, ShaderBlendFactor_t dstFactor, ShaderBlendOp_t blendOp" },
+    { "OverrideBlendSeparateAlpha", "void", "bool bOverride, bool bBlendEnable, ShaderBlendFactor_t srcFactor, ShaderBlendFactor_t dstFactor, ShaderBlendOp_t blendOp" },
 };
 const size_t kShaderApiSlotsCount = std::size(kShaderApiSlots);
 

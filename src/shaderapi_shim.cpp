@@ -46,7 +46,7 @@ using CreateInterfaceFn = void* (*)(const char* name, int* returnCode);
 constexpr int kInterfaceFailed = 1;
 constexpr size_t kMaxSlots = 320;
 constexpr int kImageFormatBgra8888 = 12;
-constexpr int kDevFilePollFrames = 30;
+constexpr int kDevFilePollFrames = 10;
 constexpr int kTraceLineBudget = 200000;
 constexpr int kTracedCommandFloats = 16;
 constexpr int kMaxCommandBufferDepth = 8;
@@ -107,7 +107,9 @@ constexpr unsigned kShaderApiReadPixels = 159;
 constexpr unsigned kShaderUtilRestoreShaderObjects = 12;
 constexpr unsigned kShadowSetVertexShader = 23;
 constexpr unsigned kShadowSetPixelShader = 24;
-// IVEngineClient013 slots, confirmed in GMod's engine.dll (see engine_interfaces.cpp).
+// IVEngineClient013 slots, confirmed in GMod's engine.dll (see engine_interfaces.cpp). IsInGame
+// (engine.dll+0x7f550, Ghidra) compares the client's signon state with SIGNONSTATE_FULL (6).
+constexpr unsigned kEngineIsInGame = 26;
 constexpr unsigned kEngineGetLevelName = 51;
 constexpr unsigned kEngineClientCmdUnrestricted = 106;
 
@@ -171,6 +173,7 @@ struct Shim {
     unsigned frame = 0;
     DWORD mainThread = 0;
     void* engineClient = nullptr;
+    std::string inGameLevel;
     bool benchmarking = false;
     Benchmark benchmark;
 };
@@ -647,22 +650,43 @@ void Capture(const std::filesystem::path& path)
     log::Info("Capture: {} {}", written ? "wrote" : "failed to write", path.string());
 }
 
-// Runs gmodpp_console.txt once a map is loaded, on the thread that loaded the shim (the engine's main thread).
-void RunConsoleRequest()
+void* EngineClient()
 {
-    std::filesystem::path path = g_shim->gameDirectory / L"gmodpp_console.txt";
-    std::ifstream file(path);
-    if (!file || GetCurrentThreadId() != g_shim->mainThread)
-        return;
     if (g_shim->engineClient == nullptr) {
         HMODULE engine = GetModuleHandleW(L"engine.dll");
         auto create = engine != nullptr ? reinterpret_cast<CreateInterfaceFn>(GetProcAddress(engine, "CreateInterface")) : nullptr;
         g_shim->engineClient = create != nullptr ? create("VEngineClient013", nullptr) : nullptr;
-        if (g_shim->engineClient == nullptr)
-            return;
     }
-    const char* level = RealSlot<const char* (*)(void*)>(g_shim->engineClient, kEngineGetLevelName)(g_shim->engineClient);
-    if (level == nullptr || level[0] == '\0')
+    return g_shim->engineClient;
+}
+
+// Logs when the client has fully joined a map and when it leaves, so test scripts can wait for these lines.
+void TrackLevel()
+{
+    void* engine = EngineClient();
+    if (engine == nullptr || GetCurrentThreadId() != g_shim->mainThread)
+        return;
+    const char* level = RealSlot<bool (*)(void*)>(engine, kEngineIsInGame)(engine)
+        ? RealSlot<const char* (*)(void*)>(engine, kEngineGetLevelName)(engine)
+        : nullptr;
+    std::string current = level != nullptr ? level : "";
+    if (current == g_shim->inGameLevel)
+        return;
+    if (current.empty())
+        log::Info("Dev: left {} at frame {}", g_shim->inGameLevel, g_shim->frame);
+    else
+        log::Info("Dev: in game on {} at frame {}", current, g_shim->frame);
+    g_shim->inGameLevel = std::move(current);
+}
+
+// Runs gmodpp_console.txt once the client is in game, on the thread that loaded the shim (the engine's main thread).
+void RunConsoleRequest()
+{
+    std::filesystem::path path = g_shim->gameDirectory / L"gmodpp_console.txt";
+    if (g_shim->inGameLevel.empty())
+        return;
+    std::ifstream file(path);
+    if (!file)
         return;
     std::string commands((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
     file.close();
@@ -751,6 +775,7 @@ void __fastcall PresentOverride(Wrapper* self)
                 g_prewarming = false;
             }).detach();
         }
+        TrackLevel();
         RunConsoleRequest();
     }
     RealSlot<void (*)(void*)>(self->real, kDevicePresent)(self->real);

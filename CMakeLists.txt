@@ -309,6 +309,10 @@ add_library(gmodpp SHARED
     src/shaderapi_config.cpp
     src/shaderapi_device.cpp
     src/shaderapi_native.cpp
+    src/shaderapi_meshes.cpp
+    src/shaderapi_pipelines.cpp
+    src/shaderapi_shadow.cpp
+    src/shaderapi_textures.cpp
 )
 target_compile_definitions(gmodpp PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
 target_compile_options(gmodpp PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4 /permissive- /utf-8>)

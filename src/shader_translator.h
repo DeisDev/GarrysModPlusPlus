@@ -17,8 +17,14 @@ enum class TextureType : std::uint8_t { None, Texture2D, Cube, Volume };
 struct Variant {
     // Samplers bound to depth textures, which D3D9 samples as a depth comparison (hardware shadow maps).
     std::uint16_t shadowSamplers = 0;
-    // Vertex shader input registers fed from integer vertex formats (UBYTE4), declared uint4 and converted.
+    // Vertex shader input registers fed from integer vertex formats (UBYTE4, SHORT2), declared uint4 (int4 when also
+    // in signedInputs) and converted.
     std::uint16_t integerInputs = 0;
+    std::uint16_t signedInputs = 0;
+    // Pixel shaders: Direct3D 9's alpha test as a D3DCMPFUNC (0 off), against gmodpp_alpha.x (ALPHAREF, 0-255).
+    std::uint8_t alphaTest = 0;
+    // Vertex shaders: how many of gmodpp_clipPlanes (clip-space user clip planes) clip the output.
+    std::uint8_t clipPlanes = 0;
 };
 
 struct VertexInput {

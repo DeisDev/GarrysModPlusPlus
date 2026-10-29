@@ -23,9 +23,25 @@ void CountVB(NativeObject*, void*, bool, int, int, std::uint64_t) {}
 void UnCountVB(NativeObject*, void*) {}
 bool TrackMeshAllocations(NativeObject*, const char*) { return false; }
 
+// The texture debug list (mat_texture_list) is not kept: enabling it does nothing and the list is never fresh.
+void IgnoreBool(NativeObject*, bool) {}
+void* GetDebugTextureList(NativeObject*) { return nullptr; }
+int GetTextureMemoryUsed(NativeObject*, int) { return 0; }
+bool IsDebugTextureListFresh(NativeObject*, int) { return false; }
+bool SetDebugTextureRendering(NativeObject*, bool) { return false; }
+
 NativeObject* DebugTextureInfo()
 {
-    static NativeClass nativeClass("IDebugTextureInfo", { shim::kDebugTextureInfoSlots, shim::kDebugTextureInfoSlotsCount }, kDebugTextureInfoSlots);
+    static NativeClass nativeClass = [] {
+        NativeClass c("IDebugTextureInfo", { shim::kDebugTextureInfoSlots, shim::kDebugTextureInfoSlotsCount }, kDebugTextureInfoSlots);
+        c.Bind("EnableDebugTextureList", &IgnoreBool);
+        c.Bind("EnableGetAllTextures", &IgnoreBool);
+        c.Bind("GetDebugTextureList", &GetDebugTextureList);
+        c.Bind("GetTextureMemoryUsed", &GetTextureMemoryUsed);
+        c.Bind("IsDebugTextureListFresh", &IsDebugTextureListFresh);
+        c.Bind("SetDebugTextureRendering", &SetDebugTextureRendering);
+        return c;
+    }();
     static NativeObject object{ nativeClass.Vtable(), &nativeClass };
     return &object;
 }

@@ -3,9 +3,13 @@
 #include "command_line.h"
 #include "d3d12_device.h"
 #include "log.h"
+#include "shaderapi.h"
+#include "shaderapi_meshes.h"
+#include "shaderapi_pipelines.h"
 
 #include <algorithm>
 #include <cstring>
+#include <fstream>
 #include <set>
 #include <string>
 #include <tuple>
@@ -24,6 +28,13 @@ constexpr int kDxSupportLevel = 95;
 // The shader-visible CBV/SRV/UAV heap size every resource binding tier supports.
 constexpr UINT kDescriptorCapacity = 1000000;
 constexpr UINT64 kUploadPageSize = 16 << 20;
+constexpr UINT64 kStagingPageSize = 32 << 20;
+// Staging memory one frame may hold before Flush reclaims it, so loading a map does not keep every upload alive.
+constexpr UINT64 kStagingFlushBytes = 256 << 20;
+constexpr UINT kRenderTargetViews = 4096;
+constexpr UINT kDepthStencilViews = 1024;
+// The shader-visible sampler heap's maximum size (D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE).
+constexpr UINT kSamplerHeapSize = 2048;
 
 unsigned Hex(HRESULT hr) { return static_cast<unsigned>(hr); }
 
@@ -77,13 +88,22 @@ struct DeviceManagerObject : NativeObject {
 
 bool Connect(DeviceManagerObject*, CreateInterfaceFn factory)
 {
-    GetBackend().shaderUtil = factory != nullptr ? factory("VShaderUtil001", nullptr) : nullptr;
-    if (GetBackend().shaderUtil == nullptr)
-        log::Info("Native: materialsystem's VShaderUtil001 is not available");
-    return GetBackend().shaderUtil != nullptr;
+    Backend& backend = GetBackend();
+    backend.shaderUtil = factory != nullptr ? factory("VShaderUtil001", nullptr) : nullptr;
+    // shaderapidx9.dll asks for VFileSystem022 and reads files through its IBaseFileSystem base, which IFileSystem
+    // (public/filesystem.h) puts after IAppSystem's vtable pointer.
+    void* fileSystem = factory != nullptr ? factory("VFileSystem022", nullptr) : nullptr;
+    backend.fileSystem = fileSystem != nullptr ? static_cast<std::uint8_t*>(fileSystem) + sizeof(void*) : nullptr;
+    if (backend.shaderUtil == nullptr || backend.fileSystem == nullptr)
+        log::Info("Native: VShaderUtil001 ({}) or VFileSystem022 ({}) is not available", backend.shaderUtil != nullptr, backend.fileSystem != nullptr);
+    return backend.shaderUtil != nullptr && backend.fileSystem != nullptr;
 }
 
-void Disconnect(DeviceManagerObject*) { GetBackend().shaderUtil = nullptr; }
+void Disconnect(DeviceManagerObject*)
+{
+    GetBackend().shaderUtil = nullptr;
+    GetBackend().fileSystem = nullptr;
+}
 void* QueryInterface(DeviceManagerObject*, const char* name) { return CreateInterface(name, nullptr); }
 InitReturnVal Init(DeviceManagerObject*) { return kInitOk; }
 void Shutdown(DeviceManagerObject*) {}
@@ -151,7 +171,10 @@ bool SetAdapter(DeviceManagerObject* self, int adapterIndex, int)
 
 CreateInterfaceFn SetMode(DeviceManagerObject*, void* window, int, const ShaderDeviceInfo& info)
 {
-    return GetBackend().SetMode(static_cast<HWND>(window), info) ? &CreateInterface : nullptr;
+    if (!GetBackend().SetMode(static_cast<HWND>(window), info))
+        return nullptr;
+    ResetDynamicState();
+    return &CreateInterface;
 }
 
 void AddModeChangeCallback(DeviceManagerObject* self, void (*callback)()) { self->modeChangeCallbacks.push_back(callback); }
@@ -223,6 +246,13 @@ bool Backend::CreateDevice()
         log::Info("Native: D3D12CreateDevice failed: {:#010x}", Hex(hr));
         return false;
     }
+    if (HasArgument(L"-gmodpp_debug") && SUCCEEDED(m_device.As(&m_infoQueue))) {
+        D3D12_MESSAGE_SEVERITY hidden[] = { D3D12_MESSAGE_SEVERITY_INFO, D3D12_MESSAGE_SEVERITY_MESSAGE, D3D12_MESSAGE_SEVERITY_WARNING };
+        D3D12_INFO_QUEUE_FILTER filter = {};
+        filter.DenyList.NumSeverities = static_cast<UINT>(std::size(hidden));
+        filter.DenyList.pSeverityList = hidden;
+        m_infoQueue->PushStorageFilter(&filter);
+    }
     D3D12_COMMAND_QUEUE_DESC queueDesc = {};
     queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
     if (FAILED(hr = m_device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&m_queue))) || FAILED(hr = m_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&m_fence)))) {
@@ -241,14 +271,15 @@ bool Backend::CreateDevice()
         return false;
     }
     m_commandList->Close();
-    D3D12_DESCRIPTOR_HEAP_DESC rtvDesc = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, kBackBuffers, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0 };
-    if (FAILED(hr = m_device->CreateDescriptorHeap(&rtvDesc, IID_PPV_ARGS(&m_rtvHeap)))) {
-        log::Info("Native: creating the back buffer descriptors failed: {:#010x}", Hex(hr));
+    if (!m_descriptors.Initialize(m_device.Get(), kDescriptorCapacity) || !m_rtvs.Initialize(m_device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_RTV, kRenderTargetViews)
+        || !m_dsvs.Initialize(m_device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_DSV, kDepthStencilViews))
+        return false;
+    D3D12_DESCRIPTOR_HEAP_DESC samplerDesc = { D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, kSamplerHeapSize, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0 };
+    if (FAILED(hr = m_device->CreateDescriptorHeap(&samplerDesc, IID_PPV_ARGS(&m_samplerHeap)))) {
+        log::Info("Native: creating the sampler heap failed: {:#010x}", Hex(hr));
         return false;
     }
-    if (!m_descriptors.Initialize(m_device.Get(), kDescriptorCapacity))
-        return false;
-    m_rtvSize = m_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    m_samplerIncrement = m_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
     BOOL tearing = FALSE;
     m_tearing = SUCCEEDED(m_factory->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &tearing, sizeof(tearing))) && tearing;
     DXGI_ADAPTER_DESC1 desc;
@@ -280,7 +311,8 @@ bool Backend::CreateSwapChain()
         desc.Height = m_height;
         desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
         desc.SampleDesc.Count = 1;
-        desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        // Copies of the back buffer into textures (StretchRect) read it in a shader.
+        desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT | DXGI_USAGE_SHADER_INPUT;
         desc.BufferCount = kBackBuffers;
         desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
         desc.Flags = m_tearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
@@ -292,15 +324,69 @@ bool Backend::CreateSwapChain()
         }
         m_factory->MakeWindowAssociation(m_window, DXGI_MWA_NO_ALT_ENTER);
     }
-    D3D12_CPU_DESCRIPTOR_HANDLE rtv = m_rtvHeap->GetCPUDescriptorHandleForHeapStart();
     for (UINT i = 0; i < kBackBuffers; ++i) {
         m_swapChain->GetBuffer(i, IID_PPV_ARGS(&m_backBuffers[i].resource));
         m_backBuffers[i].state = D3D12_RESOURCE_STATE_PRESENT;
-        m_device->CreateRenderTargetView(m_backBuffers[i].resource.Get(), nullptr, { rtv.ptr + i * m_rtvSize });
+        // Flip-model buffers accept an sRGB view of their UNORM format (DXGI flip model documentation).
+        for (UINT srgb = 0; srgb < 2; ++srgb) {
+            D3D12_CPU_DESCRIPTOR_HANDLE& view = m_backBufferViews[i * 2 + srgb];
+            if (view.ptr == 0)
+                view = m_rtvs.Allocate();
+            D3D12_RENDER_TARGET_VIEW_DESC desc = {};
+            desc.Format = srgb ? DXGI_FORMAT_B8G8R8A8_UNORM_SRGB : kBackBufferFormat;
+            desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+            m_device->CreateRenderTargetView(m_backBuffers[i].resource.Get(), &desc, view);
+        }
+        if (m_backBufferTextures[i] == DescriptorHeap::kInvalid)
+            m_backBufferTextures[i] = m_descriptors.Allocate();
+        D3D12_SHADER_RESOURCE_VIEW_DESC view = {};
+        view.Format = kBackBufferFormat;
+        view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        view.Texture2D.MipLevels = 1;
+        m_device->CreateShaderResourceView(m_backBuffers[i].resource.Get(), &view, m_descriptors.Cpu(m_backBufferTextures[i]));
     }
+    if (!CreateDepthBuffer())
+        return false;
     log::Info("Native: swap chain {}x{}, vsync {}", m_width, m_height, m_vsync ? "on" : "off");
     BeginFrame();
     return true;
+}
+
+bool Backend::CreateDepthBuffer()
+{
+    if (m_depthBuffer.resource != nullptr)
+        Retire(std::move(m_depthBuffer.resource));
+    m_depthBuffer = {};
+    const D3D12_HEAP_PROPERTIES heap = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC desc = {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = m_width;
+    desc.Height = m_height;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = kDepthFormat;
+    desc.SampleDesc.Count = 1;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    D3D12_CLEAR_VALUE clear = {};
+    clear.Format = kDepthFormat;
+    clear.DepthStencil.Depth = 1.0f;
+    HRESULT hr = m_device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_DEPTH_WRITE, &clear,
+        IID_PPV_ARGS(&m_depthBuffer.resource));
+    if (FAILED(hr)) {
+        log::Info("Native: creating the {}x{} depth buffer failed: {:#010x}", m_width, m_height, Hex(hr));
+        return false;
+    }
+    m_depthBuffer.state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+    if (m_depthView.ptr == 0)
+        m_depthView = m_dsvs.Allocate();
+    m_device->CreateDepthStencilView(m_depthBuffer.resource.Get(), nullptr, m_depthView);
+    return true;
+}
+
+D3D12_CPU_DESCRIPTOR_HANDLE Backend::BackBufferView(bool srgb) const
+{
+    return m_backBufferViews[m_swapChain->GetCurrentBackBufferIndex() * 2 + (srgb ? 1 : 0)];
 }
 
 bool Backend::SetMode(HWND window, const ShaderDeviceInfo& info)
@@ -342,8 +428,12 @@ void Backend::BeginFrame()
     frame.retiredDescriptors.clear();
     for (UploadPage& page : frame.uploads)
         page.used = 0;
+    for (UploadPage& page : frame.staging)
+        page.used = 0;
+    m_stagingUsed = 0;
     frame.allocator->Reset();
     m_commandList->Reset(frame.allocator.Get(), nullptr);
+    ++m_listGeneration;
     m_recording = true;
     Transition(m_backBuffers[m_swapChain->GetCurrentBackBufferIndex()], D3D12_RESOURCE_STATE_RENDER_TARGET);
 }
@@ -352,6 +442,21 @@ void Backend::Present()
 {
     if (!m_recording)
         return;
+    static const bool developer = HasArgument(L"-gmodpp_dev");
+    if (developer) {
+        const std::filesystem::path request = ExecutablePath().parent_path() / L"gmodpp_drawlog.request";
+        std::error_code ignored;
+        if (std::filesystem::remove(request, ignored))
+            LogNextDraws(200);
+        static int limit = -1;
+        const std::filesystem::path limitRequest = ExecutablePath().parent_path() / L"gmodpp_drawlimit.request";
+        if (std::filesystem::exists(limitRequest, ignored)) {
+            std::ifstream file(limitRequest);
+            file >> limit;
+            std::filesystem::remove(limitRequest, ignored);
+        }
+        LimitDraws(limit);
+    }
     Transition(m_backBuffers[m_swapChain->GetCurrentBackBufferIndex()], D3D12_RESOURCE_STATE_PRESENT);
     m_commandList->Close();
     m_recording = false;
@@ -362,13 +467,78 @@ void Backend::Present()
         log::Info("Native: Present failed: {:#010x}", Hex(hr));
     m_queue->Signal(m_fence.Get(), ++m_fenceValue);
     m_frames[m_frame].fence = m_fenceValue;
+    DrainDebugMessages();
     m_frame = (m_frame + 1) % kFrames;
     BeginFrame();
 }
 
-Backend::Upload Backend::AllocateUpload(UINT64 size, UINT64 alignment)
+// Logs the debug layer's errors (at most kMaxDebugMessages in all).
+void Backend::DrainDebugMessages()
 {
-    std::vector<UploadPage>& pages = m_frames[m_frame].uploads;
+    constexpr UINT64 kMaxDebugMessages = 500;
+    if (m_infoQueue == nullptr)
+        return;
+    const UINT64 count = m_infoQueue->GetNumStoredMessagesAllowedByRetrievalFilter();
+    for (UINT64 i = 0; i < count && m_debugMessages < kMaxDebugMessages; ++i, ++m_debugMessages) {
+        SIZE_T length = 0;
+        if (FAILED(m_infoQueue->GetMessage(i, nullptr, &length)))
+            continue;
+        std::vector<std::byte> storage(length);
+        auto* message = reinterpret_cast<D3D12_MESSAGE*>(storage.data());
+        if (SUCCEEDED(m_infoQueue->GetMessage(i, message, &length)))
+            log::Info("D3D12 [{}] {}", static_cast<int>(message->Severity), std::string_view(message->pDescription, message->DescriptionByteLength ? message->DescriptionByteLength - 1 : 0));
+    }
+    m_infoQueue->ClearStoredMessages();
+}
+
+void Backend::Flush()
+{
+    if (!m_recording)
+        return;
+    m_commandList->Close();
+    ID3D12CommandList* lists[] = { m_commandList.Get() };
+    m_queue->ExecuteCommandLists(1, lists);
+    WaitForGpu();
+    Frame& frame = m_frames[m_frame];
+    frame.retired.clear();
+    for (UploadPage& page : frame.staging)
+        page.used = 0;
+    m_stagingUsed = 0;
+    frame.allocator->Reset();
+    m_commandList->Reset(frame.allocator.Get(), nullptr);
+    ++m_listGeneration;
+}
+
+Backend::Upload Backend::AllocateUpload(UINT64 size, UINT64 alignment) { return Allocate(m_frames[m_frame].uploads, size, alignment); }
+
+Backend::Upload Backend::AllocateStaging(UINT64 size, UINT64 alignment)
+{
+    if (m_stagingUsed + size > kStagingFlushBytes && m_stagingUsed > 0)
+        Flush();
+    m_stagingUsed += size;
+    return Allocate(m_frames[m_frame].staging, size, alignment);
+}
+
+UINT Backend::SamplerIndex(const D3D12_SAMPLER_DESC& desc)
+{
+    std::string key(reinterpret_cast<const char*>(&desc), sizeof(desc));
+    auto found = m_samplers.find(key);
+    if (found != m_samplers.end())
+        return found->second;
+    const UINT index = static_cast<UINT>(m_samplers.size());
+    if (index == kSamplerHeapSize) {
+        log::Info("Native: the sampler heap is full ({} samplers)", kSamplerHeapSize);
+        return 0;
+    }
+    D3D12_CPU_DESCRIPTOR_HANDLE handle = m_samplerHeap->GetCPUDescriptorHandleForHeapStart();
+    handle.ptr += static_cast<SIZE_T>(index) * m_samplerIncrement;
+    m_device->CreateSampler(&desc, handle);
+    m_samplers.emplace(std::move(key), index);
+    return index;
+}
+
+Backend::Upload Backend::Allocate(std::vector<UploadPage>& pages, UINT64 size, UINT64 alignment)
+{
     for (UploadPage& page : pages) {
         const UINT64 offset = (page.used + alignment - 1) / alignment * alignment;
         if (offset + size <= page.size) {
@@ -377,7 +547,7 @@ Backend::Upload Backend::AllocateUpload(UINT64 size, UINT64 alignment)
         }
     }
     UploadPage page;
-    page.size = std::max(kUploadPageSize, size);
+    page.size = std::max(&pages == &m_frames[m_frame].staging ? kStagingPageSize : kUploadPageSize, size);
     const D3D12_HEAP_PROPERTIES heap = { D3D12_HEAP_TYPE_UPLOAD };
     D3D12_RESOURCE_DESC desc = {};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
@@ -413,6 +583,39 @@ void Backend::Transition(TrackedResource& resource, D3D12_RESOURCE_STATES state)
     barrier.Transition.StateAfter = state;
     m_commandList->ResourceBarrier(1, &barrier);
     resource.state = state;
+}
+
+bool CpuDescriptorPool::Initialize(ID3D12Device* device, D3D12_DESCRIPTOR_HEAP_TYPE type, UINT capacity)
+{
+    D3D12_DESCRIPTOR_HEAP_DESC desc = { type, capacity, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0 };
+    HRESULT hr = device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&m_heap));
+    if (FAILED(hr)) {
+        log::Info("Native: creating a {}-entry descriptor heap of type {} failed: {:#010x}", capacity, static_cast<int>(type), Hex(hr));
+        return false;
+    }
+    m_increment = device->GetDescriptorHandleIncrementSize(type);
+    m_capacity = capacity;
+    return true;
+}
+
+D3D12_CPU_DESCRIPTOR_HANDLE CpuDescriptorPool::Allocate()
+{
+    D3D12_CPU_DESCRIPTOR_HANDLE handle = {};
+    if (!m_free.empty()) {
+        handle.ptr = m_free.back();
+        m_free.pop_back();
+    } else if (m_next < m_capacity) {
+        handle.ptr = m_heap->GetCPUDescriptorHandleForHeapStart().ptr + static_cast<SIZE_T>(m_next++) * m_increment;
+    } else {
+        log::Info("Native: a view heap is full ({} views)", m_capacity);
+    }
+    return handle;
+}
+
+void CpuDescriptorPool::Free(D3D12_CPU_DESCRIPTOR_HANDLE handle)
+{
+    if (handle.ptr != 0)
+        m_free.push_back(handle.ptr);
 }
 
 Backend& GetBackend()
@@ -461,6 +664,7 @@ NativeObject* Device()
         c.Bind("Present", &Present);
         c.Bind("GetWindowSize", &GetWindowSize);
         c.Bind("SetHardwareGammaRamp", &SetHardwareGammaRamp);
+        BindMeshDeviceMethods(c);
         return c;
     }();
     static NativeObject object{ nativeClass.Vtable(), &nativeClass };

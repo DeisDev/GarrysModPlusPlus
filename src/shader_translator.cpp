@@ -15,8 +15,9 @@
 
 // Binding model of the generated HLSL (shader model 6.6):
 // - b0: the float constants the shader reads, gmodpp_c[0] = c[firstFloatConstant].
-// - b1: the integer and boolean constants, the half-pixel offset and, per sampler, the indices of its texture in
-//   ResourceDescriptorHeap and of its sampler in SamplerDescriptorHeap (vertex shaders: their s0-s3).
+// - b1: the integer and boolean constants, the half-pixel offset, per sampler the indices of its texture in
+//   ResourceDescriptorHeap and of its sampler in SamplerDescriptorHeap (vertex shaders: their s0-s3), and the alpha
+//   test reference.
 // - Vertex shader inputs keep their D3D9 usage as the semantic (POSITION0, TEXCOORD3, ...).
 // - Vertex and pixel shaders link through one fixed interpolant struct (TEXCOORD0-9, COLOR0-1, FOG), so any pair
 //   matches. A declaration whose mask does not start at x is packed into the first components of its member.
@@ -860,7 +861,7 @@ std::string Translator::Assemble()
     if (m_out.floatConstantCount > 0)
         text += std::format("cbuffer gmodpp_floats : register(b0) {{ float4 gmodpp_c[{}]; }};\n", m_out.floatConstantCount);
     text += "cbuffer gmodpp_state : register(b1) {\n    int4 gmodpp_i[16];\n    uint4 gmodpp_b[4];\n    float4 gmodpp_halfPixel;\n"
-            "    uint4 gmodpp_textures[4];\n    uint4 gmodpp_samplers[4];\n};\n";
+            "    uint4 gmodpp_textures[4];\n    uint4 gmodpp_samplers[4];\n    float4 gmodpp_alpha;\n    float4 gmodpp_clipPlanes[6];\n};\n";
     text += kHelpers;
 
     for (const auto& [sampler, kind] : m_sampleHelpers) {
@@ -922,12 +923,22 @@ std::string Translator::Assemble()
         for (const Declaration& input : m_inputs) {
             const char* semantic = UsageSemantic(input.usage);
             const bool integer = (m_variant.integerInputs >> input.reg) & 1;
-            text += std::format("    {} v{} : {}{};\n", integer ? "uint4" : "float4", input.reg, semantic, input.usageIndex);
+            const bool signedInteger = (m_variant.signedInputs >> input.reg) & 1;
+            text += std::format("    {} v{} : {}{};\n", integer ? (signedInteger ? "int4" : "uint4") : "float4", input.reg, semantic, input.usageIndex);
             m_out.inputs.push_back({ static_cast<BYTE>(input.usage), static_cast<BYTE>(input.usageIndex), static_cast<BYTE>(input.reg) });
         }
         if (m_inputs.empty())
             text += "    uint gmodpp_vertex : SV_VertexID;\n";
-        text += "};\ngmodpp_Interpolants main(gmodpp_VertexInput input)\n{\n";
+        const UINT clipPlanes = std::min<UINT>(m_variant.clipPlanes, 6);
+        if (clipPlanes > 0) {
+            // Clip distances follow the interpolants, so pixel shaders whose inputs end before them still link.
+            text += "};\nstruct gmodpp_VertexOutput {\n    gmodpp_Interpolants interpolants;\n    float4 clip0 : SV_ClipDistance0;\n";
+            if (clipPlanes > 4)
+                text += "    float2 clip1 : SV_ClipDistance1;\n";
+            text += "};\ngmodpp_VertexOutput main(gmodpp_VertexInput input)\n{\n";
+        } else {
+            text += "};\ngmodpp_Interpolants main(gmodpp_VertexInput input)\n{\n";
+        }
         for (const Declaration& input : m_inputs)
             text += std::format("    v{0} = float4(input.v{0});\n", input.reg);
         text += "    gmodpp_main();\n    gmodpp_Interpolants output = (gmodpp_Interpolants)0;\n";
@@ -952,6 +963,16 @@ std::string Translator::Assemble()
                 else if (global.starts_with("oD"))
                     text += std::format("    output.color{} = saturate({});\n", global.substr(2), global);
             }
+        }
+        if (clipPlanes > 0) {
+            // D3D9 clips against the position the shader wrote, before the half-pixel offset; unused planes pass.
+            text += "    gmodpp_VertexOutput result;\n    result.clip0 = float4(1, 1, 1, 1);\n";
+            if (clipPlanes > 4)
+                text += "    result.clip1 = float2(1, 1);\n";
+            for (UINT i = 0; i < clipPlanes; ++i)
+                text += std::format("    result.clip{}.{} = dot(gmodpp_clipPlanes[{}], output.position);\n", i / 4, kComponents[i % 4], i);
+            text += "    output.position.xy += gmodpp_halfPixel.xy * output.position.w;\n    result.interpolants = output;\n    return result;\n}\n";
+            return text;
         }
         text += "    output.position.xy += gmodpp_halfPixel.xy * output.position.w;\n    return output;\n}\n";
         return text;
@@ -984,6 +1005,12 @@ std::string Translator::Assemble()
         text += std::format("    {}{}{} = input.{}{};\n", texture ? "t" : "v", input.reg & 0xFF, MaskString(input.mask), *member, LeadingComponents(input.mask));
     }
     text += "    gmodpp_main();\n";
+    if (m_variant.alphaTest != 0 && m_variant.alphaTest != D3DCMP_ALWAYS && (m_out.colorOutputs & 1)) {
+        // D3D9 tests the alpha written to oC0, at 8-bit precision, against ALPHAREF.
+        static constexpr const char* kTests[] = { "true", "false", "a < r", "a == r", "a <= r", "a > r", "a != r", "a >= r" };
+        text += std::format("    float a = round(saturate(oC0.a) * 255);\n    float r = gmodpp_alpha.x;\n    if (!({}))\n        discard;\n",
+            kTests[m_variant.alphaTest]);
+    }
     for (UINT i = 0; i < 4; ++i) {
         if (m_out.colorOutputs & (1u << i))
             text += std::format("    gmodpp_target{0} = oC{0};\n", i);
