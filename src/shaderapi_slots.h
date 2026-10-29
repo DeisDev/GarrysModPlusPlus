@@ -26,5 +26,11 @@ extern const SlotInfo kVBAllocTrackerSlots[];
 extern const size_t kVBAllocTrackerSlotsCount;
 extern const SlotInfo kShaderUtilSlots[];
 extern const size_t kShaderUtilSlotsCount;
+extern const SlotInfo kVertexBufferSlots[];
+extern const size_t kVertexBufferSlotsCount;
+extern const SlotInfo kIndexBufferSlots[];
+extern const size_t kIndexBufferSlotsCount;
+extern const SlotInfo kMeshSlots[];
+extern const size_t kMeshSlotsCount;
 
 }

@@ -167,6 +167,7 @@ add_library(gmodpp_d3d9 SHARED
     src/watchdog.cpp
     src/frame_trace.cpp
     src/presenter.cpp
+    src/d3d12_device.cpp
     src/renderer.cpp
     src/module_scan.cpp
     src/client_hooks.cpp
@@ -295,9 +296,25 @@ add_library(gmodpp SHARED
     src/capture.cpp
     src/command_line.cpp
     src/log.cpp
+    src/module_scan.cpp
+    src/d3d12_device.cpp
+    src/descriptor_heap.cpp
+    src/shader_bytecode.cpp
+    src/shader_compiler.cpp
+    src/shader_prewarm.cpp
+    src/shader_translator.cpp
+    src/vcs.cpp
+    src/vpk.cpp
+    src/shaderapi.cpp
+    src/shaderapi_config.cpp
+    src/shaderapi_device.cpp
+    src/shaderapi_native.cpp
 )
 target_compile_definitions(gmodpp PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
 target_compile_options(gmodpp PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4 /permissive- /utf-8>)
+target_include_directories(gmodpp BEFORE PRIVATE "${AGILITY_SDK_DIR}/build/native/include")
+target_include_directories(gmodpp PRIVATE "${DXC_DIR}/inc")
+target_link_libraries(gmodpp PRIVATE d3d12 dxgi dxguid lzma_dec)
 
 if(GMOD_DIR)
     add_custom_target(deploy
@@ -310,6 +327,7 @@ if(GMOD_DIR)
             -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/deploy_loader.cmake"
         COMMAND ${CMAKE_COMMAND} -E make_directory "${GMOD_DIR}/bin/win64/gmodpp"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:gmodpp> "${GMOD_DIR}/bin/win64/gmodpp/gmodpp.dll"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${DXC_DIR}/bin/x64/dxcompiler.dll" "${GMOD_DIR}/bin/win64/gmodpp/dxcompiler.dll"
         DEPENDS gmodpp_d3d9 gmodpp_loader gmodpp
         COMMENT "Deploying d3d9.dll, nvngx_dlssd.dll, the Agility SDK runtime, winmm.dll and gmodpp.dll to ${GMOD_DIR}"
     )

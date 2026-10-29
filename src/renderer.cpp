@@ -1,5 +1,6 @@
 ﻿#include "renderer.h"
 
+#include "d3d12_device.h"
 #include "log.h"
 #include "mod.h"
 #include "presenter.h"
@@ -52,42 +53,16 @@ void LogDisplayTopology(IDXGIFactory4* factory)
     }
 }
 
-// The directory holding this DLL, relative to the game's executable: the Agility SDK runtime is deployed to its
-// D3D12 subdirectory, and side-by-side runtimes are named relative to the executable.
-std::string AgilityRuntimePath()
+// The Agility SDK runtime is deployed to the D3D12 subdirectory of this DLL's directory.
+std::filesystem::path AgilityRuntimeDirectory()
 {
     HMODULE module = nullptr;
-    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCWSTR>(&AgilityRuntimePath),
-        &module);
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        reinterpret_cast<LPCWSTR>(&AgilityRuntimeDirectory), &module);
     wchar_t modulePath[MAX_PATH];
-    wchar_t exePath[MAX_PATH];
-    if (GetModuleFileNameW(module, modulePath, MAX_PATH) == 0 || GetModuleFileNameW(nullptr, exePath, MAX_PATH) == 0)
+    if (GetModuleFileNameW(module, modulePath, MAX_PATH) == 0)
         return {};
-    const std::filesystem::path runtime = std::filesystem::path(modulePath).parent_path() / L"D3D12";
-    std::error_code error;
-    const std::filesystem::path relative = std::filesystem::relative(runtime, std::filesystem::path(exePath).parent_path(), error);
-    return error ? std::string() : relative.string() + "\\";
-}
-
-// A device factory that loads the Agility SDK's D3D12Core.dll for this process's devices alone (independent devices;
-// no developer mode or exported SDK version needed), or nothing where the system's D3D12 cannot do that.
-ComPtr<ID3D12DeviceFactory> AgilityDeviceFactory()
-{
-    ComPtr<ID3D12SDKConfiguration1> configuration;
-    HRESULT hr = D3D12GetInterface(CLSID_D3D12SDKConfiguration, IID_PPV_ARGS(&configuration));
-    if (FAILED(hr)) {
-        log::Info("D3D12 SDK configuration unavailable ({:#010x}); using the system D3D12 runtime", Hex(hr));
-        return nullptr;
-    }
-    const std::string path = AgilityRuntimePath();
-    ComPtr<ID3D12DeviceFactory> factory;
-    hr = configuration->CreateDeviceFactory(D3D12_SDK_VERSION, path.c_str(), IID_PPV_ARGS(&factory));
-    if (FAILED(hr)) {
-        log::Info("Agility SDK {} runtime at '{}' could not be loaded ({:#010x}); using the system D3D12 runtime", D3D12_SDK_VERSION, path, Hex(hr));
-        return nullptr;
-    }
-    log::Info("Agility SDK {} runtime loaded from '{}'", D3D12_SDK_VERSION, path);
-    return factory;
+    return std::filesystem::path(modulePath).parent_path() / L"D3D12";
 }
 
 }
@@ -103,7 +78,7 @@ Renderer* Renderer::Create(LUID adapterLuid, const Options& options)
         return nullptr;
     }
 
-    ComPtr<ID3D12DeviceFactory> agility = AgilityDeviceFactory();
+    ComPtr<ID3D12DeviceFactory> agility = AgilityDeviceFactory(AgilityRuntimeDirectory());
     if (options.d3d12Debug) {
         ComPtr<ID3D12Debug1> debug;
         const HRESULT debugResult = agility ? agility->GetConfigurationInterface(CLSID_D3D12Debug, IID_PPV_ARGS(&debug)) : D3D12GetDebugInterface(IID_PPV_ARGS(&debug));

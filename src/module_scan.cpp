@@ -128,4 +128,53 @@ std::vector<const std::byte*> FindCodePattern(HMODULE module, std::string_view p
     return matches;
 }
 
+// MSVC's x64 RTTI (rttidata.h, ehdata_forceinclude.h in MSVC 14.51): a TypeDescriptor is { vftable, spare, name },
+// and a complete object locator { signature = COL_SIG_REV1, offset, cdOffset, then image-relative pTypeDescriptor,
+// pClassDescriptor, pSelf } is referenced by the slot before each vtable of the class.
+const void* const* FindVtable(HMODULE module, std::string_view decoratedName, DWORD offset)
+{
+    struct Locator {
+        DWORD signature, offset, cdOffset;
+        DWORD typeDescriptor, classDescriptor, self;
+    };
+    constexpr DWORD kLocatorSignature = 1;
+    const auto base = reinterpret_cast<uintptr_t>(module);
+    std::vector<Section> sections = Sections(module);
+    const std::byte* name = FindString(sections, decoratedName);
+    if (name == nullptr)
+        return nullptr;
+    const auto typeDescriptor = static_cast<DWORD>(reinterpret_cast<uintptr_t>(name) - 2 * sizeof(void*) - base);
+
+    const Locator* locator = nullptr;
+    for (const Section& section : sections) {
+        if (section.executable)
+            continue;
+        for (size_t i = 0; i + sizeof(Locator) <= section.bytes.size(); i += 4) {
+            Locator candidate;
+            std::memcpy(&candidate, section.bytes.data() + i, sizeof(candidate));
+            if (candidate.signature == kLocatorSignature && candidate.offset == offset && candidate.typeDescriptor == typeDescriptor &&
+                candidate.self == reinterpret_cast<uintptr_t>(section.bytes.data() + i) - base)
+                locator = reinterpret_cast<const Locator*>(section.bytes.data() + i);
+        }
+    }
+    if (locator == nullptr)
+        return nullptr;
+
+    const void* const* vtable = nullptr;
+    for (const Section& section : sections) {
+        if (section.executable)
+            continue;
+        for (size_t i = 0; i + 2 * sizeof(void*) <= section.bytes.size(); i += sizeof(void*)) {
+            const void* entry;
+            std::memcpy(&entry, section.bytes.data() + i, sizeof(entry));
+            if (entry != locator)
+                continue;
+            if (vtable != nullptr)
+                return nullptr;
+            vtable = reinterpret_cast<const void* const*>(section.bytes.data() + i + sizeof(void*));
+        }
+    }
+    return vtable;
+}
+
 }

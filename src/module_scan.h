@@ -15,4 +15,8 @@ void* FindFunctionReferencingString(HMODULE module, std::string_view text);
 // Every match in the module's code of `pattern`: hex bytes separated by spaces, "??" for any byte.
 std::vector<const std::byte*> FindCodePattern(HMODULE module, std::string_view pattern);
 
+// The virtual function table of the class with the RTTI name `decoratedName` (".?AVCMeshDX8@@") for its subobject at
+// `offset`, or nullptr when the module has no unique one.
+const void* const* FindVtable(HMODULE module, std::string_view decoratedName, DWORD offset);
+
 }

@@ -526,4 +526,74 @@ const SlotInfo kShaderUtilSlots[] = {
     { "UncacheUnusedMaterials", "void", "bool bRecomputeStateSnapshots = false" },
 };
 const size_t kShaderUtilSlotsCount = std::size(kShaderUtilSlots);
+
+// The objects behind IVertexBuffer, IIndexBuffer and IMesh (public/materialsystem/imesh.h). GMod's classes were found
+// by their RTTI: CVertexBufferDx8 (11 entries), CIndexBufferDx8 (13), and CMeshDX8, CDynamicMeshDX8, CTempMeshDX8 and
+// CBufferedMeshDX8 (44 entries, with IIndexBuffer's 13 at subobject offset 8). The interfaces' virtual destructors
+// are slot 0. IMesh's methods follow IVertexBuffer's at 11, its Draw overloads in MSVC's reverse order; 27-43 are the
+// classes' own. Confirmed by decompiling: CMeshDX8 11 SetPrimitiveType (0x18000d1b0), 18 LockMesh (0x18000c370, by
+// its error string, calls slots 7 and 8 of both subobjects), 21 UnlockMesh, CDynamicMeshDX8 25 MarkAsDrawn; 12
+// Draw(CPrimList*) and 14 SetColorMesh are overridden only by the static meshes.
+const SlotInfo kVertexBufferSlots[] = {
+    { "~IVertexBuffer", "void", "" },
+    { "VertexCount", "int", "" },
+    { "GetVertexFormat", "VertexFormat_t", "" },
+    { "IsDynamic", "bool", "" },
+    { "BeginCastBuffer", "void", "VertexFormat_t format" },
+    { "EndCastBuffer", "void", "" },
+    { "GetRoomRemaining", "int", "" },
+    { "Lock", "bool", "int nVertexCount, bool bAppend, VertexDesc_t &desc" },
+    { "Unlock", "void", "int nVertexCount, VertexDesc_t &desc" },
+    { "Spew", "void", "int nVertexCount, const VertexDesc_t &desc" },
+    { "ValidateData", "void", "int nVertexCount, const VertexDesc_t & desc" },
+};
+const size_t kVertexBufferSlotsCount = std::size(kVertexBufferSlots);
+
+const SlotInfo kIndexBufferSlots[] = {
+    { "~IIndexBuffer", "void", "" },
+    { "IndexCount", "int", "" },
+    { "IndexFormat", "MaterialIndexFormat_t", "" },
+    { "IsDynamic", "bool", "" },
+    { "BeginCastBuffer", "void", "MaterialIndexFormat_t format" },
+    { "EndCastBuffer", "void", "" },
+    { "GetRoomRemaining", "int", "" },
+    { "Lock", "bool", "int nMaxIndexCount, bool bAppend, IndexDesc_t &desc" },
+    { "Unlock", "void", "int nWrittenIndexCount, IndexDesc_t &desc" },
+    { "ModifyBegin", "void", "bool bReadOnly, int nFirstIndex, int nIndexCount, IndexDesc_t& desc" },
+    { "ModifyEnd", "void", "IndexDesc_t& desc" },
+    { "Spew", "void", "int nIndexCount, const IndexDesc_t &desc" },
+    { "ValidateData", "void", "int nIndexCount, const IndexDesc_t &desc" },
+};
+const size_t kIndexBufferSlotsCount = std::size(kIndexBufferSlots);
+
+const SlotInfo kMeshSlots[] = {
+    { "~IVertexBuffer", "void", "" },
+    { "VertexCount", "int", "" },
+    { "GetVertexFormat", "VertexFormat_t", "" },
+    { "IsDynamic", "bool", "" },
+    { "BeginCastBuffer", "void", "VertexFormat_t format" },
+    { "EndCastBuffer", "void", "" },
+    { "GetRoomRemaining", "int", "" },
+    { "Lock", "bool", "int nVertexCount, bool bAppend, VertexDesc_t &desc" },
+    { "Unlock", "void", "int nVertexCount, VertexDesc_t &desc" },
+    { "Spew", "void", "int nVertexCount, const VertexDesc_t &desc" },
+    { "ValidateData", "void", "int nVertexCount, const VertexDesc_t & desc" },
+    { "SetPrimitiveType", "void", "MaterialPrimitiveType_t type" },
+    { "Draw", "void", "CPrimList *pLists, int nLists" },
+    { "Draw", "void", "int nFirstIndex = -1, int nIndexCount = 0" },
+    { "SetColorMesh", "void", "IMesh *pColorMesh, int nVertexOffset" },
+    { "CopyToMeshBuilder", "void", "int iStartVert, int nVerts, int iStartIndex, int nIndices, int indexOffset, CMeshBuilder &builder" },
+    { "Spew", "void", "int nVertexCount, int nIndexCount, const MeshDesc_t &desc" },
+    { "ValidateData", "void", "int nVertexCount, int nIndexCount, const MeshDesc_t &desc" },
+    { "LockMesh", "void", "int nVertexCount, int nIndexCount, MeshDesc_t &desc" },
+    { "ModifyBegin", "void", "int nFirstVertex, int nVertexCount, int nFirstIndex, int nIndexCount, MeshDesc_t& desc" },
+    { "ModifyEnd", "void", "MeshDesc_t& desc" },
+    { "UnlockMesh", "void", "int nVertexCount, int nIndexCount, MeshDesc_t &desc" },
+    { "ModifyBeginEx", "void", "bool bReadOnly, int nFirstVertex, int nVertexCount, int nFirstIndex, int nIndexCount, MeshDesc_t &desc" },
+    { "SetFlexMesh", "void", "IMesh *pMesh, int nVertexOffset" },
+    { "DisableFlexMesh", "void", "" },
+    { "MarkAsDrawn", "void", "" },
+    { "ComputeMemoryUsed", "unsigned", "" },
+};
+const size_t kMeshSlotsCount = std::size(kMeshSlots);
 }

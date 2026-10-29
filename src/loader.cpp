@@ -71,7 +71,7 @@ void InstallShaderApiRedirect()
     std::filesystem::path gameDirectory = exe.parent_path();
     log::Open((gameDirectory / L"gmodpp_loader.log").c_str());
 
-    if (!HasArgument(L"-gmodpp_vanilla")) {
+    if (!HasArgument(L"-gmodpp_vanilla") && !HasArgument(L"-gmodpp_native")) {
         log::Info("The native backend is not available yet: shaderapidx9.dll and the d3d9.dll build are used.");
         return;
     }
