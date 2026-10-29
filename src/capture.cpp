@@ -11,9 +11,7 @@ using Microsoft::WRL::ComPtr;
 
 namespace gmodpp {
 
-namespace {
-
-bool WriteBmp(const std::filesystem::path& path, UINT width, UINT height, const D3DLOCKED_RECT& locked)
+bool WriteBmp(const std::filesystem::path& path, UINT width, UINT height, const void* bgra, size_t pitch)
 {
     const UINT rowBytes = width * 3;
     const UINT stride = (rowBytes + 3) & ~3u;
@@ -35,7 +33,7 @@ bool WriteBmp(const std::filesystem::path& path, UINT width, UINT height, const 
     std::fwrite(&info, sizeof(info), 1, out);
     std::vector<unsigned char> row(stride, 0);
     for (UINT y = 0; y < height; ++y) {
-        const auto* src = static_cast<const unsigned char*>(locked.pBits) + static_cast<size_t>(y) * locked.Pitch;
+        const auto* src = static_cast<const unsigned char*>(bgra) + y * pitch;
         for (UINT x = 0; x < width; ++x) {
             row[x * 3 + 0] = src[x * 4 + 0];
             row[x * 3 + 1] = src[x * 4 + 1];
@@ -44,8 +42,6 @@ bool WriteBmp(const std::filesystem::path& path, UINT width, UINT height, const 
         std::fwrite(row.data(), stride, 1, out);
     }
     return std::fclose(out) == 0;
-}
-
 }
 
 bool CaptureBackBuffer(IDirect3DDevice9* device, const std::filesystem::path& path)
@@ -84,7 +80,7 @@ bool CaptureBackBuffer(IDirect3DDevice9* device, const std::filesystem::path& pa
         return false;
     }
 
-    bool written = WriteBmp(path, desc.Width, desc.Height, locked);
+    bool written = WriteBmp(path, desc.Width, desc.Height, locked.pBits, static_cast<size_t>(locked.Pitch));
     staging->UnlockRect();
     log::Info("Capture: {} {}", written ? "wrote" : "failed to write", path.string());
     return written;

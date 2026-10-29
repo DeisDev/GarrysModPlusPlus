@@ -1,5 +1,5 @@
 ﻿cmake_minimum_required(VERSION 3.25)
-project(GarrysModPP LANGUAGES C CXX)
+project(GarrysModPP LANGUAGES C CXX ASM_MASM)
 
 if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
     message(FATAL_ERROR "GarrysMod++ targets the 64-bit branch of Garry's Mod; configure with an x64 toolchain.")
@@ -158,6 +158,7 @@ endforeach()
 add_library(gmodpp_d3d9 SHARED
     src/d3d9.def
     src/mod.cpp
+    src/command_line.cpp
     src/exports.cpp
     src/log.cpp
     src/d3d9_hooks.cpp
@@ -245,6 +246,59 @@ target_compile_definitions(gmodpp_d3d9 PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNIC
 target_compile_options(gmodpp_d3d9 PRIVATE /W4 /permissive- /utf-8)
 target_link_libraries(gmodpp_d3d9 PRIVATE d3d12 dxgi dxguid minhook imgui lzma_dec "${DLSS_SDK_DIR}/lib/Windows_x86_64/x64/nvsdk_ngx_s.lib")
 
+# winmm.dll loader for the game root: forwards every export of the system winmm.dll (winmm_exports.txt holds
+# their ordinals and names) and, with -insecure, sends the game's shaderapidx9.dll load to gmodpp.dll.
+file(STRINGS src/winmm_exports.txt WINMM_EXPORTS)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS src/winmm_exports.txt)
+list(LENGTH WINMM_EXPORTS WINMM_COUNT)
+set(WINMM_DEF_EXPORTS "")
+set(WINMM_NAMES "")
+set(WINMM_STRINGS "")
+set(WINMM_STUBS "")
+set(index 0)
+foreach(entry IN LISTS WINMM_EXPORTS)
+    string(REPLACE " " ";" entry "${entry}")
+    list(GET entry 0 ordinal)
+    list(GET entry 1 name)
+    if(name STREQUAL "NONAME")
+        string(APPEND WINMM_DEF_EXPORTS "    Ordinal${ordinal}=gmodpp_winmm_${index} @${ordinal} NONAME\n")
+        string(APPEND WINMM_NAMES "    QWORD ${ordinal}\n")
+    else()
+        string(APPEND WINMM_DEF_EXPORTS "    ${name}=gmodpp_winmm_${index} @${ordinal}\n")
+        string(APPEND WINMM_NAMES "    QWORD winmmName${index}\n")
+        string(APPEND WINMM_STRINGS "winmmName${index} BYTE \"${name}\", 0\n")
+    endif()
+    string(APPEND WINMM_STUBS "WINMM_STUB ${index}\n")
+    math(EXPR index "${index} + 1")
+endforeach()
+configure_file(src/winmm.def.in "${CMAKE_CURRENT_BINARY_DIR}/winmm.def" @ONLY)
+configure_file(src/winmm_stubs.asm.in "${CMAKE_CURRENT_BINARY_DIR}/winmm_stubs.asm" @ONLY)
+
+add_library(gmodpp_loader SHARED
+    src/loader.cpp
+    src/loader.rc
+    src/command_line.cpp
+    src/log.cpp
+    "${CMAKE_CURRENT_BINARY_DIR}/winmm.def"
+    "${CMAKE_CURRENT_BINARY_DIR}/winmm_stubs.asm"
+)
+set_target_properties(gmodpp_loader PROPERTIES OUTPUT_NAME winmm)
+target_compile_definitions(gmodpp_loader PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
+target_compile_options(gmodpp_loader PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4 /permissive- /utf-8>)
+target_link_libraries(gmodpp_loader PRIVATE minhook)
+
+# The game's shader API replacement, loaded from bin\win64\gmodpp through the loader.
+add_library(gmodpp SHARED
+    src/shaderapi_shim.cpp
+    src/shaderapi_slots.cpp
+    src/shaderapi_thunks.asm
+    src/capture.cpp
+    src/command_line.cpp
+    src/log.cpp
+)
+target_compile_definitions(gmodpp PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
+target_compile_options(gmodpp PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4 /permissive- /utf-8>)
+
 if(GMOD_DIR)
     add_custom_target(deploy
         COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:gmodpp_d3d9> "${GMOD_DIR}/bin/win64/d3d9.dll"
@@ -252,7 +306,11 @@ if(GMOD_DIR)
         COMMAND ${CMAKE_COMMAND} -E make_directory "${GMOD_DIR}/bin/win64/D3D12"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different "${AGILITY_RUNTIME_DIR}/D3D12Core.dll" "${AGILITY_RUNTIME_DIR}/d3d12SDKLayers.dll"
             "${GMOD_DIR}/bin/win64/D3D12/"
-        DEPENDS gmodpp_d3d9
-        COMMENT "Deploying d3d9.dll, nvngx_dlssd.dll and the Agility SDK runtime to ${GMOD_DIR}/bin/win64"
+        COMMAND ${CMAKE_COMMAND} "-DSOURCE=$<TARGET_FILE:gmodpp_loader>" "-DDESTINATION=${GMOD_DIR}/winmm.dll"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/deploy_loader.cmake"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${GMOD_DIR}/bin/win64/gmodpp"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:gmodpp> "${GMOD_DIR}/bin/win64/gmodpp/gmodpp.dll"
+        DEPENDS gmodpp_d3d9 gmodpp_loader gmodpp
+        COMMENT "Deploying d3d9.dll, nvngx_dlssd.dll, the Agility SDK runtime, winmm.dll and gmodpp.dll to ${GMOD_DIR}"
     )
 endif()

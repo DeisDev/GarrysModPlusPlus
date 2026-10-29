@@ -23,6 +23,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Light switches, toggled lights and animated lights (flicker, pulse, scripted day and night) now work with real-time lighting.
 - Water has ray-traced reflections over the game's refraction, a sun glint and a physical Fresnel term.
 - Underwater, the surface shows the world above through Snell's window and mirrors the water below beyond it, and sunlight scatters in the water's colour.
+- A `winmm.dll` loader in the game folder. With `-insecure -gmodpp_vanilla` it runs the game's own renderer through `gmodpp.dll`, as a reference for the coming native Direct3D 12 renderer.
 
 ### Changed
 
