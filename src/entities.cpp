@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstring>
+#include <unordered_map>
 
 namespace gmodpp::entities {
 
@@ -38,6 +39,22 @@ constexpr int kBoneUsedByAnything = 0x0007FF00;
 constexpr int kGetClientNetworkableSlot = 4;
 constexpr int kGetClientClassSlot = 2;
 constexpr size_t kClientClassName = 16;
+// ClientClass::m_pRecvTable, RecvTable::m_pProps and m_nProps, and RecvProp (SDK public/client_class.h and dt_recv.h,
+// 64-bit layout): m_pVarName, m_RecvType, m_pDataTable and m_Offset in a 96-byte struct. Checked in game: the walk finds
+// m_iViewModelIndex of DT_BaseCombatWeapon at kWeaponViewModelIndex.
+constexpr size_t kClientClassRecvTable = 24;
+constexpr size_t kRecvTableProps = 0;
+constexpr size_t kRecvTablePropCount = 8;
+constexpr size_t kRecvPropSize = 96;
+constexpr size_t kRecvPropName = 0;
+constexpr size_t kRecvPropType = 8;
+constexpr size_t kRecvPropDataTable = 64;
+constexpr size_t kRecvPropOffset = 72;
+constexpr int kPropTypeDataTable = 6;
+constexpr int kMaxRecvProps = 4096;
+constexpr int kMaxRecvDepth = 16;
+constexpr char kSkinProp[] = "m_nSkin";
+constexpr int kNoProp = -1;
 constexpr int kModelInfoGetModelSlot = 1;
 // C_BaseCombatWeapon's m_iViewModelIndex and m_iWorldModelIndex (their DT_BaseCombatWeapon RecvProps are built at
 // client.dll+0x27990, confirmed in Ghidra).
@@ -64,6 +81,8 @@ constexpr int kRopeMaxSubdiv = 7;
 constexpr float kWorldLimit = 65536.0f;
 
 void* g_entityList = nullptr;
+// Offset of m_nSkin in each client class, or kNoProp.
+std::unordered_map<const void*, int> g_skinOffsets;
 void* g_modelInfo = nullptr;
 void* g_engineClient = nullptr;
 bool g_attempted = false;
@@ -88,6 +107,43 @@ T Field(const void* object, size_t offset)
     T value;
     std::memcpy(&value, static_cast<const std::byte*>(object) + offset, sizeof(T));
     return value;
+}
+
+// The offset of a networked variable in an entity of the class, found through its receive tables (base classes are
+// nested data tables, at their own offset), or kNoProp.
+int FindProp(const void* table, const char* name, int depth)
+{
+    if (table == nullptr || depth > kMaxRecvDepth)
+        return kNoProp;
+    const auto* props = Field<const std::byte*>(table, kRecvTableProps);
+    const int count = Field<int>(table, kRecvTablePropCount);
+    if (props == nullptr || count < 0 || count > kMaxRecvProps)
+        return kNoProp;
+    for (int i = 0; i < count; ++i) {
+        const std::byte* prop = props + static_cast<size_t>(i) * kRecvPropSize;
+        const char* propName = Field<const char*>(prop, kRecvPropName);
+        const int offset = Field<int>(prop, kRecvPropOffset);
+        if (propName != nullptr && std::strcmp(propName, name) == 0)
+            return offset;
+        if (Field<int>(prop, kRecvPropType) == kPropTypeDataTable) {
+            const int nested = FindProp(Field<const void*>(prop, kRecvPropDataTable), name, depth + 1);
+            if (nested != kNoProp)
+                return offset + nested;
+        }
+    }
+    return kNoProp;
+}
+
+int SkinOf(void* entity)
+{
+    void* networkable = Slot<void*(__fastcall*)(void*)>(entity, kGetClientNetworkableSlot)(entity);
+    const void* clientClass = networkable != nullptr ? Slot<const void*(__fastcall*)(void*)>(networkable, kGetClientClassSlot)(networkable) : nullptr;
+    if (clientClass == nullptr)
+        return 0;
+    auto found = g_skinOffsets.find(clientClass);
+    if (found == g_skinOffsets.end())
+        found = g_skinOffsets.emplace(clientClass, FindProp(Field<const void*>(clientClass, kClientClassRecvTable), kSkinProp, 0)).first;
+    return found->second != kNoProp ? std::max(Field<int>(entity, static_cast<size_t>(found->second)), 0) : 0;
 }
 
 }
@@ -139,6 +195,7 @@ void Collect(std::vector<ModelEntity>& entities)
         out.renderable = renderable;
         out.parent = Slot<void*(__fastcall*)(void*)>(renderable, kGetShadowParentSlot)(renderable);
         out.model = name;
+        out.skin = SkinOf(entity);
         std::memcpy(out.transform, transform, sizeof(out.transform));
     }
 }

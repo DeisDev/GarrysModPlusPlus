@@ -13,6 +13,8 @@ struct ModelEntity {
     // The renderable of the entity it is attached to (its move parent), or null; a held weapon's is its owner's.
     void* parent;
     std::string model;
+    // Its skin family (C_BaseAnimating::m_nSkin), 0 for entities without one.
+    int skin;
     float transform[3][4];
 };
 

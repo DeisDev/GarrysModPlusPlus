@@ -1039,7 +1039,7 @@ void AddHeldWeapon(const entities::ModelEntity& weapon, const studio::Matrix3x4&
     const std::string worldModel = entities::WeaponWorldModel(weapon);
     if (worldModel.empty())
         return;
-    const ModelEntry& model = ModelFor(worldModel);
+    const ModelEntry& model = ModelFor(worldModel, weapon.skin);
     if (model.sceneModel < 0 || !model.rightHandPoseToBone)
         return;
     const studio::Matrix3x4 transform = studio::Multiply(hand, *model.rightHandPoseToBone);
@@ -1064,7 +1064,7 @@ void CollectEntities()
         g_state.localPlayer = std::array<float, 3>{player->transform[0][3], player->transform[1][3], player->transform[2][3]};
     std::optional<studio::Matrix3x4> playerHand;
     if (player != g_state.entities.end()) {
-        const ModelEntry& body = ModelFor(player->model);
+        const ModelEntry& body = ModelFor(player->model, player->skin);
         g_state.bones.resize(kMaxBones);
         if (body.rightHand >= 0 && body.rightHand < kMaxBones &&
             entities::SetupBones(player->renderable, reinterpret_cast<float (*)[3][4]>(g_state.bones.data()), kMaxBones))
@@ -1078,7 +1078,7 @@ void CollectEntities()
                 AddHeldWeapon(entity, *playerHand);
             continue;
         }
-        const ModelEntry& model = ModelFor(entity.model);
+        const ModelEntry& model = ModelFor(entity.model, entity.skin);
         if (model.sceneModel < 0)
             continue;
         const UINT mask = carried ? kLocalPlayerMask : InSkybox(entity, model.center) ? kSkyboxMask : kDynamicMask;
