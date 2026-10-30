@@ -51,6 +51,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - In the native renderer, eyes and teeth are lit by real-time light.
 - In the native renderer, brushes and models with `$phong` get their highlights, shadowed by ray tracing: brushes from the sun as in GMod, models from the sun, the strongest lights and flashlights.
 - Reflections of materials with `$envmaplightscale` fade where the surface is dark, as in the game.
+- In the native renderer, bump-mapped models and skin materials with `$halflambert` (most characters) take light with the game's half-Lambert shading.
 
 ### Removed
 

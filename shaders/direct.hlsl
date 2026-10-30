@@ -140,6 +140,10 @@ void main(uint3 id : SV_DispatchThreadID)
     uint seed = PixelSeed(pixel, 0x2Du);
     Texture2D<uint> pixelFlags = ResourceDescriptorHeap[g_frame.pixelFlagsView];
     float3 lightNormal = lit && (pixelFlags.Load(int3(pixel, 0)) & kPixelIgnoreNormals) != 0 ? 0.0 : normal;
+    if (lit) {
+        Texture2D<float4> gbufferFlags = ResourceDescriptorHeap[g_frame.flagsView];
+        g_halfLambert = (MaterialBits(gbufferFlags.Load(int3(pixel, 0))) & kMaterialHalfLambert) != 0;
+    }
 
     float3 exact = 0.0;
     float3 specular = 0.0;

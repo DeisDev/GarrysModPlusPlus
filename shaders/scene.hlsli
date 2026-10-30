@@ -509,9 +509,19 @@ uint ShadowMask(bool attachedLight)
 // a zero normal stands for them.
 static const float kIgnoredNormalLambert = 0.35;
 
+// Set by a pass for the pixel it lights: Source's half-Lambert diffuse term ($halflambert, DiffuseTerm in
+// common_vertexlitgeneric_dx9.h).
+static bool g_halfLambert = false;
+
 float Lambert(float3 normal, float3 toLight)
 {
-    return any(normal != 0.0) ? saturate(dot(normal, toLight)) : kIgnoredNormalLambert;
+    if (!any(normal != 0.0))
+        return kIgnoredNormalLambert;
+    if (g_halfLambert) {
+        float wrapped = saturate(dot(normal, toLight) * 0.5 + 0.5);
+        return wrapped * wrapped;
+    }
+    return saturate(dot(normal, toLight));
 }
 
 // Map lights first, then the engine's dynamic lights.

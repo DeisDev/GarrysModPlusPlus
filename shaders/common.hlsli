@@ -157,6 +157,14 @@ static const uint kPixelHit = 1;
 static const uint kPixelUnlit = 2;
 static const uint kPixelIgnoreNormals = 4;
 
+// Material bits the twins (shaders/twins) store in the G-buffer flags' green as 1 - bits / 255 on covered pixels.
+static const uint kMaterialHalfLambert = 1;
+
+uint MaterialBits(float4 flags)
+{
+    return 255u - uint(round(saturate(flags.g) * 255.0));
+}
+
 // Game draws that light themselves (forward twins, shaders/forward_twin.hlsli) keep their own constants in b0 and b1
 // and reach these in register space 1 (the translated shaders' root signature, shaderapi_pipelines.cpp).
 #ifdef GMODPP_GAME_DRAW
