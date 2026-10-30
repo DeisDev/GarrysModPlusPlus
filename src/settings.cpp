@@ -48,6 +48,7 @@ constexpr NamedField kFields[] = {
     {"ao_intensity", &Settings::aoIntensity, {0.0f, 1.0f}},
     {"reflections", &Settings::reflections},
     {"translucent_lighting", &Settings::translucentLighting},
+    {"render_target_lighting", &Settings::renderTargetLighting},
     {"volumetric_light", &Settings::volumetricLight},
     {"volumetric_intensity", &Settings::volumetricIntensity, {0.0f, 4.0f}},
     {"fog", &Settings::fog},

@@ -292,6 +292,7 @@ void DrawLightingTab(Settings& settings)
         ToggleRow(TextId::AmbientOcclusion, settings.ambientOcclusion, settings, &Settings::aoIntensity);
         ToggleRow(TextId::Reflections, settings.reflections, settings, &Settings::reflectionIntensity);
         ToggleRow(TextId::TranslucentLighting, settings.translucentLighting, settings, nullptr);
+        ToggleRow(TextId::RenderTargetLighting, settings.renderTargetLighting, settings, nullptr);
         ToggleRow(TextId::VolumetricLight, settings.volumetricLight, settings, &Settings::volumetricIntensity);
         ImGui::EndTable();
     }

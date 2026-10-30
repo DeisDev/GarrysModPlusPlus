@@ -30,6 +30,7 @@ bool End(gbuffer::ViewKind kind, ViewInputs& inputs);
 // Lights the translucent surfaces drawn until EndForward from the probe volume.
 void BeginForward(const gbuffer::ForwardConstants& constants);
 void EndForward();
+bool ForwardActive();
 
 // INT_RENDERPARM_ENABLE_FIXED_LIGHTING while capturing or lighting translucent surfaces, or -1 to keep the game's.
 int FixedLighting();

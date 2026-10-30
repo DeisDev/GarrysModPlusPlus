@@ -38,6 +38,7 @@ enum class TextId {
     AmbientOcclusion,
     Reflections,
     TranslucentLighting,
+    RenderTargetLighting,
     VolumetricLight,
     Fog,
     SectionAntiAliasing,

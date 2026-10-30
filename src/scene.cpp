@@ -817,6 +817,12 @@ bool Scene::EnsureFrameCapacity(FrameTlas& frame, UINT count)
     D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO info = {};
     m_device->GetRaytracingAccelerationStructurePrebuildInfo(&inputs, &info);
     const UINT recordsView = frame.recordsView != DescriptorHeap::kInvalid ? frame.recordsView : m_descriptors->Allocate();
+    // Views drawn into textures may still trace the TLAS being replaced (Lighting::ForwardScene of an earlier view).
+    if (frame.tlas) {
+        m_queue->Signal(m_fence.Get(), ++m_fenceValue);
+        m_fence->SetEventOnCompletion(m_fenceValue, m_fenceEvent);
+        WaitForSingleObject(m_fenceEvent, INFINITE);
+    }
     frame.instances.Reset();
     frame.records.Reset();
     frame.scratch.Reset();

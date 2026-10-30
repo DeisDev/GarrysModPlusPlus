@@ -2,21 +2,28 @@
 
 #include "command_line.h"
 #include "d3d12_device.h"
+#include "engine_interfaces.h"
 #include "log.h"
+#include "options.h"
 #include "overlay.h"
 #include "settings.h"
 #include "shaderapi.h"
 #include "shaderapi_capture.h"
 #include "shaderapi_device.h"
+#include "shaderapi_textures.h"
 #include "video_menu.h"
 #include "view_events.h"
 #include "world.h"
 
 #include <wrl/client.h>
 
+#include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <filesystem>
 #include <optional>
+#include <set>
+#include <string>
 #include <utility>
 
 using Microsoft::WRL::ComPtr;
@@ -32,6 +39,11 @@ struct State {
     bool loggedSamples = false;
     bool viewmodelCapture = false;
     float viewmodelDepth[2] = {};
+    // The last main view's forward lighting, which views drawn into textures reuse, and its map: the GPU addresses in
+    // it do not outlive the map's scene.
+    std::optional<gbuffer::ForwardConstants> forward;
+    std::string forwardLevel;
+    std::set<std::string> loggedTargets;
 };
 
 State g_state;
@@ -57,6 +69,26 @@ bool CanCapture()
     return dynamic.colorTargets[0] == kDefaultTarget && dynamic.depthTarget == kDefaultTarget;
 }
 
+// Views drawn into a texture (monitors, mirrors, scopes) are not captured; their surfaces are lit while drawn, like
+// translucent ones, with the last main view's light. Shadow depth views draw no colour.
+bool CanLightRenderTargetView()
+{
+    if (!g_state.forward || engine::LevelName() != g_state.forwardLevel || !GetSettings().renderTargetLighting || !GetSettings().realtimeLighting || !world::Ready() || capture::Active() ||
+        capture::ForwardActive() || !GetBackend().OnRenderThread() || GetBackend().Samples() > 1)
+        return false;
+    const DynamicState& dynamic = Dynamic();
+    if (dynamic.colorTargets[0] == kDefaultTarget || dynamic.colorTargets[0] == 0)
+        return false;
+    // The water's own views keep the game's light: its reflections are traced (shaders/water.hlsli), so the game's
+    // reflection is not shown, and lighting the refraction view as it is drawn costs about 3 ms at 2560x1440.
+    const Texture* target = TextureFromHandle(dynamic.colorTargets[0]);
+    std::string name = target != nullptr ? target->name : std::string();
+    std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (GetOptions().devMode && g_state.loggedTargets.insert(name).second && g_state.loggedTargets.size() <= 16)
+        log::Info("Real-time lighting: a view is drawn into '{}'", name);
+    return !name.starts_with("_rt_water");
+}
+
 void Finish(gbuffer::ViewKind kind)
 {
     ViewInputs inputs = {};
@@ -67,8 +99,11 @@ void Finish(gbuffer::ViewKind kind)
     // Lighting submits its own commands, which must follow the game's that drew the view.
     GetBackend().Submit();
     world::LightView(inputs);
-    if (const std::optional<gbuffer::ForwardConstants> forward = world::ForwardLighting(inputs))
+    if (const std::optional<gbuffer::ForwardConstants> forward = world::ForwardLighting(inputs)) {
+        g_state.forward = forward;
+        g_state.forwardLevel = engine::LevelName();
         capture::BeginForward(*forward);
+    }
 }
 
 // Source draws the viewmodel with DepthRange(0, 0.1); a few sprites use 0..0.01, which is not the viewmodel.
@@ -152,6 +187,10 @@ namespace gmodpp::effects {
 void OnViewOpaqueBegin()
 {
     using namespace native;
+    if (realtime::CanLightRenderTargetView()) {
+        capture::BeginForward(*realtime::g_state.forward);
+        return;
+    }
     if (!realtime::CanCapture())
         return;
     Backend& backend = GetBackend();

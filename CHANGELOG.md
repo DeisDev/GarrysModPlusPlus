@@ -26,6 +26,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Underwater, the surface shows the world above through Snell's window and mirrors the water below beyond it, and sunlight scatters in the water's colour.
 - A `winmm.dll` loader in the game folder. With `-insecure -gmodpp_vanilla` it runs the game's own renderer through `gmodpp.dll`, as a reference for the coming native Direct3D 12 renderer.
 - In the native renderer, GMod's Advanced video options have settings for anti-aliasing (TAA or DLSS), the DLSS mode, real-time lighting, ray tracing quality and indirect light. MSAA and Direct3D 9Ex are hidden there, and MSAA is turned off when the options are applied.
+- In the native renderer, camera screens, mirrors and scopes that draw the world into a texture get real-time light ("Cameras and mirrors" in the menu; about 1 ms for a 512x512 view). The water's own views keep the game's light.
 
 ### Changed
 

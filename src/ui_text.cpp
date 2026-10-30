@@ -42,6 +42,7 @@ constexpr std::array<const char*, static_cast<size_t>(TextId::Count)> kEnglish =
     "Ambient occlusion",
     "Reflections",
     "Translucent surfaces",
+    "Cameras and mirrors",
     "Volumetric light",
     "Fog",
     "Anti-aliasing",

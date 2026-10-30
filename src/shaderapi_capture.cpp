@@ -428,6 +428,8 @@ void BeginForward(const gbuffer::ForwardConstants& constants)
     g_state.forwardTwinDraws = 0;
 }
 
+bool ForwardActive() { return g_state.forwardActive; }
+
 void EndForward()
 {
     if (!g_state.forwardActive)
