@@ -25,6 +25,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Water has ray-traced reflections over the game's refraction, a sun glint and a physical Fresnel term.
 - Underwater, the surface shows the world above through Snell's window and mirrors the water below beyond it, and sunlight scatters in the water's colour.
 - A `winmm.dll` loader in the game folder. With `-insecure -gmodpp_vanilla` it runs the game's own renderer through `gmodpp.dll`, as a reference for the coming native Direct3D 12 renderer.
+- In the native renderer, GMod's Advanced video options have settings for anti-aliasing (TAA or DLSS), the DLSS mode, real-time lighting, ray tracing quality and indirect light. MSAA and Direct3D 9Ex are hidden there, and MSAA is turned off when the options are applied.
 
 ### Changed
 
@@ -46,6 +47,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - The debug view that showed the game's flashlight pass now shows additive glows.
 - Glows, sprites and other additive effects are added after anti-aliasing and DLSS, so they no longer jitter or smear.
 - In third person, your own flashlight is treated like your first-person flashlight, so your body no longer blocks it.
+- In the native renderer, glass and other translucent surfaces get sharp shadows from the sun and nearby lights.
 
 ### Removed
 
@@ -78,5 +80,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fixed rain, snow and other unlit particles disappearing with real-time lighting.
 - Fixed the physics gun's glow on held objects flickering.
 - Fixed thin bright lines along the edges of white window frames, as on gm_skywatching.
+- Fixed baked indirect light counting dim light-emitting surfaces twice.
 - Fixed window glass turning white in the flashlight.
 - Fixed the underwater fog being grey instead of the water's colour.
