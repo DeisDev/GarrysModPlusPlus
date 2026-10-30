@@ -8,8 +8,12 @@
 // Combos with g_WaterFogParams fog the refraction by that depth; the others (REFRACT_ALPHA_FOG) by the refraction's
 // alpha. With $lightmapwaterfog (LIGHTMAP_FOG) the fog colour is lit by the lightmap and, as GMod's combos do, scaled
 // by the tonemap scale twice; some of those combos (OPAQUE_FOG) draw the lit fog colour alone, without the refraction.
+// Textured flowing water (FLOW_COLOR, no refraction or lightmap) flows its base texture the same way with its own
+// period, parallax-shifted by the normal map's alpha, and fades from the fog colour to it by its alpha times the flow
+// map's; the reflection's share fades out where that alpha is high (combo 74 of GMod's water_ps20b).
 
 sampler RefractSampler : register(s0);
+sampler BaseTextureSampler : register(s1);
 sampler LightmapSampler : register(s3);
 sampler NormalSampler : register(s4);
 sampler FlowmapSampler : register(s5);
@@ -23,10 +27,13 @@ float4 g_WaterFogColor : register(c6);
 float4 g_WaterFogParams : register(c7);
 // w: the time in seconds.
 float4 g_EyePos : register(c9);
-// x: flow map coordinate scale, y: normal map coordinate scale, z: bump strength.
+// x: flow map coordinate scale, y: normal map coordinate scale, z: bump strength, w: parallax scale.
 float4 g_FlowParams1 : register(c13);
 // x: the period in seconds, y: the scroll distance per period, z: noise coordinate scale.
 float4 g_FlowParams2 : register(c14);
+// The base texture's flow: x coordinate scale, y period in seconds, z scroll distance per period, w the exponent of
+// the blend between its two samples.
+float4 g_ColorFlowParams : register(c26);
 float4 cLightScale : register(c30);
 
 struct Input
@@ -57,14 +64,35 @@ static const float kPeriodOffset = 0.311;
 Output main(Input input)
 {
     float2 world = input.world * float2(1.0, -1.0);
-    float phase = g_EyePos.w / (2.0 * g_FlowParams2.x) + tex2D(FlowNoiseSampler, world * g_FlowParams2.z).y;
-    float2 flow = tex2D(FlowmapSampler, input.flowCoord * g_FlowParams1.x).xy * 2.0 - 1.0;
+    float noise = tex2D(FlowNoiseSampler, world * g_FlowParams2.z).y;
+    float phase = g_EyePos.w / (2.0 * g_FlowParams2.x) + noise;
+    float4 flowSample = tex2D(FlowmapSampler, input.flowCoord * g_FlowParams1.x);
+    float2 flow = flowSample.xy * 2.0 - 1.0;
     float2 scroll = flow * g_FlowParams2.y;
     float2 normalCoord = world * g_FlowParams1.y;
-    float2 first = tex2D(NormalSampler, normalCoord + floor(phase) * kPeriodOffset + frac(phase) * scroll).xy;
+    float4 first = tex2D(NormalSampler, normalCoord + floor(phase) * kPeriodOffset + frac(phase) * scroll);
     float shifted = phase + 0.5;
-    float2 second = tex2D(NormalSampler, normalCoord + floor(shifted) * kPeriodOffset + 0.5 + frac(shifted) * scroll).xy;
-    float2 slope = (lerp(first, second, abs(2.0 * frac(phase) - 1.0)) * 2.0 - 1.0) * (g_FlowParams1.z * (dot(flow, flow) + 0.1));
+    float4 second = tex2D(NormalSampler, normalCoord + floor(shifted) * kPeriodOffset + 0.5 + frac(shifted) * scroll);
+    float4 bump = lerp(first, second, abs(2.0 * frac(phase) - 1.0));
+    float2 slope = (bump.xy * 2.0 - 1.0) * (g_FlowParams1.z * (dot(flow, flow) + 0.1));
+    float eyeAngle = dot(input.tangentEye.xy, input.tangentEye.xy) > 1e-6 ? atan2(input.tangentEye.y, input.tangentEye.x) : kNoEyeAngle;
+    Output output;
+    output.normal = float4(slope, dot(g_ReflectTint.rgb, 1.0 / 3.0), eyeAngle);
+    output.emissive = 0.0;
+#if FLOW_COLOR
+    float colorPhase = g_EyePos.w / (2.0 * g_ColorFlowParams.y) + noise;
+    float2 colorScroll = flow * g_ColorFlowParams.z;
+    float2 colorCoord = world * g_ColorFlowParams.x + bump.w * g_FlowParams1.w * (normalize(input.tangentEye).xy - slope);
+    float colorShifted = colorPhase + 0.5;
+    float4 colorFirst = tex2D(BaseTextureSampler, colorCoord + floor(colorPhase) * kPeriodOffset + (frac(colorPhase) - 0.5) * colorScroll);
+    float4 colorSecond = tex2D(BaseTextureSampler, colorCoord + floor(colorShifted) * kPeriodOffset + 0.5 + (frac(colorShifted) - 0.5) * colorScroll);
+    float4 color = colorFirst * pow(abs(2.0 * frac(colorShifted) - 1.0), g_ColorFlowParams.w) +
+        colorSecond * pow(abs(2.0 * frac(colorPhase) - 1.0), g_ColorFlowParams.w);
+    float opacity = color.a * flowSample.a;
+    output.refraction = float4(lerp(g_WaterFogColor.rgb, color.rgb * flowSample.a, saturate(2.0 * opacity)), 1.0);
+    output.flags = float4(0.0, 1.0, 0.0, 1.0 - smoothstep(0.5, 0.7, opacity));
+    return output;
+#else
 
     float2 screenCoord = input.reflectRefract.wz / input.projection.w;
 #if REFRACT_ALPHA_FOG
@@ -91,11 +119,8 @@ Output main(Input input)
     refraction.rgb = lerp(refraction.rgb, fogColor * cLightScale.x, fog);
 #endif
 
-    Output output;
     output.refraction = float4(refraction.rgb, 1.0);
-    float eyeAngle = dot(input.tangentEye.xy, input.tangentEye.xy) > 1e-6 ? atan2(input.tangentEye.y, input.tangentEye.x) : kNoEyeAngle;
-    output.normal = float4(slope, dot(g_ReflectTint.rgb, 1.0 / 3.0), eyeAngle);
-    output.emissive = 0.0;
     output.flags = float4(0.0, 1.0, 0.0, shore);
     return output;
+#endif
 }

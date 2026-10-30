@@ -6,6 +6,7 @@
 #include <g_forwardSnippetPS.h>
 #include <g_forwardSnippetPS2.h>
 #include <g_waterFlowSurfaceAlphaFogPS.h>
+#include <g_waterFlowSurfaceColorPS.h>
 #include <g_waterFlowSurfaceLightmapFogPS.h>
 #include <g_waterFlowSurfaceOpaqueFogPS.h>
 #include <g_waterFlowSurfacePS.h>
@@ -107,6 +108,19 @@ bool IsTexturedWater(const std::vector<bytecode::Constant>& constants)
         !HasConstant(constants, "FlowmapSampler");
 }
 
+// The flowing textured combos without a lightmap, which flow their base texture instead of refracting
+// (shaders/water_flow_surface.hlsl, FLOW_COLOR).
+bool IsFlowingColorWater(const std::vector<bytecode::Constant>& constants)
+{
+    using bytecode::RegisterSet;
+    return HasRegister(constants, "BaseTextureSampler", RegisterSet::Sampler, 1) && HasRegister(constants, "NormalSampler", RegisterSet::Sampler, 4) &&
+        HasRegister(constants, "FlowmapSampler", RegisterSet::Sampler, 5) && HasRegister(constants, "FlowNoiseSampler", RegisterSet::Sampler, 6) &&
+        HasRegister(constants, "g_vReflectTint", RegisterSet::Float4, 4) && HasRegister(constants, "g_WaterFogColor", RegisterSet::Float4, 6) &&
+        HasRegister(constants, "g_EyePos", RegisterSet::Float4, 9) && HasRegister(constants, "g_vFlowParams1", RegisterSet::Float4, 13) &&
+        HasRegister(constants, "g_vFlowParams2", RegisterSet::Float4, 14) && HasRegister(constants, "g_vColorFlowParams1", RegisterSet::Float4, 26) &&
+        !HasConstant(constants, "RefractSampler") && !HasConstant(constants, "LightmapSampler");
+}
+
 // Which of a water replacement's variants (still or flowing) matches a combo: depth or alpha fog, and with
 // $lightmapwaterfog whether the combo blends the refraction's colour or draws the lit fog colour alone. Combos without
 // a lightmap that leave the refraction's colour out have no replacement.
@@ -194,6 +208,11 @@ PixelShaderClass ClassifyPixelShader(std::span<const DWORD> code, UINT registerL
     if (IsFlashlightPass(constants)) {
         result.kind = ShaderKind::Flashlight;
         result.flashlight = FlashlightRegistersOf(constants, registerLimit);
+        return result;
+    }
+    if (IsFlowingColorWater(constants)) {
+        result.kind = ShaderKind::Water;
+        result.replacement = Code(g_waterFlowSurfaceColorPS);
         return result;
     }
     if (IsTexturedWater(constants)) {
