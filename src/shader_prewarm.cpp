@@ -339,7 +339,8 @@ void PrewarmShaders(const std::filesystem::path& gameDirectory, const std::files
                 file.result.compileFailures.load(), file.result.firstError);
     };
 
-    // Twins already built: shipped combos share them (twins::GBufferShader keeps each twin at one address).
+    // Twins already built: shipped combos share them (twins::GBufferShader and ForwardShader keep each twin at one
+    // address).
     std::mutex twinsMutex;
     std::unordered_set<const DWORD*> builtTwins;
     std::mutex queueMutex;
@@ -388,17 +389,24 @@ void PrewarmShaders(const std::filesystem::path& gameDirectory, const std::files
             }
             if (index >= file->work.size()) {
                 const auto [staticCombo, dynamicCombo] = file->twinCombos[index - file->work.size()];
-                const std::span<const DWORD> twin = twins::GBufferShader(file->name, file->header,
-                    static_cast<int>(staticCombo) * std::max(file->header.dynamicCombos, 1), static_cast<int>(dynamicCombo));
-                bool first = false;
-                if (!twin.empty()) {
-                    std::scoped_lock lock(twinsMutex);
-                    first = builtTwins.insert(twin.data()).second;
-                }
-                if (first) {
-                    translator::Translation translation;
-                    bool available = false;
-                    build(*file, vcs::Combo{ staticCombo, dynamicCombo, std::vector<DWORD>(twin.begin(), twin.end()) }, {}, translation, available);
+                const int staticIndex = static_cast<int>(staticCombo) * std::max(file->header.dynamicCombos, 1);
+                // The G-buffer twin, and the forward twin translucent draws and views drawn into textures use.
+                for (const bool forward : {false, true}) {
+                    const std::span<const DWORD> twin = forward
+                        ? twins::ForwardShader(file->name, file->header, staticIndex, static_cast<int>(dynamicCombo))
+                        : twins::GBufferShader(file->name, file->header, staticIndex, static_cast<int>(dynamicCombo));
+                    bool first = false;
+                    if (!twin.empty()) {
+                        std::scoped_lock lock(twinsMutex);
+                        first = builtTwins.insert(twin.data()).second;
+                    }
+                    if (first) {
+                        translator::Variant variant;
+                        variant.forwardLighting = forward ? 1 : 0;
+                        translator::Translation translation;
+                        bool available = false;
+                        build(*file, vcs::Combo{ staticCombo, dynamicCombo, std::vector<DWORD>(twin.begin(), twin.end()) }, variant, translation, available);
+                    }
                 }
                 ++progress.done;
                 if (--file->remaining == 0)
