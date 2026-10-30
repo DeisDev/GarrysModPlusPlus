@@ -55,7 +55,7 @@ GBufferTwinOutput main( PS_INPUT i )
 	GBufferTwinOutput twin;
 	twin.albedo = baseSample;
 	twin.normal = float4( 0, 0, 0, baseSample.a );
-	twin.emissive = float4( 0, 0, 0, baseSample.a );
+	twin.emissive = float4( 0, 0, 0, 0 );
 #if FORWARD_TWIN
 	twin.flags = float4( i.worldPos_projPosZ.xyz, baseSample.a );
 #else

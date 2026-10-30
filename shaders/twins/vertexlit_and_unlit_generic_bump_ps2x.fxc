@@ -321,7 +321,7 @@ float4 main( PS_INPUT i ) : COLOR
 	GBufferTwinOutput twin;
 	twin.albedo = float4( twinAlbedo, alpha );
 	twin.normal = float4( worldSpaceNormal, alpha );
-	twin.emissive = float4( twinEmissive, alpha );
+	twin.emissive = float4( twinEmissive, 0 );
 #if FORWARD_TWIN
 	// shaders/forward_twin.hlsli lights the draw at its world position.
 	twin.flags = float4( i.worldPos_projPosZ.xyz, alpha );

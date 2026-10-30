@@ -33,6 +33,24 @@ float3 ApplyFog(float3 color, float3 position)
     return lerp(color, g_frame.fogColor, g_frame.fogParams.y > 0.0 ? fog : fog * fog);
 }
 
+// The sun highlight of GMod's brush Phong (shaders/twins/lightmappedgeneric_ps2_3_x.h): GMod's lightmappedgeneric_ps30
+// computes pow(|N.H|, exponent) * sqrt(N.L) * strength * L * saturate(L) toward g_LightDir, with L the lightmap; here L
+// is the traced direct sunlight. The exponent is in the emissive target's alpha, the strength in the flags' blue.
+float3 PhongHighlight(int2 pixel, float3 normal, float3 position, float sunVisibility, bool unlit)
+{
+    Texture2D<float4> emissives = ResourceDescriptorHeap[g_frame.emissiveView];
+    float exponent = emissives.Load(int3(pixel, 0)).a;
+    if (unlit || exponent <= 0.0 || g_frame.sunEnabled == 0.0 || sunVisibility <= 0.0)
+        return 0.0;
+    Texture2D<float4> flags = ResourceDescriptorHeap[g_frame.flagsView];
+    float strength = flags.Load(int3(pixel, 0)).b;
+    float3 toEye = normalize(g_frame.eyePosition - position);
+    float3 halfway = normalize(toEye + g_frame.sunDirection);
+    float lambert = saturate(dot(normal, g_frame.sunDirection));
+    float3 sunlight = g_frame.sunColor * (sunVisibility * lambert);
+    return sunlight * saturate(sunlight) * (strength * sqrt(lambert) * pow(saturate(abs(dot(normal, halfway))), exponent));
+}
+
 [RootSignature(ROOT_SIGNATURE)]
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID)
@@ -135,7 +153,8 @@ void main(uint3 id : SV_DispatchThreadID)
         Texture2D<uint> pixelFlags = ResourceDescriptorHeap[g_frame.pixelFlagsView];
         bool unlit = (pixelFlags.Load(int3(pixel, 0)) & kPixelUnlit) != 0;
         float3 light = unlit ? 1.0 : direct + indirect;
-        float3 shaded = ApplyFog((albedo * light + emissive + added) * g_frame.tonemapScale, position) + additive + VolumetricLight(pixel);
+        float3 shaded = ApplyFog((albedo * light + emissive + added + PhongHighlight(pixel, surface.xyz, position, directLight.a, unlit)) * g_frame.tonemapScale,
+            position) + additive + VolumetricLight(pixel);
         result = g_frame.outputLinear != 0 ? shaded : Encode(shaded);
         break;
     }

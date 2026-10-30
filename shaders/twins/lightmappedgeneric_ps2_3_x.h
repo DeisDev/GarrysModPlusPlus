@@ -95,6 +95,12 @@ const float4 g_DetailTint_and_BlendFactor	: register( c8 );
 const HALF3 g_EyePos						: register( c10 );
 const HALF4 g_FogParams						: register( c11 );
 const float4 g_TintValuesAndLightmapScale	: register( c12 );
+#if PHONG
+// GMod's brush Phong constants, at the registers its lightmappedgeneric_ps30 PHONG combos read them from.
+const float4 g_Phong_Exp_and_BaseTint			: register( c22 );
+const float4 g_PhongMask_Contrast_and_Brightness	: register( c23 );
+const float4 g_PhongAmount						: register( c24 );
+#endif
 
 #define g_flAlpha2 g_TintValuesAndLightmapScale.w
 
@@ -504,15 +510,29 @@ HALF4 main( PS_INPUT i ) : COLOR
 		twinEmissive = g_SelfIllumTint * albedo.xyz * baseColor.a;
 		twinAlbedo *= 1 - baseColor.a;
 	}
+	// The sun highlight of GMod's brush Phong, which shaders/deferred_lighting.hlsl adds: its exponent (0: none) and
+	// strength. GMod's PHONG combos (read from their bytecode) mask it by the base texture's luminance with
+	// $phongmaskcontrastbrightness, tint it by $phongamount and $phongbasetint, and scale the diffuse colour by
+	// $phongamount.w; they light it with the lightmap where ray tracing uses the sun.
+	float twinPhongExponent = 0.0f;
+	float twinPhong = 0.0f;
+#if PHONG
+	float phongMask = saturate( ( dot( baseColor.rgb, float3( 0.299f, 0.587f, 0.114f ) ) - 0.5f ) * g_PhongMask_Contrast_and_Brightness.x +
+		g_PhongMask_Contrast_and_Brightness.y + 0.5f );
+	float3 phongTint = g_PhongAmount.rgb * lerp( float3( 1.0f, 1.0f, 1.0f ), baseColor.rgb, g_Phong_Exp_and_BaseTint.y );
+	twinPhong = phongMask * dot( phongTint, float3( 1.0f, 1.0f, 1.0f ) / 3.0f );
+	twinPhongExponent = g_Phong_Exp_and_BaseTint.x;
+	twinAlbedo *= g_PhongAmount.w;
+#endif
 	GBufferTwinOutput twin;
 	twin.albedo = float4( twinAlbedo, alpha );
 	twin.normal = float4( mul( vNormal.xyz, i.tangentSpaceTranspose ), alpha );
-	twin.emissive = float4( twinEmissive, alpha );
+	twin.emissive = float4( twinEmissive, twinPhongExponent );
 #if FORWARD_TWIN
 	// shaders/forward_twin.hlsli lights the draw at its world position.
 	twin.flags = float4( i.worldPos_projPosZ.xyz, alpha );
 #else
-	twin.flags = float4( 1, 1, 1, alpha );
+	twin.flags = float4( 1, 1, twinPhong, alpha );
 #endif
 	return twin;
 #else

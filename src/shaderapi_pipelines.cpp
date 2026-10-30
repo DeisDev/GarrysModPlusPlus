@@ -1028,8 +1028,8 @@ void DrawPass(const ShadowState& shadow, const MeshDraw& mesh)
             key.blend.RenderTarget[i] = blend;
             key.blend.RenderTarget[i].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
         }
-        key.blend.RenderTarget[gbuffer::kEmissiveTarget].RenderTargetWriteMask =
-            pass.emissive ? D3D12_COLOR_WRITE_ENABLE_RED | D3D12_COLOR_WRITE_ENABLE_GREEN | D3D12_COLOR_WRITE_ENABLE_BLUE : 0;
+        // Twins write self-illumination and, in alpha, the Phong exponent.
+        key.blend.RenderTarget[gbuffer::kEmissiveTarget].RenderTargetWriteMask = pass.emissive ? D3D12_COLOR_WRITE_ENABLE_ALL : 0;
     }
 
     D3D12_RASTERIZER_DESC& raster = key.raster;
