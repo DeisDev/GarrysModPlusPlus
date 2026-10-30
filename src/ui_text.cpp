@@ -111,6 +111,9 @@ constexpr std::array<const char*, static_cast<size_t>(TextId::Count)> kEnglish =
     "Opacity micromaps: {} triangles, {} maps",
     "Ambient occlusion: {:.2f} ms",
     "3D skybox and viewmodel: {:.2f} ms",
+    "Preparing shaders. This happens once and takes a few minutes. Close this window to skip; shaders then load when first used.",
+    // Shaders prepared so far, of all.
+    "{0:L} of {1:L}",
 };
 
 }

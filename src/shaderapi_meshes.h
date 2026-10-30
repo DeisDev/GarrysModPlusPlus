@@ -3,6 +3,8 @@
 #include "shaderapi_device.h"
 
 #include <cstdint>
+#include <span>
+#include <utility>
 #include <vector>
 
 namespace gmodpp::native {
@@ -41,17 +43,20 @@ struct VertexElement {
     DXGI_FORMAT format;
     UINT offset;
 };
-std::vector<VertexElement> VertexElements(std::uint64_t format, bool colorMesh);
+// The input layout of a vertex format, its colour stream and its flex stream; layouts are cached (render thread only).
+const std::vector<VertexElement>& VertexElements(std::uint64_t format, bool colorMesh, std::uint64_t flexFormat);
 
 // What IShaderAPI::RenderPass draws: the mesh IMesh::Draw handed to the material.
 struct MeshDraw {
     std::uint64_t vertexFormat = 0;
     // Streams 0 (vertices), 1 (static prop colour mesh) and 2 (flex deltas); an empty view is absent.
     D3D12_VERTEX_BUFFER_VIEW streams[3] = {};
+    // The flex mesh's vertex format when stream 2 is bound.
+    std::uint64_t flexFormat = 0;
     D3D12_INDEX_BUFFER_VIEW indices = {};
     D3D12_PRIMITIVE_TOPOLOGY topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
     // (first index, index count) per primitive list; for unindexed meshes, vertices.
-    std::vector<std::pair<int, int>> primitives;
+    std::span<const std::pair<int, int>> primitives;
     int vertexCount = 0;
     ID3D12Resource* buffers[3] = {};
     // The vertices' CPU copy when there is one (developer diagnostics).

@@ -20,7 +20,8 @@
 //   test reference.
 // - Vertex shader inputs keep their D3D9 usage as the semantic (POSITION0, TEXCOORD3, ...).
 // - Vertex and pixel shaders link through one fixed interpolant struct (TEXCOORD0-9, COLOR0-1, FOG), so any pair
-//   matches. A declaration whose mask does not start at x is packed into the first components of its member.
+//   matches. A masked declaration keeps its components in place: a pixel shader reading texcoord5 into v4.z reads the
+//   z the vertex shader wrote to texcoord5 ("Match Semantics on vs_3_0 and ps_3_0 Shaders", Shader model 3).
 // D3D9 semantics follow the shader model reference (learn.microsoft.com, "Asm Shader Reference"): rcp, rsq, log and
 // nrm of 0 give +-FLT_MAX, pow and log take the absolute value, mova rounds to nearest, texkill tests xyz, vPos is the
 // pixel centre at integer coordinates, and D3D9 pixel centres sit half a pixel off D3D10's (applied to positions).
@@ -67,13 +68,6 @@ std::string MaskString(DWORD mask)
             text += kComponents[i];
     }
     return text;
-}
-
-// The first `count` components, for packing a masked declaration into the start of its member.
-std::string LeadingComponents(DWORD mask)
-{
-    int count = std::popcount(mask);
-    return count == 4 ? "" : "." + std::string(kComponents, count);
 }
 
 std::string Float(float value)
@@ -950,7 +944,7 @@ std::string Translator::Assemble()
                 }
                 auto member = InterpolantMember(output.usage, output.usageIndex);
                 if (member)
-                    text += std::format("    output.{}{} = o{}{};\n", *member, LeadingComponents(output.mask), output.reg, MaskString(output.mask));
+                    text += std::format("    output.{}{} = o{}{};\n", *member, MaskString(output.mask), output.reg, MaskString(output.mask));
             }
         } else {
             for (const std::string& global : m_globals) {
@@ -1002,7 +996,7 @@ std::string Translator::Assemble()
     for (const Declaration& input : m_inputs) {
         auto member = InterpolantMember(input.usage, input.usageIndex);
         const bool texture = (input.reg & 0x100) != 0;
-        text += std::format("    {}{}{} = input.{}{};\n", texture ? "t" : "v", input.reg & 0xFF, MaskString(input.mask), *member, LeadingComponents(input.mask));
+        text += std::format("    {}{}{} = input.{}{};\n", texture ? "t" : "v", input.reg & 0xFF, MaskString(input.mask), *member, MaskString(input.mask));
     }
     text += "    gmodpp_main();\n";
     if (m_variant.alphaTest != 0 && m_variant.alphaTest != D3DCMP_ALWAYS && (m_out.colorOutputs & 1)) {

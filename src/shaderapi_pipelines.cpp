@@ -2,6 +2,7 @@
 
 #include "command_line.h"
 #include "log.h"
+#include "shader_cache.h"
 #include "shader_compiler.h"
 #include "shader_translator.h"
 #include "shaderapi.h"
@@ -14,11 +15,14 @@
 #include <array>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <iterator>
 #include <memory>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -40,9 +44,6 @@ public:
 
 namespace {
 
-// Bumped whenever the translator's output changes, so the disk cache misses old translations.
-constexpr std::uint32_t kTranslatorVersion = 3;
-constexpr std::uint32_t kCacheMagic = 0x53504d47;
 // IBaseFileSystem (public/filesystem.h), confirmed in filesystem_stdio.dll (engine_interfaces.cpp).
 constexpr unsigned kFileSystemRead = 0;
 constexpr unsigned kFileSystemOpen = 2;
@@ -53,6 +54,9 @@ constexpr UINT kConstantAlignment = D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNME
 constexpr UINT kZeroStream = 3;
 // Unbound samplers read a null descriptor of the shader's texture type.
 constexpr size_t kTextureTypes = 4;
+// Bumped when the pipeline descriptions change in ways their names don't capture (the root signature).
+constexpr std::uint32_t kPipelineLibraryVersion = 1;
+constexpr auto kPipelineLibrarySaveInterval = std::chrono::seconds(30);
 
 std::uint64_t Fnv(const void* data, size_t size, std::uint64_t hash = 14695981039346656037ull)
 {
@@ -120,7 +124,69 @@ std::span<const DWORD> Combo(const ShaderFile& constFile, int staticIndex, int d
 struct CompiledShader {
     translator::Translation info;
     std::vector<unsigned char> dxil;
+    // Names the shader in pipeline library names.
+    std::uint64_t dxilHash = 0;
     bool failed = false;
+};
+
+struct PipelineKey {
+    const CompiledShader* vertexShader;
+    const CompiledShader* pixelShader;
+    D3D12_BLEND_DESC blend;
+    D3D12_RASTERIZER_DESC raster;
+    D3D12_DEPTH_STENCIL_DESC depthStencil;
+    D3D12_INPUT_ELEMENT_DESC elements[16];
+    UINT elementCount;
+    D3D12_PRIMITIVE_TOPOLOGY_TYPE topology;
+    UINT targets;
+    DXGI_FORMAT targetFormats[4];
+    DXGI_FORMAT depthFormat;
+    UINT samples;
+};
+
+// Keys are zero-filled before use, so their padding compares and hashes equal; semantic names point to static strings.
+struct PipelineKeyHash {
+    size_t operator()(const PipelineKey& key) const
+    {
+        // Unused input element slots are zero, so they are left out.
+        const auto* bytes = reinterpret_cast<const std::uint8_t*>(&key);
+        const size_t elementsEnd = offsetof(PipelineKey, elements) + key.elementCount * sizeof(D3D12_INPUT_ELEMENT_DESC);
+        std::uint64_t hash = 14695981039346656037ull;
+        auto mix = [&](size_t begin, size_t end) {
+            for (size_t i = begin; i + 8 <= end; i += 8) {
+                std::uint64_t word;
+                std::memcpy(&word, bytes + i, sizeof(word));
+                hash = (hash ^ word) * 1099511628211ull ^ (hash >> 31);
+            }
+        };
+        mix(0, elementsEnd);
+        mix(offsetof(PipelineKey, elementCount), sizeof(PipelineKey));
+        return static_cast<size_t>(hash);
+    }
+};
+
+struct PipelineKeyEqual {
+    bool operator()(const PipelineKey& a, const PipelineKey& b) const { return std::memcmp(&a, &b, sizeof(PipelineKey)) == 0; }
+};
+
+// A combo's bytecode never moves once loaded, so its address and the variant find its translation without hashing it.
+struct VariantSlot {
+    const DWORD* code;
+    std::uint64_t variant;
+    bool operator==(const VariantSlot&) const = default;
+};
+
+struct VariantSlotHash {
+    size_t operator()(const VariantSlot& slot) const { return std::hash<const void*>()(slot.code) ^ std::hash<std::uint64_t>()(slot.variant * 0x9e3779b97f4a7c15ull); }
+};
+
+// The last upload of a register file's constants, valid while the command list and the registers are unchanged.
+struct ConstantUpload {
+    std::uint64_t generation = ~0ull;
+    std::uint64_t version = 0;
+    UINT first = 0;
+    UINT count = 0;
+    D3D12_GPU_VIRTUAL_ADDRESS address = 0;
 };
 
 struct PipelineCache {
@@ -135,14 +201,27 @@ struct PipelineCache {
     std::unordered_set<std::string> missingFiles;
     std::unordered_map<const DWORD*, std::unique_ptr<CompiledShader>> baseInfo;
     std::unordered_map<std::uint64_t, std::unique_ptr<CompiledShader>> shaders;
-    std::unordered_map<std::uint64_t, ComPtr<ID3D12PipelineState>> pipelines;
-    std::unordered_map<DXGI_FORMAT, ComPtr<ID3D12PipelineState>> blitPipelines;
+    std::unordered_map<VariantSlot, CompiledShader*, VariantSlotHash> variants;
+    std::unordered_map<PipelineKey, ComPtr<ID3D12PipelineState>, PipelineKeyHash, PipelineKeyEqual> pipelines;
+    // Consecutive passes often share a pipeline state.
+    PipelineKey lastKey = {};
+    ID3D12PipelineState* lastPipeline = nullptr;
+    ConstantUpload vertexConstants;
+    ConstantUpload pixelConstants;
+    // By format and sample count.
+    std::unordered_map<std::uint64_t, ComPtr<ID3D12PipelineState>> blitPipelines;
     std::vector<unsigned char> blitVertexShader;
     std::vector<unsigned char> blitPixelShader;
     std::uint64_t boundGeneration = ~0ull;
     ID3D12PipelineState* boundPipeline = nullptr;
     size_t compiled = 0;
     double compileSeconds = 0;
+    // Pipeline states saved across launches (ID3D12PipelineLibrary); the blob must outlive the library.
+    ComPtr<ID3D12PipelineLibrary> library;
+    std::vector<std::uint8_t> libraryBlob;
+    std::filesystem::path libraryPath;
+    bool libraryDirty = false;
+    std::chrono::steady_clock::time_point librarySaved;
 };
 
 PipelineCache g_cache;
@@ -228,6 +307,34 @@ void CreateNullViews()
     }
 }
 
+// A library from another driver, adapter or runtime is replaced by an empty one.
+void OpenPipelineLibrary(const std::filesystem::path& path)
+{
+    ComPtr<ID3D12Device1> device;
+    D3D12_FEATURE_DATA_SHADER_CACHE support = {};
+    if (FAILED(GetBackend().Device()->QueryInterface(IID_PPV_ARGS(&device)))
+        || FAILED(device->CheckFeatureSupport(D3D12_FEATURE_SHADER_CACHE, &support, sizeof(support)))
+        || !(support.SupportFlags & D3D12_SHADER_CACHE_SUPPORT_LIBRARY)) {
+        log::Info("Native: pipeline libraries are not supported; pipeline states are not saved");
+        return;
+    }
+    g_cache.libraryPath = path;
+    if (std::ifstream file{ path, std::ios::binary })
+        g_cache.libraryBlob.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+    HRESULT hr = device->CreatePipelineLibrary(g_cache.libraryBlob.data(), g_cache.libraryBlob.size(), IID_PPV_ARGS(&g_cache.library));
+    if (FAILED(hr) && !g_cache.libraryBlob.empty()) {
+        log::Info("Native: the saved pipeline library could not be used ({:#010x}); starting a new one", static_cast<unsigned>(hr));
+        g_cache.libraryBlob.clear();
+        hr = device->CreatePipelineLibrary(nullptr, 0, IID_PPV_ARGS(&g_cache.library));
+    }
+    if (FAILED(hr)) {
+        log::Info("Native: creating a pipeline library failed: {:#010x}", static_cast<unsigned>(hr));
+        g_cache.library = nullptr;
+        return;
+    }
+    g_cache.librarySaved = std::chrono::steady_clock::now();
+}
+
 bool Initialize()
 {
     if (g_cache.initialized)
@@ -239,54 +346,15 @@ bool Initialize()
         log::Info("Native: the shader compiler is unavailable: {}", error);
         return false;
     }
-    g_cache.cacheDirectory = game / L"gmodpp_cache" / L"shaders";
+    g_cache.cacheDirectory = shader_cache::Directory(game);
     std::error_code ignored;
     std::filesystem::create_directories(g_cache.cacheDirectory, ignored);
     if (!CreateRootSignature() || !CreateZeroBuffer())
         return false;
     CreateNullViews();
+    OpenPipelineLibrary(game / L"gmodpp_cache" / L"pipelines.bin");
     g_cache.usable = true;
     return true;
-}
-
-bool LoadCached(std::uint64_t key, CompiledShader& shader)
-{
-    std::ifstream file(g_cache.cacheDirectory / std::format("{:016x}.bin", key), std::ios::binary);
-    if (!file)
-        return false;
-    std::uint32_t header[6] = {};
-    file.read(reinterpret_cast<char*>(header), sizeof(header));
-    if (!file || header[0] != kCacheMagic || header[1] != kTranslatorVersion)
-        return false;
-    shader.info.firstFloatConstant = header[2];
-    shader.info.floatConstantCount = header[3];
-    shader.info.colorOutputs = header[4];
-    shader.info.writesDepth = header[5] != 0;
-    file.read(reinterpret_cast<char*>(shader.info.samplers.data()), sizeof(shader.info.samplers));
-    std::uint32_t inputs = 0;
-    file.read(reinterpret_cast<char*>(&inputs), sizeof(inputs));
-    shader.info.inputs.resize(inputs);
-    file.read(reinterpret_cast<char*>(shader.info.inputs.data()), static_cast<std::streamsize>(inputs * sizeof(translator::VertexInput)));
-    std::uint32_t size = 0;
-    file.read(reinterpret_cast<char*>(&size), sizeof(size));
-    shader.dxil.resize(size);
-    file.read(reinterpret_cast<char*>(shader.dxil.data()), size);
-    return static_cast<bool>(file);
-}
-
-void StoreCached(std::uint64_t key, const CompiledShader& shader)
-{
-    std::ofstream file(g_cache.cacheDirectory / std::format("{:016x}.bin", key), std::ios::binary | std::ios::trunc);
-    const std::uint32_t header[6] = { kCacheMagic, kTranslatorVersion, shader.info.firstFloatConstant, shader.info.floatConstantCount,
-        shader.info.colorOutputs, shader.info.writesDepth ? 1u : 0u };
-    file.write(reinterpret_cast<const char*>(header), sizeof(header));
-    file.write(reinterpret_cast<const char*>(shader.info.samplers.data()), sizeof(shader.info.samplers));
-    const std::uint32_t inputs = static_cast<std::uint32_t>(shader.info.inputs.size());
-    file.write(reinterpret_cast<const char*>(&inputs), sizeof(inputs));
-    file.write(reinterpret_cast<const char*>(shader.info.inputs.data()), static_cast<std::streamsize>(inputs * sizeof(translator::VertexInput)));
-    const std::uint32_t size = static_cast<std::uint32_t>(shader.dxil.size());
-    file.write(reinterpret_cast<const char*>(&size), sizeof(size));
-    file.write(reinterpret_cast<const char*>(shader.dxil.data()), size);
 }
 
 // The translation with the default variant, for what a draw must know before choosing its variant.
@@ -307,20 +375,27 @@ const CompiledShader* BaseInfo(std::span<const DWORD> code)
     return result;
 }
 
+const CompiledShader* CompiledByHash(std::span<const DWORD> code, const translator::Variant& variant, const char* fileName);
+
 const CompiledShader* Compiled(std::span<const DWORD> code, const translator::Variant& variant, const char* fileName)
 {
-    std::uint64_t key = Fnv(code.data(), code.size_bytes());
-    key = Fnv(&variant.shadowSamplers, sizeof(variant.shadowSamplers), key);
-    key = Fnv(&variant.integerInputs, sizeof(variant.integerInputs), key);
-    key = Fnv(&variant.signedInputs, sizeof(variant.signedInputs), key);
-    key = Fnv(&variant.alphaTest, sizeof(variant.alphaTest), key);
-    key = Fnv(&variant.clipPlanes, sizeof(variant.clipPlanes), key);
-    key = Fnv(&kTranslatorVersion, sizeof(kTranslatorVersion), key);
+    static_assert(sizeof(translator::Variant) == sizeof(std::uint64_t));
+    VariantSlot slot = { code.data(), 0 };
+    std::memcpy(&slot.variant, &variant, sizeof(slot.variant));
+    auto found = g_cache.variants.find(slot);
+    if (found == g_cache.variants.end())
+        found = g_cache.variants.emplace(slot, const_cast<CompiledShader*>(CompiledByHash(code, variant, fileName))).first;
+    return found->second;
+}
+
+const CompiledShader* CompiledByHash(std::span<const DWORD> code, const translator::Variant& variant, const char* fileName)
+{
+    const std::uint64_t key = shader_cache::Key(code, variant);
     auto found = g_cache.shaders.find(key);
     if (found != g_cache.shaders.end())
         return found->second->failed ? nullptr : found->second.get();
     auto shader = std::make_unique<CompiledShader>();
-    if (!LoadCached(key, *shader)) {
+    if (!shader_cache::Load(g_cache.cacheDirectory, key, shader->info, shader->dxil)) {
         *shader = {};
         const auto start = std::chrono::steady_clock::now();
         std::string error;
@@ -334,7 +409,7 @@ const CompiledShader* Compiled(std::span<const DWORD> code, const translator::Va
                 std::ofstream(g_cache.cacheDirectory / std::format("{:016x}.failed.hlsl", key)) << shader->info.hlsl << "\n/*\n" << error << "\n*/\n";
                 shader->failed = true;
             } else {
-                StoreCached(key, *shader);
+                shader_cache::Store(g_cache.cacheDirectory, key, shader->info, shader->dxil);
                 static const bool developer = HasArgument(L"-gmodpp_dev");
                 if (developer)
                     std::ofstream(g_cache.cacheDirectory / std::format("{:016x}.{}.hlsl", key, fileName)) << shader->info.hlsl;
@@ -345,6 +420,7 @@ const CompiledShader* Compiled(std::span<const DWORD> code, const translator::Va
         if (++g_cache.compiled % 100 == 0)
             log::Info("Native: {} shaders translated and compiled ({:.1f} s)", g_cache.compiled, g_cache.compileSeconds);
     }
+    shader->dxilHash = Fnv(shader->dxil.data(), shader->dxil.size());
     const CompiledShader* result = shader->failed ? nullptr : shader.get();
     g_cache.shaders.emplace(key, std::move(shader));
     return result;
@@ -396,32 +472,40 @@ const char* Semantic(BYTE usage)
     return usage < std::size(kNames) ? kNames[usage] : "TEXCOORD";
 }
 
-// Everything a pipeline state depends on, zero-filled so its bytes can be hashed.
-struct PipelineKey {
-    const CompiledShader* vertexShader;
-    const CompiledShader* pixelShader;
-    D3D12_BLEND_DESC blend;
-    D3D12_RASTERIZER_DESC raster;
-    D3D12_DEPTH_STENCIL_DESC depthStencil;
-    D3D12_INPUT_ELEMENT_DESC elements[16];
-    UINT elementCount;
-    D3D12_PRIMITIVE_TOPOLOGY_TYPE topology;
-    UINT targets;
-    DXGI_FORMAT targetFormats[4];
-    DXGI_FORMAT depthFormat;
-};
+// A pipeline's name in the library: its key with the shaders identified by content and the semantic names spelled out,
+// so the same pipeline has the same name in every launch.
+std::wstring PipelineName(const PipelineKey& key)
+{
+    PipelineKey stable;
+    std::memcpy(&stable, &key, sizeof(stable));
+    stable.vertexShader = nullptr;
+    stable.pixelShader = nullptr;
+    std::uint64_t hash = Fnv(&kPipelineLibraryVersion, sizeof(kPipelineLibraryVersion));
+    for (UINT i = 0; i < stable.elementCount; ++i) {
+        hash = Fnv(stable.elements[i].SemanticName, std::strlen(stable.elements[i].SemanticName), hash);
+        stable.elements[i].SemanticName = nullptr;
+    }
+    hash = Fnv(&stable, sizeof(stable), hash);
+    const std::uint64_t shaders[2] = { key.vertexShader->dxilHash, key.pixelShader != nullptr ? key.pixelShader->dxilHash : 0 };
+    return std::format(L"{:016x}", Fnv(shaders, sizeof(shaders), hash));
+}
 
+// Everything a pipeline state depends on, zero-filled so its bytes can be hashed.
 ID3D12PipelineState* Pipeline(PipelineKey& key)
 {
-    // Semantic names point to static strings, so hashing the pointers is enough.
-    const std::uint64_t hash = Fnv(&key, sizeof(key));
-    auto found = g_cache.pipelines.find(hash);
-    if (found != g_cache.pipelines.end())
-        return found->second.Get();
+    if (g_cache.lastPipeline != nullptr && PipelineKeyEqual()(key, g_cache.lastKey))
+        return g_cache.lastPipeline;
+    auto found = g_cache.pipelines.find(key);
+    if (found != g_cache.pipelines.end()) {
+        g_cache.lastKey = key;
+        g_cache.lastPipeline = found->second.Get();
+        return g_cache.lastPipeline;
+    }
     D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = {};
     desc.pRootSignature = g_cache.rootSignature.Get();
     desc.VS = { key.vertexShader->dxil.data(), key.vertexShader->dxil.size() };
-    desc.PS = { key.pixelShader->dxil.data(), key.pixelShader->dxil.size() };
+    if (key.pixelShader != nullptr)
+        desc.PS = { key.pixelShader->dxil.data(), key.pixelShader->dxil.size() };
     desc.BlendState = key.blend;
     desc.SampleMask = UINT_MAX;
     desc.RasterizerState = key.raster;
@@ -431,13 +515,19 @@ ID3D12PipelineState* Pipeline(PipelineKey& key)
     desc.NumRenderTargets = key.targets;
     std::copy(std::begin(key.targetFormats), std::end(key.targetFormats), desc.RTVFormats);
     desc.DSVFormat = key.depthFormat;
-    desc.SampleDesc.Count = 1;
+    desc.SampleDesc.Count = key.samples;
     ComPtr<ID3D12PipelineState> pipeline;
-    HRESULT hr = GetBackend().Device()->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pipeline));
-    if (FAILED(hr))
-        log::Info("Native: creating a pipeline state failed: {:#010x}", static_cast<unsigned>(hr));
+    const std::wstring name = g_cache.library != nullptr ? PipelineName(key) : std::wstring();
+    HRESULT hr = g_cache.library != nullptr ? g_cache.library->LoadGraphicsPipeline(name.c_str(), &desc, IID_PPV_ARGS(&pipeline)) : E_FAIL;
+    if (FAILED(hr)) {
+        hr = GetBackend().Device()->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pipeline));
+        if (FAILED(hr))
+            log::Info("Native: creating a pipeline state failed: {:#010x}", static_cast<unsigned>(hr));
+        else if (g_cache.library != nullptr && SUCCEEDED(g_cache.library->StorePipeline(name.c_str(), pipeline.Get())))
+            g_cache.libraryDirty = true;
+    }
     ID3D12PipelineState* result = pipeline.Get();
-    g_cache.pipelines.emplace(hash, std::move(pipeline));
+    g_cache.pipelines.emplace(key, std::move(pipeline));
     if (g_cache.pipelines.size() % 200 == 0)
         log::Info("Native: {} pipeline states", g_cache.pipelines.size());
     return result;
@@ -534,9 +624,10 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
 }
 )";
 
-ID3D12PipelineState* BlitPipeline(DXGI_FORMAT format)
+ID3D12PipelineState* BlitPipeline(DXGI_FORMAT format, UINT samples)
 {
-    auto found = g_cache.blitPipelines.find(format);
+    const std::uint64_t key = static_cast<std::uint64_t>(format) << 32 | samples;
+    auto found = g_cache.blitPipelines.find(key);
     if (found != g_cache.blitPipelines.end())
         return found->second.Get();
     std::string error;
@@ -558,12 +649,12 @@ ID3D12PipelineState* BlitPipeline(DXGI_FORMAT format)
     desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     desc.NumRenderTargets = 1;
     desc.RTVFormats[0] = format;
-    desc.SampleDesc.Count = 1;
+    desc.SampleDesc.Count = samples;
     ComPtr<ID3D12PipelineState> pipeline;
     HRESULT hr = GetBackend().Device()->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pipeline));
     if (FAILED(hr))
         log::Info("Native: creating the copy pipeline for format {} failed: {:#010x}", static_cast<int>(format), static_cast<unsigned>(hr));
-    return g_cache.blitPipelines.emplace(format, std::move(pipeline)).first->second.Get();
+    return g_cache.blitPipelines.emplace(key, std::move(pipeline)).first->second.Get();
 }
 
 // Formats a copy (CopyTextureRegion) can move between: the same typeless family.
@@ -591,7 +682,7 @@ void StretchRect(const CopySurface& source, const D3D12_RECT& sourceRect, const 
     if (width <= 0 || height <= 0 || destinationRect.right <= destinationRect.left || destinationRect.bottom <= destinationRect.top)
         return;
     if (width == destinationRect.right - destinationRect.left && height == destinationRect.bottom - destinationRect.top
-        && Family(source.format) == Family(destination.format)) {
+        && Family(source.format) == Family(destination.format) && source.samples == destination.samples) {
         backend.Transition(*source.resource, D3D12_RESOURCE_STATE_COPY_SOURCE);
         backend.Transition(*destination.resource, D3D12_RESOURCE_STATE_COPY_DEST);
         D3D12_TEXTURE_COPY_LOCATION to = {};
@@ -609,7 +700,7 @@ void StretchRect(const CopySurface& source, const D3D12_RECT& sourceRect, const 
         log::Info("Native: a scaled copy into a texture that is not a render target was skipped");
         return;
     }
-    ID3D12PipelineState* pipeline = BlitPipeline(destination.format);
+    ID3D12PipelineState* pipeline = BlitPipeline(destination.format, destination.samples);
     if (pipeline == nullptr)
         return;
     backend.Transition(*source.resource, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
@@ -640,6 +731,37 @@ void StretchRect(const CopySurface& source, const D3D12_RECT& sourceRect, const 
     commands->RSSetScissorRects(1, &destinationRect);
     commands->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     commands->DrawInstanced(3, 1, 0, 0);
+}
+
+void SavePipelineLibrary(bool now)
+{
+    if (g_cache.library == nullptr || !g_cache.libraryDirty)
+        return;
+    const auto time = std::chrono::steady_clock::now();
+    if (!now && time - g_cache.librarySaved < kPipelineLibrarySaveInterval)
+        return;
+    g_cache.librarySaved = time;
+    g_cache.libraryDirty = false;
+    std::vector<std::uint8_t> data(g_cache.library->GetSerializedSize());
+    HRESULT hr = g_cache.library->Serialize(data.data(), data.size());
+    if (FAILED(hr)) {
+        log::Info("Native: saving the pipeline library failed: {:#010x}", static_cast<unsigned>(hr));
+        return;
+    }
+    std::filesystem::path temporary = g_cache.libraryPath;
+    temporary += L".tmp";
+    {
+        std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
+        file.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
+        if (!file) {
+            log::Info("Native: writing {} failed", temporary.string());
+            return;
+        }
+    }
+    std::error_code error;
+    std::filesystem::rename(temporary, g_cache.libraryPath, error);
+    if (error)
+        log::Info("Native: replacing {} failed: {}", g_cache.libraryPath.string(), error.message());
 }
 
 void LogNextDraws(int count) { g_drawLog = count; }
@@ -704,6 +826,7 @@ Targets PrepareTargets(bool srgb)
             targets.colors[0] = backend.BackBufferView(srgb);
             targets.colorFormats[0] = srgb ? DXGI_FORMAT_B8G8R8A8_UNORM_SRGB : Backend::kBackBufferFormat;
             targets.count = 1;
+            targets.samples = backend.Samples();
             continue;
         }
         Texture* texture = TextureFromHandle(handle);
@@ -716,11 +839,20 @@ Targets PrepareTargets(bool srgb)
         targets.colorFormats[i] = texture->TargetFormat(useSrgb);
         targets.count = i + 1;
     }
-    if (state.depthTarget == kDefaultTarget) {
+    // Targets must share a sample count. With MSAA the game gives render target textures their own depth buffers
+    // (DoRenderTargetsNeedSeparateDepthBuffer), so a depth buffer that does not match the colour is left out.
+    Texture* depth = state.depthTarget == kDefaultTarget ? nullptr : TextureFromHandle(state.depthTarget);
+    const UINT depthSamples = state.depthTarget == kDefaultTarget ? backend.Samples() : 1;
+    if (targets.count != 0 && depthSamples != targets.samples && (state.depthTarget == kDefaultTarget || depth != nullptr)) {
+        static bool logged = false;
+        if (!std::exchange(logged, true))
+            log::Info("Native: a target was drawn with a depth buffer of another sample count, without depth");
+    } else if (state.depthTarget == kDefaultTarget) {
+        targets.samples = depthSamples;
         backend.Transition(backend.DepthBuffer(), D3D12_RESOURCE_STATE_DEPTH_WRITE);
         targets.depth = backend.DepthBufferView();
         targets.depthFormat = Backend::kDepthFormat;
-    } else if (Texture* depth = TextureFromHandle(state.depthTarget); depth != nullptr && depth->IsDepth() && !depth->copies.empty()) {
+    } else if (depth != nullptr && depth->IsDepth() && !depth->copies.empty()) {
         backend.Transition(depth->Current().resource, D3D12_RESOURCE_STATE_DEPTH_WRITE);
         targets.depth = depth->Current().target;
         targets.depthFormat = depth->TargetFormat(false);
@@ -735,33 +867,39 @@ void DrawPass(const ShadowState& shadow, const MeshDraw& mesh)
         return;
     if (g_drawLimit >= 0 && g_frameDraws++ >= g_drawLimit)
         return;
-    if (shadow.vertexShader == nullptr || shadow.pixelShader == nullptr) {
-        static bool logged = false;
-        if (!std::exchange(logged, true))
-            log::Info("Native: a pass without vertex and pixel shaders was skipped; fixed-function rendering is not implemented");
-        return;
-    }
     Backend& backend = GetBackend();
     const DynamicState& dynamic = Dynamic();
+    const bool colorWrite = dynamic.overrideColorWrite ? dynamic.colorWriteEnable : shadow.colorWrite != 0;
+    const bool alphaWrite = dynamic.overrideAlphaWrite ? dynamic.alphaWriteEnable : shadow.alphaWrite != 0;
+    // A vertex shader without a pixel shader that writes no colour (engine/occlusionproxy, for occlusion queries) only
+    // needs depth, so it runs without a pixel shader; one that writes colour needs Direct3D 9's fixed-function pixel stage.
+    const bool depthOnly = shadow.vertexShader != nullptr && shadow.pixelShader == nullptr && !colorWrite && !alphaWrite;
+    if (shadow.vertexShader == nullptr || (shadow.pixelShader == nullptr && !depthOnly)) {
+        static std::set<std::string> logged;
+        if (logged.size() < 50 && logged.insert(BoundMaterialName()).second)
+            log::Info("Native: a pass of '{}' without a vertex or pixel shader was skipped; fixed-function rendering is not implemented", BoundMaterialName());
+        return;
+    }
     const std::span<const DWORD> vertexCode = Combo(*shadow.vertexShader, shadow.vertexStaticIndex, std::max(dynamic.vertexShaderIndex, 0));
-    const std::span<const DWORD> pixelCode = Combo(*shadow.pixelShader, shadow.pixelStaticIndex, dynamic.pixelShaderIndex);
-    if (vertexCode.empty() || pixelCode.empty()) {
+    const std::span<const DWORD> pixelCode = depthOnly ? std::span<const DWORD>() : Combo(*shadow.pixelShader, shadow.pixelStaticIndex, dynamic.pixelShaderIndex);
+    if (vertexCode.empty() || (pixelCode.empty() && !depthOnly)) {
         static bool logged = false;
         if (!std::exchange(logged, true))
             log::Info("Native: {} static {} or {} static {} has no code for its dynamic combo", shadow.vertexShader->name, shadow.vertexStaticIndex,
-                shadow.pixelShader->name, shadow.pixelStaticIndex);
+                depthOnly ? "none" : shadow.pixelShader->name, shadow.pixelStaticIndex);
         return;
     }
     const CompiledShader* vertexBase = BaseInfo(vertexCode);
-    const CompiledShader* pixelBase = BaseInfo(pixelCode);
-    if (vertexBase == nullptr || pixelBase == nullptr)
+    const CompiledShader* pixelBase = depthOnly ? nullptr : BaseInfo(pixelCode);
+    if (vertexBase == nullptr || (pixelBase == nullptr && !depthOnly))
         return;
 
     const Targets targets = PrepareTargets(shadow.srgbWrite != 0);
 
     StateBuffer pixelState = {};
     translator::Variant pixelVariant;
-    BindSamplers(*pixelBase, dynamic.textures.data(), kSamplers, shadow.srgbRead, pixelState, &pixelVariant.shadowSamplers);
+    if (pixelBase != nullptr)
+        BindSamplers(*pixelBase, dynamic.textures.data(), kSamplers, shadow.srgbRead, pixelState, &pixelVariant.shadowSamplers);
     if (shadow.alphaTest)
         pixelVariant.alphaTest = static_cast<std::uint8_t>(shadow.alphaFunc + 1);
     StateBuffer vertexState = {};
@@ -770,7 +908,7 @@ void DrawPass(const ShadowState& shadow, const MeshDraw& mesh)
     PipelineKey key;
     std::memset(&key, 0, sizeof(key));
     translator::Variant vertexVariant;
-    const std::vector<VertexElement> elements = VertexElements(mesh.vertexFormat, mesh.streams[1].SizeInBytes != 0);
+    const std::vector<VertexElement>& elements = VertexElements(mesh.vertexFormat, mesh.streams[1].SizeInBytes != 0, mesh.flexFormat);
     for (const translator::VertexInput& input : vertexBase->info.inputs) {
         if (key.elementCount == std::size(key.elements))
             break;
@@ -794,8 +932,8 @@ void DrawPass(const ShadowState& shadow, const MeshDraw& mesh)
     }
     vertexVariant.clipPlanes = static_cast<std::uint8_t>(UserClipPlanes(vertexState.clipPlanes));
     const CompiledShader* vertexShader = Compiled(vertexCode, vertexVariant, shadow.vertexShader->name.c_str());
-    const CompiledShader* pixelShader = Compiled(pixelCode, pixelVariant, shadow.pixelShader->name.c_str());
-    if (vertexShader == nullptr || pixelShader == nullptr)
+    const CompiledShader* pixelShader = depthOnly ? nullptr : Compiled(pixelCode, pixelVariant, shadow.pixelShader->name.c_str());
+    if (vertexShader == nullptr || (pixelShader == nullptr && !depthOnly))
         return;
     key.vertexShader = vertexShader;
     key.pixelShader = pixelShader;
@@ -815,21 +953,24 @@ void DrawPass(const ShadowState& shadow, const MeshDraw& mesh)
     blend.DestBlendAlpha = Blend(separate ? (alphaOverride.active ? alphaOverride.destination : shadow.dstBlendAlpha) : destination, true);
     blend.BlendOpAlpha = BlendOp(separate ? (alphaOverride.active ? alphaOverride.op : shadow.blendOpAlpha) : op);
     blend.LogicOp = D3D12_LOGIC_OP_NOOP;
-    const bool colorWrite = dynamic.overrideColorWrite ? dynamic.colorWriteEnable : shadow.colorWrite != 0;
-    const bool alphaWrite = dynamic.overrideAlphaWrite ? dynamic.alphaWriteEnable : shadow.alphaWrite != 0;
     blend.RenderTargetWriteMask = static_cast<UINT8>((colorWrite ? D3D12_COLOR_WRITE_ENABLE_RED | D3D12_COLOR_WRITE_ENABLE_GREEN | D3D12_COLOR_WRITE_ENABLE_BLUE : 0)
         | (alphaWrite ? D3D12_COLOR_WRITE_ENABLE_ALPHA : 0));
-    key.blend.AlphaToCoverageEnable = shadow.alphaToCoverage != 0;
+    // Direct3D 9 has alpha to coverage only through NVIDIA's ATOC render state, which needs multisampling; without
+    // it the pass is just alpha tested, where Direct3D 12 would dither instead.
+    key.blend.AlphaToCoverageEnable = shadow.alphaToCoverage != 0 && targets.samples > 1;
 
     D3D12_RASTERIZER_DESC& raster = key.raster;
     raster.FillMode = shadow.polyModeFront == 1 ? D3D12_FILL_MODE_WIREFRAME : D3D12_FILL_MODE_SOLID;
     // Source's front faces are clockwise; MaterialCullMode_t 0 is D3DCULL_CCW, 1 D3DCULL_CW, 2 (GMod) none (0x180014c60).
     raster.CullMode = !shadow.culling || dynamic.cullMode == 2 ? D3D12_CULL_MODE_NONE : dynamic.cullMode == 1 ? D3D12_CULL_MODE_FRONT : D3D12_CULL_MODE_BACK;
     raster.DepthClipEnable = TRUE;
-    if (shadow.polyOffset == 1 && targets.depth.ptr != 0) {
-        static bool logged = false;
-        if (!std::exchange(logged, true))
-            log::Info("Native: decal depth bias is not applied yet");
+    if (targets.depth.ptr != 0) {
+        // Direct3D 9's DEPTHBIAS is in depth-buffer z; Direct3D 12's counts the format's smallest step (Depth Bias,
+        // Microsoft Learn). The slope scale means the same in both.
+        const DepthBias bias = PassDepthBias(shadow.polyOffset);
+        const double step = targets.depthFormat == DXGI_FORMAT_D16_UNORM ? 1.0 / 65535.0 : 1.0 / 16777215.0;
+        raster.DepthBias = static_cast<INT>(std::lround(bias.constant / step));
+        raster.SlopeScaledDepthBias = bias.slopeScale;
     }
 
     D3D12_DEPTH_STENCIL_DESC& depth = key.depthStencil;
@@ -858,6 +999,7 @@ void DrawPass(const ShadowState& shadow, const MeshDraw& mesh)
     key.targets = targets.count;
     std::copy(std::begin(targets.colorFormats), std::end(targets.colorFormats), key.targetFormats);
     key.depthFormat = targets.depth.ptr != 0 ? targets.depthFormat : DXGI_FORMAT_UNKNOWN;
+    key.samples = targets.samples;
     ID3D12PipelineState* pipeline = Pipeline(key);
     if (pipeline == nullptr)
         return;
@@ -871,7 +1013,7 @@ void DrawPass(const ShadowState& shadow, const MeshDraw& mesh)
             auto c = [&](int r) { const float* v = dynamic.vertexFloats[static_cast<size_t>(r)].v; return std::format("({:.4g} {:.4g} {:.4g} {:.4g})", v[0], v[1], v[2], v[3]); };
             const Texture* t0 = TextureFromHandle(dynamic.textures[0]);
             log::Info("DIAG draw {} {}#{}+{} {}#{}+{} fmt {:#x} verts {} prims {}x{} vp {} {} {} {} c4 {} {} {} {} c8 {} {} {} {} c58 {} {} {} tex0 {} {}x{} rt0 {} first {} count {}",
-                diagnostics, shadow.vertexShader->name, shadow.vertexStaticIndex, dynamic.vertexShaderIndex, shadow.pixelShader->name, shadow.pixelStaticIndex,
+                diagnostics, shadow.vertexShader->name, shadow.vertexStaticIndex, dynamic.vertexShaderIndex, depthOnly ? "none" : shadow.pixelShader->name, shadow.pixelStaticIndex,
                 dynamic.pixelShaderIndex, mesh.vertexFormat, mesh.vertexCount, mesh.primitives.size(), mesh.primitives.empty() ? 0 : mesh.primitives[0].second,
                 viewport.TopLeftX, viewport.TopLeftY, viewport.Width, viewport.Height, c(4), c(5), c(6), c(7), c(8), c(9), c(10), c(11), c(58), c(59), c(60),
                 t0 != nullptr ? t0->name : "none", t0 != nullptr ? t0->width : 0, t0 != nullptr ? t0->height : 0, dynamic.colorTargets[0],
@@ -891,7 +1033,9 @@ void DrawPass(const ShadowState& shadow, const MeshDraw& mesh)
     }
     if (viewport.Width <= 0 || viewport.Height <= 0)
         return;
-    const float halfPixel[4] = { -1.0f / viewport.Width, 1.0f / viewport.Height, 0, 0 };
+    // Direct3D 9's render target origin is the centre of the top-left pixel, so its geometry lands half a pixel right
+    // of and below Direct3D 12's (Coordinate Systems (Direct3D 10), Microsoft Learn).
+    const float halfPixel[4] = { 1.0f / viewport.Width, -1.0f / viewport.Height, 0, 0 };
     for (StateBuffer* state : { &vertexState, &pixelState })
         std::memcpy(state->halfPixel, halfPixel, sizeof(halfPixel));
     std::memcpy(vertexState.ints, dynamic.vertexInts.data(), sizeof(vertexState.ints));
@@ -914,16 +1058,21 @@ void DrawPass(const ShadowState& shadow, const MeshDraw& mesh)
         commands->SetPipelineState(pipeline);
         g_cache.boundPipeline = pipeline;
     }
-    auto floats = [&](const CompiledShader& shader, const Float4* registers, UINT registerCount, D3D12_GPU_VIRTUAL_ADDRESS fallback) {
+    auto floats = [&](const CompiledShader& shader, const Float4* registers, UINT registerCount, std::uint64_t version, ConstantUpload& last,
+                      D3D12_GPU_VIRTUAL_ADDRESS fallback) {
         const UINT first = std::min(shader.info.firstFloatConstant, registerCount);
         const UINT count = std::min(shader.info.floatConstantCount, registerCount - first);
-        return count == 0 ? fallback : UploadConstants(registers + first, count * sizeof(Float4));
+        if (count == 0)
+            return fallback;
+        if (last.generation != backend.ListGeneration() || last.version != version || last.first != first || last.count < count)
+            last = { backend.ListGeneration(), version, first, count, UploadConstants(registers + first, count * sizeof(Float4)) };
+        return last.address;
     };
     const D3D12_GPU_VIRTUAL_ADDRESS vertexStateAddress = UploadConstants(&vertexState, sizeof(vertexState));
     const D3D12_GPU_VIRTUAL_ADDRESS pixelStateAddress = UploadConstants(&pixelState, sizeof(pixelState));
-    commands->SetGraphicsRootConstantBufferView(0, floats(*vertexShader, dynamic.vertexFloats.data(), kVertexFloatConstants, vertexStateAddress));
+    commands->SetGraphicsRootConstantBufferView(0, floats(*vertexShader, dynamic.vertexFloats.data(), kVertexFloatConstants, dynamic.vertexFloatsVersion, g_cache.vertexConstants, vertexStateAddress));
     commands->SetGraphicsRootConstantBufferView(1, vertexStateAddress);
-    commands->SetGraphicsRootConstantBufferView(2, floats(*pixelShader, dynamic.pixelFloats.data(), kPixelFloatConstants, pixelStateAddress));
+    commands->SetGraphicsRootConstantBufferView(2, pixelShader != nullptr ? floats(*pixelShader, dynamic.pixelFloats.data(), kPixelFloatConstants, dynamic.pixelFloatsVersion, g_cache.pixelConstants, pixelStateAddress) : pixelStateAddress);
     commands->SetGraphicsRootConstantBufferView(3, pixelStateAddress);
 
     commands->RSSetViewports(1, &viewport);

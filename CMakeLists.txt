@@ -245,7 +245,7 @@ target_include_directories(gmodpp_d3d9 BEFORE PRIVATE "${AGILITY_SDK_DIR}/build/
 target_include_directories(gmodpp_d3d9 PRIVATE "${SHADER_OUTPUT_DIR}" "${DLSS_SDK_DIR}/include")
 target_compile_definitions(gmodpp_d3d9 PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
 target_compile_options(gmodpp_d3d9 PRIVATE /W4 /permissive- /utf-8)
-target_link_libraries(gmodpp_d3d9 PRIVATE d3d12 dxgi dxguid minhook imgui lzma_dec "${DLSS_SDK_DIR}/lib/Windows_x86_64/x64/nvsdk_ngx_s.lib")
+target_link_libraries(gmodpp_d3d9 PRIVATE d3d12 dxgi dxguid dbghelp minhook imgui lzma_dec "${DLSS_SDK_DIR}/lib/Windows_x86_64/x64/nvsdk_ngx_s.lib")
 
 # winmm.dll loader for the game root: forwards every export of the system winmm.dll (winmm_exports.txt holds
 # their ordinals and names) and, with -insecure, sends the game's shaderapidx9.dll load to gmodpp.dll.
@@ -301,8 +301,11 @@ add_library(gmodpp SHARED
     src/descriptor_heap.cpp
     src/shader_bytecode.cpp
     src/shader_compiler.cpp
+    src/shader_cache.cpp
     src/shader_prewarm.cpp
+    src/prewarm_window.cpp
     src/shader_translator.cpp
+    src/ui_text.cpp
     src/vcs.cpp
     src/vpk.cpp
     src/shaderapi.cpp
@@ -313,12 +316,13 @@ add_library(gmodpp SHARED
     src/shaderapi_pipelines.cpp
     src/shaderapi_shadow.cpp
     src/shaderapi_textures.cpp
+    src/watchdog.cpp
 )
 target_compile_definitions(gmodpp PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
 target_compile_options(gmodpp PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4 /permissive- /utf-8>)
 target_include_directories(gmodpp BEFORE PRIVATE "${AGILITY_SDK_DIR}/build/native/include")
 target_include_directories(gmodpp PRIVATE "${DXC_DIR}/inc")
-target_link_libraries(gmodpp PRIVATE d3d12 dxgi dxguid lzma_dec)
+target_link_libraries(gmodpp PRIVATE d3d12 dxgi dxguid lzma_dec dbghelp comctl32)
 
 if(GMOD_DIR)
     add_custom_target(deploy

@@ -6,6 +6,7 @@
 #include "shaderapi_native.h"
 #include "shaderapi_commands.h"
 #include "shaderapi_slots.h"
+#include "watchdog.h"
 
 #include <windows.h>
 
@@ -769,9 +770,12 @@ void __fastcall PresentOverride(Wrapper* self)
         }
         if (!g_shim->benchmarking)
             StartBenchmark();
+        if (TakeRequest(L"gmodpp_profile.request"))
+            watchdog::ProfileThisThread(10);
         if (TakeRequest(L"gmodpp_shaders.request") && !g_prewarming.exchange(true)) {
             std::thread([directory = g_shim->gameDirectory] {
-                PrewarmShaders(directory, directory / L"bin" / L"win64" / L"gmodpp");
+                PrewarmProgress progress;
+                PrewarmShaders(directory, directory / L"bin" / L"win64" / L"gmodpp", progress);
                 g_prewarming = false;
             }).detach();
         }

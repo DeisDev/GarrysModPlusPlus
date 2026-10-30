@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstring>
 #include <mutex>
 #include <unordered_set>
@@ -274,6 +275,11 @@ void Upload(Texture& texture, int level, int face, int x, int y, int z, int widt
 {
     if (data == nullptr || texture.copies.empty() || level < 0 || level >= texture.mips)
         return;
+    if (!GetBackend().OnRenderThread()) {
+        static std::atomic<bool> logged = false;
+        if (!logged.exchange(true))
+            log::Info("Native: texture '{}' was uploaded off the render thread; texture uploads are not synchronised yet", texture.name);
+    }
     std::vector<std::uint8_t> converted;
     const std::uint8_t* source = static_cast<const std::uint8_t*>(data);
     UINT sourceRow = stride > 0 ? static_cast<UINT>(stride) : RowBytes(format, width);
@@ -490,7 +496,7 @@ void ReadTarget(int x, int y, int width, int height, unsigned char* data, int fo
     Backend& backend = GetBackend();
     const std::intptr_t handle = Dynamic().colorTargets[0];
     Texture* texture = TextureFromHandle(handle);
-    TrackedResource* source = &backend.BackBuffer();
+    TrackedResource* source = nullptr;
     int sourceFormat = kFormatBgra8888;
     UINT targetWidth = backend.Width();
     UINT targetHeight = backend.Height();
@@ -499,6 +505,8 @@ void ReadTarget(int x, int y, int width, int height, unsigned char* data, int fo
         sourceFormat = texture->storage;
         targetWidth = static_cast<UINT>(texture->width);
         targetHeight = static_cast<UINT>(texture->height);
+    } else {
+        source = &backend.ResolvedBackBuffer();
     }
     const UINT left = static_cast<UINT>(std::clamp(x, 0, static_cast<int>(targetWidth)));
     const UINT top = static_cast<UINT>(std::clamp(y, 0, static_cast<int>(targetHeight)));
@@ -662,16 +670,18 @@ CopySurface TextureSurface(Texture& texture)
     return { &copy.resource, copy.view, copy.target, texture.TargetFormat(false), static_cast<UINT>(texture.width), static_cast<UINT>(texture.height) };
 }
 
-// The colour of render target `id` as Direct3D 9's GetRenderTarget gives it: the back buffer for the default target 0.
-bool TargetSurface(int id, CopySurface& surface)
+// The colour of render target `id` as Direct3D 9's GetRenderTarget gives it: the back buffer for the default target 0,
+// resolved when it is read.
+bool TargetSurface(int id, bool read, CopySurface& surface)
 {
     if (id < 0 || id >= kRenderTargets)
         return false;
     const std::intptr_t handle = Dynamic().colorTargets[static_cast<size_t>(id)];
     if (id == 0 && handle == kDefaultTarget) {
         Backend& backend = GetBackend();
-        surface = { &backend.BackBuffer(), backend.BackBufferTexture(), backend.BackBufferView(false), Backend::kBackBufferFormat, backend.Width(),
-            backend.Height() };
+        TrackedResource& resource = read ? backend.ResolvedBackBuffer() : backend.BackBuffer();
+        surface = { &resource, backend.BackBufferTexture(), backend.BackBufferView(false), Backend::kBackBufferFormat, backend.Width(),
+            backend.Height(), read ? 1 : backend.Samples() };
         return true;
     }
     Texture* texture = TextureFromHandle(handle);
@@ -694,7 +704,7 @@ void CopyRenderTargetToTextureEx(NativeObject*, std::intptr_t handle, int id, co
 {
     Texture* texture = TextureFromHandle(handle);
     CopySurface source;
-    if (texture == nullptr || texture->copies.empty() || texture->copies.size() > 1 || !TargetSurface(id, source))
+    if (texture == nullptr || texture->copies.empty() || texture->copies.size() > 1 || !TargetSurface(id, true, source))
         return;
     const CopySurface destination = TextureSurface(*texture);
     StretchRect(source, Rect(sourceRect, source.width, source.height), destination, Rect(destinationRect, destination.width, destination.height));
@@ -707,7 +717,7 @@ void CopyTextureToRenderTargetEx(NativeObject*, int id, std::intptr_t handle, co
 {
     Texture* texture = TextureFromHandle(handle);
     CopySurface destination;
-    if (texture == nullptr || texture->copies.empty() || texture->copies.size() > 1 || !TargetSurface(id, destination))
+    if (texture == nullptr || texture->copies.empty() || texture->copies.size() > 1 || !TargetSurface(id, false, destination))
         return;
     const CopySurface source = TextureSurface(*texture);
     StretchRect(source, Rect(sourceRect, source.width, source.height), destination, Rect(destinationRect, destination.width, destination.height));

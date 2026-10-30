@@ -18,6 +18,7 @@ struct Targets {
     DXGI_FORMAT depthFormat = DXGI_FORMAT_UNKNOWN;
     UINT width = 0;
     UINT height = 0;
+    UINT samples = 1;
 };
 Targets PrepareTargets(bool srgb);
 
@@ -33,10 +34,14 @@ struct CopySurface {
     DXGI_FORMAT format;
     UINT width;
     UINT height;
+    UINT samples = 1;
 };
 // Copies `sourceRect` of `source` to `destinationRect` of `destination` with linear filtering, as StretchRect with
 // D3DTEXF_LINEAR does: a plain copy when the sizes and formats allow it, otherwise a draw.
 void StretchRect(const CopySurface& source, const D3D12_RECT& sourceRect, const CopySurface& destination, const D3D12_RECT& destinationRect);
+
+// Saves new pipeline states to the pipeline library on disk: when `now`, or at most every 30 seconds.
+void SavePipelineLibrary(bool now);
 
 // Logs the next draws' state (developer diagnostics).
 void LogNextDraws(int count);

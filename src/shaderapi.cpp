@@ -10,10 +10,13 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstring>
 #include <mutex>
+#include <set>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -28,11 +31,16 @@ constexpr unsigned kShaderUtilBindStandardTexture = 9;
 constexpr unsigned kShaderUtilInFlashlightMode = 14;
 constexpr unsigned kShaderUtilNoteAnisotropicLevel = 15;
 constexpr unsigned kShaderUtilInEditorMode = 16;
+constexpr unsigned kShaderUtilDrawClearBufferQuad = 19;
 constexpr unsigned kShaderUtilOnFlushBufferedPrimitives = 25;
 // MaterialSystem_Config_t (public/materialsystem/materialsystem_config.h): bReverseDepth and m_bSuppressRendering,
 // the offsets shaderapidx9.dll reads (0x18002a170, 0x1800152c0).
 constexpr size_t kConfigReverseDepth = 0x3d;
 constexpr size_t kConfigSuppressRendering = 0x4b;
+constexpr size_t kConfigNormalSlopeScaleDepthBias = 0x54;
+constexpr size_t kConfigNormalDepthBias = 0x58;
+constexpr size_t kConfigDecalSlopeScaleDepthBias = 0x5c;
+constexpr size_t kConfigDecalDepthBias = 0x60;
 // IMaterialInternal slots shaderapidx9.dll's DrawMesh (0x1800152c0) and CommitStateChanges (0x180012c70) call:
 // IMaterial::IsVertexLit and GetVertexFormat, and IMaterialInternal::DrawMesh(VertexCompressionType_t).
 constexpr unsigned kMaterialIsVertexLit = 19;
@@ -68,8 +76,6 @@ constexpr int kShaderFogBlack = 2;
 constexpr int kShaderFogGrey = 3;
 constexpr int kShaderFogColor = 4;
 constexpr int kShaderFogWhite = 5;
-// HDRType_t of the reported caps (GetHDRType 1, integer HDR).
-constexpr int kHdrType = 1;
 constexpr int kStandardTextures = 128;
 constexpr int kRenderParameters = 64;
 
@@ -149,9 +155,12 @@ struct ApiState {
     float fogEnd = 0;
     float fogZ = 0;
     float fogMaxDensity = 1;
+    // The register the last SetPixelShaderFogParams wrote, rewritten when a pass's fog mode is applied.
+    int pixelFogRegister = -1;
     unsigned char fogColor[3] = {};
-    float toneMapping[3] = { 1, 1, 1 };
     float lightScale[4] = { 1, 1, 1, 1 };
+    // D3DRS_TEXTUREFACTOR, which only fixed-function texture stages read.
+    unsigned textureFactor = 0xffffffff;
     Float4 ambientCube[6] = {};
     unsigned clearColor = 0xff000000;
     std::array<std::intptr_t, kStandardTextures> standardTextures = {};
@@ -210,6 +219,10 @@ struct ClipState {
     // SetClipPlane (0x18001dc20) stores (a, b, c, -d).
     float planes[kClipPlanes][4] = {};
     unsigned enabled = 0;
+    // EnableUserClipTransformOverride and UserClipTransform (0x1800157c0, 0x1800224a0): a world-to-view matrix, stored
+    // transposed like the transforms, used for the clip planes instead of the view matrix.
+    bool transformOverride = false;
+    Matrix userTransform = {};
 };
 
 struct OcclusionQueries {
@@ -239,6 +252,17 @@ ApiState g_api;
 DynamicState g_dynamic;
 LightingState g_lighting;
 ClipState g_clip;
+
+// SetFlashlightStateEx (0x18001e200) copies FlashlightState_t field by field: 0x98 bytes in GMod.
+constexpr size_t kFlashlightStateSize = 0x98;
+
+struct FlashlightState {
+    std::array<std::uint8_t, kFlashlightStateSize> state = {};
+    Matrix worldToTexture = {};
+    void* depthTexture = nullptr;
+};
+
+FlashlightState g_flashlight;
 OcclusionQueries g_queries;
 
 // The enabled lights in shaderapidx9.dll's order (0x180020ea0): spot, point, then directional, stable.
@@ -311,6 +335,7 @@ void SetVertexFloats(int first, const float* values, int count)
     if (first < 0 || first + count > kVertexFloatConstants)
         return;
     std::memcpy(&g_dynamic.vertexFloats[static_cast<size_t>(first)], values, static_cast<size_t>(count) * sizeof(Float4));
+    ++g_dynamic.vertexFloatsVersion;
 }
 
 void SetPixelFloats(int first, const float* values, int count)
@@ -318,6 +343,7 @@ void SetPixelFloats(int first, const float* values, int count)
     if (first < 0 || first + count > kPixelFloatConstants)
         return;
     std::memcpy(&g_dynamic.pixelFloats[static_cast<size_t>(first)], values, static_cast<size_t>(count) * sizeof(Float4));
+    ++g_dynamic.pixelFloatsVersion;
 }
 
 void SetVertexMatrixRows(int first, const Matrix& matrix, int rows)
@@ -397,9 +423,9 @@ void CommitStateChanges()
     void* material = g_api.material;
     const bool vertexShader = material == nullptr || (MaterialSlot<std::uint64_t (*)(void*)>(material, kMaterialGetVertexFormat)(material) & kVertexFormatVertexShader) != 0;
     if (!vertexShader) {
-        static bool logged = false;
-        if (!std::exchange(logged, true))
-            log::Info("Native: a fixed-function material was drawn; fixed-function rendering is not implemented");
+        static std::set<std::string> logged;
+        if (logged.size() < 50 && logged.insert(BoundMaterialName()).second)
+            log::Info("Native: fixed-function material '{}' was drawn; fixed-function rendering is not implemented", BoundMaterialName());
         return;
     }
     CommitVertexShaderTransforms();
@@ -505,6 +531,78 @@ void MultMatrixLocal(NativeObject*, const float* m)
     MatrixChanged();
 }
 
+// The helpers below build D3DX matrices (formulas from the D3DXMatrix* reference) and left-multiply them onto the
+// current stack like ID3DXMatrixStack's *Local methods, as shaderapidx9.dll does.
+void MultLocal(NativeObject* self, const Matrix& matrix) { MultMatrixLocal(self, &matrix.m[0][0]); }
+
+// 0x180019a20. The arguments reach D3DXMatrixOrthoOffCenterRH as (l, r, b, t) = (1st, 3rd, 2nd, 4th).
+void Ortho(NativeObject* self, double left, double top, double right, double bottom, double zNear, double zFar)
+{
+    const float l = static_cast<float>(left), r = static_cast<float>(right), b = static_cast<float>(top), t = static_cast<float>(bottom);
+    const float zn = static_cast<float>(zNear), zf = static_cast<float>(zFar);
+    MultLocal(self, { { { 2 / (r - l), 0, 0, 0 }, { 0, 2 / (t - b), 0, 0 }, { 0, 0, 1 / (zn - zf), 0 }, { (l + r) / (l - r), (t + b) / (b - t), zn / (zn - zf), 1 } } });
+}
+
+Matrix PerspectiveOffCenter(float l, float r, float b, float t, float zn, float zf)
+{
+    return { { { 2 * zn / (r - l), 0, 0, 0 }, { 0, 2 * zn / (t - b), 0, 0 }, { (l + r) / (r - l), (t + b) / (t - b), zf / (zn - zf), -1 },
+        { 0, 0, zn * zf / (zn - zf), 0 } } };
+}
+
+// 0x18001a120: D3DXMatrixPerspectiveRH with the near plane's width from the horizontal field of view.
+void PerspectiveX(NativeObject* self, double fovx, double aspect, double zNear, double zFar)
+{
+    const float width = static_cast<float>(std::tan(fovx * 0.0087266462599716) * (zNear + zNear));
+    const float height = static_cast<float>(width / aspect);
+    MultLocal(self, PerspectiveOffCenter(-width / 2, width / 2, -height / 2, height / 2, static_cast<float>(zNear), static_cast<float>(zFar)));
+}
+
+// 0x180019f00: the window's edges are fractions of the full frustum, 0 the near plane's minimum and 1 its maximum.
+void PerspectiveOffCenterX(NativeObject* self, double fovx, double aspect, double zNear, double zFar, double bottom, double top, double left,
+    double right)
+{
+    const float width = static_cast<float>(std::tan(fovx * 0.0087266462599716) * (zNear + zNear));
+    const double halfWidth = width * 0.5f;
+    const double halfHeight = static_cast<float>(width / aspect) * 0.5f;
+    auto edge = [](double half, double fraction) { return static_cast<float>(half * fraction - (1.0 - fraction) * half); };
+    MultLocal(self, PerspectiveOffCenter(edge(halfWidth, left), edge(halfWidth, right), edge(halfHeight, bottom), edge(halfHeight, top),
+        static_cast<float>(zNear), static_cast<float>(zFar)));
+}
+
+// 0x18001a250. Both offsets subtract the viewport's x, as shaderapidx9.dll does.
+void PickMatrix(NativeObject* self, int x, int y, int width, int height)
+{
+    const D3D12_VIEWPORT& viewport = g_dynamic.viewport;
+    const float viewportX = static_cast<float>(static_cast<int>(viewport.TopLeftX));
+    const float inverseWidth = 1.0f / static_cast<float>(static_cast<int>(viewport.Width));
+    const float inverseHeight = 1.0f / static_cast<float>(static_cast<int>(viewport.Height));
+    const float sx = 1.0f / (static_cast<float>(width + width) * inverseWidth);
+    const float sy = 1.0f / (static_cast<float>(height + height) * inverseHeight);
+    const float tx = ((static_cast<float>(x) - viewportX) * -4.0f * inverseWidth + 2.0f) * sx;
+    const float ty = ((static_cast<float>(y) - viewportX) * -4.0f * inverseHeight + 2.0f) * sy;
+    MultLocal(self, { { { sx + sx, 0, 0, 0 }, { 0, sy + sy, 0, 0 }, { 0, 0, 1, 0 }, { tx, ty, 0, 1 } } });
+}
+
+// 0x18001d280: RotateAxisLocal, the angle in degrees.
+void Rotate(NativeObject* self, float angle, float x, float y, float z)
+{
+    const float length = std::sqrt(x * x + y * y + z * z);
+    if (length == 0)
+        return;
+    x /= length;
+    y /= length;
+    z /= length;
+    const float radians = angle * 0.017453292f;
+    const float c = std::cos(radians), s = std::sin(radians), t = 1 - c;
+    MultLocal(self, { { { t * x * x + c, t * x * y + s * z, t * x * z - s * y, 0 }, { t * x * y - s * z, t * y * y + c, t * y * z + s * x, 0 },
+                        { t * x * z + s * y, t * y * z - s * x, t * z * z + c, 0 }, { 0, 0, 0, 1 } } });
+}
+
+// 0x180021c30, 0x18001d380 and 0x18001d450: TranslateLocal and ScaleLocal.
+void Translate(NativeObject* self, float x, float y, float z) { MultLocal(self, { { { 1, 0, 0, 0 }, { 0, 1, 0, 0 }, { 0, 0, 1, 0 }, { x, y, z, 1 } } }); }
+void Scale(NativeObject* self, float x, float y, float z) { MultLocal(self, { { { x, 0, 0, 0 }, { 0, y, 0, 0 }, { 0, 0, z, 0 }, { 0, 0, 0, 1 } } }); }
+void ScaleXY(NativeObject* self, float x, float y) { Scale(self, x, y, 1); }
+
 void GetMatrix(NativeObject*, int mode, float* destination)
 {
     if (mode >= 0 && mode < kMatrixModes)
@@ -573,11 +671,12 @@ int GetCurrentFogType(NativeObject*) { return g_api.fogMode; }
 void SetVertexShaderIndex(NativeObject*, int index) { g_dynamic.vertexShaderIndex = index; }
 void SetPixelShaderIndex(NativeObject*, int index) { g_dynamic.pixelShaderIndex = index; }
 
-// SetPixelShaderFogParams (0x18001f160).
-void SetPixelShaderFogParams(NativeObject*, int reg)
+// 0x18001f160: no fog when the scene has none or the pass's ShaderFogMode_t is disabled ($nofog).
+void WritePixelFogParams(int reg, int shaderFogMode)
 {
+    g_api.pixelFogRegister = reg;
     float fog[4] = { 0, g_api.fogZ, 1, 0 };
-    if (g_api.fogMode != 0) {
+    if (g_api.fogMode != 0 && shaderFogMode != 0) {
         const float range = g_api.fogEnd != g_api.fogStart ? 1.0f / (g_api.fogEnd - g_api.fogStart) : 1.0f;
         fog[0] = g_api.fogStart * range;
         fog[2] = std::clamp(g_api.fogMaxDensity, 0.0f, 1.0f);
@@ -590,7 +689,23 @@ void SetPixelShaderFogParams(NativeObject*, int reg)
     SetPixelFloats(reg, fog, 1);
 }
 
+// SetPixelShaderFogParams (0x18001f290): with the fog mode of the pass being drawn.
+void SetPixelShaderFogParams(NativeObject*, int reg)
+{
+    const ShadowState* shadow = Snapshot(g_api.snapshot);
+    WritePixelFogParams(reg, shadow != nullptr ? shadow->fogMode : 0);
+}
+
 void SetAmbientLightCube(NativeObject*, const Float4* cube) { std::memcpy(g_api.ambientCube, cube, sizeof(g_api.ambientCube)); }
+
+// GetAmbientLightCubeLuminance (0x180017000): the mean luminance (0.3, 0.59, 0.11) of the six cube faces.
+float GetAmbientLightCubeLuminance(NativeObject*)
+{
+    float sum = 0;
+    for (const Float4& face : g_api.ambientCube)
+        sum += face.v[0] * 0.3f + face.v[1] * 0.59f + face.v[2] * 0.11f;
+    return sum / 6.0f;
+}
 
 void SetVertexShaderStateAmbientLightCube(NativeObject*) { SetVertexFloats(kVertexAmbientCube, &g_api.ambientCube[0].v[0], 6); }
 
@@ -718,20 +833,26 @@ int GetPixelFogCombo(NativeObject*) { return g_api.fogMode != 0 ? g_api.fogMode 
 bool InFlashlightMode(NativeObject*) { return UtilSlot<bool (*)(void*)>(kShaderUtilInFlashlightMode)(GetBackend().shaderUtil); }
 bool InEditorMode(NativeObject*) { return UtilSlot<bool (*)(void*)>(kShaderUtilInEditorMode)(GetBackend().shaderUtil); }
 
-// SetToneMappingScaleLinear (0x180020280): pixel c30 is (scale, lightmap scale, 16 for integer HDR, scale^(1/2.2)).
-void SetToneMappingScaleLinear(NativeObject*, const float* scale)
+// GetLightMapScaleFactor (0x180017ed0): 16 for integer HDR, 1 for float HDR, 2^2.2 without HDR.
+float GetLightMapScaleFactor(NativeObject*)
 {
-    std::memcpy(g_api.toneMapping, scale, sizeof(g_api.toneMapping));
-    g_api.lightScale[0] = scale[0];
-    g_api.lightScale[1] = 16.0f;
-    g_api.lightScale[2] = kHdrType == 1 ? 16.0f : 1.0f;
-    g_api.lightScale[3] = std::pow(scale[0], 1.0f / 2.2f);
+    const int hdr = HdrType();
+    return hdr == kHdrInteger ? 16.0f : hdr == kHdrFloat ? 1.0f : std::pow(2.0f, 2.2f);
+}
+
+// SetToneMappingScaleLinear (0x180020280): pixel c30 is (scale, lightmap scale, 16 for integer HDR, scale^(1/2.2)),
+// with the scale and z 1 without HDR. GetToneMappingScaleLinear (0x180018350) returns that vector.
+void SetToneMappingScaleLinear(NativeObject* self, const float* scale)
+{
+    const int hdr = HdrType();
+    g_api.lightScale[0] = hdr == kHdrNone ? 1.0f : scale[0];
+    g_api.lightScale[1] = GetLightMapScaleFactor(self);
+    g_api.lightScale[2] = hdr == kHdrInteger ? 16.0f : 1.0f;
+    g_api.lightScale[3] = std::pow(g_api.lightScale[0], 1.0f / 2.2f);
     SetPixelFloats(kPixelLightScale, g_api.lightScale, 1);
 }
 
-const float* GetToneMappingScaleLinear(NativeObject*) { return g_api.toneMapping; }
-// GetLightMapScaleFactor (0x180017ed0) for integer HDR.
-float GetLightMapScaleFactor(NativeObject*) { return 16.0f; }
+const float* GetToneMappingScaleLinear(NativeObject*) { return g_api.lightScale; }
 
 void SetIntRenderingParameter(NativeObject*, int parameter, int value)
 {
@@ -854,10 +975,13 @@ void SetSamplerBorderAddress(NativeObject*, int sampler)
         g_dynamic.borderAddress[static_cast<size_t>(sampler)] = true;
 }
 
+// SetAnisotropicLevel (0x18001d820): levels outside 2 to the maximum become a quarter of the maximum, from 2 to 8.
 void SetAnisotropicLevel(NativeObject*, int level)
 {
-    g_dynamic.anisotropy = level;
     UtilSlot<void (*)(void*, int)>(kShaderUtilNoteAnisotropicLevel)(GetBackend().shaderUtil, level);
+    if (level < 2 || level > kMaxAnisotropy)
+        level = std::clamp(kMaxAnisotropy / 4, 2, 8);
+    g_dynamic.anisotropy = level;
 }
 
 void SetRenderTargetEx(NativeObject*, int id, std::intptr_t color, std::intptr_t depth)
@@ -873,11 +997,46 @@ void SetRenderTarget(NativeObject* self, std::intptr_t color, std::intptr_t dept
 void EnableLinearColorSpaceFrameBuffer(NativeObject*, bool enable) { g_api.linearFramebuffer = enable; }
 void SetFullScreenTextureHandle(NativeObject*, std::intptr_t handle) { g_api.fullScreenTexture = handle; }
 
+// Color3f..Color4ubv (0x180011ec0..0x180012300) set D3DRS_TEXTUREFACTOR as A8R8G8B8, alpha 255 for the 3-component
+// forms.
+unsigned PackColor(float r, float g, float b, float a)
+{
+    auto channel = [](float v) { return static_cast<unsigned>(static_cast<int>(v * 255.0f)) & 0xff; };
+    return channel(a) << 24 | channel(r) << 16 | channel(g) << 8 | channel(b);
+}
+
+void Color3f(NativeObject*, float r, float g, float b) { g_api.textureFactor = PackColor(r, g, b, 1.0f); }
+void Color3fv(NativeObject*, const float* c) { g_api.textureFactor = PackColor(c[0], c[1], c[2], 1.0f); }
+void Color4f(NativeObject*, float r, float g, float b, float a) { g_api.textureFactor = PackColor(r, g, b, a); }
+void Color4fv(NativeObject*, const float* c) { g_api.textureFactor = PackColor(c[0], c[1], c[2], c[3]); }
+void Color3ub(NativeObject*, unsigned char r, unsigned char g, unsigned char b) { g_api.textureFactor = 0xff000000u | r << 16 | g << 8 | b; }
+void Color3ubv(NativeObject*, const unsigned char* c) { g_api.textureFactor = 0xff000000u | c[0] << 16 | c[1] << 8 | c[2]; }
+void Color4ub(NativeObject*, unsigned char r, unsigned char g, unsigned char b, unsigned char a)
+{
+    g_api.textureFactor = static_cast<unsigned>(a) << 24 | r << 16 | g << 8 | b;
+}
+void Color4ubv(NativeObject*, const unsigned char* c) { g_api.textureFactor = static_cast<unsigned>(c[3]) << 24 | c[0] << 16 | c[1] << 8 | c[2]; }
+
 void ClearColor3ub(NativeObject*, unsigned char r, unsigned char g, unsigned char b) { g_api.clearColor = 0xff000000u | (r << 16) | (g << 8) | b; }
 
 void ClearColor4ub(NativeObject*, unsigned char r, unsigned char g, unsigned char b, unsigned char a)
 {
     g_api.clearColor = (static_cast<unsigned>(a) << 24) | (r << 16) | (g << 8) | b;
+}
+
+// The clear colour as shaderapidx9.dll applies it (0x180016f00): with a linear colour space frame buffer, RGB goes
+// through its pow(x, 2.2) table (filled at 0x18003ad70), read as 1 from 0.95 up (0x18003b180).
+unsigned ClearColor()
+{
+    const unsigned c = g_api.clearColor;
+    if (!g_api.linearFramebuffer)
+        return c;
+    auto linear = [](unsigned channel) {
+        const float x = static_cast<float>(channel) * 0.003921569f;
+        const float y = x >= 0.95f ? 1.0f : static_cast<float>(std::pow(std::round(x * 255.0f) * 0.003921569, 2.2));
+        return static_cast<unsigned>(static_cast<long long>(y * 255.0f)) & 0xff;
+    };
+    return (c & 0xff000000u) | linear((c >> 16) & 0xff) << 16 | linear((c >> 8) & 0xff) << 8 | linear(c & 0xff);
 }
 
 // ClearBuffers (0x1800118d0): Direct3D 9 clears the viewport of every bound target; colour is written without sRGB
@@ -887,11 +1046,6 @@ void ClearBuffers(NativeObject*, bool color, bool depth, bool stencil, int, int)
     const std::uint8_t* config = Config();
     if (config != nullptr && config[kConfigSuppressRendering] != 0)
         return;
-    if (g_api.linearFramebuffer) {
-        static bool logged = false;
-        if (!std::exchange(logged, true))
-            log::Info("Native: clearing a linear colour space frame buffer does not convert the clear colour yet");
-    }
     Targets targets = PrepareTargets(false);
     ID3D12GraphicsCommandList* commands = GetBackend().Commands();
     const D3D12_VIEWPORT& viewport = g_dynamic.viewport;
@@ -902,7 +1056,7 @@ void ClearBuffers(NativeObject*, bool color, bool depth, bool stencil, int, int)
     if (rect.right <= rect.left || rect.bottom <= rect.top)
         return;
     if (color) {
-        const unsigned c = g_api.clearColor;
+        const unsigned c = ClearColor();
         const float value[4] = { ((c >> 16) & 0xff) / 255.0f, ((c >> 8) & 0xff) / 255.0f, (c & 0xff) / 255.0f, (c >> 24) / 255.0f };
         for (UINT i = 0; i < targets.count; ++i) {
             if (targets.colors[i].ptr != 0)
@@ -971,6 +1125,15 @@ void SetClipPlane(NativeObject*, int index, const float* plane)
     g_clip.planes[index][1] = plane[1];
     g_clip.planes[index][2] = plane[2];
     g_clip.planes[index][3] = -plane[3];
+}
+
+void EnableUserClipTransformOverride(NativeObject*, bool enable) { g_clip.transformOverride = enable; }
+
+void UserClipTransform(NativeObject*, const float* worldToView)
+{
+    Matrix matrix;
+    std::memcpy(&matrix, worldToView, sizeof(matrix));
+    g_clip.userTransform = Transpose(matrix);
 }
 
 void EnableClipPlane(NativeObject*, int index, bool enable)
@@ -1113,16 +1276,25 @@ void SetDepthFeatheringPixelShaderConstant(NativeObject*, int reg, float scale)
 // ResetRenderState (0x18001bf40), which shaderapidx9.dll also runs after creating its device: a partial reset clears the
 // constant registers and sets the standard vertex shader constants with an overbright of 2; every derived matrix
 // constant is stale again and the viewport covers the window.
+// ResetRenderState (0x18001bf40). Both resets zero the constants; a full one, which a new device gets
+// (ReacquireResourcesInternal, 0x1800276b0), also sets the anisotropy and identity view and projection matrices.
 void ResetRenderState(NativeObject* self, bool fullReset)
 {
-    if (!fullReset) {
-        g_dynamic.vertexFloats = {};
-        g_dynamic.pixelFloats = {};
-        g_dynamic.vertexInts = {};
-        g_dynamic.pixelInts = {};
-        g_dynamic.vertexBools = {};
-        g_dynamic.pixelBools = {};
-        SetStandardVertexShaderConstants(self, kOverbright);
+    g_dynamic.vertexFloats = {};
+    g_dynamic.pixelFloats = {};
+    ++g_dynamic.vertexFloatsVersion;
+    ++g_dynamic.pixelFloatsVersion;
+    g_dynamic.vertexInts = {};
+    g_dynamic.pixelInts = {};
+    g_dynamic.vertexBools = {};
+    g_dynamic.pixelBools = {};
+    SetStandardVertexShaderConstants(self, kOverbright);
+    if (fullReset) {
+        SetAnisotropicLevel(self, 1);
+        for (int mode : { kMatrixView, kMatrixProjection }) {
+            MatrixMode(self, mode);
+            LoadIdentity(self);
+        }
     }
     g_api.dirty.fill(true);
     RECT client = {};
@@ -1166,13 +1338,15 @@ void ExecuteCommands(NativeObject* self, const std::uint8_t* at)
         case kCommandSetVertexShaderFloatConst: {
             const int first = read(4);
             const int count = read(8);
-            std::vector<float> values(static_cast<size_t>(count) * 4);
-            std::memcpy(values.data(), at + 12, values.size() * sizeof(float));
+            // The floats are unaligned in the buffer.
+            std::array<float, kVertexFloatConstants * 4> values;
+            const int copied = std::clamp(count, 0, kVertexFloatConstants);
+            std::memcpy(values.data(), at + 12, static_cast<size_t>(copied) * 4 * sizeof(float));
             if (opcode == kCommandSetPixelShaderFloatConst)
-                SetPixelFloats(first, values.data(), count);
+                SetPixelFloats(first, values.data(), copied);
             else
-                SetVertexFloats(first, values.data(), count);
-            at += 12 + values.size() * sizeof(float);
+                SetVertexFloats(first, values.data(), copied);
+            at += 12 + static_cast<size_t>(std::max(count, 0)) * 4 * sizeof(float);
             continue;
         }
         case kCommandSetPixelShaderFogParams:
@@ -1241,8 +1415,9 @@ void ExecuteCommandBuffer(NativeObject* self, const std::uint8_t* buffer) { Exec
 void BeginPass(NativeObject*, short snapshot) { g_api.snapshot = snapshot; }
 
 // The fog colour a pass's shader fog mode selects (shaderapidx9.dll 0x180010ed0) as pixel c29, linear and scaled by
-// the tone mapping scale like 0x180022230, with w the reciprocal of the destination alpha depth range. Pixel fog is
-// used (r_pixelfog), so Direct3D 9's fixed-function fog stays off at DX level 95 (0x1800167e0).
+// the tone mapping scale like 0x180022230, with w the reciprocal of the destination alpha depth range; the pixel fog
+// params are rewritten for that mode too. Pixel fog is used (r_pixelfog), so Direct3D 9's fixed-function fog stays
+// off at DX level 95 (0x1800167e0).
 void CommitLinearFogColor(const ShadowState& shadow)
 {
     float color[4] = { 0, 0, 0, 1.0f / kDestAlphaDepthRange };
@@ -1265,6 +1440,8 @@ void CommitLinearFogColor(const ShadowState& shadow)
         }
     }
     SetPixelFloats(kPixelLinearFogColor, color, 1);
+    if (g_api.pixelFogRegister != -1)
+        WritePixelFogParams(g_api.pixelFogRegister, shadow.fogMode);
 }
 
 // RenderPass (0x18001ab60): draws the render mesh with the pass's snapshot, then forgets the snapshot.
@@ -1287,9 +1464,12 @@ bool SetMode(ShaderApiObject* self, void* window, int, const ShaderDeviceInfo& i
 {
     if (!GetBackend().SetMode(static_cast<HWND>(window), info))
         return false;
-    ResetRenderState(self, false);
+    ResetRenderState(self, true);
     return true;
 }
+
+// shaderapidx9.dll 0x180011870 only records the mode; Present applies it.
+void ChangeVideoMode(ShaderApiObject*, const ShaderDeviceInfo& info) { RequestVideoMode(info); }
 
 void EnableShaderShaderMutex(ShaderApiObject* self, bool enable) { self->mutexEnabled = enable; }
 
@@ -1311,9 +1491,57 @@ void FlushBufferedPrimitives(ShaderApiObject*)
         UtilSlot<bool (*)(void*)>(kShaderUtilOnFlushBufferedPrimitives)(GetBackend().shaderUtil);
 }
 
+// ClearBuffersObeyStencilEx (0x180011b30): materialsystem draws a quad over the viewport with the current stencil state,
+// user clip planes off. ClearBuffersObeyStencil (0x180011b10) clears alpha with colour.
+void ClearBuffersObeyStencilEx(ShaderApiObject* self, bool color, bool alpha, bool depth)
+{
+    if (!color && !alpha && !depth)
+        return;
+    FlushBufferedPrimitives(self);
+    const unsigned clipPlanes = std::exchange(g_clip.enabled, 0u);
+    const unsigned c = ClearColor();
+    using DrawFn = void (*)(void*, unsigned char, unsigned char, unsigned char, unsigned char, bool, bool, bool);
+    UtilSlot<DrawFn>(kShaderUtilDrawClearBufferQuad)(GetBackend().shaderUtil, static_cast<unsigned char>(c >> 16), static_cast<unsigned char>(c >> 8),
+        static_cast<unsigned char>(c), static_cast<unsigned char>(c >> 24), color, alpha, depth);
+    FlushBufferedPrimitives(self);
+    g_clip.enabled = clipPlanes;
+}
+
+void ClearBuffersObeyStencil(ShaderApiObject* self, bool color, bool depth) { ClearBuffersObeyStencilEx(self, color, color, depth); }
+
+// 0x18001e200; shadow depth textures are supported, so shadows are kept. SetFlashlightState (0x18001e1f0) passes no
+// depth texture.
+void SetFlashlightStateEx(ShaderApiObject* self, const std::uint8_t* state, const Matrix& worldToTexture, void* depthTexture)
+{
+    FlushBufferedPrimitives(self);
+    std::memcpy(g_flashlight.state.data(), state, kFlashlightStateSize);
+    g_flashlight.worldToTexture = worldToTexture;
+    g_flashlight.depthTexture = depthTexture;
+}
+
+void SetFlashlightState(ShaderApiObject* self, const std::uint8_t* state, const Matrix& worldToTexture)
+{
+    SetFlashlightStateEx(self, state, worldToTexture, nullptr);
+}
+
+// 0x180017da0 and 0x180017dd0.
+const std::uint8_t* GetFlashlightState(ShaderApiObject*, Matrix& worldToTexture)
+{
+    worldToTexture = g_flashlight.worldToTexture;
+    return g_flashlight.state.data();
+}
+
+const std::uint8_t* GetFlashlightStateEx(ShaderApiObject*, Matrix& worldToTexture, void** depthTexture)
+{
+    worldToTexture = g_flashlight.worldToTexture;
+    *depthTexture = g_flashlight.depthTexture;
+    return g_flashlight.state.data();
+}
+
 // shaderapidx9.dll 0x180011840: whether the device exists and is not deactivated.
 bool CanDownloadTextures(ShaderApiObject*) { return GetBackend().HasDevice(); }
-bool DoRenderTargetsNeedSeparateDepthBuffer(ShaderApiObject*) { return false; }
+// shaderapidx9.dll 0x180015270: render target textures cannot share the multisampled depth buffer.
+bool DoRenderTargetsNeedSeparateDepthBuffer(ShaderApiObject*) { return GetBackend().Samples() > 1; }
 
 void GetBackBufferDimensions(ShaderApiObject*, int& width, int& height)
 {
@@ -1345,7 +1573,11 @@ float GammaToLinear(NativeObject*, float value)
 }
 
 void SetLinearToGammaConversionTextures(NativeObject*, std::intptr_t, std::intptr_t) {}
-void IgnoreFloats(NativeObject*, float, float) {}
+void SetShadowDepthBiasFactors(NativeObject*, float slopeScale, float bias)
+{
+    g_dynamic.shadowSlopeScaleDepthBias = slopeScale;
+    g_dynamic.shadowDepthBias = bias;
+}
 void IgnorePix(NativeObject*, unsigned long, const char*) {}
 
 }
@@ -1357,7 +1589,10 @@ int UserClipPlanes(float planes[6][4])
     if (g_clip.enabled == 0)
         return 0;
     Matrix transform;
-    if (!Invert(Multiply(Top(kMatrixView), Top(kMatrixProjection)), transform))
+    // 0x180012ec0 with vertex shaders: world-space planes go to clip space through the view (or the override) and
+    // the projection.
+    const Matrix& view = g_clip.transformOverride ? g_clip.userTransform : Top(kMatrixView);
+    if (!Invert(Multiply(view, Top(kMatrixProjection)), transform))
         return 0;
     transform = Transpose(transform);
     int count = 0;
@@ -1371,8 +1606,36 @@ int UserClipPlanes(float planes[6][4])
     }
     return count;
 }
-void ResetDynamicState() { ResetRenderState(ShaderApi(), false); }
+void ResetDynamicState() { ResetRenderState(ShaderApi(), true); }
 void* BoundMaterial() { return g_api.material; }
+
+const char* BoundMaterialName()
+{
+    constexpr unsigned kMaterialGetName = 0;
+    return g_api.material != nullptr ? MaterialSlot<const char* (*)(void*)>(g_api.material, kMaterialGetName)(g_api.material) : "none";
+}
+
+// 0x1800112c0: decals use the reciprocals of MaterialSystem_Config_t's decal factors (slope 0x5c, bias 0x60; SDK
+// defaults -0.5 and -262144), other passes those of its normal ones (0x54, 0x58), and shadow depth the factors set
+// for it. The ATI and no-slope-bias fallbacks there do not apply to this device.
+DepthBias PassDepthBias(int polygonOffsetMode)
+{
+    constexpr int kPolygonOffsetDecal = 1;
+    constexpr int kPolygonOffsetShadowBias = 2;
+    if (polygonOffsetMode == kPolygonOffsetShadowBias)
+        return { g_dynamic.shadowSlopeScaleDepthBias, g_dynamic.shadowDepthBias };
+    const std::uint8_t* config = Config();
+    if (config == nullptr)
+        return {};
+    const size_t slope = polygonOffsetMode == kPolygonOffsetDecal ? kConfigDecalSlopeScaleDepthBias : kConfigNormalSlopeScaleDepthBias;
+    const size_t bias = polygonOffsetMode == kPolygonOffsetDecal ? kConfigDecalDepthBias : kConfigNormalDepthBias;
+    auto reciprocal = [&](size_t offset) {
+        float value;
+        std::memcpy(&value, config + offset, sizeof(value));
+        return value != 0 ? 1.0f / value : 0.0f;
+    };
+    return { reciprocal(slope), reciprocal(bias) };
+}
 
 void DrawMesh(const MeshDraw& mesh)
 {
@@ -1384,6 +1647,10 @@ void DrawMesh(const MeshDraw& mesh)
         return;
     g_api.renderMesh = &mesh;
     CommitStateChanges();
+    // 0x18000d6c0: c3 scales the flex position delta (x) and wrinkle (y, ps_2_b only), and is zero without flex.
+    const float flex = mesh.streams[2].SizeInBytes != 0 ? 1.0f : 0.0f;
+    const float flexScale[4] = { flex, flex, 0, 0 };
+    SetVertexFloats(kVertexFlexScale, flexScale, 1);
     MaterialSlot<void (*)(void*, int)>(material, kMaterialDrawMesh)(material, (mesh.vertexFormat & kVertexFormatCompressed) ? 1 : 0);
     g_api.renderMesh = nullptr;
 }
@@ -1393,10 +1660,17 @@ NativeObject* ShaderApi()
     static NativeClass nativeClass = [] {
         NativeClass c("IShaderAPI", { shim::kShaderApiSlots, shim::kShaderApiSlotsCount }, kShaderApiSlots);
         c.Bind("SetMode", &SetMode);
+        c.Bind("ChangeVideoMode", &ChangeVideoMode);
         c.Bind("EnableShaderShaderMutex", &EnableShaderShaderMutex);
         c.Bind("ShaderLock", &ShaderLock);
         c.Bind("ShaderUnlock", &ShaderUnlock);
         c.Bind("FlushBufferedPrimitives", &FlushBufferedPrimitives);
+        c.Bind("ClearBuffersObeyStencil", &ClearBuffersObeyStencil);
+        c.Bind("ClearBuffersObeyStencilEx", &ClearBuffersObeyStencilEx);
+        c.Bind("SetFlashlightState", &SetFlashlightState);
+        c.Bind("SetFlashlightStateEx", &SetFlashlightStateEx);
+        c.Bind("GetFlashlightState", &GetFlashlightState);
+        c.Bind("GetFlashlightStateEx", &GetFlashlightStateEx);
         c.Bind("CanDownloadTextures", &CanDownloadTextures);
         c.Bind("DoRenderTargetsNeedSeparateDepthBuffer", &DoRenderTargetsNeedSeparateDepthBuffer);
         c.Bind("GetBackBufferDimensions", &GetBackBufferDimensions);
@@ -1430,6 +1704,7 @@ NativeObject* ShaderApi()
         c.Bind("GetMaxLights", &GetMaxLights);
         c.Bind("SetPixelShaderFogParams", &SetPixelShaderFogParams);
         c.Bind("SetAmbientLightCube", &SetAmbientLightCube);
+        c.Bind("GetAmbientLightCubeLuminance", &GetAmbientLightCubeLuminance);
         c.Bind("SetVertexShaderStateAmbientLightCube", &SetVertexShaderStateAmbientLightCube);
         c.Bind("SetPixelShaderStateAmbientLightCube", &SetPixelShaderStateAmbientLightCube);
         c.Bind("CommitPixelShaderLighting", &CommitPixelShaderLighting);
@@ -1470,6 +1745,22 @@ NativeObject* ShaderApi()
         c.Bind("SetSamplerBorderAddress", &SetSamplerBorderAddress);
         c.Bind("ClearBuffers", &ClearBuffers);
         c.Bind("ClearColor3ub", &ClearColor3ub);
+        c.Bind("Ortho", &Ortho);
+        c.Bind("PerspectiveX", &PerspectiveX);
+        c.Bind("PerspectiveOffCenterX", &PerspectiveOffCenterX);
+        c.Bind("PickMatrix", &PickMatrix);
+        c.Bind("Rotate", &Rotate);
+        c.Bind("Translate", &Translate);
+        c.Bind("Scale", &Scale);
+        c.Bind("ScaleXY", &ScaleXY);
+        c.Bind("Color3f", &Color3f);
+        c.Bind("Color3fv", &Color3fv);
+        c.Bind("Color4f", &Color4f);
+        c.Bind("Color4fv", &Color4fv);
+        c.Bind("Color3ub", &Color3ub);
+        c.Bind("Color3ubv", &Color3ubv);
+        c.Bind("Color4ub", &Color4ub);
+        c.Bind("Color4ubv", &Color4ubv);
         c.Bind("ClearColor4ub", &ClearColor4ub);
         c.Bind("Bind", &Bind);
         c.Bind("BeginPass", &BeginPass);
@@ -1509,6 +1800,8 @@ NativeObject* ShaderApi()
         c.Bind("OverrideColorWriteEnable", &OverrideColorWriteEnable);
         c.Bind("SetScissorRect", &SetScissorRect);
         c.Bind("SetClipPlane", &SetClipPlane);
+        c.Bind("EnableUserClipTransformOverride", &EnableUserClipTransformOverride);
+        c.Bind("UserClipTransform", &UserClipTransform);
         c.Bind("EnableClipPlane", &EnableClipPlane);
         c.Bind("CreateOcclusionQueryObject", &CreateOcclusionQueryObject);
         c.Bind("DestroyOcclusionQueryObject", &DestroyOcclusionQueryObject);
@@ -1526,7 +1819,7 @@ NativeObject* ShaderApi()
         c.Bind("BeginPIXEvent", &IgnorePix);
         c.Bind("EndPIXEvent", &Nothing);
         c.Bind("SetPIXMarker", &IgnorePix);
-        c.Bind("SetShadowDepthBiasFactors", &IgnoreFloats);
+        c.Bind("SetShadowDepthBiasFactors", &SetShadowDepthBiasFactors);
         c.Bind("ResetRenderState", &ResetRenderState);
         // Managed resources are default-heap resources here, and the backend bounds the frames in flight itself.
         c.Bind("EvictManagedResources", &Nothing);

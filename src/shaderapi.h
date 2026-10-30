@@ -12,6 +12,7 @@ constexpr int kPixelFloatConstants = 224;
 constexpr int kIntConstants = 16;
 constexpr int kBoolConstants = 16;
 constexpr int kSamplers = 16;
+constexpr int kMaxAnisotropy = 16;
 constexpr int kVertexSamplers = 4;
 constexpr int kRenderTargets = 4;
 // SHADER_RENDERTARGET_BACKBUFFER / SHADER_RENDERTARGET_DEPTHBUFFER and SHADER_RENDERTARGET_NONE (ishaderapi.h).
@@ -26,6 +27,9 @@ struct Float4 {
 struct DynamicState {
     std::array<Float4, kVertexFloatConstants> vertexFloats = {};
     std::array<Float4, kPixelFloatConstants> pixelFloats = {};
+    // Bumped on every write to the float registers, so draws can reuse an upload of unchanged ones.
+    std::uint64_t vertexFloatsVersion = 0;
+    std::uint64_t pixelFloatsVersion = 0;
     std::array<std::array<int, 4>, kIntConstants> vertexInts = {};
     std::array<std::array<int, 4>, kIntConstants> pixelInts = {};
     std::array<int, kBoolConstants> vertexBools = {};
@@ -75,12 +79,28 @@ struct DynamicState {
     };
     BlendOverride blendOverride;
     BlendOverride alphaBlendOverride;
+    // SetShadowDepthBiasFactors, in Direct3D 9's units.
+    float shadowSlopeScaleDepthBias = 0;
+    float shadowDepthBias = 0;
+};
+
+// The slope-scaled and constant depth bias in Direct3D 9's units (depth-buffer z) for a PolygonOffsetMode_t.
+struct DepthBias {
+    float slopeScale = 0;
+    float constant = 0;
 };
 
 DynamicState& Dynamic();
 // The enabled user clip planes in clip space, as shaderapidx9.dll commits them for vertex shaders (0x180012ec0);
 // returns how many.
 int UserClipPlanes(float planes[6][4]);
+DepthBias PassDepthBias(int polygonOffsetMode);
+// HDRType_t.
+constexpr int kHdrNone = 0;
+constexpr int kHdrInteger = 1;
+constexpr int kHdrFloat = 2;
+// IMaterialSystemHardwareConfig::GetHDRType.
+int HdrType();
 // The dynamic state a new device starts with (IShaderAPI::ResetRenderState).
 void ResetDynamicState();
 
@@ -89,5 +109,7 @@ void ResetDynamicState();
 void DrawMesh(const MeshDraw& mesh);
 // The material IShaderAPI::Bind selected (an IMaterialInternal*).
 void* BoundMaterial();
+// Its name (IMaterial::GetName, slot 0), or "none".
+const char* BoundMaterialName();
 
 }

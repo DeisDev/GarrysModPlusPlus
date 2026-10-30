@@ -10,8 +10,11 @@
 #include <atomic>
 #include <cstddef>
 #include <cstring>
+#include <map>
+#include <tuple>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 using Microsoft::WRL::ComPtr;
 
@@ -140,17 +143,32 @@ bool Resize(GpuBuffer& buffer, UINT64 size)
     return true;
 }
 
-void Upload(GpuBuffer& buffer, const std::vector<std::uint8_t>& data, size_t begin, size_t end)
+void UploadBytes(GpuBuffer& buffer, size_t total, size_t begin, const std::uint8_t* bytes, size_t count)
 {
-    if (begin >= end || !Resize(buffer, data.size()))
+    if (!Resize(buffer, total))
         return;
     Backend& backend = GetBackend();
-    Backend::Upload staging = backend.AllocateStaging(end - begin, 16);
+    Backend::Upload staging = backend.AllocateStaging(count, 16);
     if (staging.data == nullptr)
         return;
-    std::memcpy(staging.data, data.data() + begin, end - begin);
+    std::memcpy(staging.data, bytes, count);
     buffer.Require(D3D12_RESOURCE_STATE_COPY_DEST);
-    backend.Commands()->CopyBufferRegion(buffer.resource.resource.Get(), begin, staging.buffer, staging.offset, end - begin);
+    backend.Commands()->CopyBufferRegion(buffer.resource.resource.Get(), begin, staging.buffer, staging.offset, count);
+}
+
+// Copies [begin, end) of a static mesh's CPU copy into its buffer, sized to the whole copy.
+void Upload(GpuBuffer& buffer, const std::vector<std::uint8_t>& data, size_t begin, size_t end)
+{
+    if (begin >= end)
+        return;
+    Backend& backend = GetBackend();
+    if (backend.OnRenderThread()) {
+        UploadBytes(buffer, data.size(), begin, data.data() + begin, end - begin);
+        return;
+    }
+    backend.RunOnRenderThread([&buffer, total = data.size(), begin, bytes = std::vector<std::uint8_t>(data.begin() + begin, data.begin() + end)] {
+        UploadBytes(buffer, total, begin, bytes.data(), bytes.size());
+    });
 }
 
 // GMod's IMesh object: its vtable (44 entries), then IIndexBuffer's at offset 8, as CMeshDX8 lays them out.
@@ -173,8 +191,9 @@ struct Mesh {
     UINT64 dynamicIndexBytes = 0;
     Mesh* colorMesh = nullptr;
     int colorOffset = 0;
-    Mesh* flexMesh = nullptr;
-    int flexOffset = 0;
+    // Stream 2 from SetFlexMesh, and the flex mesh's vertex format.
+    D3D12_VERTEX_BUFFER_VIEW flexStream = {};
+    std::uint64_t flexFormat = 0;
     Mesh* vertexOverride = nullptr;
     Mesh* indexOverride = nullptr;
     bool modifyReadOnly = true;
@@ -223,10 +242,9 @@ void Streams(Mesh& mesh, MeshDraw& draw)
         draw.streams[1] = { colors.resource.resource->GetGPUVirtualAddress() + offset, static_cast<UINT>(colors.size - offset),
             static_cast<UINT>(Stride(*mesh.colorMesh)) };
     }
-    if (mesh.flexMesh != nullptr) {
-        static bool logged = false;
-        if (!std::exchange(logged, true))
-            log::Info("Native: flex meshes are not drawn yet");
+    if (mesh.flexFormat != 0) {
+        draw.streams[2] = mesh.flexStream;
+        draw.flexFormat = mesh.flexFormat;
     }
 }
 
@@ -254,13 +272,14 @@ D3D12_PRIMITIVE_TOPOLOGY Topology(int type)
     }
 }
 
-void Submit(Mesh& mesh, std::vector<std::pair<int, int>> primitives)
+void Submit(Mesh& mesh, std::span<const std::pair<int, int>> primitives)
 {
+    GetBackend().RunPending();
     MeshDraw draw;
     Streams(mesh, draw);
     Indices(mesh, draw);
     draw.topology = Topology(mesh.primitiveType);
-    draw.primitives = std::move(primitives);
+    draw.primitives = primitives;
     if (draw.streams[0].SizeInBytes == 0) {
         static bool logged = false;
         if (!std::exchange(logged, true))
@@ -290,14 +309,16 @@ void DrawRange(Mesh* self, int first, int count)
     Mesh& indexSource = self->indexOverride != nullptr ? *self->indexOverride : *self;
     if (indexSource.indexCount == 0) {
         Mesh& vertexSource = self->vertexOverride != nullptr ? *self->vertexOverride : *self;
-        Submit(*self, { { 0, vertexSource.vertexCount } });
+        const std::pair<int, int> vertices = { 0, vertexSource.vertexCount };
+        Submit(*self, { &vertices, 1 });
         return;
     }
     if (first == -1 || count == 0) {
         first = 0;
         count = indexSource.indexCount;
     }
-    Submit(*self, { { first, count } });
+    const std::pair<int, int> indices = { first, count };
+    Submit(*self, { &indices, 1 });
 }
 
 void DrawLists(Mesh* self, CPrimList* lists, int count)
@@ -307,10 +328,12 @@ void DrawLists(Mesh* self, CPrimList* lists, int count)
         MarkAsDrawn(self);
         return;
     }
-    std::vector<std::pair<int, int>> primitives;
+    // Reused across draws (render thread only) to avoid an allocation per draw.
+    static std::vector<std::pair<int, int>> primitives;
+    primitives.clear();
     for (int i = 0; i < count; ++i)
         primitives.emplace_back(lists[i].firstIndex, lists[i].indexCount);
-    Submit(*self, std::move(primitives));
+    Submit(*self, primitives);
 }
 
 void LockVertices(Mesh* self, int count, VertexDesc& desc)
@@ -367,9 +390,11 @@ void UnlockMesh(Mesh* self, int vertexCount, int indexCount, MeshDesc&)
         self->vertexCount = vertexCount;
     if (self->indexOverride == nullptr)
         self->indexCount = indexCount;
+    // Direct3D 9 keeps everything written to a locked static buffer, whatever count the unlock reports: the engine
+    // fills static prop colour meshes through the locked pointer and unlocks them with a count of 0.
     if (!self->dynamic) {
-        Upload(self->vertexBuffer, self->vertices, 0, static_cast<size_t>(vertexCount) * Stride(*self));
-        Upload(self->indexBuffer, self->indices, 0, static_cast<size_t>(indexCount) * sizeof(unsigned short));
+        Upload(self->vertexBuffer, self->vertices, 0, self->vertices.size());
+        Upload(self->indexBuffer, self->indices, 0, self->indices.size());
     }
 }
 
@@ -439,7 +464,7 @@ void UnlockVertexBuffer(Mesh* self, int count, VertexDesc&)
 {
     self->vertexCount = count;
     if (!self->dynamic)
-        Upload(self->vertexBuffer, self->vertices, 0, static_cast<size_t>(count) * Stride(*self));
+        Upload(self->vertexBuffer, self->vertices, 0, self->vertices.size());
 }
 
 void Ignore(Mesh*, int, const void*) {}
@@ -459,13 +484,29 @@ void CopyToMeshBuilder(Mesh*, int, int, int, int, int, void*)
         log::Info("Native: IMesh::CopyToMeshBuilder is not implemented");
 }
 
-void SetFlexMesh(Mesh* self, Mesh* flexMesh, int offset)
+void DisableFlexMesh(Mesh* self)
 {
-    self->flexMesh = flexMesh;
-    self->flexOffset = offset;
+    self->flexStream = {};
+    self->flexFormat = 0;
 }
 
-void DisableFlexMesh(Mesh* self) { self->flexMesh = nullptr; }
+// CMeshDX8::SetFlexMesh and its stream 2 (0x18000d6c0): the deltas start offset bytes into the flex mesh's vertices.
+// The flex mesh's locks report offset 0, so the engine's offsets are into its last lock, which is kept here.
+void SetFlexMesh(Mesh* self, Mesh* flexMesh, int offset)
+{
+    DisableFlexMesh(self);
+    if (flexMesh == nullptr)
+        return;
+    if (!flexMesh->dynamic || flexMesh->dynamicVertices.buffer == nullptr || offset < 0 || static_cast<UINT64>(offset) >= flexMesh->dynamicVertexBytes) {
+        static bool logged = false;
+        if (!std::exchange(logged, true))
+            log::Info("Native: a flex mesh offset of {} bytes is outside its last lock of {} bytes", offset, flexMesh->dynamicVertexBytes);
+        return;
+    }
+    self->flexStream = { flexMesh->dynamicVertices.buffer->GetGPUVirtualAddress() + flexMesh->dynamicVertices.offset + static_cast<UINT64>(offset),
+        static_cast<UINT>(flexMesh->dynamicVertexBytes - static_cast<UINT64>(offset)), static_cast<UINT>(Stride(*flexMesh)) };
+    self->flexFormat = flexMesh->format;
+}
 unsigned ComputeMemoryUsed(Mesh* self) { return static_cast<unsigned>(self->vertexBuffer.size + self->indexBuffer.size); }
 
 // The IIndexBuffer subobject, at offset 8.
@@ -594,6 +635,14 @@ Mesh& DynamicMesh()
     return *mesh;
 }
 
+// CMeshMgr::GetFlexMesh (0x18000a280): a dynamic mesh of position, wrinkle and normal (28 bytes), the wrinkle only
+// with ps_2_b, which the hardware config reports.
+Mesh* GetFlexMesh(NativeObject*)
+{
+    static Mesh* mesh = NewMesh(true, kVertexPosition | kVertexNormal | kVertexWrinkle | kVertexFormatUseExactFormat);
+    return mesh;
+}
+
 // CMeshMgr::GetDynamicMesh (0x18000a020): the vertex format comes from the override, the given format or the
 // material, with two bone weights and bone indices when skinned; buffering is not emulated, so materialsystem's
 // draws reach the dynamic mesh at once.
@@ -603,7 +652,8 @@ Mesh* GetDynamicMeshEx(NativeObject*, void* material, std::uint64_t format, int 
     mesh.vertexOverride = vertexOverride;
     mesh.indexOverride = indexOverride;
     mesh.colorMesh = nullptr;
-    mesh.flexMesh = nullptr;
+    mesh.flexStream = {};
+    mesh.flexFormat = 0;
     if (vertexOverride != nullptr) {
         mesh.format = vertexOverride->format;
         return &mesh;
@@ -670,9 +720,14 @@ void DestroyStaticMesh(NativeObject*, Mesh* mesh)
     if (mesh == nullptr || mesh == &DynamicMesh())
         return;
     Backend& backend = GetBackend();
-    backend.Retire(std::move(mesh->vertexBuffer.resource.resource));
-    backend.Retire(std::move(mesh->indexBuffer.resource.resource));
-    delete mesh;
+    // After the uploads queued for it.
+    backend.RunOnRenderThread([mesh] {
+        Backend& backend = GetBackend();
+        backend.RunPending();
+        backend.Retire(std::move(mesh->vertexBuffer.resource.resource));
+        backend.Retire(std::move(mesh->indexBuffer.resource.resource));
+        delete mesh;
+    });
 }
 
 // The layout walk of shaderapidx9.dll's ComputeVertexDescription (0x180005a60); see VertexElements for the same walk
@@ -680,12 +735,13 @@ void DestroyStaticMesh(NativeObject*, Mesh* mesh)
 void FillVertexDesc(std::uint8_t* base, std::uint64_t format, VertexDesc& desc)
 {
     const bool compressed = (format & kVertexFormatCompressed) != 0;
-    std::vector<int*> present;
+    std::array<int*, 24> present;
+    size_t presentCount = 0;
     int offset = 0;
     auto take = [&](int* size, auto*& pointer, int bytes) {
         using Pointer = std::remove_reference_t<decltype(pointer)>;
         pointer = reinterpret_cast<Pointer>(base + offset);
-        present.push_back(size);
+        present[presentCount++] = size;
         offset += bytes;
     };
     auto absent = [&](int* size, auto*& pointer) {
@@ -697,11 +753,11 @@ void FillVertexDesc(std::uint8_t* base, std::uint64_t format, VertexDesc& desc)
     desc.numBoneWeights = BoneWeights(format);
     if (format & kVertexPosition) {
         desc.position = reinterpret_cast<float*>(base);
-        present.push_back(&desc.sizePosition);
+        present[presentCount++] = &desc.sizePosition;
         offset = 12;
         if (format & kVertexWrinkle) {
             desc.wrinkle = reinterpret_cast<float*>(base + 12);
-            present.push_back(&desc.sizeWrinkle);
+            present[presentCount++] = &desc.sizeWrinkle;
             offset = 16;
         } else {
             absent(&desc.sizeWrinkle, desc.wrinkle);
@@ -755,8 +811,8 @@ void FillVertexDesc(std::uint8_t* base, std::uint64_t format, VertexDesc& desc)
     if (!(format & kVertexFormatUseExactFormat) && offset > 16)
         offset = (offset + 15) & ~15;
     desc.actualVertexSize = offset;
-    for (int* size : present)
-        *size = offset;
+    for (size_t i = 0; i < presentCount; ++i)
+        *present[i] = offset;
 }
 
 }
@@ -780,7 +836,9 @@ int VertexSize(std::uint64_t format)
     return desc.actualVertexSize;
 }
 
-std::vector<VertexElement> VertexElements(std::uint64_t format, bool colorMesh)
+namespace {
+
+std::vector<VertexElement> BuildVertexElements(std::uint64_t format, bool colorMesh, std::uint64_t flexFormat)
 {
     std::vector<VertexElement> elements;
     VertexDesc desc;
@@ -820,7 +878,25 @@ std::vector<VertexElement> VertexElements(std::uint64_t format, bool colorMesh)
     }
     if (colorMesh)
         elements.push_back({ D3DDECLUSAGE_COLOR, 1, 1, DXGI_FORMAT_B8G8R8A8_UNORM, 0 });
+    // Flex deltas: the position with the wrinkle weight in w, then the normal.
+    if (flexFormat != 0) {
+        const bool wrinkle = (flexFormat & kVertexWrinkle) != 0;
+        elements.push_back({ D3DDECLUSAGE_POSITION, 1, 2, wrinkle ? DXGI_FORMAT_R32G32B32A32_FLOAT : DXGI_FORMAT_R32G32B32_FLOAT, 0 });
+        elements.push_back({ D3DDECLUSAGE_NORMAL, 1, 2, DXGI_FORMAT_R32G32B32_FLOAT, wrinkle ? 16u : 12u });
+    }
     return elements;
+}
+
+}
+
+const std::vector<VertexElement>& VertexElements(std::uint64_t format, bool colorMesh, std::uint64_t flexFormat)
+{
+    static std::map<std::tuple<std::uint64_t, bool, std::uint64_t>, std::vector<VertexElement>> layouts;
+    const auto key = std::make_tuple(format, colorMesh, flexFormat);
+    auto found = layouts.find(key);
+    if (found == layouts.end())
+        found = layouts.emplace(key, BuildVertexElements(format, colorMesh, flexFormat)).first;
+    return found->second;
 }
 
 void BindMeshDeviceMethods(NativeClass& c)
@@ -833,6 +909,7 @@ void BindMeshMethods(NativeClass& c)
 {
     c.Bind("GetDynamicMesh", &GetDynamicMesh);
     c.Bind("GetDynamicMeshEx", &GetDynamicMeshEx);
+    c.Bind("GetFlexMesh", &GetFlexMesh);
     c.Bind("GetCurrentDynamicVBSize", &GetCurrentDynamicVBSize);
     c.Bind("GetMaxToRender", &GetMaxToRender);
     c.Bind("GetMaxVerticesToRender", &GetMaxVerticesToRender);

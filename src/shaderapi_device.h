@@ -9,8 +9,10 @@
 #include <wrl/client.h>
 
 #include <array>
+#include <atomic>
 #include <cstdint>
-#include <string>
+#include <functional>
+#include <mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -76,9 +78,16 @@ public:
     std::uint64_t PendingFence() const { return m_fenceValue + 1; }
     std::uint64_t CompletedFence() const { return m_fence->GetCompletedValue(); }
 
-    TrackedResource& BackBuffer() { return m_backBuffers[m_swapChain->GetCurrentBackBufferIndex()]; }
+    // The samples per pixel of the back buffer and its depth buffer (the game's MSAA setting).
+    UINT Samples() const { return m_samples; }
+    // What draws to the default target render into: the multisampled colour target with MSAA, else the swap chain's
+    // current buffer.
+    TrackedResource& BackBuffer() { return m_samples > 1 ? m_multisampleTarget : SwapChainBuffer(); }
     D3D12_CPU_DESCRIPTOR_HANDLE BackBufferView(bool srgb) const;
-    // The current back buffer's shader resource view, for copies out of it.
+    // The swap chain's current buffer holding what has been drawn so far, resolved from the multisampled target with
+    // MSAA, as Direct3D 9 resolves for StretchRect and Present. For copies out of the back buffer.
+    TrackedResource& ResolvedBackBuffer();
+    // Its shader resource view.
     UINT BackBufferTexture() const { return m_backBufferTextures[m_swapChain->GetCurrentBackBufferIndex()]; }
     TrackedResource& DepthBuffer() { return m_depthBuffer; }
     D3D12_CPU_DESCRIPTOR_HANDLE DepthBufferView() const { return m_depthView; }
@@ -94,6 +103,12 @@ public:
     // Frees a descriptor once the GPU has finished the current frame.
     void RetireDescriptor(UINT index);
     void Transition(TrackedResource& resource, D3D12_RESOURCE_STATES state);
+
+    // The command list is recorded only on the thread that created the device. Work from other threads (the engine
+    // fills static prop colour meshes on a loader thread) runs there before the next draw, flush or present.
+    bool OnRenderThread() const { return GetCurrentThreadId() == m_renderThread; }
+    void RunOnRenderThread(std::function<void()> work);
+    void RunPending();
 
     // materialsystem's IShaderUtil, from the factory given to IShaderDeviceMgr::Connect.
     void* shaderUtil = nullptr;
@@ -120,6 +135,8 @@ private:
     bool CreateDevice();
     bool CreateSwapChain();
     bool CreateDepthBuffer();
+    bool CreateMultisampleTarget();
+    TrackedResource& SwapChainBuffer() { return m_backBuffers[m_swapChain->GetCurrentBackBufferIndex()]; }
     void DrainDebugMessages();
     void BeginFrame();
     void WaitForGpu();
@@ -134,6 +151,9 @@ private:
     std::array<TrackedResource, kBackBuffers> m_backBuffers;
     std::array<D3D12_CPU_DESCRIPTOR_HANDLE, kBackBuffers * 2> m_backBufferViews = {};
     std::array<UINT, kBackBuffers> m_backBufferTextures = { DescriptorHeap::kInvalid, DescriptorHeap::kInvalid, DescriptorHeap::kInvalid };
+    TrackedResource m_multisampleTarget;
+    std::array<D3D12_CPU_DESCRIPTOR_HANDLE, 2> m_multisampleViews = {};
+    UINT m_samples = 1;
     TrackedResource m_depthBuffer;
     D3D12_CPU_DESCRIPTOR_HANDLE m_depthView = {};
     std::array<Frame, kFrames> m_frames;
@@ -150,7 +170,23 @@ private:
     CpuDescriptorPool m_dsvs;
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_samplerHeap;
     UINT m_samplerIncrement = 0;
-    std::unordered_map<std::string, UINT> m_samplers;
+    // D3D12_SAMPLER_DESC's 13 four-byte members.
+    using SamplerKey = std::array<std::uint32_t, sizeof(D3D12_SAMPLER_DESC) / 4>;
+    struct SamplerKeyHash {
+        size_t operator()(const SamplerKey& key) const
+        {
+            std::uint64_t hash = 14695981039346656037ull;
+            for (std::uint32_t word : key)
+                hash = (hash ^ word) * 1099511628211ull;
+            return static_cast<size_t>(hash);
+        }
+    };
+    std::unordered_map<SamplerKey, UINT, SamplerKeyHash> m_samplers;
+    DWORD m_renderThread = 0;
+    std::mutex m_pendingMutex;
+    std::vector<std::function<void()>> m_pending;
+    std::atomic<bool> m_hasPending = false;
+    bool m_runningPending = false;
     HWND m_window = nullptr;
     UINT m_width = 0;
     UINT m_height = 0;
@@ -159,5 +195,7 @@ private:
 };
 
 Backend& GetBackend();
+// IShaderAPI::ChangeVideoMode: the mode the next Present switches to.
+void RequestVideoMode(const ShaderDeviceInfo& info);
 
 }

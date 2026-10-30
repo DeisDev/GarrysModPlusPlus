@@ -1,3 +1,5 @@
+#include "shaderapi.h"
+#include "shaderapi_device.h"
 #include "shaderapi_native.h"
 
 // IMaterialSystemHardwareConfig answers as GMod's shaderapidx9.dll does on the reference machine (an RTX GPU at DX
@@ -26,8 +28,11 @@ const char* ShaderDllName(NativeObject*) { return "DEFAULT"; }
 const char* NoName(NativeObject*) { return nullptr; }
 bool SupportsHdrMode(NativeObject*, int) { return true; }
 bool GetHdrEnabled(Config* self) { return self->hdrEnabled; }
+// 0x1800049a0: the caps' HDR type (integer, from vanilla's dump) while HDR is enabled at DX level 90 or above.
+int GetHdrType(Config* self) { return self->hdrEnabled ? kHdrInteger : kHdrNone; }
 void SetHdrEnabled(Config* self, bool enable) { self->hdrEnabled = enable; }
 void OverrideStreamOffsetSupport(NativeObject*, bool, bool) {}
+bool IsAAEnabled(NativeObject*) { return GetBackend().Samples() > 1; }
 
 NativeClass& ConfigClass()
 {
@@ -46,7 +51,7 @@ NativeClass& ConfigClass()
         c.Bind("SupportsStaticControlFlow", &Constant<true>);
         c.Bind("SupportsPixelShaders_2_0", &Constant<true>);
         c.Bind("SupportsVertexShaders_2_0", &Constant<true>);
-        c.Bind("MaximumAnisotropicLevel", &Constant<16>);
+        c.Bind("MaximumAnisotropicLevel", &Constant<kMaxAnisotropy>);
         c.Bind("MaxTextureWidth", &Constant<16384>);
         c.Bind("MaxTextureHeight", &Constant<16384>);
         c.Bind("TextureMemorySize", &Constant<536870912>);
@@ -83,12 +88,12 @@ NativeClass& ConfigClass()
         c.Bind("FakeSRGBWrite", &Constant<false>);
         c.Bind("CanDoSRGBReadFromRTs", &Constant<true>);
         c.Bind("SupportsGLMixedSizeTargets", &Constant<false>);
-        c.Bind("IsAAEnabled", &Constant<false>);
+        c.Bind("IsAAEnabled", &IsAAEnabled);
         c.Bind("GetVertexTextureCount", &Constant<4>);
         c.Bind("GetMaxVertexTextureDimension", &Constant<4096>);
         c.Bind("MaxTextureDepth", &Constant<2048>);
-        c.Bind("GetHDRType", &Constant<1>);
-        c.Bind("GetHardwareHDRType", &Constant<1>);
+        c.Bind("GetHDRType", &GetHdrType);
+        c.Bind("GetHardwareHDRType", &Constant<kHdrInteger>);
         c.Bind("SupportsPixelShaders_2_b", &Constant<true>);
         c.Bind("SupportsStreamOffset", &Constant<true>);
         c.Bind("StencilBufferBits", &Constant<8>);
@@ -121,5 +126,7 @@ NativeObject* HardwareConfig()
     static Config object{ { ConfigClass().Vtable(), &ConfigClass() } };
     return &object;
 }
+
+int HdrType() { return GetHdrType(static_cast<Config*>(HardwareConfig())); }
 
 }
