@@ -515,7 +515,9 @@ Pass Prepare(std::span<const DWORD> vertexCode, std::span<const DWORD> pixelCode
         const float* waterFog = PixelRegister(gbuffer::kWaterFogColorRegister).v;
         g_state.waterFogColor = std::array<float, 3>{waterFog[0], waterFog[1], waterFog[2]};
     }
-    const bool gbuffer = (shaderClass.kind == ShaderKind::GBuffer || water) && depthTest && gameTarget;
+    // Opaque shaders with a twin but no preview combo (eyes, teeth) are drawn into the G-buffer by their twin.
+    const bool twinOnly = shaderClass.kind == ShaderKind::Other && !blend && pixelFile != nullptr && twins::HasTwin(pixelFile);
+    const bool gbuffer = (shaderClass.kind == ShaderKind::GBuffer || water || twinOnly) && depthTest && gameTarget;
     if (shaderClass.kind == ShaderKind::GBuffer && !gbuffer && !g_state.loggedOtherTarget) {
         g_state.loggedOtherTarget = true;
         log::Info("G-buffer: a G-buffer draw went to another render target during a capture; it is drawn there unlit");

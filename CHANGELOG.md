@@ -48,6 +48,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Glows, sprites and other additive effects are added after anti-aliasing and DLSS, so they no longer jitter or smear.
 - In third person, your own flashlight is treated like your first-person flashlight, so your body no longer blocks it.
 - In the native renderer, glass and other translucent surfaces get sharp shadows from the sun and nearby lights.
+- In the native renderer, eyes and teeth are lit by real-time light.
 
 ### Removed
 

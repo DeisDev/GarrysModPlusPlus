@@ -80,6 +80,9 @@ constexpr Family kFamilies[] = {
     // GMod's total of 2,717,908,992 combos wraps in the header's 32-bit signed field.
     { "lightmappedgeneric_ps30", "lightmappedgeneric_ps2x.fxc", "ps30", "ps_3_0", "SHADER_MODEL_PS_3_0", -1577058304, 96, 0x3b558d77, &KeepNone,
         "FASTPATHENVMAPCONTRAST WRITEWATERFOGTODESTALPHA PIXELFOGTYPE WRITE_DEPTH_TO_DESTALPHA" },
+    // Eyes and teeth have no lighting preview combo; their twins are drawn in place of the game's lit shader.
+    { "eyes_ps20b", "eyes_ps2x.fxc", "ps20b", "ps_2_b", "SHADER_MODEL_PS_2_B", 4, 4, 0x2dc0584a, &KeepNone, "WRITE_DEPTH_TO_DESTALPHA PIXELFOGTYPE" },
+    { "teeth_ps20b", "teeth_ps2x.fxc", "ps20b", "ps_2_b", "SHADER_MODEL_PS_2_B", 8, 4, 0x08da8ae0, &KeepNone, "PIXELFOGTYPE WRITE_DEPTH_TO_DESTALPHA" },
 };
 
 std::filesystem::path TwinDirectory() { return GetOptions().gameDirectory / L"bin" / L"win64" / L"gmodpp" / L"twins"; }
