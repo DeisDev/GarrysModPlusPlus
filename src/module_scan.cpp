@@ -64,16 +64,15 @@ DWORD64 PrimaryFunctionStart(DWORD64 address)
 
 }
 
-void* FindFunctionReferencingString(HMODULE module, std::string_view text)
+std::vector<const std::byte*> FindStringReferences(HMODULE module, std::string_view text)
 {
     std::vector<Section> sections = Sections(module);
     const std::byte* target = FindString(sections, text);
     if (target == nullptr) {
         log::Info("Scan: string '{}' not found", text);
-        return nullptr;
+        return {};
     }
-
-    DWORD64 found = 0;
+    std::vector<const std::byte*> references;
     for (const Section& section : sections) {
         if (!section.executable || section.bytes.size() < 7)
             continue;
@@ -83,17 +82,25 @@ void* FindFunctionReferencingString(HMODULE module, std::string_view text)
                 continue;
             int32_t displacement;
             std::memcpy(&displacement, code + i + 3, sizeof(displacement));
-            if (reinterpret_cast<const std::byte*>(code + i + 7) + displacement != target)
-                continue;
-            DWORD64 start = PrimaryFunctionStart(reinterpret_cast<DWORD64>(code + i));
-            if (start == 0)
-                continue;
-            if (found != 0 && found != start) {
-                log::Info("Scan: string '{}' is referenced by more than one function", text);
-                return nullptr;
-            }
-            found = start;
+            if (reinterpret_cast<const std::byte*>(code + i + 7) + displacement == target)
+                references.push_back(section.bytes.data() + i);
         }
+    }
+    return references;
+}
+
+void* FindFunctionReferencingString(HMODULE module, std::string_view text)
+{
+    DWORD64 found = 0;
+    for (const std::byte* reference : FindStringReferences(module, text)) {
+        DWORD64 start = PrimaryFunctionStart(reinterpret_cast<DWORD64>(reference));
+        if (start == 0)
+            continue;
+        if (found != 0 && found != start) {
+            log::Info("Scan: string '{}' is referenced by more than one function", text);
+            return nullptr;
+        }
+        found = start;
     }
     if (found == 0)
         log::Info("Scan: no code references '{}'", text);

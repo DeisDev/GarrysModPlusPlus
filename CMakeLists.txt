@@ -348,6 +348,7 @@ add_library(gmodpp SHARED
     src/shaderapi_textures.cpp
     src/shaderapi_capture.cpp
     src/shader_twins.cpp
+    src/video_menu.cpp
     src/watchdog.cpp
     # Real-time lighting, shared with d3d9.dll.
     src/native_lighting.cpp

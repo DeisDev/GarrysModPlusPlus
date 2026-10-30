@@ -121,6 +121,8 @@ constexpr std::array<const char*, static_cast<size_t>(TextId::Count)> kEnglish =
     "{0:L} of {1:L}, about {2}:{3:02} left",
     "Starting...",
     "Skip",
+    "Ray tracing quality",
+    "DLSS",
 };
 
 }

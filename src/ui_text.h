@@ -115,6 +115,8 @@ enum class TextId {
     PrewarmTimeLeft,
     PrewarmStarting,
     PrewarmSkip,
+    VideoRayTracingQuality,
+    VideoAntiAliasingDlss,
     Count
 };
 

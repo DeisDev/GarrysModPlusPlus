@@ -12,6 +12,9 @@ namespace gmodpp {
 // read-only data) with a RIP-relative LEA. Returns nullptr when no unique match exists.
 void* FindFunctionReferencingString(HMODULE module, std::string_view text);
 
+// The RIP-relative LEA instructions in the module's code that load the address of `text`.
+std::vector<const std::byte*> FindStringReferences(HMODULE module, std::string_view text);
+
 // Every match in the module's code of `pattern`: hex bytes separated by spaces, "??" for any byte.
 std::vector<const std::byte*> FindCodePattern(HMODULE module, std::string_view pattern);
 

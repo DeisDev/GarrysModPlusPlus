@@ -8,6 +8,7 @@
 #include "shaderapi.h"
 #include "shaderapi_capture.h"
 #include "shaderapi_device.h"
+#include "video_menu.h"
 #include "view_events.h"
 #include "world.h"
 
@@ -138,6 +139,7 @@ void OnPresent()
     capture::EndForward();
     RecordFrameInterval();
     overlay::EnsureWindowHook();
+    video_menu::TryInstall();
     Backend& backend = GetBackend();
     // gmodpp_console.txt is read by the shim (shaderapi_shim.cpp).
     world::OnPresent(backend.Width(), backend.Height(), false);
