@@ -28,6 +28,8 @@ struct BakeLuxel
     uint face;
     float3 normal;
     uint luxel;
+    // bsp::BakeLuxel::weights, unorm16.
+    uint2 weights;
 };
 
 // Mirrors gmodpp::BakedTriangle in src/scene.h.
@@ -71,6 +73,12 @@ float3 DecodeSample(uint packed)
 }
 
 float3 LoadResidual(ByteAddressBuffer residual, uint sample)
+{
+    uint2 halves = residual.Load2(sample * 8);
+    return float3(f16tof32(halves.x), f16tof32(halves.x >> 16), f16tof32(halves.y));
+}
+
+float3 LoadResidual(RWByteAddressBuffer residual, uint sample)
 {
     uint2 halves = residual.Load2(sample * 8);
     return float3(f16tof32(halves.x), f16tof32(halves.x >> 16), f16tof32(halves.y));

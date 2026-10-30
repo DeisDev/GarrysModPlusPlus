@@ -5,8 +5,11 @@
 // light of the style-0 lights and sun, recomputed here with VRAD's falloff (LightIrradiance) and occluders (the world
 // and static props that cast shadows), is taken out; ray tracing adds it back exactly. A thread per luxel, run in
 // parts over several frames; g_frame holds the map's lights and sun at their baked strength.
-// Step 0 (bake): input0: BakeLuxels; input1: lightmap samples; input2: FaceLightmaps; input3: first luxel; input4:
-// luxel count; output0: residual; output1: counters (0: luxels clamped at zero).
+// Step 0 (bake): the direct light at each luxel's sample. input0: BakeLuxels; input2: FaceLightmaps; input3: first
+// luxel; input4: luxel count; output0: direct light, laid out as the lightmap samples.
+// Step 3 (gather): each luxel mixes the samples around it as VRAD did and takes them out of its baked light. input1:
+// lightmap samples; output0: residual; output1: counters (0: luxels clamped at zero; 2: luxels without a sample; from
+// byte 16, clamped luxels per face); output2: step 0's direct light; the rest as step 0.
 // Step 1 (filter): the residual is low-pass filtered within each face, which hides where VRAD's shadow edges and
 // ours differ. input1: residual; output0: filtered residual; output1: counters (1: luxels changed by more than a
 // tenth); the rest as step 0.
@@ -15,9 +18,11 @@
 // AmbientLights; input1: their count; input3: first sample; input4: sample count; output0: ambient samples, changed
 // in place; output1: counters (3: samples with a cube side clamped at zero).
 
-// VRAD's occluders: the world, and static props and brushes as VRAD shaped them (kWorldMask | kVradOccluderMask in
-// src/scene.h).
-static const uint kVradOccluders = 0x01 | 0x40;
+// VRAD's occluders: the world and the 3D skybox, static props and brushes as VRAD shaped them, and the sky faces
+// (kWorldMask, kSkyboxMask, kVradOccluderMask and kVradSkyMask in src/scene.h).
+static const uint kVradOccluders = 0x01 | 0x10 | 0x40 | 0x80;
+// The sky faces (kVradSkyMask): VRAD's sun rays end there unblocked.
+static const uint kVradSky = 0x80;
 // A luxel counts as clamped when the direct light exceeds the baked light by more than this share of it.
 static const float kClampTolerance = 0.05;
 
@@ -50,14 +55,29 @@ bool SunReaches(float3 position)
     return (clusters.Load((cluster >> 5) * 4) & (1u << (cluster & 31))) != 0;
 }
 
-// SunVisibility (shaders/scene.hlsli) with SolidTransmittance, through the 3D skybox as VRAD's TestLine_DoesHitSky.
+// Whether a sun ray reaches the sky or leaves the map: VRAD's closest hit must be a sky face or nothing.
+float SolidSkyVisibility(float3 origin)
+{
+    SCENE_RAY_QUERY(RAY_FLAG_SKIP_CLOSEST_HIT_SHADER | RAY_FLAG_FORCE_OPAQUE) query;
+    RayDesc ray;
+    ray.Origin = origin;
+    ray.Direction = g_frame.sunDirection;
+    ray.TMin = 0.01;
+    ray.TMax = 65536.0;
+    query.TraceRayInline(g_scene, RAY_FLAG_NONE, kVradSky, ray);
+    query.Proceed();
+    float sky = query.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? query.CommittedRayT() : ray.TMax;
+    return SolidTransmittance(origin, g_frame.sunDirection, sky, kVradOccluders & ~kVradSky);
+}
+
+// SunVisibility (shaders/scene.hlsli) as VRAD's TestLine_DoesHitSky: then again from the matching point of the 3D
+// skybox, against every occluder.
 float SolidSunVisibility(float3 origin)
 {
-    float visibility = SolidTransmittance(origin, g_frame.sunDirection, 65536.0, kVradOccluders);
+    float visibility = SolidSkyVisibility(origin);
     if (visibility > 0.0 && g_frame.worldToSky > 0.0) {
         float3 camera = float3(g_frame.skyCameraX, g_frame.skyCameraY, g_frame.skyCameraZ);
-        // The 3D skybox's faces and props, and its brushes as VRAD traced them (kVradSkyboxOccluderMask).
-        visibility *= SolidTransmittance(camera + origin * g_frame.worldToSky, g_frame.sunDirection, 65536.0, kSkyboxMask | 0x80);
+        visibility *= SolidSkyVisibility(camera + origin * g_frame.worldToSky);
     }
     return visibility;
 }
@@ -104,25 +124,54 @@ void DirectLight(BakeLuxel luxel, FaceLightmap face, out float3 direct[4])
 void Bake(uint index)
 {
     ByteAddressBuffer luxels = ResourceDescriptorHeap[g_pass.input0];
-    ByteAddressBuffer samples = ResourceDescriptorHeap[g_pass.input1];
-    RWByteAddressBuffer residual = ResourceDescriptorHeap[g_pass.output0];
-    RWByteAddressBuffer counters = ResourceDescriptorHeap[g_pass.output1];
-    BakeLuxel luxel = luxels.Load<BakeLuxel>(index * 32);
+    RWByteAddressBuffer output = ResourceDescriptorHeap[g_pass.output0];
+    BakeLuxel luxel = luxels.Load<BakeLuxel>(index * 40);
     FaceLightmap face = LoadFace(g_pass.input2, luxel.face);
     float3 direct[4];
     DirectLight(luxel, face, direct);
     uint count = face.bumped != 0 ? 4 : 1;
     uint luxelCount = face.width * face.height;
+    for (uint n = 0; n < count; ++n)
+        StoreResidual(output, face.sample + n * luxelCount + luxel.luxel, direct[n]);
+}
+
+// A luxel is the weighted mean of the samples of the cells around it (FinalLightFace's SampleRadial in
+// src/utils/vrad/radial.cpp). VRAD left a luxel that no sample reaches black; its own point stands in here.
+void Gather(uint index)
+{
+    ByteAddressBuffer luxels = ResourceDescriptorHeap[g_pass.input0];
+    ByteAddressBuffer samples = ResourceDescriptorHeap[g_pass.input1];
+    RWByteAddressBuffer residual = ResourceDescriptorHeap[g_pass.output0];
+    RWByteAddressBuffer counters = ResourceDescriptorHeap[g_pass.output1];
+    RWByteAddressBuffer direct = ResourceDescriptorHeap[g_pass.output2];
+    BakeLuxel luxel = luxels.Load<BakeLuxel>(index * 40);
+    FaceLightmap face = LoadFace(g_pass.input2, luxel.face);
+    float4 weights = float4(luxel.weights.x & 0xFFFF, luxel.weights.x >> 16, luxel.weights.y & 0xFFFF, luxel.weights.y >> 16) / 65535.0;
+    bool sampled = any(weights > 0.0);
+    if (!sampled)
+        weights = float4(0.0, 0.0, 0.0, 1.0);
+    uint count = face.bumped != 0 ? 4 : 1;
+    uint luxelCount = face.width * face.height;
     bool clamped = false;
     for (uint n = 0; n < count; ++n) {
-        uint sample = face.sample + n * luxelCount + luxel.luxel;
-        float3 baked = DecodeSample(samples.Load(sample * 4));
-        float3 remainder = baked - direct[n];
+        uint plane = face.sample + n * luxelCount;
+        float3 light = 0.0;
+        for (uint k = 0; k < 4; ++k) {
+            if (weights[k] > 0.0)
+                light += weights[k] * LoadResidual(direct, plane + luxel.luxel - (1 - (k & 1)) - (k < 2 ? face.width : 0));
+        }
+        float3 baked = DecodeSample(samples.Load((plane + luxel.luxel) * 4));
+        float3 remainder = baked - light;
         clamped = clamped || any(remainder < -kClampTolerance * max(baked, 1e-3));
-        StoreResidual(residual, sample, max(remainder, 0.0));
+        StoreResidual(residual, plane + luxel.luxel, max(remainder, 0.0));
     }
-    if (clamped)
+    if (!sampled) {
+        counters.InterlockedAdd(8, 1);
+    } else if (clamped) {
         counters.InterlockedAdd(0, 1);
+        // Per face after the four totals, for the log of the most clamped faces.
+        counters.InterlockedAdd(16 + luxel.face * 4, 1);
+    }
 }
 
 void Filter(uint index)
@@ -131,7 +180,7 @@ void Filter(uint index)
     ByteAddressBuffer residual = ResourceDescriptorHeap[g_pass.input1];
     RWByteAddressBuffer filtered = ResourceDescriptorHeap[g_pass.output0];
     RWByteAddressBuffer counters = ResourceDescriptorHeap[g_pass.output1];
-    BakeLuxel luxel = luxels.Load<BakeLuxel>(index * 32);
+    BakeLuxel luxel = luxels.Load<BakeLuxel>(index * 40);
     FaceLightmap face = LoadFace(g_pass.input2, luxel.face);
     int2 at = int2(luxel.luxel % face.width, luxel.luxel / face.width);
     uint count = face.bumped != 0 ? 4 : 1;
@@ -227,6 +276,8 @@ void main(uint3 id : SV_DispatchThreadID)
         Bake(index);
     else if (g_pass.step == 1)
         Filter(index);
-    else
+    else if (g_pass.step == 2)
         RemoveAmbientLights(index);
+    else
+        Gather(index);
 }

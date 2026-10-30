@@ -562,7 +562,16 @@ bool Scene::LoadBaked(const bsp::BakedLighting& baked, std::span<const BakedTria
     }
     m_baked.ambientSampleCount = static_cast<UINT>(baked.ambientSamples.size());
     m_baked.ambientLightCount = static_cast<UINT>(baked.ambientLights.size());
-    m_bakedCounters = CreateBuffer(16, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    m_bakedCounters = CreateBuffer(16 + ((baked.faces.size() * 4 + 15) & ~size_t(15)), D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    m_bakedFaces.assign(baked.faces.size(), BakedFaceInfo{});
+    std::vector<bool> placed(baked.faces.size(), false);
+    for (const bsp::BakeLuxel& luxel : baked.luxels) {
+        if (luxel.face < placed.size() && !placed[luxel.face]) {
+            placed[luxel.face] = true;
+            m_bakedFaces[luxel.face] = {luxel.position, luxel.normal};
+        }
+    }
     const bool uploaded = m_baked.samplesView != DescriptorHeap::kInvalid && m_baked.facesView != DescriptorHeap::kInvalid &&
         m_baked.luxelsView != DescriptorHeap::kInvalid && m_baked.leafAmbientView != DescriptorHeap::kInvalid &&
         m_baked.ambientSamplesView != DescriptorHeap::kInvalid && m_baked.ambientLightsView != DescriptorHeap::kInvalid &&
@@ -605,6 +614,7 @@ void Scene::Clear()
     m_bakedFiltered.Reset();
     m_bakedCounters.Reset();
     m_bakedAmbient.Reset();
+    m_bakedFaces.clear();
     for (Model& model : m_models)
         ReleaseModel(model);
     m_models.clear();

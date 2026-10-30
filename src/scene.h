@@ -31,10 +31,10 @@ constexpr UINT kSkyboxMask = 0x10;
 // Static props the map marks as casting no shadows (often foliage). They shadow the sun but not local lights, so a
 // lamp model marked this way still lets its own light out as VRAD did.
 constexpr UINT kShadowlessPropMask = 0x20;
-// Static props and brushes as VRAD's shadows saw them (collision models or boxes, every side of opaque brushes),
-// traced only by the residual bake; the 3D skybox's brushes have their own mask.
+// Static props and brushes as VRAD's shadows saw them (collision models or mesh hulls, every side of opaque brushes),
+// traced only by the residual bake, with the sky faces that end VRAD's sun rays.
 constexpr UINT kVradOccluderMask = 0x40;
-constexpr UINT kVradSkyboxOccluderMask = 0x80;
+constexpr UINT kVradSkyMask = 0x80;
 
 // SceneInstance::flags, read by shaders from the instance record.
 constexpr uint32_t kInstanceIgnoreNormals = 0x01;
@@ -107,7 +107,7 @@ static_assert(sizeof(BakedTriangle) == 32);
 
 // The format of the baked residual cache (gmodpp_cache\baked): bump when shaders/baked_residual.hlsl or the data it
 // reads changes.
-inline constexpr uint32_t kBakeVersion = 9;
+inline constexpr uint32_t kBakeVersion = 11;
 
 // VRAD's baked light on the GPU (indirect_lighting = 1): raw views of bsp::BakedLighting and of the world's
 // BakedTriangles, and the residual shaders/baked_residual.hlsl writes: the baked light less the direct light VRAD
@@ -129,8 +129,8 @@ struct BakedBuffers {
     UINT residualUav = DescriptorHeap::kInvalid;
     UINT filteredView = DescriptorHeap::kInvalid;
     UINT filteredUav = DescriptorHeap::kInvalid;
-    // Clamped luxels, luxels the filter changed by more than a tenth, luxels baked and ambient samples clamped
-    // (shaders/baked_residual.hlsl).
+    // Clamped luxels, luxels the filter changed by more than a tenth, luxels without a VRAD sample and ambient
+    // samples clamped (shaders/baked_residual.hlsl).
     UINT countersUav = DescriptorHeap::kInvalid;
     UINT luxelCount = 0;
     UINT leafCount = 0;
@@ -175,6 +175,12 @@ public:
     ID3D12Resource* BakedFiltered() const { return m_bakedFiltered.Get(); }
     ID3D12Resource* BakedCounters() const { return m_bakedCounters.Get(); }
     ID3D12Resource* BakedAmbient() const { return m_bakedAmbient.Get(); }
+    // A baked face's first luxel and its normal, for the log of the most clamped faces.
+    struct BakedFaceInfo {
+        bsp::Float3 position;
+        bsp::Float3 normal;
+    };
+    const std::vector<BakedFaceInfo>& BakedFaces() const { return m_bakedFaces; }
     // Builds a BLAS for the geometry and returns its model id, or -1 when the geometry is empty or fails.
     int AddModel(const ModelGeometry& geometry);
     // A texture for alpha tests and material masks: VTF mips in their stored layout, largest first. Returns its
@@ -369,6 +375,7 @@ private:
     Microsoft::WRL::ComPtr<ID3D12Resource> m_bakedFiltered;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_bakedCounters;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_bakedAmbient;
+    std::vector<BakedFaceInfo> m_bakedFaces;
 };
 
 }

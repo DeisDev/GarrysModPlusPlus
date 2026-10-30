@@ -44,6 +44,7 @@
 #include <cmath>
 #include <cstring>
 #include <fstream>
+#include <numeric>
 #include <tuple>
 
 using Microsoft::WRL::ComPtr;
@@ -950,15 +951,24 @@ void Lighting::BakeStep(Scene& scene, const FrameConstants& constants, D3D12_GPU
     const D3D12_RESOURCE_BARRIER countersBarrier = {D3D12_RESOURCE_BARRIER_TYPE_UAV, D3D12_RESOURCE_BARRIER_FLAG_NONE, {.UAV = {scene.BakedCounters()}}};
     if (baked.bakedLuxels < baked.luxelCount) {
         const UINT count = std::min(kBakeLuxelsPerView, baked.luxelCount - baked.bakedLuxels);
-        DispatchGroups(Pass::Baked, {.input0 = baked.luxelsView, .input1 = baked.samplesView, .input2 = baked.facesView, .input3 = baked.bakedLuxels,
-            .input4 = count, .output0 = baked.residualUav, .output1 = baked.countersUav, .step = 0}, (count + 63) / 64, 1, 1);
+        // The filtered buffer holds each sample's direct light until the filter overwrites it.
+        DispatchGroups(Pass::Baked, {.input0 = baked.luxelsView, .input2 = baked.facesView, .input3 = baked.bakedLuxels, .input4 = count,
+            .output0 = baked.filteredUav, .step = 0}, (count + 63) / 64, 1, 1);
         baked.bakedLuxels += count;
-        if (baked.bakedLuxels == baked.luxelCount) {
-            D3D12_RESOURCE_BARRIER barrier = Transition(scene.BakedResidual(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-            m_list->ResourceBarrier(1, &barrier);
-        }
     } else {
-        m_list->ResourceBarrier(1, &countersBarrier);
+        const D3D12_RESOURCE_BARRIER directBarrier = {D3D12_RESOURCE_BARRIER_TYPE_UAV, D3D12_RESOURCE_BARRIER_FLAG_NONE, {.UAV = {scene.BakedFiltered()}}};
+        m_list->ResourceBarrier(1, &directBarrier);
+        for (UINT first = 0; first < baked.luxelCount; first += kMaxGroups * 64) {
+            const UINT count = std::min(kMaxGroups * 64, baked.luxelCount - first);
+            DispatchGroups(Pass::Baked, {.input0 = baked.luxelsView, .input1 = baked.samplesView, .input2 = baked.facesView, .input3 = first, .input4 = count,
+                .output0 = baked.residualUav, .output1 = baked.countersUav, .output2 = baked.filteredUav, .step = 3}, (count + 63) / 64, 1, 1);
+        }
+        const D3D12_RESOURCE_BARRIER gathered[] = {
+            Transition(scene.BakedResidual(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+            directBarrier,
+            countersBarrier,
+        };
+        m_list->ResourceBarrier(3, gathered);
         for (UINT first = 0; first < baked.luxelCount; first += kMaxGroups * 64) {
             const UINT count = std::min(kMaxGroups * 64, baked.luxelCount - first);
             DispatchGroups(Pass::Baked, {.input0 = baked.luxelsView, .input1 = baked.residualView, .input2 = baked.facesView, .input3 = first, .input4 = count,
@@ -978,7 +988,10 @@ void Lighting::BakeStep(Scene& scene, const FrameConstants& constants, D3D12_GPU
             Transition(ambient, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
         };
         m_list->ResourceBarrier(ambient != nullptr ? 3 : 2, barriers);
-        m_list->CopyBufferRegion(m_bakeReadback.Get(), 0, scene.BakedCounters(), 0, 16);
+        const UINT64 counterBytes = scene.BakedCounters()->GetDesc().Width;
+        if (!m_bakeReadback || m_bakeReadback->GetDesc().Width < counterBytes)
+            m_bakeReadback = CreateBuffer(m_device, D3D12_HEAP_TYPE_READBACK, counterBytes, D3D12_RESOURCE_STATE_COPY_DEST);
+        m_list->CopyBufferRegion(m_bakeReadback.Get(), 0, scene.BakedCounters(), 0, counterBytes);
         if (!baked.cachePath.empty()) {
             const UINT64 residualBytes = scene.BakedFiltered()->GetDesc().Width;
             const UINT64 ambientBytes = ambient != nullptr ? ambient->GetDesc().Width : 0;
@@ -1720,18 +1733,32 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
         m_bakeLogPending = false;
         WaitForGpu();
         uint32_t counters[4] = {};
+        const std::vector<Scene::BakedFaceInfo>& faces = scene.BakedFaces();
+        std::vector<uint32_t> faceClamps(faces.size());
         void* mapped = nullptr;
-        const D3D12_RANGE range = {0, sizeof(counters)};
+        const D3D12_RANGE range = {0, static_cast<SIZE_T>(m_bakeReadback->GetDesc().Width)};
         if (SUCCEEDED(m_bakeReadback->Map(0, &range, &mapped))) {
             std::memcpy(counters, mapped, sizeof(counters));
+            if (16 + faceClamps.size() * 4 <= range.End)
+                std::memcpy(faceClamps.data(), static_cast<const std::byte*>(mapped) + 16, faceClamps.size() * 4);
             const D3D12_RANGE written = {0, 0};
             m_bakeReadback->Unmap(0, &written);
         }
         const UINT luxels = std::max(scene.Baked().luxelCount, 1u);
-        log::Info("Baked light: {} of {} luxels clamped where the recomputed direct light exceeded the baked light ({:.1f}%); the filter changed {} "
-                  "({:.1f}%) by more than a tenth; {} of {} leaf ambient samples clamped after taking out {} surface lights",
-            counters[0], scene.Baked().luxelCount, 100.0 * counters[0] / luxels, counters[1], 100.0 * counters[1] / luxels, counters[3],
+        const UINT sampled = std::max(scene.Baked().luxelCount - std::min(counters[2], scene.Baked().luxelCount), 1u);
+        log::Info("Baked light: {} of {} sampled luxels clamped where the recomputed direct light exceeded the baked light ({:.1f}%), {} without a VRAD "
+                  "sample; the filter changed {} ({:.1f}%) by more than a tenth; {} of {} leaf ambient samples clamped after taking out {} surface lights",
+            counters[0], sampled, 100.0 * counters[0] / sampled, counters[2], counters[1], 100.0 * counters[1] / luxels, counters[3],
             scene.Baked().ambientSampleCount, scene.Baked().ambientLightCount);
+        std::vector<uint32_t> order(faceClamps.size());
+        std::iota(order.begin(), order.end(), 0u);
+        const size_t shown = std::min<size_t>(order.size(), 8);
+        std::partial_sort(order.begin(), order.begin() + shown, order.end(), [&](uint32_t a, uint32_t b) { return faceClamps[a] > faceClamps[b]; });
+        for (size_t i = 0; i < shown && faceClamps[order[i]] > 0; ++i) {
+            const Scene::BakedFaceInfo& face = faces[order[i]];
+            log::Info("Baked light: lightmap {} has {} clamped luxels, first luxel at ({:.0f} {:.0f} {:.0f}), normal ({:.2f} {:.2f} {:.2f})", order[i],
+                faceClamps[order[i]], face.position.x, face.position.y, face.position.z, face.normal.x, face.normal.y, face.normal.z);
+        }
         if (m_bakeCacheReadback) {
             const std::filesystem::path& path = scene.Baked().cachePath;
             const UINT64 bytes = m_bakeCacheReadback->GetDesc().Width;

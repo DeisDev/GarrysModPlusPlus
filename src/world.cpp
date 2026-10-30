@@ -620,6 +620,39 @@ const ModelEntry& ModelFor(const std::string& mdlPath)
     return entry;
 }
 
+// The convex hulls VRAD shadowed a static prop's model with, as model-space points (CreateCollisionModel in
+// src/utils/vrad/vradstaticprops.cpp): the pieces of its collision model's first solid, or for a model without one a
+// hull around each of its meshes (ComputeConvexHull).
+std::vector<std::vector<bsp::Float3>> VradPropHulls(const std::string& path, bool& fromCollision)
+{
+    std::vector<std::vector<bsp::Float3>> hulls;
+    const std::string base = path.size() > 4 ? path.substr(0, path.size() - 4) : path;
+    const std::vector<std::byte> phy = ReadOptional(base + ".phy");
+    studio::Geometry geometry;
+    std::string error;
+    fromCollision = !phy.empty();
+    if (!phy.empty()) {
+        if (!studio::ReadCollisionPieces(phy, hulls, error) && ++g_state.modelErrors <= 10)
+            log::Info("Scene: collision model of '{}' skipped: {}", path, error);
+    } else if (studio::BuildGeometry(ReadOptional(path), ReadOptional(base + ".vvd"), ReadOptional(base + ".dx90.vtx"), {}, geometry, error)) {
+        std::vector<std::vector<uint32_t>> vertices;
+        for (size_t t = 0; t < geometry.triangleTextures.size(); ++t) {
+            const size_t mesh = geometry.triangleTextures[t];
+            if (vertices.size() <= mesh)
+                vertices.resize(mesh + 1);
+            vertices[mesh].insert(vertices[mesh].end(), geometry.indices.begin() + t * 3, geometry.indices.begin() + t * 3 + 3);
+        }
+        for (std::vector<uint32_t>& mesh : vertices) {
+            std::sort(mesh.begin(), mesh.end());
+            mesh.erase(std::unique(mesh.begin(), mesh.end()), mesh.end());
+            std::vector<bsp::Float3>& points = hulls.emplace_back();
+            for (uint32_t v : mesh)
+                points.push_back(geometry.positions[v]);
+        }
+    }
+    return hulls;
+}
+
 // The convex hulls of static props that VRAD's shadows hid most of a light behind: those the light sits in or
 // against.
 std::vector<LightHull> FixtureHulls(const bsp::WorldGeometry& world)
@@ -649,7 +682,6 @@ std::vector<LightHull> FixtureHulls(const bsp::WorldGeometry& world)
             continue;
         PropModel& model = models[prop.model];
         const std::string& path = world.propModels[prop.model];
-        const std::string base = path.size() > 4 ? path.substr(0, path.size() - 4) : path;
         if (!model.read) {
             model.read = true;
             model.bounded = studio::ReadBounds(ReadOptional(path), model.mins, model.maxs);
@@ -671,29 +703,7 @@ std::vector<LightHull> FixtureHulls(const bsp::WorldGeometry& world)
             continue;
         if (!model.hullsRead) {
             model.hullsRead = true;
-            const std::vector<std::byte> phy = ReadOptional(base + ".phy");
-            studio::Geometry geometry;
-            std::string error;
-            model.fromCollision = !phy.empty();
-            if (!phy.empty()) {
-                if (!studio::ReadCollisionPieces(phy, model.hulls, error) && ++g_state.modelErrors <= 10)
-                    log::Info("Scene: collision model of '{}' skipped: {}", path, error);
-            } else if (studio::BuildGeometry(ReadOptional(path), ReadOptional(base + ".vvd"), ReadOptional(base + ".dx90.vtx"), {}, geometry, error)) {
-                std::vector<std::vector<uint32_t>> vertices;
-                for (size_t t = 0; t < geometry.triangleTextures.size(); ++t) {
-                    const size_t mesh = geometry.triangleTextures[t];
-                    if (vertices.size() <= mesh)
-                        vertices.resize(mesh + 1);
-                    vertices[mesh].insert(vertices[mesh].end(), geometry.indices.begin() + t * 3, geometry.indices.begin() + t * 3 + 3);
-                }
-                for (std::vector<uint32_t>& mesh : vertices) {
-                    std::sort(mesh.begin(), mesh.end());
-                    mesh.erase(std::unique(mesh.begin(), mesh.end()), mesh.end());
-                    std::vector<bsp::Float3>& points = model.hulls.emplace_back();
-                    for (uint32_t v : mesh)
-                        points.push_back(geometry.positions[v]);
-                }
-            }
+            model.hulls = VradPropHulls(path, model.fromCollision);
         }
         for (const std::vector<bsp::Float3>& piece : model.hulls) {
             if (piece.empty())
@@ -726,14 +736,12 @@ std::vector<LightHull> FixtureHulls(const bsp::WorldGeometry& world)
 }
 
 // Static props as VRAD shadowed them when the map was compiled without -StaticPropPolys (AddPolysForRayTrace in
-// src/utils/vrad/vradstaticprops.cpp): the convex pieces of a model's collision model, or for a model without one
-// the box of its hull bounds around the prop's origin, unrotated. Props marked "disable shadows" are left out.
+// src/utils/vrad/vradstaticprops.cpp): the convex hulls of VradPropHulls. Props marked "disable shadows" are left out.
 void AddVradOccluders(const bsp::WorldGeometry& world, std::vector<SceneInstance>& instances)
 {
     constexpr int kUnread = -2;
     std::vector<int> collisionModels(world.propModels.size(), kUnread);
-    std::vector<std::optional<std::pair<bsp::Float3, bsp::Float3>>> hullBounds(world.propModels.size());
-    int unitBox = -1;
+    std::vector<bool> fromCollision(world.propModels.size(), false);
     const auto addModel = [](const std::vector<bsp::Float3>& triangles) {
         std::vector<uint32_t> indices(triangles.size());
         std::iota(indices.begin(), indices.end(), 0u);
@@ -741,7 +749,7 @@ void AddVradOccluders(const bsp::WorldGeometry& world, std::vector<SceneInstance
         return g_state.scene.AddModel({triangles, indices, albedo, static_cast<UINT>(albedo.size()), {}, {}, {}});
     };
     size_t collisionProps = 0;
-    size_t boxProps = 0;
+    size_t meshProps = 0;
     for (const bsp::StaticProp& prop : world.props) {
         if (prop.noShadow)
             continue;
@@ -749,52 +757,27 @@ void AddVradOccluders(const bsp::WorldGeometry& world, std::vector<SceneInstance
         int& collision = collisionModels[prop.model];
         if (collision == kUnread) {
             collision = -1;
-            const std::vector<std::byte> mdl = ReadOptional(path);
-            const std::string base = path.size() > 4 ? path.substr(0, path.size() - 4) : path;
-            const std::vector<std::byte> phy = ReadOptional(base + ".phy");
-            std::vector<std::vector<bsp::Float3>> pieces;
-            std::string error;
+            bool collides = false;
             std::vector<bsp::Float3> triangles;
-            if (!phy.empty() && studio::ReadCollisionPieces(phy, pieces, error)) {
-                for (const std::vector<bsp::Float3>& piece : pieces) {
-                    const std::vector<bsp::Float3> hull = hull::Triangles(piece);
-                    triangles.insert(triangles.end(), hull.begin(), hull.end());
-                }
+            for (const std::vector<bsp::Float3>& piece : VradPropHulls(path, collides)) {
+                const std::vector<bsp::Float3> hull = hull::Triangles(piece);
+                triangles.insert(triangles.end(), hull.begin(), hull.end());
             }
-            if (!triangles.empty()) {
+            fromCollision[prop.model] = collides;
+            if (!triangles.empty())
                 collision = addModel(triangles);
-            } else if (phy.empty()) {
-                bsp::Float3 mins, maxs;
-                if (studio::ReadHullBounds(mdl, mins, maxs) && mins.x < maxs.x && mins.y < maxs.y && mins.z < maxs.z)
-                    hullBounds[prop.model] = std::pair(mins, maxs);
-            }
         }
+        if (collision < 0)
+            continue;
         SceneInstance instance;
         instance.mask = kVradOccluderMask;
-        if (collision >= 0) {
-            instance.model = collision;
-            std::memcpy(instance.transform, prop.transform, sizeof(instance.transform));
-            ++collisionProps;
-        } else if (const auto& bounds = hullBounds[prop.model]) {
-            if (unitBox < 0) {
-                std::vector<bsp::Float3> corners(8);
-                for (int c = 0; c < 8; ++c)
-                    corners[c] = {static_cast<float>(c & 1), static_cast<float>(c >> 1 & 1), static_cast<float>(c >> 2 & 1)};
-                unitBox = addModel(hull::Triangles(corners));
-            }
-            const auto& [mins, maxs] = *bounds;
-            const float origin[3] = {prop.transform[0][3], prop.transform[1][3], prop.transform[2][3]};
-            const float box[3][4] = {{maxs.x - mins.x, 0.0f, 0.0f, origin[0] + mins.x}, {0.0f, maxs.y - mins.y, 0.0f, origin[1] + mins.y},
-                {0.0f, 0.0f, maxs.z - mins.z, origin[2] + mins.z}};
-            instance.model = unitBox;
-            std::memcpy(instance.transform, box, sizeof(instance.transform));
-            ++boxProps;
-        }
-        if (instance.model >= 0)
-            instances.push_back(instance);
+        instance.model = collision;
+        std::memcpy(instance.transform, prop.transform, sizeof(instance.transform));
+        instances.push_back(instance);
+        ++(fromCollision[prop.model] ? collisionProps : meshProps);
     }
     const float identity[3][4] = {{1.0f, 0.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 1.0f, 0.0f}};
-    for (const auto& [triangles, mask] : {std::pair(&world.brushOccluders, kVradOccluderMask), std::pair(&world.skyboxBrushOccluders, kVradSkyboxOccluderMask)}) {
+    for (const auto& [triangles, mask] : {std::pair(&world.brushOccluders, kVradOccluderMask), std::pair(&world.skyOccluders, kVradSkyMask)}) {
         if (triangles->empty())
             continue;
         SceneInstance instance;
@@ -804,8 +787,8 @@ void AddVradOccluders(const bsp::WorldGeometry& world, std::vector<SceneInstance
         if (instance.model >= 0)
             instances.push_back(instance);
     }
-    log::Info("Scene: VRAD's shadows for the bake: {} props by collision model, {} by box; {} brush triangles, {} in the 3D skybox", collisionProps,
-        boxProps, world.brushOccluders.size() / 3, world.skyboxBrushOccluders.size() / 3);
+    log::Info("Scene: VRAD's shadows for the bake: {} props by collision model, {} by mesh hulls; {} brush triangles, {} sky triangles", collisionProps,
+        meshProps, world.brushOccluders.size() / 3, world.skyOccluders.size() / 3);
 }
 
 bool IsFirstPersonModel(const std::string& path)

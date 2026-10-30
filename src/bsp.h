@@ -133,15 +133,18 @@ struct FaceLightmap {
 };
 static_assert(sizeof(FaceLightmap) == 64);
 
-// A style-0 luxel of a world face where VRAD sampled it: `luxel` is s + t * width in the face's lightmap. Mirrors
-// BakeLuxel in shaders/baked.hlsli.
+// A style-0 luxel of a world face, `luxel` = s + t * width in the face's lightmap, with the point where VRAD sampled
+// the cell from it to the next luxel (its luxel point when VRAD had none there). `weights` (unorm16) mix the samples
+// of the cells at (s - 1, t - 1), (s, t - 1), (s - 1, t) and (s, t) into the luxel; all zero when none reaches it.
+// Mirrors BakeLuxel in shaders/baked.hlsli.
 struct BakeLuxel {
     Float3 position;
     uint32_t face;
     Float3 normal;
     uint32_t luxel;
+    std::array<uint16_t, 4> weights = {0, 0, 0, 0xFFFF};
 };
-static_assert(sizeof(BakeLuxel) == 32);
+static_assert(sizeof(BakeLuxel) == 40);
 
 // A leaf ambient sample (dleafambientlighting_t): the light arriving from each axis direction (+x, -x, +y, -y,
 // +z, -z) at a point of a leaf. Mirrors AmbientSample in shaders/baked.hlsli.
@@ -195,10 +198,10 @@ struct WorldGeometry {
     Mesh skybox;
     std::vector<StaticProp> skyboxProps;
     // VRAD's brush occluders as triangle lists, for the baked light only: every side of every opaque brush of the
-    // world model but sky and displacement sides, whatever its texture (AddBrushesForRayTrace in
-    // src/utils/vrad/trace.cpp), split between the map and the 3D skybox.
+    // world model but sky and displacement sides, whatever its texture, 3D skybox included; and the world model's sky
+    // faces, where VRAD's sun rays end unblocked (AddBrushesForRayTrace in src/utils/vrad/trace.cpp).
     std::vector<Float3> brushOccluders;
-    std::vector<Float3> skyboxBrushOccluders;
+    std::vector<Float3> skyOccluders;
     BakedLighting baked;
     // The sky camera's area (BspLeaf::area), or -1, and the bounds of its leaves.
     int32_t skyArea = -1;

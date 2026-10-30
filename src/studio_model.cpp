@@ -218,18 +218,6 @@ int BoneCount(std::span<const std::byte> mdlBytes)
     return mdl.At<int32_t>(kHeaderNumBones).value_or(0);
 }
 
-bool ReadHullBounds(std::span<const std::byte> mdlBytes, bsp::Float3& mins, bsp::Float3& maxs)
-{
-    Reader mdl(mdlBytes);
-    auto low = mdl.At<bsp::Float3>(kHeaderHullMin);
-    auto high = mdl.At<bsp::Float3>(kHeaderHullMin + sizeof(bsp::Float3));
-    if (!low || !high)
-        return false;
-    mins = *low;
-    maxs = *high;
-    return true;
-}
-
 bool ReadBounds(std::span<const std::byte> mdlBytes, bsp::Float3& mins, bsp::Float3& maxs)
 {
     Reader mdl(mdlBytes);
