@@ -10,6 +10,10 @@
 // Step 1 (filter): the residual is low-pass filtered within each face, which hides where VRAD's shadow edges and
 // ours differ. input1: residual; output0: filtered residual; output1: counters (1: luxels changed by more than a
 // tenth); the rest as step 0.
+// Step 2 (leaf ambient): the leaf ambient samples lose the direct light of the dim surface lights VRAD added to them
+// (AddEmitSurfaceLights in src/utils/vrad/leaf_ambient_lighting.cpp), which ray tracing adds back. input0:
+// AmbientLights; input1: their count; input3: first sample; input4: sample count; output0: ambient samples, changed
+// in place; output1: counters (3: samples with a cube side clamped at zero).
 
 // VRAD's occluders: the world and static props as VRAD shaped them (kWorldMask | kVradOccluderMask in src/scene.h).
 static const uint kVradOccluders = 0x01 | 0x40;
@@ -115,6 +119,61 @@ void Filter(uint index)
         counters.InterlockedAdd(4, 1);
 }
 
+struct AmbientLight
+{
+    float3 origin;
+    float radius;
+    float4 intensity;
+    float4 normal;
+};
+
+static const float3 kBoxDirections[6] = {float3(1, 0, 0), float3(-1, 0, 0), float3(0, 1, 0), float3(0, -1, 0), float3(0, 0, 1), float3(0, 0, -1)};
+
+// VRAD's falloff for these lights is the engine's for surface lights (Engine_WorldLightDistanceFalloff and
+// Engine_WorldLightAngle, l_studio.cpp): inverse square from 1 unit, within the radius, times the cosine at the
+// emitting surface; the receiving direction is the light's own, so each cube side takes its cosine to the light.
+void RemoveAmbientLights(uint index)
+{
+    ByteAddressBuffer lights = ResourceDescriptorHeap[g_pass.input0];
+    RWByteAddressBuffer samples = ResourceDescriptorHeap[g_pass.output0];
+    AmbientSample sample = samples.Load<AmbientSample>(index * 112);
+    float3 position = sample.position.xyz;
+    bool changed = false;
+    bool clamped = false;
+    for (uint i = 0; i < g_pass.input1; ++i) {
+        AmbientLight light = lights.Load<AmbientLight>(i * 48);
+        float3 delta = light.origin - position;
+        float distanceSquared = dot(delta, delta);
+        if (light.radius != 0.0 && distanceSquared > light.radius * light.radius)
+            continue;
+        float distance = sqrt(distanceSquared);
+        float3 toLight = delta / max(distance, 1e-4);
+        // ON_EPSILON / 10: behind the light's surface.
+        float emitter = -dot(toLight, light.normal.xyz);
+        if (emitter <= 0.01)
+            continue;
+        float visibility = Transmittance(position, toLight, ShadowRayLength(kLightClearance, distance), kVradOccluders);
+        if (visibility <= 0.0)
+            continue;
+        float ratio = emitter * visibility / max(distanceSquared, 1.0);
+        for (uint s = 0; s < 6; ++s) {
+            float t = dot(kBoxDirections[s], toLight);
+            if (t <= 0.0)
+                continue;
+            float3 value = sample.cube[s].rgb - light.intensity.rgb * (t * ratio);
+            clamped = clamped || any(value < -kClampTolerance * max(sample.cube[s].rgb, 1e-4));
+            sample.cube[s].rgb = max(value, 0.0);
+            changed = true;
+        }
+    }
+    if (changed)
+        samples.Store<AmbientSample>(index * 112, sample);
+    if (clamped) {
+        RWByteAddressBuffer counters = ResourceDescriptorHeap[g_pass.output1];
+        counters.InterlockedAdd(12, 1);
+    }
+}
+
 [RootSignature(ROOT_SIGNATURE)]
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID)
@@ -124,6 +183,8 @@ void main(uint3 id : SV_DispatchThreadID)
     uint index = g_pass.input3 + id.x;
     if (g_pass.step == 0)
         Bake(index);
-    else
+    else if (g_pass.step == 1)
         Filter(index);
+    else
+        RemoveAmbientLights(index);
 }

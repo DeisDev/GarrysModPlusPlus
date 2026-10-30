@@ -962,20 +962,36 @@ void Lighting::BakeStep(Scene& scene, const FrameConstants& constants, D3D12_GPU
             DispatchGroups(Pass::Baked, {.input0 = baked.luxelsView, .input1 = baked.residualView, .input2 = baked.facesView, .input3 = first, .input4 = count,
                 .output0 = baked.filteredUav, .output1 = baked.countersUav, .step = 1}, (count + 63) / 64, 1, 1);
         }
+        ID3D12Resource* ambient = scene.BakedAmbient();
+        if (ambient != nullptr) {
+            for (UINT first = 0; first < baked.ambientSampleCount; first += kMaxGroups * 64) {
+                const UINT count = std::min(kMaxGroups * 64, baked.ambientSampleCount - first);
+                DispatchGroups(Pass::Baked, {.input0 = baked.ambientLightsView, .input1 = baked.ambientLightCount, .input3 = first, .input4 = count,
+                    .output0 = baked.ambientSamplesUav, .output1 = baked.countersUav, .step = 2}, (count + 63) / 64, 1, 1);
+            }
+        }
         D3D12_RESOURCE_BARRIER barriers[] = {
             Transition(scene.BakedFiltered(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
             Transition(scene.BakedCounters(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
+            Transition(ambient, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
         };
-        m_list->ResourceBarrier(static_cast<UINT>(std::size(barriers)), barriers);
+        m_list->ResourceBarrier(ambient != nullptr ? 3 : 2, barriers);
         m_list->CopyBufferRegion(m_bakeReadback.Get(), 0, scene.BakedCounters(), 0, 16);
         if (!baked.cachePath.empty()) {
-            const UINT64 bytes = scene.BakedFiltered()->GetDesc().Width;
-            m_bakeCacheReadback = CreateBuffer(m_device, D3D12_HEAP_TYPE_READBACK, bytes, D3D12_RESOURCE_STATE_COPY_DEST);
-            if (m_bakeCacheReadback)
-                m_list->CopyBufferRegion(m_bakeCacheReadback.Get(), 0, scene.BakedFiltered(), 0, bytes);
+            const UINT64 residualBytes = scene.BakedFiltered()->GetDesc().Width;
+            const UINT64 ambientBytes = ambient != nullptr ? ambient->GetDesc().Width : 0;
+            m_bakeCacheReadback = CreateBuffer(m_device, D3D12_HEAP_TYPE_READBACK, residualBytes + ambientBytes, D3D12_RESOURCE_STATE_COPY_DEST);
+            if (m_bakeCacheReadback) {
+                m_list->CopyBufferRegion(m_bakeCacheReadback.Get(), 0, scene.BakedFiltered(), 0, residualBytes);
+                if (ambient != nullptr)
+                    m_list->CopyBufferRegion(m_bakeCacheReadback.Get(), residualBytes, ambient, 0, ambientBytes);
+            }
         }
-        D3D12_RESOURCE_BARRIER readable = Transition(scene.BakedFiltered(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        m_list->ResourceBarrier(1, &readable);
+        D3D12_RESOURCE_BARRIER readable[] = {
+            Transition(scene.BakedFiltered(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+            Transition(ambient, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+        };
+        m_list->ResourceBarrier(ambient != nullptr ? 2 : 1, readable);
         baked.filtered = true;
         m_bakeLogPending = true;
     }
@@ -1707,8 +1723,9 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
         }
         const UINT luxels = std::max(scene.Baked().luxelCount, 1u);
         log::Info("Baked light: {} of {} luxels clamped where the recomputed direct light exceeded the baked light ({:.1f}%); the filter changed {} "
-                  "({:.1f}%) by more than a tenth", counters[0], scene.Baked().luxelCount, 100.0 * counters[0] / luxels, counters[1],
-            100.0 * counters[1] / luxels);
+                  "({:.1f}%) by more than a tenth; {} of {} leaf ambient samples clamped after taking out {} surface lights",
+            counters[0], scene.Baked().luxelCount, 100.0 * counters[0] / luxels, counters[1], 100.0 * counters[1] / luxels, counters[3],
+            scene.Baked().ambientSampleCount, scene.Baked().ambientLightCount);
         if (m_bakeCacheReadback) {
             const std::filesystem::path& path = scene.Baked().cachePath;
             const UINT64 bytes = m_bakeCacheReadback->GetDesc().Width;

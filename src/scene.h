@@ -100,11 +100,13 @@ static_assert(sizeof(BakedTriangle) == 32);
 
 // The format of the baked residual cache (gmodpp_cache\baked): bump when shaders/baked_residual.hlsl or the data it
 // reads changes.
-inline constexpr uint32_t kBakeVersion = 4;
+inline constexpr uint32_t kBakeVersion = 5;
 
 // VRAD's baked light on the GPU (indirect_lighting = 1): raw views of bsp::BakedLighting and of the world's
 // BakedTriangles, and the residual shaders/baked_residual.hlsl writes: the baked light less the direct light VRAD
-// summed into it, per lightmap sample, as half4, then filtered within each face.
+// summed into it, per lightmap sample, as half4, then filtered within each face. The leaf ambient samples lose the
+// direct light of the lights VRAD added to them in the same bake. The cache holds the filtered residual, then the
+// ambient samples.
 struct BakedBuffers {
     UINT samplesView = DescriptorHeap::kInvalid;
     UINT facesView = DescriptorHeap::kInvalid;
@@ -112,11 +114,16 @@ struct BakedBuffers {
     UINT luxelsView = DescriptorHeap::kInvalid;
     UINT leafAmbientView = DescriptorHeap::kInvalid;
     UINT ambientSamplesView = DescriptorHeap::kInvalid;
+    UINT ambientSamplesUav = DescriptorHeap::kInvalid;
+    UINT ambientLightsView = DescriptorHeap::kInvalid;
+    UINT ambientSampleCount = 0;
+    UINT ambientLightCount = 0;
     UINT residualView = DescriptorHeap::kInvalid;
     UINT residualUav = DescriptorHeap::kInvalid;
     UINT filteredView = DescriptorHeap::kInvalid;
     UINT filteredUav = DescriptorHeap::kInvalid;
-    // Clamped luxels, luxels the filter changed by more than a tenth, and luxels baked (shaders/baked_residual.hlsl).
+    // Clamped luxels, luxels the filter changed by more than a tenth, luxels baked and ambient samples clamped
+    // (shaders/baked_residual.hlsl).
     UINT countersUav = DescriptorHeap::kInvalid;
     UINT luxelCount = 0;
     UINT leafCount = 0;
@@ -160,6 +167,7 @@ public:
     ID3D12Resource* BakedResidual() const { return m_bakedResidual.Get(); }
     ID3D12Resource* BakedFiltered() const { return m_bakedFiltered.Get(); }
     ID3D12Resource* BakedCounters() const { return m_bakedCounters.Get(); }
+    ID3D12Resource* BakedAmbient() const { return m_bakedAmbient.Get(); }
     // Builds a BLAS for the geometry and returns its model id, or -1 when the geometry is empty or fails.
     int AddModel(const ModelGeometry& geometry);
     // A texture for alpha tests and material masks: VTF mips in their stored layout, largest first. Returns its
@@ -350,6 +358,7 @@ private:
     Microsoft::WRL::ComPtr<ID3D12Resource> m_bakedResidual;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_bakedFiltered;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_bakedCounters;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_bakedAmbient;
 };
 
 }

@@ -47,6 +47,8 @@ struct Light {
     int32_t cluster;
     // Light style: 0 for plain lights, 1-31 for animated patterns, 32 and up for switchable (named) lights.
     int32_t style;
+    // VRAD added the light's direct light to the leaf ambient samples (DWL_FLAGS_INAMBIENTCUBE: dim surface lights).
+    bool inAmbientCube;
 };
 
 // A world BSP node; a negative child is leaf -child - 1.
@@ -145,6 +147,15 @@ static_assert(sizeof(AmbientSample) == 112);
 
 // VRAD's baked light: the lightmaps of style 0 (direct light from style-0 lights, sky ambient and bounced light,
 // summed) and the leaf ambient samples, HDR when the map has them.
+// A light whose direct light VRAD added to the leaf ambient samples (Light::inAmbientCube), as
+// shaders/baked_residual.hlsl reads it: origin and radius, intensity, the surface's normal.
+struct AmbientLight {
+    float origin[4];
+    float intensity[4];
+    float normal[4];
+};
+static_assert(sizeof(AmbientLight) == 48);
+
 struct BakedLighting {
     // ColorRGBExp32 samples (r, g, b, exponent): c * 2^exponent / 255.
     std::vector<uint32_t> samples;
@@ -154,6 +165,7 @@ struct BakedLighting {
     // Per BSP leaf (Visibility::leaves): its first sample in `ambientSamples` and their number.
     std::vector<std::array<uint32_t, 2>> leafAmbient;
     std::vector<AmbientSample> ambientSamples;
+    std::vector<AmbientLight> ambientLights;
 };
 
 struct WorldGeometry {

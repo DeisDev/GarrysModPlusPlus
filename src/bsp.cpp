@@ -43,6 +43,8 @@ constexpr int kLumpLeafAmbientLightingHdr = 55;
 constexpr int kLumpLeafAmbientLighting = 56;
 constexpr int kLumpFacesHdr = 58;
 
+// dworldlight_t::flags (bspfile.h).
+constexpr int32_t kWorldLightInAmbientCube = 0x0001;
 constexpr int32_t kSurfSky2D = 0x0002;
 constexpr int32_t kSurfSky = 0x0004;
 constexpr int32_t kSurfWarp = 0x0008;
@@ -913,7 +915,8 @@ void ReadLights(std::span<const std::byte> file, const Header& header, WorldGeom
             case LightType::Point:
             case LightType::Spot:
                 world.lights.push_back({static_cast<LightType>(light.type), light.origin, light.intensity, light.normal, light.stopdot,
-                    light.stopdot2, light.exponent, light.radius, light.constantAttn, light.linearAttn, light.quadraticAttn, light.cluster, light.style});
+                    light.stopdot2, light.exponent, light.radius, light.constantAttn, light.linearAttn, light.quadraticAttn, light.cluster, light.style,
+                    (light.flags & kWorldLightInAmbientCube) != 0});
                 break;
             default:
                 break;
@@ -1129,6 +1132,11 @@ bool LoadWorld(std::span<const std::byte> file, WorldGeometry& world, std::strin
     ReadLights(file, header, world);
     ReadVisibility(file, header, world.visibility);
     ReadLeafAmbient(file, header, world.visibility, world.baked);
+    for (const Light& light : world.lights) {
+        if (light.inAmbientCube)
+            world.baked.ambientLights.push_back({{light.origin.x, light.origin.y, light.origin.z, light.radius},
+                {light.intensity.x, light.intensity.y, light.intensity.z, 0.0f}, {light.normal.x, light.normal.y, light.normal.z, 0.0f}});
+    }
     ReadStaticProps(file, header, world);
     if (skyArea >= 0) {
         for (const StaticProp& prop : world.props) {
