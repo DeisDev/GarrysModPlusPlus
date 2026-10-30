@@ -83,6 +83,9 @@ struct Phong
     float strength;
     float3 normal;
     float3 toEye;
+    // Rim light (Source's SpecularAndRimTerms), or exponent 0.
+    float rimExponent;
+    float rimScale;
 };
 
 Phong PhongAt(int2 pixel, bool lit, float3 position, float3 normal)
@@ -95,10 +98,26 @@ Phong PhongAt(int2 pixel, bool lit, float3 position, float3 normal)
     if (phong.exponent == 0.0)
         return phong;
     Texture2D<float4> flags = ResourceDescriptorHeap[g_frame.flagsView];
-    phong.strength = flags.Load(int3(pixel, 0)).b;
+    float4 marks = flags.Load(int3(pixel, 0));
+    phong.strength = marks.b;
     phong.normal = normal;
     phong.toEye = normalize(g_frame.eyePosition - position);
+    if (phong.exponent < 0.0 && (MaterialBits(marks) & kMaterialRimLight) != 0) {
+        Texture2D<float4> normals = ResourceDescriptorHeap[g_frame.gbufferNormalView];
+        phong.rimExponent = normals.Load(int3(pixel, 0)).a;
+        phong.rimScale = RimScale(marks);
+    }
     return phong;
+}
+
+// Rim light from one light: pow(R.L, rim exponent) times the light reaching the surface, scaled by the rim's mask,
+// Fresnel and tint. The skin shader takes the larger of the summed highlights and the summed rim.
+float3 ModelRim(Phong phong, float3 light, float3 toLight)
+{
+    if (phong.rimExponent <= 0.0)
+        return 0.0;
+    float3 reflected = 2.0 * phong.normal * dot(phong.normal, phong.toEye) - phong.toEye;
+    return light * (phong.rimScale * pow(saturate(dot(reflected, toLight)), phong.rimExponent));
 }
 
 // Models: Source's SpecularAndRimTerms (common_vertexlitgeneric_dx9.h), pow(R.L, exponent) times the light reaching
@@ -147,6 +166,7 @@ void main(uint3 id : SV_DispatchThreadID)
 
     float3 exact = 0.0;
     float3 specular = 0.0;
+    float3 rim = 0.0;
     Phong phong = PhongAt(pixel, lit && inside, position, normal);
     float sunVisibility = 0.0;
     float lambert = Lambert(lightNormal, g_frame.sunDirection);
@@ -154,6 +174,7 @@ void main(uint3 id : SV_DispatchThreadID)
         sunVisibility = SunVisibility(origin, g_frame.sunShadowMask);
         exact += g_frame.sunColor * lambert * sunVisibility;
         specular += SunHighlight(phong, g_frame.sunColor * (lambert * sunVisibility));
+        rim += ModelRim(phong, g_frame.sunColor * (lambert * sunVisibility), g_frame.sunDirection);
     }
 
     LightSet set = (LightSet)0;
@@ -222,6 +243,7 @@ void main(uint3 id : SV_DispatchThreadID)
         float3 shadowed = light * LightTransmittance(set, top[k], origin, toLight, distance);
         exact += shadowed;
         specular += ModelHighlight(phong, shadowed, toLight);
+        rim += ModelRim(phong, shadowed, toLight);
     }
     float3 sampled = 0.0;
     if (remainder > 0.0) {
@@ -244,7 +266,7 @@ void main(uint3 id : SV_DispatchThreadID)
     remainderOutput[pixel] = float4(sampled, 1.0);
     if (g_pass.output2 != kNoView) {
         RWTexture2D<float4> specularOutput = ResourceDescriptorHeap[g_pass.output2];
-        specularOutput[pixel] = float4(specular, 0.0);
+        specularOutput[pixel] = float4(max(specular, rim), 0.0);
     }
     if (g_frame.probeView != kNoView && all(uint2(pixel) == uint2(g_frame.probePixel & 0xFFFF, g_frame.probePixel >> 16))) {
         RWByteAddressBuffer probe = ResourceDescriptorHeap[g_frame.probeView];

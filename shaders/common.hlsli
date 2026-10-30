@@ -158,7 +158,16 @@ static const uint kPixelUnlit = 2;
 static const uint kPixelIgnoreNormals = 4;
 
 // Material bits the twins (shaders/twins) store in the G-buffer flags' green as 1 - bits / 255 on covered pixels.
+// Rim light (skin twin) also stores its boost in eighths from bit kMaterialRimBoostShift, its mask, Fresnel and tint
+// in the flags' red above 0.5 and its exponent in the normal's alpha.
 static const uint kMaterialHalfLambert = 1;
+static const uint kMaterialRimLight = 2;
+static const uint kMaterialRimBoostShift = 2;
+
+float RimScale(float4 flags)
+{
+    return saturate((flags.r - 0.5) * 2.0);
+}
 
 uint MaterialBits(float4 flags)
 {

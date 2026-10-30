@@ -33,6 +33,19 @@ float3 ApplyFog(float3 color, float3 position)
     return lerp(color, g_frame.fogColor, g_frame.fogParams.y > 0.0 ? fog : fog * fog);
 }
 
+// Source's rim light also adds the ambient light seen along the view (vRimAmbientCubeColor in skin_ps20b) times its
+// boost where the surface faces up; the indirect light at the pixel stands in for the ambient cube.
+float3 AmbientRim(int2 pixel, float3 normal, float3 indirect)
+{
+    Texture2D<float4> flags = ResourceDescriptorHeap[g_frame.flagsView];
+    float4 marks = flags.Load(int3(pixel, 0));
+    uint bits = MaterialBits(marks);
+    if ((bits & kMaterialRimLight) == 0)
+        return 0.0;
+    float boost = float(bits >> kMaterialRimBoostShift) / 8.0;
+    return indirect * (boost * saturate(RimScale(marks) * normal.z));
+}
+
 [RootSignature(ROOT_SIGNATURE)]
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID)
@@ -124,10 +137,10 @@ void main(uint3 id : SV_DispatchThreadID)
     case 8: result = Encode(Decode(lightTexture.Load(int3(pixel, 0)).rgb)); break;
     case 9: {
         // Reflections, self-illumination from the material table and Phong highlights.
-        float3 highlights = 0.0;
+        float3 highlights = AmbientRim(pixel, surface.xyz, indirect);
         if (g_frame.specularView != kNoView) {
             Texture2D<float4> specularTexture = ResourceDescriptorHeap[g_frame.specularView];
-            highlights = specularTexture.Load(int3(pixel, 0)).rgb;
+            highlights += specularTexture.Load(int3(pixel, 0)).rgb;
         }
         result = Encode((added + highlights) * g_frame.tonemapScale);
         break;
@@ -144,10 +157,10 @@ void main(uint3 id : SV_DispatchThreadID)
         Texture2D<uint> pixelFlags = ResourceDescriptorHeap[g_frame.pixelFlagsView];
         bool unlit = (pixelFlags.Load(int3(pixel, 0)) & kPixelUnlit) != 0;
         float3 light = unlit ? 1.0 : direct + indirect;
-        float3 specular = 0.0;
+        float3 specular = unlit ? 0.0 : AmbientRim(pixel, surface.xyz, indirect);
         if (!unlit && g_frame.specularView != kNoView) {
             Texture2D<float4> highlights = ResourceDescriptorHeap[g_frame.specularView];
-            specular = highlights.Load(int3(pixel, 0)).rgb;
+            specular += highlights.Load(int3(pixel, 0)).rgb;
         }
         float3 shaded = ApplyFog((albedo * light + emissive + added + specular) * g_frame.tonemapScale, position) + additive + VolumetricLight(pixel);
         result = g_frame.outputLinear != 0 ? shaded : Encode(shaded);

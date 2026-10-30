@@ -365,7 +365,8 @@ float4 main( PS_INPUT i ) : COLOR
 	}
 	GBufferTwinOutput twin;
 	twin.albedo = float4( twinAlbedo, twinAlpha );
-	twin.normal = float4( worldSpaceNormal, twinAlpha );
+	// With rim light, the normal's alpha holds its exponent (shaders/direct.hlsl).
+	twin.normal = float4( worldSpaceNormal, bDoRimLighting ? g_RimExponent : twinAlpha );
 	// The Phong highlight shaders/deferred_lighting.hlsl adds from the sun: the exponent, negated to mark Source's
 	// model specular (SpecularAndRimTerms), and the strength the code above scales it by (mask with Fresnel, boost,
 	// tint).
@@ -375,8 +376,12 @@ float4 main( PS_INPUT i ) : COLOR
 	// shaders/forward_twin.hlsli lights the draw at its world position.
 	twin.flags = float4( i.worldPos_atten3.xyz, twinAlpha );
 #else
-	// Green: 1 less the material bits over 255 (shaders/common.hlsli kMaterialHalfLambert).
-	twin.flags = float4( 1, HALFLAMBERT ? 254.0f / 255.0f : 1.0f, twinSpecular, twinAlpha );
+	// Rim light: red holds the rim's mask, Fresnel and tint above coverage's 0.5, and the material bits its boost.
+	float twinRim = saturate( fRimMask * fRimFresnel * dot( vSpecularTint, float3( 1.0f, 1.0f, 1.0f ) / 3.0f ) );
+	float twinRimBoost = round( saturate( g_fRimBoost / 7.875f ) * 63.0f );
+	// Green: 1 less the material bits over 255 (shaders/common.hlsli kMaterialHalfLambert, kMaterialRimLight).
+	float twinBits = ( HALFLAMBERT ? 1.0f : 0.0f ) + ( bDoRimLighting ? 2.0f + 4.0f * twinRimBoost : 0.0f );
+	twin.flags = float4( bDoRimLighting ? 0.5f + 0.5f * twinRim : 1.0f, 1.0f - twinBits / 255.0f, twinSpecular, twinAlpha );
 #endif
 	return twin;
 #else

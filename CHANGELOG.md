@@ -56,6 +56,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Self-illuminated surfaces such as screens and light panels glow in reflections even when they are off screen.
 - Ambient occlusion is steadier while the camera moves.
 - In the native renderer, bump-mapped models and skin materials with `$halflambert` (most characters) take light with the game's half-Lambert shading.
+- In the native renderer, characters with `$rimlight` (many Half-Life 2 models and the first-person hands) get their rim highlights from real-time light.
 - In the native renderer, glass and other translucent surfaces no longer hitch the first time they appear: their shaders are prepared with the rest after a game update.
 
 ### Removed
