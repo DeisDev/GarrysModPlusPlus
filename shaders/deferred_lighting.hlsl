@@ -46,6 +46,19 @@ float3 AmbientRim(int2 pixel, float3 normal, float3 indirect)
     return indirect * (boost * saturate(RimScale(marks) * normal.z));
 }
 
+// LightmappedGeneric's light warp: the total diffuse light scaled by the warp texture at half its length, doubled
+// (lightmappedgeneric_ps2_3_x.h, where it warps the lightmap).
+float3 WarpedTotalLight(int2 pixel, float3 light)
+{
+    Texture2D<float4> flags = ResourceDescriptorHeap[g_frame.flagsView];
+    float4 marks = flags.Load(int3(pixel, 0));
+    uint view = WarpsTotalLight(MaterialBits(marks)) ? LightWarpView(marks) : kNoView;
+    if (view == kNoView)
+        return light;
+    Texture2D<float4> warp = ResourceDescriptorHeap[NonUniformResourceIndex(view)];
+    return light * (2.0 * warp.SampleLevel(g_linearClamp, float2(0.5 * length(light), 0.5), 0.0).rgb);
+}
+
 [RootSignature(ROOT_SIGNATURE)]
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID)
@@ -156,7 +169,7 @@ void main(uint3 id : SV_DispatchThreadID)
     default: {
         Texture2D<uint> pixelFlags = ResourceDescriptorHeap[g_frame.pixelFlagsView];
         bool unlit = (pixelFlags.Load(int3(pixel, 0)) & kPixelUnlit) != 0;
-        float3 light = unlit ? 1.0 : direct + indirect;
+        float3 light = unlit ? 1.0 : WarpedTotalLight(pixel, direct + indirect);
         float3 specular = unlit ? 0.0 : AmbientRim(pixel, surface.xyz, indirect);
         if (!unlit && g_frame.specularView != kNoView) {
             Texture2D<float4> highlights = ResourceDescriptorHeap[g_frame.specularView];

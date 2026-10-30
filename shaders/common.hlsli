@@ -163,16 +163,23 @@ static const uint kPixelIgnoreNormals = 4;
 // Material bits the twins (shaders/twins) store in the G-buffer flags' green as 1 - bits / 255 on covered pixels.
 // Rim light (skin twin) also stores its boost in quarters from bit kMaterialRimBoostShift, its mask, Fresnel and tint
 // in the flags' red above 0.5 and its exponent in the normal's alpha. Light warp ($lightwarptexture) stores its
-// texture's slot in the flags' alpha.
+// texture's slot in the flags' alpha; with kMaterialWarpTotal (LightmappedGeneric's $lightwarptexture, without rim
+// light) the warp scales the total diffuse light by its brightness instead of each light (WarpsTotalLight).
 static const uint kMaterialHalfLambert = 1;
 static const uint kMaterialRimLight = 2;
 static const uint kMaterialRimBoostShift = 2;
 static const uint kMaterialRimBoostMask = 31;
 static const uint kMaterialLightWarp = 128;
+static const uint kMaterialWarpTotal = 64;
 
 float RimScale(float4 flags)
 {
     return saturate((flags.r - 0.5) * 2.0);
+}
+
+bool WarpsTotalLight(uint bits)
+{
+    return (bits & (kMaterialRimLight | kMaterialWarpTotal)) == kMaterialWarpTotal;
 }
 
 float RimBoost(uint bits)

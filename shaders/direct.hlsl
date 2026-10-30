@@ -177,7 +177,7 @@ void main(uint3 id : SV_DispatchThreadID)
         Texture2D<float4> gbufferFlags = ResourceDescriptorHeap[g_frame.flagsView];
         float4 marks = gbufferFlags.Load(int3(pixel, 0));
         g_halfLambert = (MaterialBits(marks) & kMaterialHalfLambert) != 0;
-        g_lightWarpView = LightWarpView(marks);
+        g_lightWarpView = WarpsTotalLight(MaterialBits(marks)) ? kNoView : LightWarpView(marks);
     }
 
     float3 exact = 0.0;

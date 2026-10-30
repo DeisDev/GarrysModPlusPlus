@@ -55,8 +55,9 @@ struct Family {
     // 0 so their combos share one twin. LIGHTING_PREVIEW is always 0: the game binds its preview combos during a
     // capture, whose pow(x, 2.2) would convert the sRGB-decoded textures again.
     std::string_view ignoredDynamics;
-    // The source's DiffuseWarpSampler register, read when LIGHTWARPTEXTURE is 1, or -1.
+    // The register of the source's light warp sampler, read when the static switch `lightWarpSwitch` is 1, or -1.
     int lightWarpSampler = -1;
+    std::string_view lightWarpSwitch = "LIGHTWARPTEXTURE";
 };
 
 // Flashlight passes are skipped in real-time mode; GMod's lightmap switch is not in the twin yet; unlit combos keep
@@ -81,7 +82,7 @@ constexpr Family kFamilies[] = {
         "WRITEWATERFOGTODESTALPHA PIXELFOGTYPE NUM_LIGHTS WRITE_DEPTH_TO_DESTALPHA", 2 },
     // GMod's total of 2,717,908,992 combos wraps in the header's 32-bit signed field.
     { "lightmappedgeneric_ps30", "lightmappedgeneric_ps2x.fxc", "ps30", "ps_3_0", "SHADER_MODEL_PS_3_0", -1577058304, 96, 0x3b558d77, &KeepNone,
-        "FASTPATHENVMAPCONTRAST WRITEWATERFOGTODESTALPHA PIXELFOGTYPE WRITE_DEPTH_TO_DESTALPHA" },
+        "FASTPATHENVMAPCONTRAST WRITEWATERFOGTODESTALPHA PIXELFOGTYPE WRITE_DEPTH_TO_DESTALPHA", 6, "WARPLIGHTING" },
     // Eyes and teeth have no lighting preview combo; their twins are drawn in place of the game's lit shader.
     { "eyes_ps20b", "eyes_ps2x.fxc", "ps20b", "ps_2_b", "SHADER_MODEL_PS_2_B", 4, 4, 0x2dc0584a, &KeepNone, "WRITE_DEPTH_TO_DESTALPHA PIXELFOGTYPE" },
     { "teeth_ps20b", "teeth_ps2x.fxc", "ps20b", "ps_2_b", "SHADER_MODEL_PS_2_B", 8, 4, 0x08da8ae0, &KeepNone, "PIXELFOGTYPE WRITE_DEPTH_TO_DESTALPHA" },
@@ -406,7 +407,7 @@ int LightWarpSampler(std::string_view file, const vcs::Header& header, int stati
         return -1;
     Values values;
     Decode(static_cast<std::uint64_t>(staticIndex) / static_cast<std::uint64_t>(std::max(header.dynamicCombos, 1)), entry->statics, values);
-    return ValueOf(values, "LIGHTWARPTEXTURE") != 0 ? entry->family->lightWarpSampler : -1;
+    return ValueOf(values, entry->family->lightWarpSwitch) != 0 ? entry->family->lightWarpSampler : -1;
 }
 
 bool HasTwin(std::string_view file)

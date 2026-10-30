@@ -532,7 +532,9 @@ HALF4 main( PS_INPUT i ) : COLOR
 	// shaders/forward_twin.hlsli lights the draw at its world position.
 	twin.flags = float4( i.worldPos_projPosZ.xyz, alpha );
 #else
-	twin.flags = float4( 1, 1, twinPhong, alpha );
+	// Green: 1 less the material bits over 255 (shaders/common.hlsli kMaterialLightWarp, kMaterialWarpTotal); with the
+	// light warp the translator puts its texture's slot in alpha.
+	twin.flags = float4( 1, ( WARPLIGHTING && ( SEAMLESS == 0 ) ) ? 1.0f - 192.0f / 255.0f : 1.0f, twinPhong, alpha );
 #endif
 	return twin;
 #else
