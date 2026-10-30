@@ -528,7 +528,7 @@ Light LoadLight(uint index)
 }
 
 // Whether the straight path from a map light to a point crosses one of the light's convex hulls: the static prop
-// meshes VRAD shadowed it with (FixtureHulls in src/effects.cpp). Points inside a hull with the light stay lit.
+// meshes VRAD shadowed it with (FixtureHulls in src/world.cpp). Points inside a hull with the light stay lit.
 bool HullBlocks(Light light, float3 position)
 {
     ByteAddressBuffer lights = ResourceDescriptorHeap[g_frame.lightsView];

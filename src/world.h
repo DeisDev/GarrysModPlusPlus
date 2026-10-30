@@ -10,8 +10,7 @@
 #include <filesystem>
 #include <optional>
 
-// The ray-traced scene of the loaded map and its entities, and the lighting that uses it, shared by the Direct3D 9
-// build (effects.cpp) and the native backend.
+// The ray-traced scene of the loaded map and its entities, and the lighting that uses it.
 namespace gmodpp::world {
 
 // Creates the lighting on the device the game's frames go to; false (logged) when it cannot.

@@ -47,17 +47,9 @@ using ComputeLightingFn = void(__fastcall*)(void* engine, const float* point, co
 // The engine's ComputeLighting, or null before the engine is ready.
 ComputeLightingFn ComputeLightingFunction();
 
-// Sets INT_RENDERPARM_ENABLE_FIXED_LIGHTING, which selects the stock shaders' LIGHTING_PREVIEW combos
-// (2 = G-buffer outputs). Returns false when the material system is unavailable.
-bool SetFixedLighting(int mode);
-
 // Whether a material draws unlit (UnlitGeneric, UnlitTwoTexture, MonitorScreen), whose preview combos leave out vertex
 // colour.
 bool IsUnlitMaterial(void* material);
-
-// While enabled, each material the game binds switches fixed lighting between 2 and 0: unlit materials (UnlitGeneric
-// and its relatives) are drawn with their own shaders, the others with the G-buffer outputs. For the forward pass.
-void SetUnlitFilter(bool enabled);
 
 // The fog of the view being drawn (IMatRenderContext::GetFogMode and GetFogColor): its MaterialFogMode_t (0 without fog)
 // and its colour as the game sets it (gamma bytes).

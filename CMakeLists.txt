@@ -120,83 +120,7 @@ add_d3d9_shader(shaders/forward_snippet.hlsl main g_forwardSnippetPS)
 add_d3d9_shader(shaders/forward_snippet.hlsl main g_forwardSnippetPS2 PROFILE ps_2_b /D FORWARD_PS2=1)
 add_d3d9_shader(shaders/water_surface.hlsl main g_waterSurfacePS PROFILE ps_2_b)
 add_d3d9_shader(shaders/water_surface.hlsl main g_waterSurfaceAlphaFogPS PROFILE ps_2_b /D REFRACT_ALPHA_FOG=1)
-# G-buffer replacements (g_gbuffer*) and their forward-lit variants (g_forward*).
-foreach(forward 0 1)
-    if(forward)
-        set(prefix forward)
-    else()
-        set(prefix gbuffer)
-    endif()
-    add_d3d9_shader(shaders/gbuffer_models.hlsl BumpMain g_${prefix}BumpPS /D FORWARD=${forward})
-    add_d3d9_shader(shaders/gbuffer_models.hlsl BumpMain g_${prefix}BumpSelfIllumPS /D SELFILLUM=1 /D FORWARD=${forward})
-    add_d3d9_shader(shaders/gbuffer_models.hlsl BumpMain g_${prefix}BumpSelfIllumFresnelPS /D SELFILLUM=3 /D FORWARD=${forward})
-endforeach()
-foreach(normalMap 0 1)
-    if(normalMap)
-        set(suffix "")
-    else()
-        set(suffix "NoBump")
-    endif()
-    foreach(detail 0 1)
-        if(detail)
-            set(name "Skin${suffix}Detail")
-        else()
-            set(name "Skin${suffix}")
-        endif()
-        foreach(forward 0 1)
-            if(forward)
-                set(prefix forward)
-            else()
-                set(prefix gbuffer)
-            endif()
-            set(defines /D SKIN_NORMAL_MAP=${normalMap} /D SKIN_DETAIL=${detail} /D FORWARD=${forward})
-            add_d3d9_shader(shaders/gbuffer_models.hlsl SkinMain g_${prefix}${name}PS ${defines})
-            add_d3d9_shader(shaders/gbuffer_models.hlsl SkinMain g_${prefix}${name}SelfIllumPS ${defines} /D SELFILLUM=2)
-            add_d3d9_shader(shaders/gbuffer_models.hlsl SkinMain g_${prefix}${name}SelfIllumFresnelPS ${defines} /D SELFILLUM=3)
-        endforeach()
-    endforeach()
-endforeach()
 
-add_library(gmodpp_d3d9 SHARED
-    src/d3d9.def
-    src/mod.cpp
-    src/command_line.cpp
-    src/exports.cpp
-    src/log.cpp
-    src/d3d9_hooks.cpp
-    src/d3d9_vtable.c
-    src/capture.cpp
-    src/watchdog.cpp
-    src/frame_trace.cpp
-    src/presenter.cpp
-    src/d3d12_device.cpp
-    src/renderer.cpp
-    src/module_scan.cpp
-    src/client_hooks.cpp
-    src/engine_interfaces.cpp
-    src/light_queries.cpp
-    src/entities.cpp
-    src/bsp.cpp
-    src/studio_model.cpp
-    src/convex_hull.cpp
-    src/opacity_micromaps.cpp
-    src/scene.cpp
-    src/skinned_casters.cpp
-    src/swaying_props.cpp
-    src/ropes.cpp
-    src/settings.cpp
-    src/ui_text.cpp
-    src/overlay.cpp
-    src/descriptor_heap.cpp
-    src/shader_bytecode.cpp
-    src/gbuffer.cpp
-    src/gbuffer_shaders.cpp
-    src/dlss.cpp
-    src/lighting.cpp
-    src/effects.cpp
-    src/world.cpp
-    ${SHADER_HEADERS}
-)
 # NVIDIA DLSS SDK (Ray Reconstruction): headers, the NGX static library for the static runtime, and the
 # release feature DLL, each pinned by hash.
 set(DLSS_SDK_VERSION v310.9.16)
@@ -269,13 +193,6 @@ file(GLOB LIGHTING_HEADERS CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shader
 file(GLOB TWIN_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/twins/*.fxc" "${CMAKE_CURRENT_SOURCE_DIR}/shaders/twins/*.h")
 target_include_directories(lzma_dec PUBLIC "${LZMA_SDK_DIR}")
 
-set_target_properties(gmodpp_d3d9 PROPERTIES OUTPUT_NAME d3d9)
-# The Agility SDK's d3d12.h comes before the Windows SDK's.
-target_include_directories(gmodpp_d3d9 BEFORE PRIVATE "${AGILITY_SDK_DIR}/build/native/include")
-target_include_directories(gmodpp_d3d9 PRIVATE "${SHADER_OUTPUT_DIR}" "${DLSS_SDK_DIR}/include")
-target_compile_definitions(gmodpp_d3d9 PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
-target_compile_options(gmodpp_d3d9 PRIVATE /W4 /permissive- /utf-8)
-target_link_libraries(gmodpp_d3d9 PRIVATE d3d12 dxgi dxguid dbghelp minhook imgui lzma_dec "${DLSS_SDK_DIR}/lib/Windows_x86_64/x64/nvsdk_ngx_s.lib")
 
 # winmm.dll loader for the game root: forwards every export of the system winmm.dll (winmm_exports.txt holds
 # their ordinals and names) and, with -insecure, sends the game's shaderapidx9.dll load to gmodpp.dll.
@@ -350,7 +267,7 @@ add_library(gmodpp SHARED
     src/shader_twins.cpp
     src/video_menu.cpp
     src/watchdog.cpp
-    # Real-time lighting, shared with d3d9.dll.
+    # Real-time lighting.
     src/native_lighting.cpp
     src/world.cpp
     src/lighting.cpp
@@ -380,7 +297,7 @@ target_link_libraries(gmodpp PRIVATE d3d12 dxgi dxguid lzma_dec dbghelp comctl32
 
 if(GMOD_DIR)
     add_custom_target(deploy
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:gmodpp_d3d9> "${GMOD_DIR}/bin/win64/d3d9.dll"
+        COMMAND ${CMAKE_COMMAND} "-DTARGET=${GMOD_DIR}/bin/win64/d3d9.dll" -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/remove_old_proxy.cmake"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different "${DLSS_FEATURE_DLL}" "${GMOD_DIR}/bin/win64/nvngx_dlssd.dll"
         COMMAND ${CMAKE_COMMAND} -E make_directory "${GMOD_DIR}/bin/win64/D3D12"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different "${AGILITY_RUNTIME_DIR}/D3D12Core.dll" "${AGILITY_RUNTIME_DIR}/d3d12SDKLayers.dll"
@@ -394,7 +311,7 @@ if(GMOD_DIR)
         COMMAND ${CMAKE_COMMAND} -E copy_if_different ${LIGHTING_HEADERS} "${GMOD_DIR}/bin/win64/gmodpp/hlsl/"
         COMMAND ${CMAKE_COMMAND} -E make_directory "${GMOD_DIR}/bin/win64/gmodpp/twins"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different ${TWIN_SOURCES} ${SDK_SHADER_PATHS} "${GMOD_DIR}/bin/win64/gmodpp/twins/"
-        DEPENDS gmodpp_d3d9 gmodpp_loader gmodpp
-        COMMENT "Deploying d3d9.dll, nvngx_dlssd.dll, the Agility SDK runtime, winmm.dll, gmodpp.dll and the shader twins to ${GMOD_DIR}"
+        DEPENDS gmodpp_loader gmodpp
+        COMMENT "Deploying nvngx_dlssd.dll, the Agility SDK runtime, winmm.dll, gmodpp.dll and the shader twins to ${GMOD_DIR}"
     )
 endif()

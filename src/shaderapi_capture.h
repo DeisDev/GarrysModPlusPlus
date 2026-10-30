@@ -15,8 +15,7 @@
 // The G-buffer capture inside the native shader API: while a view's opaque pass is drawn into the back buffer, the
 // game's lighting preview shaders (selected through INT_RENDERPARM_ENABLE_FIXED_LIGHTING) write albedo, normal,
 // self-illumination and coverage into our targets, and the passes ray tracing replaces are skipped. After the capture
-// the translucent surfaces are drawn with variants lit by the probe volume. The rules match gbuffer.cpp's for
-// Direct3D 9.
+// the translucent surfaces are drawn with variants lit by the probe volume or traced (forward twins).
 namespace gmodpp::native::capture {
 
 // Starts capturing a view drawn into the back buffer with its depth buffer; `jitter` (NDC units) is added to its

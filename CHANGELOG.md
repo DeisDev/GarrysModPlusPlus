@@ -51,6 +51,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Removed
 
+- The Direct3D 9 build (`bin/win64/d3d9.dll` with D3D9On12). `-insecure` now starts the native Direct3D 12 renderer through the `winmm.dll` loader; deploying removes the old `d3d9.dll`.
 - The "Game" flashlight option. It made props see-through and left them unlit by the flashlight.
 
 ### Fixed

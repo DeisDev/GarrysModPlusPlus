@@ -41,8 +41,8 @@ constexpr int kBlendSourceColor = 9;
 constexpr uint64_t kCoverageViews = 600;
 
 // How the capture handled a material shader's pixel shader file (Phase 3's coverage report).
-enum class Path { Preview, Replaced, Twin, Water, Unlit, Decal, Additive, Flashlight, ProjectedShadow, Forward, ForwardTwin, ForwardUnlit, Count };
-constexpr const char* kPathNames[] = {"G-buffer (lighting preview)", "G-buffer (replacement)", "G-buffer (twin)", "G-buffer (water surface)", "game shader, unlit",
+enum class Path { Preview, Twin, Water, Unlit, Decal, Additive, Flashlight, ProjectedShadow, Forward, ForwardTwin, ForwardUnlit, Count };
+constexpr const char* kPathNames[] = {"G-buffer (lighting preview)", "G-buffer (twin)", "G-buffer (water surface)", "game shader, unlit",
     "albedo decal", "additive light", "flashlight (ray traced)", "projected shadow (skipped)", "forward lit", "forward twin", "translucent, game shader"};
 static_assert(std::size(kPathNames) == static_cast<size_t>(Path::Count));
 
@@ -288,12 +288,6 @@ void LogCoverage()
         log::Info("  {} / {}: {}, {}", std::get<0>(key), std::get<1>(key), kPathNames[static_cast<size_t>(std::get<2>(key))], draws);
 }
 
-void DetailMode(const gbuffer::PixelShaderClass& shaderClass, std::vector<RegisterPatch>& patches)
-{
-    if (shaderClass.detailMode >= 0)
-        patches.push_back({gbuffer::kDetailModeRegister, {static_cast<float>(shaderClass.detailMode), 0.0f, 0.0f, 0.0f}});
-}
-
 }
 
 bool Begin(std::array<float, 2> jitter)
@@ -334,14 +328,14 @@ bool End(ViewKind kind, ViewInputs& inputs)
     if (kind != ViewKind::Viewmodel) {
         // Every lit shader's vertex fog constant holds the view's range fog (cFogParams: end / range, 1,
         // 1 - max density, 1 / range) and pixel c29 its colour; Source writes that constant only when fog is on, so
-        // the fog mode says whether it belongs to this view (see gbuffer.cpp).
+        // the fog mode says whether it belongs to this view.
         const float* range = VertexRegister(gbuffer::kVertexFogRegister).v;
         const float* color = PixelRegister(gbuffer::kFogColorRegister).v;
         gbuffer::Fog& fog = g_state.fog[kind == ViewKind::Skybox ? 1 : 0];
         const std::optional<engine::FogState> current = engine::CurrentFog();
         fog.params = current && current->mode != 0 ? std::array<float, 4>{range[0] - 1.0f, 0.0f, 1.0f - range[2], range[3]} : std::array<float, 4>{};
         fog.color = {color[0], color[1], color[2]};
-        // Under water the view's fog is the water's, blended linearly (see gbuffer.cpp).
+        // Under water the view's fog is the water's, blended linearly.
         if (current && current->mode != 0 && g_state.waterFogColor) {
             bool same = true;
             for (int c = 0; c < 3; ++c)
@@ -491,10 +485,9 @@ Pass Prepare(std::span<const DWORD> vertexCode, std::span<const DWORD> pixelCode
             pass.pixelName = pixel->forwardName.c_str();
             pass.forwardFrame = g_state.twinFrame;
             pass.forwardScene = g_state.twinScene;
-            DetailMode(shaderClass, pass.pixelPatches);
             return pass;
         }
-        const std::span<const DWORD> forward = !shaderClass.forward.empty() ? std::span<const DWORD>(shaderClass.forward) : shaderClass.forwardReplacement;
+        const std::span<const DWORD> forward = shaderClass.forward;
         if (forward.empty() || !g_state.probes[0].resource) {
             Count(pixelFile, Path::ForwardUnlit);
             return pass;
@@ -510,7 +503,6 @@ Pass Prepare(std::span<const DWORD> vertexCode, std::span<const DWORD> pixelCode
         constants[0][0] = additive ? 1.0f : 0.0f;
         for (size_t i = 0; i < constants.size(); ++i)
             pass.pixelPatches.push_back({shaderClass.forwardUniforms[i], constants[i]});
-        DetailMode(shaderClass, pass.pixelPatches);
         return pass;
     }
 
@@ -560,7 +552,14 @@ Pass Prepare(std::span<const DWORD> vertexCode, std::span<const DWORD> pixelCode
     const std::span<const DWORD> twin = !water && pixelFile != nullptr && pixelCombo.header != nullptr
         ? twins::GBufferShader(pixelFile, *pixelCombo.header, pixelCombo.staticIndex, pixelCombo.dynamicIndex)
         : std::span<const DWORD>();
-    Count(pixelFile, water ? Path::Water : !twin.empty() ? Path::Twin : !shaderClass.patched.empty() ? Path::Preview : Path::Replaced);
+    if (!water && twin.empty() && shaderClass.patched.empty()) {
+        // A model shader whose twin is missing (its .vcs changed) keeps the game's shader, unlit.
+        Count(pixelFile, Path::Unlit);
+        pass.route = Pass::Route::Game;
+        pass.clearsCoverage = !blend;
+        return pass;
+    }
+    Count(pixelFile, water ? Path::Water : !twin.empty() ? Path::Twin : Path::Preview);
     if (!twin.empty()) {
         pass.pixelCode = twin;
         pass.emissive = true;
@@ -568,10 +567,8 @@ Pass Prepare(std::span<const DWORD> vertexCode, std::span<const DWORD> pixelCode
         pass.pixelCode = shaderClass.patched;
     } else {
         pass.pixelCode = shaderClass.replacement;
-        pass.emissive = shaderClass.emissive;
     }
     pass.pixelName = pixel->name.c_str();
-    DetailMode(shaderClass, pass.pixelPatches);
     // The game's sRGB state for its own lit surfaces says how the back buffer is encoded.
     ++(srgbWrite ? g_state.srgbDraws : g_state.linearDraws);
     for (UINT r = 0; r < 4; ++r)

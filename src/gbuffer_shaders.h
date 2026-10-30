@@ -9,7 +9,7 @@
 #include <vector>
 
 // How the G-buffer capture treats each of the game's Direct3D 9 shaders, worked out from their constant tables, and the
-// code drawn in their place. Shared by the Direct3D 9 build (gbuffer.cpp) and the native backend (shaderapi_capture.cpp).
+// code drawn in their place (shaderapi_capture.cpp).
 namespace gmodpp::gbuffer {
 
 // ProjectedShadow: Source's render-to-texture prop shadows, which would darken the albedo; ray-traced shadows
@@ -30,12 +30,10 @@ struct FlashlightRegisters {
 inline constexpr UINT kNormalTarget = 1;
 inline constexpr UINT kEmissiveTarget = 2;
 inline constexpr UINT kFlagsTarget = 3;
-// Pixel constants: the Water shader's g_WaterFogColor (shaders/water_surface.hlsl), cLightScale, g_LinearFogColor,
-// and g_SkinDetailMode in shaders/gbuffer_models.hlsl.
+// Pixel constants: the Water shader's g_WaterFogColor (shaders/water_surface.hlsl), cLightScale and g_LinearFogColor.
 inline constexpr UINT kWaterFogColorRegister = 6;
 inline constexpr UINT kLightScaleRegister = 30;
 inline constexpr UINT kFogColorRegister = 29;
-inline constexpr UINT kDetailModeRegister = 216;
 // Vertex constants: cFogParams, and Source's model-view-projection (c4-c7) and view-projection (c8-c11) rows;
 // clip = dot(row, position).
 inline constexpr UINT kVertexFogRegister = 16;
@@ -51,20 +49,14 @@ struct PixelShaderClass {
     FlashlightRegisters flashlight;
     // A lighting preview shader made to write the G-buffer (gamma and tint patches), drawn in place of the game's.
     std::vector<DWORD> patched;
-    // Our shader drawn in place of the game's during a capture (model shaders without a preview combo, refracting
-    // water), and the one lighting it from the probe volume after the capture; static code.
+    // Our shader drawn in place of the game's during a capture (refracting water); static code.
     std::span<const DWORD> replacement;
-    std::span<const DWORD> forwardReplacement;
     // The patched preview shader with the probe volume lighting appended, for translucent surfaces.
     std::vector<DWORD> forward;
     // The samplers the forward variant reads the volume from and the registers of its constants
     // (shaders/forward_light.hlsli).
     std::array<UINT, 3> probeSamplers = {};
     std::array<UINT, bytecode::kForwardUniforms> forwardUniforms = {};
-    // The capture shader writes self-illumination to the emissive target.
-    bool emissive = false;
-    // The skin detail blend mode its replacement applies (shaders/gbuffer_models.hlsl), or -1.
-    int detailMode = -1;
 };
 
 // `registerLimit`: flashlight parameters in registers from this one on are not tracked.
@@ -78,7 +70,7 @@ struct VertexShaderClass {
 
 VertexShaderClass ClassifyVertexShader(std::span<const DWORD> code, UINT registerLimit);
 
-// Shaders patched and replaced so far.
+// Preview shaders patched, and model shaders left to their twins, so far.
 struct ClassStatistics {
     uint32_t patched = 0;
     uint32_t replaced = 0;

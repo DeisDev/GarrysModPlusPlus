@@ -4,7 +4,6 @@
 #include "module_scan.h"
 #include "options.h"
 
-#include <MinHook.h>
 
 #include <windows.h>
 
@@ -35,22 +34,18 @@ constexpr int kReadSlot = 0;
 constexpr int kOpenSlot = 2;
 constexpr int kCloseSlot = 3;
 constexpr size_t kReadChunk = 256 * 1024;
-// IMaterialSystem::GetRenderContext and IMatRenderContext::BeginRender/EndRender/SetIntRenderingParameter,
-// as client.dll's SetupCurrentView calls them (client.dll+0x312d30 in Ghidra).
+// IMaterialSystem::GetRenderContext and IMatRenderContext::BeginRender/EndRender, as client.dll's SetupCurrentView
+// calls them (client.dll+0x312d30 in Ghidra); SetIntRenderingParameter is slot 113 there.
 constexpr int kGetRenderContextSlot = 98;
 constexpr int kBeginRenderSlot = 0;
 constexpr int kEndRenderSlot = 1;
-constexpr int kSetIntRenderingParameterSlot = 113;
-constexpr int kEnableFixedLightingParameter = 0;
 // IMatRenderContext::GetFogMode, as the render.GetFogMode Lua binding calls it (client.dll+0xbf300 in Ghidra).
 constexpr int kGetFogModeSlot = 45;
 // GetFogColor, by the Source SDK 2013 declaration order that puts BeginRender, GetFogMode and SetIntRenderingParameter
 // at their confirmed slots.
 constexpr int kGetFogColorSlot = 50;
-// IMatRenderContext::Bind(IMaterial*, void* proxy), slot 7 by the Source SDK 2013 declaration order that puts
-// BeginRender, GetFogMode and SetIntRenderingParameter at the confirmed 0, 45 and 113; IMaterial::GetShaderName,
-// slot 49 (the IMaterial:GetShader Lua binding, client.dll+0x12c300, calls it; Ghidra) and IMaterial::GetName, slot 0.
-constexpr int kBindSlot = 7;
+// IMaterial::GetShaderName, slot 49 (the IMaterial:GetShader Lua binding, client.dll+0x12c300, calls it; Ghidra) and
+// IMaterial::GetName, slot 0.
 constexpr int kGetShaderNameSlot = 49;
 constexpr int kGetMaterialNameSlot = 0;
 // IVEfx::CL_GetActiveDLights (engine.dll+0x143320, CVEfx vtable slot 6 found through RTTI in Ghidra). It fills
@@ -82,11 +77,6 @@ const int32_t* g_lightStyleValues = nullptr;
 std::vector<int> g_loggedLightKeys;
 bool g_attempted = false;
 
-using BindFn = void(__fastcall*)(void* context, void* material, void* proxy);
-BindFn g_bind = nullptr;
-bool g_bindHookAttempted = false;
-bool g_unlitFilter = false;
-int g_fixedLighting = 0;
 // Whether each material bound during forward lighting is unlit, by material.
 std::unordered_map<void*, bool> g_unlitMaterials;
 uint32_t g_loggedMaterials = 0;
@@ -107,40 +97,6 @@ void* CreateFrom(const wchar_t* moduleName, const char* interfaceName, HMODULE& 
         return nullptr;
     int code = 0;
     return create(interfaceName, &code);
-}
-
-void SetFixedLightingOn(void* context, int mode)
-{
-    if (g_fixedLighting == mode)
-        return;
-    g_fixedLighting = mode;
-    Slot<void(__fastcall*)(void*, int, int)>(context, kSetIntRenderingParameterSlot)(context, kEnableFixedLightingParameter, mode);
-}
-
-// Unlit materials keep the game's own shaders during forward lighting: their preview combos leave out vertex colour,
-// and lighting them with the probe volume hid the snow of gm_antarctic_base's night.
-void __fastcall HookBind(void* context, void* material, void* proxy)
-{
-    g_bind(context, material, proxy);
-    if (g_unlitFilter && material != nullptr)
-        SetFixedLightingOn(context, IsUnlitMaterial(material) ? 0 : 2);
-}
-
-void InstallBindHook(void* context)
-{
-    if (g_bindHookAttempted)
-        return;
-    g_bindHookAttempted = true;
-    void* target = (*static_cast<void***>(context))[kBindSlot];
-    MH_STATUS status = MH_Initialize();
-    if (status == MH_OK || status == MH_ERROR_ALREADY_INITIALIZED)
-        status = MH_CreateHook(target, reinterpret_cast<void*>(&HookBind), reinterpret_cast<void**>(&g_bind));
-    if (status == MH_OK)
-        status = MH_EnableHook(target);
-    if (status != MH_OK) {
-        g_bind = nullptr;
-        log::Info("Hooking IMatRenderContext::Bind failed: {}; unlit translucent materials are lit like the others", MH_StatusToString(status));
-    }
 }
 
 // The address every match of kLightStylePattern loads, or null when there is no match or they disagree.
@@ -295,23 +251,6 @@ void ActiveDynamicLights(std::vector<DynamicLight>& lights)
         }
     }
 }
-
-bool SetFixedLighting(int mode)
-{
-    if (g_materialSystem == nullptr)
-        return false;
-    void* context = Slot<void*(__fastcall*)(void*)>(g_materialSystem, kGetRenderContextSlot)(g_materialSystem);
-    if (context == nullptr)
-        return false;
-    InstallBindHook(context);
-    Slot<void(__fastcall*)(void*)>(context, kBeginRenderSlot)(context);
-    g_fixedLighting = -1;
-    SetFixedLightingOn(context, mode);
-    Slot<void(__fastcall*)(void*)>(context, kEndRenderSlot)(context);
-    return true;
-}
-
-void SetUnlitFilter(bool enabled) { g_unlitFilter = enabled && g_bind != nullptr; }
 
 std::optional<FogState> CurrentFog()
 {

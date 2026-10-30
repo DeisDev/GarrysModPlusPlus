@@ -3,38 +3,8 @@
 #include "log.h"
 #include "settings.h"
 
-#include <g_forwardBumpPS.h>
-#include <g_forwardBumpSelfIllumFresnelPS.h>
-#include <g_forwardBumpSelfIllumPS.h>
-#include <g_forwardSkinDetailPS.h>
-#include <g_forwardSkinDetailSelfIllumFresnelPS.h>
-#include <g_forwardSkinDetailSelfIllumPS.h>
-#include <g_forwardSkinNoBumpDetailPS.h>
-#include <g_forwardSkinNoBumpDetailSelfIllumFresnelPS.h>
-#include <g_forwardSkinNoBumpDetailSelfIllumPS.h>
-#include <g_forwardSkinNoBumpPS.h>
-#include <g_forwardSkinNoBumpSelfIllumFresnelPS.h>
-#include <g_forwardSkinNoBumpSelfIllumPS.h>
-#include <g_forwardSkinPS.h>
-#include <g_forwardSkinSelfIllumFresnelPS.h>
-#include <g_forwardSkinSelfIllumPS.h>
 #include <g_forwardSnippetPS.h>
 #include <g_forwardSnippetPS2.h>
-#include <g_gbufferBumpPS.h>
-#include <g_gbufferBumpSelfIllumFresnelPS.h>
-#include <g_gbufferBumpSelfIllumPS.h>
-#include <g_gbufferSkinDetailPS.h>
-#include <g_gbufferSkinDetailSelfIllumFresnelPS.h>
-#include <g_gbufferSkinDetailSelfIllumPS.h>
-#include <g_gbufferSkinNoBumpDetailPS.h>
-#include <g_gbufferSkinNoBumpDetailSelfIllumFresnelPS.h>
-#include <g_gbufferSkinNoBumpDetailSelfIllumPS.h>
-#include <g_gbufferSkinNoBumpPS.h>
-#include <g_gbufferSkinNoBumpSelfIllumFresnelPS.h>
-#include <g_gbufferSkinNoBumpSelfIllumPS.h>
-#include <g_gbufferSkinPS.h>
-#include <g_gbufferSkinSelfIllumFresnelPS.h>
-#include <g_gbufferSkinSelfIllumPS.h>
 #include <g_waterSurfaceAlphaFogPS.h>
 #include <g_waterSurfacePS.h>
 
@@ -55,38 +25,8 @@ constexpr float kPreviewGamma = 2.2f;
 constexpr UINT kLightmapTintRegister = 12;
 // The ps_2_b snippet's constants start at c0 before the patch moves them.
 constexpr UINT kSnippetConstantsPs2 = 0;
-// The samplers shaders/gbuffer_models.hlsl reads the probe volume from in its FORWARD variants, and its constants.
-constexpr std::array<UINT, 3> kModelProbeSamplers = {5, 6, 7};
-constexpr std::array<UINT, bytecode::kForwardUniforms> kModelForwardUniforms = {217, 218, 219, 220, 221, 222, 223};
-constexpr UINT kSkinDetailSampler = 13;
-// The skin shader's g_SelfIllumTint_and_DetailBlendFactor (its .w is the detail blend factor).
-constexpr UINT kSkinDetailFactor = 0;
-// A post-lighting detail add comes after the lighting math; a pre-lighting one right after the sample.
-constexpr size_t kLateDetailGap = 12;
-
-enum class SelfIllum { None, Mask, Fresnel };
-
-// Indexed by [shader][SelfIllum].
-enum class ReplacedShader { Bump, Skin, SkinNoBump, SkinDetail, SkinNoBumpDetail, Count };
-const BYTE* const kReplacementCode[][3] = {
-    {g_gbufferBumpPS, g_gbufferBumpSelfIllumPS, g_gbufferBumpSelfIllumFresnelPS},
-    {g_gbufferSkinPS, g_gbufferSkinSelfIllumPS, g_gbufferSkinSelfIllumFresnelPS},
-    {g_gbufferSkinNoBumpPS, g_gbufferSkinNoBumpSelfIllumPS, g_gbufferSkinNoBumpSelfIllumFresnelPS},
-    {g_gbufferSkinDetailPS, g_gbufferSkinDetailSelfIllumPS, g_gbufferSkinDetailSelfIllumFresnelPS},
-    {g_gbufferSkinNoBumpDetailPS, g_gbufferSkinNoBumpDetailSelfIllumPS, g_gbufferSkinNoBumpDetailSelfIllumFresnelPS},
-};
-const BYTE* const kForwardReplacementCode[][3] = {
-    {g_forwardBumpPS, g_forwardBumpSelfIllumPS, g_forwardBumpSelfIllumFresnelPS},
-    {g_forwardSkinPS, g_forwardSkinSelfIllumPS, g_forwardSkinSelfIllumFresnelPS},
-    {g_forwardSkinNoBumpPS, g_forwardSkinNoBumpSelfIllumPS, g_forwardSkinNoBumpSelfIllumFresnelPS},
-    {g_forwardSkinDetailPS, g_forwardSkinDetailSelfIllumPS, g_forwardSkinDetailSelfIllumFresnelPS},
-    {g_forwardSkinNoBumpDetailPS, g_forwardSkinNoBumpDetailSelfIllumPS, g_forwardSkinNoBumpDetailSelfIllumFresnelPS},
-};
-
 ClassStatistics g_statistics;
 uint32_t g_tintFailures = 0;
-// Skin shaders seen with each detail blend mode (-1 counted at 7).
-std::array<uint32_t, 8> g_detailModes = {};
 
 std::span<const DWORD> Code(const BYTE* bytes)
 {
@@ -128,32 +68,6 @@ bool IsRefractingWater(const std::vector<bytecode::Constant>& constants)
     return HasRegister(constants, "RefractSampler", RegisterSet::Sampler, 0) && HasRegister(constants, "NormalSampler", RegisterSet::Sampler, 4) &&
         HasRegister(constants, "g_ReflectRefractScale", RegisterSet::Float4, 5) && HasRegister(constants, "g_WaterFogColor", RegisterSet::Float4, 6) &&
         !HasConstant(constants, "FlowmapSampler") && !HasConstant(constants, "LightmapSampler") && !HasConstant(constants, "BaseTextureSampler");
-}
-
-// The replacements read self-illumination from the registers the stock shaders use, so a shader whose
-// registers differ gets no self-illumination rather than wrong values.
-SelfIllum BumpSelfIllum(const std::vector<bytecode::Constant>& constants)
-{
-    using bytecode::RegisterSet;
-    if (!HasRegister(constants, "g_SelfIllumTint_and_BlendFactor", RegisterSet::Float4, 4))
-        return SelfIllum::None;
-    if (HasRegister(constants, "g_SelfIllumScaleBiasExpBrightness", RegisterSet::Float4, 11))
-        return SelfIllum::Fresnel;
-    // With a detail texture the tint register also holds the detail blend factor, so it does not show whether
-    // the material is self-illuminated.
-    return HasConstant(constants, "DetailSampler") ? SelfIllum::None : SelfIllum::Mask;
-}
-
-SelfIllum SkinSelfIllum(const std::vector<bytecode::Constant>& constants)
-{
-    using bytecode::RegisterSet;
-    if (!HasRegister(constants, "g_SelfIllumTint_and_DetailBlendFactorOrPhongAlbedoBoost", RegisterSet::Float4, 0))
-        return SelfIllum::None;
-    if (HasRegister(constants, "SelfIllumMaskSampler", RegisterSet::Sampler, 14) && HasRegister(constants, "g_EnvMapFresnel", RegisterSet::Float4, 10))
-        return SelfIllum::Mask;
-    if (HasRegister(constants, "g_SelfIllumScaleBiasExpBrightness", RegisterSet::Float4, 3))
-        return SelfIllum::Fresnel;
-    return SelfIllum::None;
 }
 
 int RegisterOf(const std::vector<bytecode::Constant>& constants, std::initializer_list<std::string_view> names, bytecode::RegisterSet set, UINT limit)
@@ -233,36 +147,13 @@ PixelShaderClass ClassifyPixelShader(std::span<const DWORD> code, UINT registerL
         result.replacement = Code(alphaFog ? g_waterSurfaceAlphaFogPS : g_waterSurfacePS);
         return result;
     }
-    SelfIllum selfIllum = SelfIllum::None;
-    ReplacedShader replaced = ReplacedShader::Count;
-    if (HasConstant(constants, "g_DiffuseModulation") && HasConstant(constants, "BumpmapSampler")) {
-        selfIllum = BumpSelfIllum(constants);
-        replaced = ReplacedShader::Bump;
-    } else if (IsSkinShader(constants)) {
-        selfIllum = SkinSelfIllum(constants);
-        const bool normalMap = HasConstant(constants, "NormalMapSampler");
-        // Detail blend modes the replacement does not know leave the base texture alone.
-        if (HasRegister(constants, "DetailSampler", bytecode::RegisterSet::Sampler, kSkinDetailSampler)) {
-            result.detailMode = bytecode::DetailBlendMode(code, kSkinDetailSampler, kSkinDetailFactor, kLateDetailGap);
-            if (g_detailModes[result.detailMode >= 0 ? result.detailMode : 7]++ == 0)
-                log::Info("G-buffer: skin shader with detail blend mode {}", result.detailMode);
-        }
-        const bool detail = result.detailMode >= 0;
-        replaced = detail ? (normalMap ? ReplacedShader::SkinDetail : ReplacedShader::SkinNoBumpDetail)
-                          : (normalMap ? ReplacedShader::Skin : ReplacedShader::SkinNoBump);
+    // Model shaders without a lighting preview combo (bumped VertexLitGeneric, skin) are drawn by their G-buffer
+    // twins (shader_twins.h); without one they keep the game's shader.
+    if ((HasConstant(constants, "g_DiffuseModulation") && HasConstant(constants, "BumpmapSampler")) || IsSkinShader(constants)) {
+        result.kind = ShaderKind::GBuffer;
+        ++g_statistics.replaced;
+        ++GetStatistics().replacedShaders;
     }
-    if (replaced == ReplacedShader::Count)
-        return result;
-    const size_t s = static_cast<size_t>(replaced);
-    const size_t v = static_cast<size_t>(selfIllum);
-    result.kind = ShaderKind::GBuffer;
-    result.replacement = Code(kReplacementCode[s][v]);
-    result.forwardReplacement = Code(kForwardReplacementCode[s][v]);
-    result.probeSamplers = kModelProbeSamplers;
-    result.forwardUniforms = kModelForwardUniforms;
-    result.emissive = selfIllum != SelfIllum::None || result.detailMode == 5;
-    ++g_statistics.replaced;
-    ++GetStatistics().replacedShaders;
     return result;
 }
 

@@ -1,13 +1,7 @@
 #include "capture.h"
 
-#include "log.h"
-
-#include <wrl/client.h>
-
 #include <cstdio>
 #include <vector>
-
-using Microsoft::WRL::ComPtr;
 
 namespace gmodpp {
 
@@ -42,48 +36,6 @@ bool WriteBmp(const std::filesystem::path& path, UINT width, UINT height, const 
         std::fwrite(row.data(), stride, 1, out);
     }
     return std::fclose(out) == 0;
-}
-
-bool CaptureBackBuffer(IDirect3DDevice9* device, const std::filesystem::path& path)
-{
-    ComPtr<IDirect3DSurface9> backBuffer;
-    HRESULT hr = device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backBuffer);
-    D3DSURFACE_DESC desc = {};
-    if (SUCCEEDED(hr))
-        hr = backBuffer->GetDesc(&desc);
-    if (FAILED(hr)) {
-        log::Info("Capture: GetBackBuffer failed: {:#010x}", static_cast<unsigned>(hr));
-        return false;
-    }
-    if (desc.Format != D3DFMT_X8R8G8B8 && desc.Format != D3DFMT_A8R8G8B8) {
-        log::Info("Capture: unsupported back buffer format {}", static_cast<int>(desc.Format));
-        return false;
-    }
-
-    ComPtr<IDirect3DSurface9> resolved = backBuffer;
-    if (desc.MultiSampleType != D3DMULTISAMPLE_NONE) {
-        hr = device->CreateRenderTarget(desc.Width, desc.Height, desc.Format, D3DMULTISAMPLE_NONE, 0, FALSE, &resolved, nullptr);
-        if (SUCCEEDED(hr))
-            hr = device->StretchRect(backBuffer.Get(), nullptr, resolved.Get(), nullptr, D3DTEXF_NONE);
-    }
-
-    ComPtr<IDirect3DSurface9> staging;
-    if (SUCCEEDED(hr))
-        hr = device->CreateOffscreenPlainSurface(desc.Width, desc.Height, desc.Format, D3DPOOL_SYSTEMMEM, &staging, nullptr);
-    if (SUCCEEDED(hr))
-        hr = device->GetRenderTargetData(resolved.Get(), staging.Get());
-    D3DLOCKED_RECT locked = {};
-    if (SUCCEEDED(hr))
-        hr = staging->LockRect(&locked, nullptr, D3DLOCK_READONLY);
-    if (FAILED(hr)) {
-        log::Info("Capture: readback failed: {:#010x}", static_cast<unsigned>(hr));
-        return false;
-    }
-
-    bool written = WriteBmp(path, desc.Width, desc.Height, locked.pBits, static_cast<size_t>(locked.Pitch));
-    staging->UnlockRect();
-    log::Info("Capture: {} {}", written ? "wrote" : "failed to write", path.string());
-    return written;
 }
 
 }

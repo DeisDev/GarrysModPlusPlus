@@ -932,8 +932,8 @@ Shim* LoadShim()
     shim->mainThread = GetCurrentThreadId();
     g_shim = shim;
 
-    if (HasArgument(L"-gmodpp_native")) {
-        log::Info("Native Direct3D 12 shader API (in development)");
+    if (!HasArgument(L"-gmodpp_vanilla")) {
+        log::Info("Native Direct3D 12 shader API");
         shim->gameCreateInterface = &native::CreateInterface;
     } else {
         // shaderapidx9.dll imports d3d9.dll by name, and a loaded module of that name satisfies the import whatever
@@ -982,7 +982,6 @@ const Options& GetOptions()
 {
     static const Options options = [] {
         Options loaded;
-        loaded.enabled = HasArgument(L"-insecure");
         loaded.devMode = HasArgument(L"-gmodpp_dev");
         loaded.d3d12Debug = HasArgument(L"-gmodpp_debug");
         loaded.gpuValidation = HasArgument(L"-gmodpp_gbv");
