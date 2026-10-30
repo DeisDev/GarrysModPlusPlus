@@ -56,8 +56,13 @@ constexpr UINT kZeroStream = 3;
 // Unbound samplers read a null descriptor of the shader's texture type.
 constexpr size_t kTextureTypes = 4;
 // Bumped when the pipeline descriptions change in ways their names don't capture (the root signature).
-constexpr std::uint32_t kPipelineLibraryVersion = 1;
+constexpr std::uint32_t kPipelineLibraryVersion = 2;
 constexpr auto kPipelineLibrarySaveInterval = std::chrono::seconds(30);
+// Root parameters of the translated shaders: vertex b0/b1, pixel b0/b1, then the forward twins' frame constants and
+// scene.
+constexpr UINT kRootForwardFrame = 4;
+constexpr UINT kRootForwardScene = 5;
+constexpr UINT kRootParameters = 6;
 
 std::uint64_t Fnv(const void* data, size_t size, std::uint64_t hash = 14695981039346656037ull)
 {
@@ -233,17 +238,36 @@ int g_frameDraws = 0;
 bool CreateRootSignature()
 {
     Backend& backend = GetBackend();
-    D3D12_ROOT_PARAMETER1 parameters[4] = {};
+    D3D12_ROOT_PARAMETER1 parameters[kRootParameters] = {};
     for (UINT i = 0; i < 4; ++i) {
         parameters[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
         parameters[i].Descriptor.ShaderRegister = i % 2;
         parameters[i].Descriptor.Flags = D3D12_ROOT_DESCRIPTOR_FLAG_DATA_STATIC_WHILE_SET_AT_EXECUTE;
         parameters[i].ShaderVisibility = i < 2 ? D3D12_SHADER_VISIBILITY_VERTEX : D3D12_SHADER_VISIBILITY_PIXEL;
     }
+    // Forward twins light themselves with the lighting's constants and scene (shaders/common.hlsli, register space 1).
+    parameters[kRootForwardFrame].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    parameters[kRootForwardFrame].Descriptor = { 0, 1, D3D12_ROOT_DESCRIPTOR_FLAG_DATA_STATIC_WHILE_SET_AT_EXECUTE };
+    parameters[kRootForwardFrame].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    parameters[kRootForwardScene].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    parameters[kRootForwardScene].Descriptor = { 0, 1, D3D12_ROOT_DESCRIPTOR_FLAG_NONE };
+    parameters[kRootForwardScene].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_STATIC_SAMPLER_DESC samplers[2] = {};
+    for (UINT i = 0; i < 2; ++i) {
+        samplers[i].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        const D3D12_TEXTURE_ADDRESS_MODE mode = i == 0 ? D3D12_TEXTURE_ADDRESS_MODE_CLAMP : D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        samplers[i].AddressU = samplers[i].AddressV = samplers[i].AddressW = mode;
+        samplers[i].MaxLOD = D3D12_FLOAT32_MAX;
+        samplers[i].ShaderRegister = i == 0 ? 0 : 2;
+        samplers[i].RegisterSpace = 1;
+        samplers[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    }
     D3D12_VERSIONED_ROOT_SIGNATURE_DESC desc = {};
     desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
-    desc.Desc_1_1.NumParameters = 4;
+    desc.Desc_1_1.NumParameters = kRootParameters;
     desc.Desc_1_1.pParameters = parameters;
+    desc.Desc_1_1.NumStaticSamplers = 2;
+    desc.Desc_1_1.pStaticSamplers = samplers;
     desc.Desc_1_1.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT | D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED
         | D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED;
     ComPtr<ID3DBlob> blob;

@@ -8,7 +8,8 @@
 namespace gmodpp {
 
 // Compiles HLSL to DXIL with the DirectX Shader Compiler (dxcompiler.dll, loaded from `directory`). Safe to use from
-// several threads; each call creates its own compiler.
+// several threads; each call creates its own compiler. Sources that include files find them in `directory`\hlsl (the
+// shared lighting headers, deployed with the build).
 class ShaderCompiler {
 public:
     bool Load(const std::filesystem::path& directory, std::string& error);
@@ -18,6 +19,7 @@ public:
 
 private:
     void* m_createInstance = nullptr;
+    std::wstring m_includeDirectory;
 };
 
 }

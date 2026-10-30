@@ -265,6 +265,7 @@ foreach(entry IN LISTS SDK_SHADER_FILES)
         "${SDK_SHADERS_DIR}/${file}" EXPECTED_HASH SHA256=${hash} TLS_VERIFY ON)
     list(APPEND SDK_SHADER_PATHS "${SDK_SHADERS_DIR}/${file}")
 endforeach()
+file(GLOB LIGHTING_HEADERS CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/*.hlsli")
 file(GLOB TWIN_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/twins/*.fxc" "${CMAKE_CURRENT_SOURCE_DIR}/shaders/twins/*.h")
 target_include_directories(lzma_dec PUBLIC "${LZMA_SDK_DIR}")
 
@@ -388,6 +389,8 @@ if(GMOD_DIR)
         COMMAND ${CMAKE_COMMAND} -E make_directory "${GMOD_DIR}/bin/win64/gmodpp"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:gmodpp> "${GMOD_DIR}/bin/win64/gmodpp/gmodpp.dll"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different "${DXC_DIR}/bin/x64/dxcompiler.dll" "${GMOD_DIR}/bin/win64/gmodpp/dxcompiler.dll"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${GMOD_DIR}/bin/win64/gmodpp/hlsl"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${LIGHTING_HEADERS} "${GMOD_DIR}/bin/win64/gmodpp/hlsl/"
         COMMAND ${CMAKE_COMMAND} -E make_directory "${GMOD_DIR}/bin/win64/gmodpp/twins"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different ${TWIN_SOURCES} ${SDK_SHADER_PATHS} "${GMOD_DIR}/bin/win64/gmodpp/twins/"
         DEPENDS gmodpp_d3d9 gmodpp_loader gmodpp

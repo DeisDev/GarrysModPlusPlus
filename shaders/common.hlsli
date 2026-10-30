@@ -152,11 +152,18 @@ static const uint kPixelHit = 1;
 static const uint kPixelUnlit = 2;
 static const uint kPixelIgnoreNormals = 4;
 
-ConstantBuffer<FrameConstants> g_frame : register(b0);
-ConstantBuffer<PassConstants> g_pass : register(b1);
-RaytracingAccelerationStructure g_scene : register(t0);
-SamplerState g_linearClamp : register(s0);
-SamplerState g_linearWrap : register(s2);
+// Game draws that light themselves (forward twins, shaders/forward_twin.hlsli) keep their own constants in b0 and b1
+// and reach these in register space 1 (the translated shaders' root signature, shaderapi_pipelines.cpp).
+#ifdef GMODPP_GAME_DRAW
+#define GMODPP_REGISTER(r) register(r, space1)
+#else
+#define GMODPP_REGISTER(r) register(r)
+#endif
+ConstantBuffer<FrameConstants> g_frame : GMODPP_REGISTER(b0);
+ConstantBuffer<PassConstants> g_pass : GMODPP_REGISTER(b1);
+RaytracingAccelerationStructure g_scene : GMODPP_REGISTER(t0);
+SamplerState g_linearClamp : GMODPP_REGISTER(s0);
+SamplerState g_linearWrap : GMODPP_REGISTER(s2);
 
 // The pixel of a pass's thread: views whose G-buffer covers part of the screen (the viewmodel) dispatch their passes
 // over a rectangle around it only.

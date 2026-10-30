@@ -25,6 +25,7 @@ bool ShaderCompiler::Load(const std::filesystem::path& directory, std::string& e
         error = std::format("{} has no DxcCreateInstance", path.string());
         return false;
     }
+    m_includeDirectory = (directory / L"hlsl").wstring();
     return true;
 }
 
@@ -38,9 +39,22 @@ bool ShaderCompiler::Compile(std::string_view source, const wchar_t* profile, st
         return false;
     }
     const DxcBuffer buffer{ source.data(), source.size(), DXC_CP_UTF8 };
-    LPCWSTR arguments[] = { L"-E", L"main", L"-T", profile, L"-HV", L"2021", DXC_ARG_OPTIMIZATION_LEVEL3 };
+    LPCWSTR arguments[] = { L"-E", L"main", L"-T", profile, L"-HV", L"2021", DXC_ARG_OPTIMIZATION_LEVEL3, L"-I", m_includeDirectory.c_str() };
+    UINT32 argumentCount = static_cast<UINT32>(std::size(arguments)) - 2;
+    ComPtr<IDxcIncludeHandler> includes;
+    if (source.find("#include") != std::string_view::npos) {
+        ComPtr<IDxcUtils> utils;
+        hr = create(CLSID_DxcUtils, IID_PPV_ARGS(&utils));
+        if (SUCCEEDED(hr))
+            hr = utils->CreateDefaultIncludeHandler(&includes);
+        if (FAILED(hr)) {
+            error = std::format("creating DXC's include handler failed: {:#x}", static_cast<unsigned>(hr));
+            return false;
+        }
+        argumentCount += 2;
+    }
     ComPtr<IDxcResult> result;
-    hr = compiler->Compile(&buffer, arguments, static_cast<UINT32>(std::size(arguments)), nullptr, IID_PPV_ARGS(&result));
+    hr = compiler->Compile(&buffer, arguments, argumentCount, includes.Get(), IID_PPV_ARGS(&result));
     HRESULT status = hr;
     if (SUCCEEDED(hr))
         result->GetStatus(&status);
