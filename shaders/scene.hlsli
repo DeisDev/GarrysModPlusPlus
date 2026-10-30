@@ -356,6 +356,9 @@ float MaskValue(uint mask, float2 uv, float footprint)
     return (mask & (1u << 26)) != 0 ? 1.0 - value : value;
 }
 
+// kSkyboxMask in src/scene.h.
+static const uint kSkyboxMask = 0x10;
+
 // The share of light that gets from `origin` to tMax along a ray: 0 past anything solid, otherwise the product of
 // what each translucent surface crossed lets through.
 float Transmittance(float3 origin, float3 direction, float tMax, uint mask)
@@ -381,10 +384,17 @@ float Transmittance(float3 origin, float3 direction, float tMax, uint mask)
     return query.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? 0.0 : transmittance;
 }
 
-// `mask` is g_frame.sunShadowMask, or g_frame.bounceMask for the light of indirect bounces.
+// `mask` is g_frame.sunShadowMask, or g_frame.bounceMask for the light of indirect bounces. As VRAD did
+// (TestLine_DoesHitSky in src/utils/vrad/trace.cpp), rays from the map that reach the sky go on through the 3D
+// skybox, whose buildings and terrain shadow the map.
 float SunVisibility(float3 origin, uint mask)
 {
-    return Transmittance(origin, g_frame.sunDirection, 65536.0, mask);
+    float visibility = Transmittance(origin, g_frame.sunDirection, 65536.0, mask);
+    if (visibility > 0.0 && g_frame.worldToSky > 0.0 && (mask & kSkyboxMask) == 0) {
+        float3 camera = float3(g_frame.skyCameraX, g_frame.skyCameraY, g_frame.skyCameraZ);
+        visibility *= Transmittance(camera + origin * g_frame.worldToSky, g_frame.sunDirection, 65536.0, kSkyboxMask);
+    }
+    return visibility;
 }
 
 // Sunlight reaching a hit surface, with its shadow ray starting at `origin`.
@@ -456,8 +466,6 @@ static const float kAttachedLightClearance = 48.0;
 
 // kLocalPlayerMask in src/scene.h.
 static const uint kLocalPlayerMask = 0x08;
-// kSkyboxMask in src/scene.h.
-static const uint kSkyboxMask = 0x10;
 // kShadowlessPropMask in src/scene.h.
 static const uint kShadowlessPropMask = 0x20;
 

@@ -803,6 +803,10 @@ bool Lighting::FillConstants(FrameConstants& constants, const Scene& scene, cons
     constants.skyColor[0] = sun.ambient.x;
     constants.skyColor[1] = sun.ambient.y;
     constants.skyColor[2] = sun.ambient.z;
+    constants.skyCameraX = sun.skyCameraOrigin.x;
+    constants.skyCameraY = sun.skyCameraOrigin.y;
+    constants.skyCameraZ = sun.skyCameraOrigin.z;
+    constants.worldToSky = sun.skyCameraScale > 0.0f ? 1.0f / sun.skyCameraScale : 0.0f;
     const Settings& settings = GetSettings();
     const float sunStyle = scene.LightStyle(sun.style);
     const float skyStyle = scene.LightStyle(sun.ambientStyle);

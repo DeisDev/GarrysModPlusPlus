@@ -27,6 +27,10 @@ struct SunLight {
     // Light styles of the sun and the sky light (Light::style).
     int32_t style = 0;
     int32_t ambientStyle = 0;
+    // The 3D skybox's camera: VRAD continues sun rays that reach the sky into the skybox, whose scene shadows the map
+    // (TestLine_DoesHitSky in src/utils/vrad/trace.cpp). Scale 0 without one.
+    Float3 skyCameraOrigin = {};
+    float skyCameraScale = 0.0f;
 };
 
 enum class LightType : int32_t { Surface = 0, Point = 1, Spot = 2, Sky = 3, QuakeLight = 4, SkyAmbient = 5 };

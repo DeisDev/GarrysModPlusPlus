@@ -11,13 +11,15 @@
 // ours differ. input1: residual; output0: filtered residual; output1: counters (1: luxels changed by more than a
 // tenth); the rest as step 0.
 
-// VRAD's occluders: the world and static props, but not those it was told cast no shadows.
-static const uint kVradOccluders = 0x01 | 0x02;
+// VRAD's occluders: the world and static props as VRAD shaped them (kWorldMask | kVradOccluderMask in src/scene.h).
+static const uint kVradOccluders = 0x01 | 0x40;
 // A luxel counts as clamped when the direct light exceeds the baked light by more than this share of it.
 static const float kClampTolerance = 0.05;
 
 // The direct light of style-0 lights and the sun at a luxel, for its flat normal (direct[0]) and, when bumped,
-// its three bump basis normals (direct[1-3]).
+// its three bump basis normals (direct[1-3]), as VRAD gathers it (GatherSampleLightSSE and
+// GatherSampleStandardLightSSE in src/utils/vrad/lightmap.cpp): a light behind the flat face or blocked adds nothing
+// to any bump sample, and point and spot lights' bump samples are not scaled by partial visibility.
 void DirectLight(BakeLuxel luxel, FaceLightmap face, out float3 direct[4])
 {
     float3 normals[4];
@@ -28,16 +30,10 @@ void DirectLight(BakeLuxel luxel, FaceLightmap face, out float3 direct[4])
     for (uint n = 0; n < 4; ++n)
         direct[n] = 0.0;
     float3 origin = luxel.position + luxel.normal * 0.5;
-    if (g_frame.sunEnabled != 0.0) {
-        float visibility = -1.0;
-        for (uint n = 0; n < count; ++n) {
-            float lambert = saturate(dot(normals[n], g_frame.sunDirection));
-            if (lambert <= 0.0)
-                continue;
-            if (visibility < 0.0)
-                visibility = Transmittance(origin, g_frame.sunDirection, 65536.0, kVradOccluders);
-            direct[n] += g_frame.sunColor * lambert * visibility;
-        }
+    if (g_frame.sunEnabled != 0.0 && dot(normals[0], g_frame.sunDirection) > 0.0) {
+        float visibility = SunVisibility(origin, kVradOccluders);
+        for (uint n = 0; n < count && visibility > 0.0; ++n)
+            direct[n] += g_frame.sunColor * saturate(dot(normals[n], g_frame.sunDirection)) * visibility;
     }
     LightRanges ranges = LightsAt(luxel.position, luxel.normal);
     for (uint i = 0; i < LightRangeCount(ranges); ++i) {
@@ -45,17 +41,17 @@ void DirectLight(BakeLuxel luxel, FaceLightmap face, out float3 direct[4])
         // Other styles have their own lightmaps, which hold no bounce light.
         if (light.style != 0)
             continue;
-        float visibility = -1.0;
-        for (uint n = 0; n < count; ++n) {
-            float3 toLight;
-            float distance;
-            float3 irradiance = LightIrradiance(light, luxel.position, normals[n], toLight, distance);
-            if (all(irradiance <= 0.0))
-                continue;
-            if (visibility < 0.0)
-                visibility = Transmittance(origin, toLight, ShadowRayLength(kLightClearance, distance), kVradOccluders);
-            direct[n] += irradiance * visibility;
-        }
+        float3 toLight;
+        float distance;
+        float3 flat = LightIrradiance(light, luxel.position, normals[0], toLight, distance);
+        if (all(flat <= 0.0))
+            continue;
+        float visibility = Transmittance(origin, toLight, ShadowRayLength(kLightClearance, distance), kVradOccluders);
+        if (visibility <= 0.0)
+            continue;
+        direct[0] += flat * visibility;
+        for (uint n = 1; n < count; ++n)
+            direct[n] += LightIrradiance(light, luxel.position, normals[n], toLight, distance);
     }
 }
 

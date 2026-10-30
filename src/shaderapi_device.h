@@ -198,6 +198,7 @@ private:
     UINT m_height = 0;
     bool m_vsync = true;
     bool m_tearing = false;
+    bool m_deviceLost = false;
 };
 
 Backend& GetBackend();

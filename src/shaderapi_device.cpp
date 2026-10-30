@@ -262,10 +262,26 @@ void Present(NativeObject*)
         ApplyPendingMode();
 }
 
+// The window the game draws for (SetView, shaderapidx9 0x180024050). Vanilla presents into it when it is not the
+// device window (0x1800273f0), which only tools do.
+HWND g_view = nullptr;
+
+void SetView(NativeObject*, void* window)
+{
+    g_view = static_cast<HWND>(window);
+    static bool logged = false;
+    if (g_view != nullptr && g_view != GetBackend().Window() && !logged) {
+        logged = true;
+        log::Info("Native: SetView to a window other than the game's is not supported; frames still go to the game's window");
+    }
+}
+
+// 0x180023530: nothing while the device window is minimised, else the view's client area.
 void GetWindowSize(NativeObject*, int& width, int& height)
 {
     RECT rect = {};
-    GetClientRect(GetBackend().Window(), &rect);
+    if (!IsIconic(GetBackend().Window()))
+        GetClientRect(g_view != nullptr ? g_view : GetBackend().Window(), &rect);
     width = rect.right - rect.left;
     height = rect.bottom - rect.top;
 }
@@ -604,8 +620,14 @@ void Backend::Present()
     ID3D12CommandList* lists[] = { m_commandList.Get() };
     m_queue->ExecuteCommandLists(1, lists);
     const HRESULT hr = m_swapChain->Present(m_vsync ? 1 : 0, !m_vsync && m_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0);
-    if (FAILED(hr))
+    if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) {
+        if (!m_deviceLost) {
+            m_deviceLost = true;
+            log::Info("Native: the GPU device was lost ({:#010x}, reason {:#010x})", Hex(hr), Hex(m_device->GetDeviceRemovedReason()));
+        }
+    } else if (FAILED(hr)) {
         log::Info("Native: Present failed: {:#010x}", Hex(hr));
+    }
     m_queue->Signal(m_fence.Get(), ++m_fenceValue);
     m_frames[m_frame].fence = m_fenceValue;
     DrainDebugMessages();
@@ -852,6 +874,7 @@ NativeObject* Device()
         c.Bind("IsAAEnabled", &IsAAEnabled);
         c.Bind("Present", &Present);
         c.Bind("GetWindowSize", &GetWindowSize);
+        c.Bind("SetView", &SetView);
         c.Bind("SetHardwareGammaRamp", &SetHardwareGammaRamp);
         BindMeshDeviceMethods(c);
         return c;

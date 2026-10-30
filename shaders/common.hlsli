@@ -119,6 +119,12 @@ struct FrameConstants
     uint bakedResidualView;
     uint leafAmbientView;
     uint ambientSamplesView;
+    // The 3D skybox's camera and 1 / its scale, through which sun rays that reach the sky continue (SunVisibility);
+    // worldToSky is 0 without one.
+    float skyCameraX;
+    float skyCameraY;
+    float skyCameraZ;
+    float worldToSky;
 };
 
 // Per-pass descriptor indices and parameters; mirrors Lighting::PassArgs in src/lighting.h.

@@ -717,6 +717,77 @@ std::vector<LightHull> FixtureHulls(const bsp::WorldGeometry& world)
     return result;
 }
 
+// Static props as VRAD shadowed them when the map was compiled without -StaticPropPolys (AddPolysForRayTrace in
+// src/utils/vrad/vradstaticprops.cpp): the convex pieces of a model's collision model, or for a model without one
+// the box of its hull bounds around the prop's origin, unrotated. Props marked "disable shadows" are left out.
+void AddVradOccluders(const bsp::WorldGeometry& world, std::vector<SceneInstance>& instances)
+{
+    constexpr int kUnread = -2;
+    std::vector<int> collisionModels(world.propModels.size(), kUnread);
+    std::vector<std::optional<std::pair<bsp::Float3, bsp::Float3>>> hullBounds(world.propModels.size());
+    int unitBox = -1;
+    const auto addModel = [](const std::vector<bsp::Float3>& triangles) {
+        std::vector<uint32_t> indices(triangles.size());
+        std::iota(indices.begin(), indices.end(), 0u);
+        const std::vector<uint32_t> albedo(triangles.size() / 3, PackAlbedo({0.5f, 0.5f, 0.5f}));
+        return g_state.scene.AddModel({triangles, indices, albedo, static_cast<UINT>(albedo.size()), {}, {}, {}});
+    };
+    size_t collisionProps = 0;
+    size_t boxProps = 0;
+    for (const bsp::StaticProp& prop : world.props) {
+        if (prop.noShadow)
+            continue;
+        const std::string& path = world.propModels[prop.model];
+        int& collision = collisionModels[prop.model];
+        if (collision == kUnread) {
+            collision = -1;
+            const std::vector<std::byte> mdl = ReadOptional(path);
+            const std::string base = path.size() > 4 ? path.substr(0, path.size() - 4) : path;
+            const std::vector<std::byte> phy = ReadOptional(base + ".phy");
+            std::vector<std::vector<bsp::Float3>> pieces;
+            std::string error;
+            std::vector<bsp::Float3> triangles;
+            if (!phy.empty() && studio::ReadCollisionPieces(phy, pieces, error)) {
+                for (const std::vector<bsp::Float3>& piece : pieces) {
+                    const std::vector<bsp::Float3> hull = hull::Triangles(piece);
+                    triangles.insert(triangles.end(), hull.begin(), hull.end());
+                }
+            }
+            if (!triangles.empty()) {
+                collision = addModel(triangles);
+            } else if (phy.empty()) {
+                bsp::Float3 mins, maxs;
+                if (studio::ReadHullBounds(mdl, mins, maxs) && mins.x < maxs.x && mins.y < maxs.y && mins.z < maxs.z)
+                    hullBounds[prop.model] = std::pair(mins, maxs);
+            }
+        }
+        SceneInstance instance;
+        instance.mask = kVradOccluderMask;
+        if (collision >= 0) {
+            instance.model = collision;
+            std::memcpy(instance.transform, prop.transform, sizeof(instance.transform));
+            ++collisionProps;
+        } else if (const auto& bounds = hullBounds[prop.model]) {
+            if (unitBox < 0) {
+                std::vector<bsp::Float3> corners(8);
+                for (int c = 0; c < 8; ++c)
+                    corners[c] = {static_cast<float>(c & 1), static_cast<float>(c >> 1 & 1), static_cast<float>(c >> 2 & 1)};
+                unitBox = addModel(hull::Triangles(corners));
+            }
+            const auto& [mins, maxs] = *bounds;
+            const float origin[3] = {prop.transform[0][3], prop.transform[1][3], prop.transform[2][3]};
+            const float box[3][4] = {{maxs.x - mins.x, 0.0f, 0.0f, origin[0] + mins.x}, {0.0f, maxs.y - mins.y, 0.0f, origin[1] + mins.y},
+                {0.0f, 0.0f, maxs.z - mins.z, origin[2] + mins.z}};
+            instance.model = unitBox;
+            std::memcpy(instance.transform, box, sizeof(instance.transform));
+            ++boxProps;
+        }
+        if (instance.model >= 0)
+            instances.push_back(instance);
+    }
+    log::Info("Scene: VRAD's prop shadows for the bake: {} props by collision model, {} by box", collisionProps, boxProps);
+}
+
 bool IsFirstPersonModel(const std::string& path)
 {
     return path.starts_with("models/weapons/v_") || path.starts_with("models/weapons/c_");
@@ -786,6 +857,14 @@ void UpdateScene()
     }
     if (level == g_state.scene.Name() || level == g_state.failedMap)
         return;
+    // With real-time lighting off the game lights itself; the map's scene loads once it is turned on.
+    if (!GetSettings().realtimeLighting) {
+        if (g_state.scene.Ready()) {
+            ClearScene();
+            log::Info("Scene cleared");
+        }
+        return;
+    }
 
     std::vector<std::byte> file;
     bsp::WorldGeometry world;
@@ -834,6 +913,21 @@ void UpdateScene()
             }
             addProps(world.skyboxProps, kSkyboxMask);
             std::erase_if(instances, [](const SceneInstance& instance) { return instance.model < 0; });
+            // A residual baked before for this map, by the map's contents (gmodpp_cache\baked).
+            const std::filesystem::path cachePath = GetOptions().gameDirectory / L"gmodpp_cache" / L"baked" / std::format(L"{:016x}.bin", FileHash(file));
+            std::vector<std::byte> cached;
+            std::error_code sizeError;
+            const uintmax_t cacheSize = std::filesystem::file_size(cachePath, sizeError);
+            if (std::ifstream cache(cachePath, std::ios::binary); cache && !sizeError && cacheSize > sizeof(uint32_t)) {
+                uint32_t version = 0;
+                cache.read(reinterpret_cast<char*>(&version), sizeof(version));
+                cached.resize(static_cast<size_t>(cacheSize) - sizeof(version));
+                cache.read(reinterpret_cast<char*>(cached.data()), static_cast<std::streamsize>(cached.size()));
+                if (!cache || version != kBakeVersion)
+                    cached.clear();
+            }
+            if (cached.empty() && !world.baked.samples.empty())
+                AddVradOccluders(world, instances);
             log::Info("Scene '{}': {} faces, {} displacements, {} skybox faces and {} skybox props, {} world triangles ({} alpha-tested), {} of {} static props, {} lights; "
                       "sun {} dir ({:.2f} {:.2f} {:.2f}) color ({:.2f} {:.2f} {:.2f}), sky ({:.2f} {:.2f} {:.2f})",
                 level, world.faceCount, world.displacementCount, world.skyboxFaceCount, world.skyboxProps.size(), world.mesh.indices.size() / 3, worldTriangles.alphaTriangles.size(),
@@ -855,19 +949,6 @@ void UpdateScene()
                     bakedTriangles[t].luxels[corner][0] = luxel.u;
                     bakedTriangles[t].luxels[corner][1] = luxel.v;
                 }
-            }
-            // A residual baked before for this map, by the map's contents (gmodpp_cache\baked).
-            const std::filesystem::path cachePath = GetOptions().gameDirectory / L"gmodpp_cache" / L"baked" / std::format(L"{:016x}.bin", FileHash(file));
-            std::vector<std::byte> cached;
-            std::error_code sizeError;
-            const uintmax_t cacheSize = std::filesystem::file_size(cachePath, sizeError);
-            if (std::ifstream cache(cachePath, std::ios::binary); cache && !sizeError && cacheSize > sizeof(uint32_t)) {
-                uint32_t version = 0;
-                cache.read(reinterpret_cast<char*>(&version), sizeof(version));
-                cached.resize(static_cast<size_t>(cacheSize) - sizeof(version));
-                cache.read(reinterpret_cast<char*>(cached.data()), static_cast<std::streamsize>(cached.size()));
-                if (!cache || version != kBakeVersion)
-                    cached.clear();
             }
             if (g_state.scene.LoadBaked(world.baked, bakedTriangles, cached) && !g_state.scene.Baked().Ready())
                 g_state.scene.Baked().cachePath = cachePath;

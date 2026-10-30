@@ -105,6 +105,20 @@ public:
         return planes;
     }
 
+    std::vector<bsp::Float3> Triangles() const
+    {
+        std::vector<bsp::Float3> triangles;
+        for (const Face& face : m_faces) {
+            if (!face.alive)
+                continue;
+            for (uint32_t v : face.vertices) {
+                const Vec& p = m_points[v];
+                triangles.push_back({static_cast<float>(p.x), static_cast<float>(p.y), static_cast<float>(p.z)});
+            }
+        }
+        return triangles;
+    }
+
 private:
     // Adds the farthest point outside a face: the faces it sees, found by walking out from that face, give way to
     // a fan from their horizon to the point.
@@ -237,12 +251,11 @@ private:
     std::unordered_map<uint64_t, uint32_t> m_edges;
 };
 
-}
-
-std::vector<Plane> Build(std::span<const bsp::Float3> points)
+// Builds the hull of `points` and checks it holds every point; false when it could not be built.
+bool BuildChecked(std::span<const bsp::Float3> points, std::vector<Plane>& planes, std::vector<bsp::Float3>* triangles)
 {
     if (points.size() < 4)
-        return {};
+        return false;
     std::vector<Vec> vectors;
     vectors.reserve(points.size());
     Vec low = {points[0].x, points[0].y, points[0].z};
@@ -256,15 +269,32 @@ std::vector<Plane> Build(std::span<const bsp::Float3> points)
     const double epsilon = std::max(size * 1e-5, 1e-3);
     Builder builder(std::move(vectors), epsilon);
     if (!builder.Run())
-        return {};
-    std::vector<Plane> planes = builder.Planes();
+        return false;
+    planes = builder.Planes();
     // A hull that leaves an input point outside was built wrongly.
     const float tolerance = static_cast<float>(std::max(epsilon * 10.0, 0.01));
     for (const bsp::Float3& p : points) {
         if (Distance(planes, p) > tolerance)
-            return {};
+            return false;
     }
-    return planes;
+    if (triangles != nullptr)
+        *triangles = builder.Triangles();
+    return true;
+}
+
+}
+
+std::vector<Plane> Build(std::span<const bsp::Float3> points)
+{
+    std::vector<Plane> planes;
+    return BuildChecked(points, planes, nullptr) ? planes : std::vector<Plane>{};
+}
+
+std::vector<bsp::Float3> Triangles(std::span<const bsp::Float3> points)
+{
+    std::vector<Plane> planes;
+    std::vector<bsp::Float3> triangles;
+    return BuildChecked(points, planes, &triangles) ? triangles : std::vector<bsp::Float3>{};
 }
 
 float Distance(std::span<const Plane> planes, const bsp::Float3& point)

@@ -38,6 +38,8 @@ int BoneCount(std::span<const std::byte> mdl);
 
 // The box around the model's collision hull and view bounds, or false when the header sets neither.
 bool ReadBounds(std::span<const std::byte> mdl, bsp::Float3& mins, bsp::Float3& maxs);
+// The header's collision hull box (hull_min, hull_max), or false when the header has none.
+bool ReadHullBounds(std::span<const std::byte> mdl, bsp::Float3& mins, bsp::Float3& maxs);
 
 // The index of the bone with this name, or -1.
 int BoneIndex(std::span<const std::byte> mdl, std::string_view name);

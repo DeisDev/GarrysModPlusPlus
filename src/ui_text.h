@@ -112,6 +112,9 @@ enum class TextId {
     PassOtherViews,
     PrewarmMessage,
     PrewarmProgress,
+    PrewarmTimeLeft,
+    PrewarmStarting,
+    PrewarmSkip,
     Count
 };
 

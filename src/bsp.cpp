@@ -346,7 +346,7 @@ uint32_t AddFaceLightmap(const Lumps& lumps, size_t faceIndex, bool displacement
     origin = Add(origin, Scale(toWorld1, -w[1][3]));
     for (uint32_t y = 0; y < height; ++y) {
         for (uint32_t x = 0; x < width; ++x) {
-            const float sCoord = static_cast<float>(x + face.lightmapMins[0]);
+            const float sCoord = static_cast<float>(static_cast<int32_t>(x) + face.lightmapMins[0]);
             const float tCoord = static_cast<float>(static_cast<int32_t>(y) + face.lightmapMins[1]);
             const Float3 position = Add(Add(origin, Scale(toWorld0, sCoord)), Scale(toWorld1, tCoord));
             lumps.baked->luxels.push_back({position, index, plane.normal, y * width + x});
@@ -550,7 +550,12 @@ bool AddDisplacement(Mesh& mesh, const Lumps& lumps, const Face& face, const Dis
     return true;
 }
 
-std::optional<Float3> SkyCameraOrigin(std::span<const std::byte> file, const Header& header)
+struct SkyCamera {
+    Float3 origin;
+    float scale = 0.0f;
+};
+
+std::optional<SkyCamera> ReadSkyCamera(std::span<const std::byte> file, const Header& header)
 {
     const Lump& lump = header.lumps[kLumpEntities];
     if (lump.offset < 0 || lump.length <= 0 || static_cast<size_t>(lump.offset) + lump.length > file.size())
@@ -567,10 +572,12 @@ std::optional<Float3> SkyCameraOrigin(std::span<const std::byte> file, const Hea
     size_t originPos = block.find("\"origin\"");
     if (originPos == std::string::npos)
         return std::nullopt;
-    Float3 origin;
-    if (sscanf_s(block.c_str() + originPos + 8, " \"%f %f %f\"", &origin.x, &origin.y, &origin.z) != 3)
+    SkyCamera camera;
+    if (sscanf_s(block.c_str() + originPos + 8, " \"%f %f %f\"", &camera.origin.x, &camera.origin.y, &camera.origin.z) != 3)
         return std::nullopt;
-    return origin;
+    if (const size_t scalePos = block.find("\"scale\""); scalePos != std::string::npos)
+        sscanf_s(block.c_str() + scalePos + 7, " \"%f\"", &camera.scale);
+    return camera;
 }
 
 struct AreaLocator {
@@ -859,13 +866,22 @@ void ReadLeafAmbient(std::span<const std::byte> file, const Header& header, cons
             sample.position[0] = bounds.mins.x + fraction[0] * (bounds.maxs.x - bounds.mins.x);
             sample.position[1] = bounds.mins.y + fraction[1] * (bounds.maxs.y - bounds.mins.y);
             sample.position[2] = bounds.mins.z + fraction[2] * (bounds.maxs.z - bounds.mins.z);
+            // VRAD stores the cubes in linear units with VectorToColorRGBExp32, whose inverse is ColorRGBExp32ToVector:
+            // c * 2^exponent, 255 times TexLightToLinear's lightmap scale (src/mathlib/color_conversion.cpp).
             for (int side = 0; side < 6; ++side) {
-                const float scale = std::ldexp(1.0f / 255.0f, static_cast<int8_t>(source.cube[side][3]));
+                const float scale = std::ldexp(1.0f, static_cast<int8_t>(source.cube[side][3]));
                 for (int c = 0; c < 3; ++c)
                     sample.cube[side][c] = source.cube[side][c] * scale;
             }
         }
         baked.leafAmbient.push_back({first, static_cast<uint32_t>(baked.ambientSamples.size()) - first});
+    }
+    // Leaves without samples of their own hold the nearest leaf with samples in firstAmbientSample
+    // (ComputePerLeafAmbientLighting and NearestNeighborWithLight in src/utils/vrad/leaf_ambient_lighting.cpp).
+    for (size_t leaf = 0; leaf < indices->size(); ++leaf) {
+        const LeafAmbientIndex& index = (*indices)[leaf];
+        if (index.sampleCount == 0 && index.firstSample < baked.leafAmbient.size())
+            baked.leafAmbient[leaf] = baked.leafAmbient[index.firstSample];
     }
 }
 
@@ -1044,8 +1060,13 @@ bool LoadWorld(std::span<const std::byte> file, WorldGeometry& world, std::strin
     // The scaled-down 3D skybox scene is world geometry placed outside the playable space; it must not
     // occlude the main view's rays, so faces and props in the sky camera's area are kept apart.
     const std::optional<AreaLocator> areas = MakeAreaLocator(file, header);
-    const std::optional<Float3> skyCamera = SkyCameraOrigin(file, header);
-    int skyArea = areas && skyCamera ? areas->AreaAt(*skyCamera) : -1;
+    const std::optional<SkyCamera> skyCamera = ReadSkyCamera(file, header);
+    int skyArea = areas && skyCamera ? areas->AreaAt(skyCamera->origin) : -1;
+    // ProcessSkyCameras in src/utils/vrad/vrad.cpp keeps only cameras with a positive scale.
+    if (skyCamera && skyCamera->scale > 0.0f) {
+        world.sun.skyCameraOrigin = skyCamera->origin;
+        world.sun.skyCameraScale = skyCamera->scale;
+    }
     if (skyArea >= 0 && !areas->Bounds(skyArea, world.skyMins, world.skyMaxs))
         skyArea = -1;
     world.skyArea = skyArea;

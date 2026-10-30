@@ -108,6 +108,10 @@ struct FrameConstants {
     uint32_t bakedResidualView;
     uint32_t leafAmbientView;
     uint32_t ambientSamplesView;
+    float skyCameraX;
+    float skyCameraY;
+    float skyCameraZ;
+    float worldToSky;
 };
 
 // What blocks the sun at a pixel of the main view (Lighting::RequestProbe).
