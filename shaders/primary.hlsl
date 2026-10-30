@@ -11,7 +11,7 @@
 
 float3 InterpolatedPosition(uint positionsView, uint3 index, float2 barycentrics)
 {
-    ByteAddressBuffer positions = ResourceDescriptorHeap[positionsView];
+    ByteAddressBuffer positions = ResourceDescriptorHeap[NonUniformResourceIndex(positionsView)];
     float3 p0 = positions.Load<float3>(index.x * 12);
     return p0 + barycentrics.x * (positions.Load<float3>(index.y * 12) - p0) + barycentrics.y * (positions.Load<float3>(index.z * 12) - p0);
 }
@@ -20,7 +20,7 @@ float3 InterpolatedPosition(uint positionsView, uint3 index, float2 barycentrics
 float3 HitMotion(HitInfo hit)
 {
     InstanceRecord record = LoadInstance(hit.instance);
-    ByteAddressBuffer indices = ResourceDescriptorHeap[record.indices];
+    ByteAddressBuffer indices = ResourceDescriptorHeap[NonUniformResourceIndex(record.indices)];
     uint3 index = indices.Load3(hit.primitive * 12);
     float3 current = InterpolatedPosition(record.positions, index, hit.barycentrics);
     float3 previous = record.previousPositions != kNoView ? InterpolatedPosition(record.previousPositions, index, hit.barycentrics) : current;

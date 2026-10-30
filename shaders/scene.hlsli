@@ -123,7 +123,7 @@ struct AlphaTriangle
 // filter it; unfiltered, the low-resolution alpha's texels showed as square blocks in leaf shadows.
 float CandidateOpacity(uint instance, uint alphaPrimitive, float2 barycentrics, out bool translucent)
 {
-    ByteAddressBuffer alpha = ResourceDescriptorHeap[LoadInstance(instance).alpha];
+    ByteAddressBuffer alpha = ResourceDescriptorHeap[NonUniformResourceIndex(LoadInstance(instance).alpha)];
     AlphaTriangle entry = alpha.Load<AlphaTriangle>(alphaPrimitive * 32);
     uint packed = entry.packed;
     translucent = (packed & kTranslucentFlag) != 0;
@@ -131,7 +131,7 @@ float CandidateOpacity(uint instance, uint alphaPrimitive, float2 barycentrics, 
     float textureAlpha = 1.0;
     if ((packed & 0xFFFFFF) != kNoAlphaTexture) {
         float2 uv = entry.uv0 + barycentrics.x * (entry.uv1 - entry.uv0) + barycentrics.y * (entry.uv2 - entry.uv0);
-        Texture2D<float4> texture = ResourceDescriptorHeap[packed & 0xFFFFFF];
+        Texture2D<float4> texture = ResourceDescriptorHeap[NonUniformResourceIndex(packed & 0xFFFFFF)];
         textureAlpha = texture.SampleLevel(g_linearWrap, uv, 0.0).a;
     }
     if (translucent)
@@ -233,9 +233,9 @@ float3 AboveSurface(float3 direction, float3 geometricNormal)
 HitSurface SurfaceOf(HitInfo hit, float3 origin, float3 direction)
 {
     InstanceRecord record = LoadInstance(hit.instance);
-    ByteAddressBuffer positions = ResourceDescriptorHeap[record.positions];
-    ByteAddressBuffer indices = ResourceDescriptorHeap[record.indices];
-    ByteAddressBuffer albedo = ResourceDescriptorHeap[record.albedo];
+    ByteAddressBuffer positions = ResourceDescriptorHeap[NonUniformResourceIndex(record.positions)];
+    ByteAddressBuffer indices = ResourceDescriptorHeap[NonUniformResourceIndex(record.indices)];
+    ByteAddressBuffer albedo = ResourceDescriptorHeap[NonUniformResourceIndex(record.albedo)];
     uint3 index = indices.Load3(hit.primitive * 12);
     float3 p0 = positions.Load<float3>(index.x * 12);
     float3 p1 = positions.Load<float3>(index.y * 12);
@@ -288,7 +288,7 @@ uint MaterialFlags(HitInfo hit)
     InstanceRecord record = LoadInstance(hit.instance);
     if (record.materials == kNoView)
         return 0;
-    ByteAddressBuffer materials = ResourceDescriptorHeap[record.materials];
+    ByteAddressBuffer materials = ResourceDescriptorHeap[NonUniformResourceIndex(record.materials)];
     uint index = materials.Load(hit.primitive * 4);
     if (index == kNoMaterial)
         return 0;
@@ -321,16 +321,16 @@ bool HitMaterial(HitInfo hit, out Material material, out float2 uv, out float uv
     InstanceRecord record = LoadInstance(hit.instance);
     if (record.materials == kNoView)
         return false;
-    ByteAddressBuffer materials = ResourceDescriptorHeap[record.materials];
+    ByteAddressBuffer materials = ResourceDescriptorHeap[NonUniformResourceIndex(record.materials)];
     uint index = materials.Load(hit.primitive * 4);
     if (index == kNoMaterial)
         return false;
     ByteAddressBuffer table = ResourceDescriptorHeap[g_frame.materialsView];
     material = table.Load<Material>(index * 64);
     if (record.uvs != kNoView) {
-        ByteAddressBuffer indices = ResourceDescriptorHeap[record.indices];
-        ByteAddressBuffer uvs = ResourceDescriptorHeap[record.uvs];
-        ByteAddressBuffer positions = ResourceDescriptorHeap[record.positions];
+        ByteAddressBuffer indices = ResourceDescriptorHeap[NonUniformResourceIndex(record.indices)];
+        ByteAddressBuffer uvs = ResourceDescriptorHeap[NonUniformResourceIndex(record.uvs)];
+        ByteAddressBuffer positions = ResourceDescriptorHeap[NonUniformResourceIndex(record.positions)];
         uint3 vertex = indices.Load3(hit.primitive * 12);
         float2 uv0 = uvs.Load<float2>(vertex.x * 8);
         float2 uv1 = uvs.Load<float2>(vertex.y * 8) - uv0;
@@ -351,7 +351,7 @@ float MaskValue(uint mask, float2 uv, float footprint)
     uint view = mask & 0xFFFFFF;
     if (view == 0xFFFFFF)
         return 1.0;
-    Texture2D<float4> texture = ResourceDescriptorHeap[view];
+    Texture2D<float4> texture = ResourceDescriptorHeap[NonUniformResourceIndex(view)];
     uint width, height, levels;
     texture.GetDimensions(0, width, height, levels);
     float lod = log2(max(footprint * max(width, height), 1e-6));
@@ -654,7 +654,7 @@ float3 ProjectorIrradiance(Projector projector, float3 position, float3 normal, 
         return 0.0;
     float3 cookie;
     if (projector.cookieView != kNoCookie) {
-        Texture2D<float4> texture = ResourceDescriptorHeap[projector.cookieView];
+        Texture2D<float4> texture = ResourceDescriptorHeap[NonUniformResourceIndex(projector.cookieView)];
         cookie = texture.SampleLevel(g_linearClamp, coords, 0.0).rgb;
     } else {
         cookie = smoothstep(0.5, 0.35, length(coords - 0.5));

@@ -67,8 +67,8 @@ float3 LastVolumeIrradiance(float3 position, float3 normal)
 bool HitBackFace(HitInfo hit, float3 direction)
 {
     InstanceRecord record = LoadInstance(hit.instance);
-    ByteAddressBuffer positions = ResourceDescriptorHeap[record.positions];
-    ByteAddressBuffer indices = ResourceDescriptorHeap[record.indices];
+    ByteAddressBuffer positions = ResourceDescriptorHeap[NonUniformResourceIndex(record.positions)];
+    ByteAddressBuffer indices = ResourceDescriptorHeap[NonUniformResourceIndex(record.indices)];
     uint3 index = indices.Load3(hit.primitive * 12);
     float3 p0 = positions.Load<float3>(index.x * 12);
     float3 normal = mul((float3x3)hit.objectToWorld, cross(positions.Load<float3>(index.y * 12) - p0, positions.Load<float3>(index.z * 12) - p0));
