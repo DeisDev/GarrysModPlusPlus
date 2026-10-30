@@ -42,8 +42,12 @@ void main(uint3 id : SV_DispatchThreadID)
     }
     float3 position = WorldPositionFromDepth(pixel, depth);
     float3 toEye = g_frame.eyePosition - position;
-    float3 stored = gbufferNormal.Load(int3(pixel, 0)).xyz;
-    float3 normal = dot(stored, stored) > 0.25 ? normalize(stored) : DepthNormal(pixel, depth, position);
+    float4 stored = gbufferNormal.Load(int3(pixel, 0));
+    float3 normal;
+    if (IsWaterSurface(MaterialBits(coverage)))
+        normal = WaterNormal(stored.xy, stored.w, normalize(toEye), 1.0);
+    else
+        normal = dot(stored.xyz, stored.xyz) > 0.25 ? normalize(stored.xyz) : DepthNormal(pixel, depth, position);
     // Two-sided materials report the front-face normal on back faces.
     if (dot(normal, toEye) < 0.0)
         normal = -normal;

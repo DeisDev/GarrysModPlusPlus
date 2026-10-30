@@ -1,4 +1,4 @@
-#include "reflection.hlsli"
+#include "water.hlsli"
 
 // Light the deferred pass adds on top of diffuse lighting, found from the material of the triangle each pixel
 // shows (shaders/primary.hlsl): mirror reflections of env_cubemap materials (envmap mask times $envmaptint, as
@@ -39,6 +39,23 @@ void main(uint3 id : SV_DispatchThreadID)
     WriteGuides(pixel, 0.0, 1.0, 0.0);
     float3 position = WorldPositionFromDepth(pixel, DepthAt(pixel));
     float3 view = normalize(position - g_frame.eyePosition);
+    Texture2D<float4> flags = ResourceDescriptorHeap[g_frame.flagsView];
+    if (IsWaterSurface(MaterialBits(flags.Load(int3(pixel, 0))))) {
+        // Textured water: a mirror under the water's Fresnel term, scaled by its reflect tint and the base texture's
+        // alpha, from just above the plane (shaders/water.hlsli).
+        Texture2D<float4> normals = ResourceDescriptorHeap[g_frame.gbufferNormalView];
+        float4 water = normals.Load(int3(pixel, 0));
+        float3 direction = reflect(view, WaterNormal(water.xy, water.w, -view, kWaveSlope));
+        direction.z = max(direction.z, 0.02);
+        float strength = Schlick(dot(surface.xyz, -view)) * water.z * g_frame.reflectionScale;
+        float hitDistance;
+        uint seed = PixelSeed(pixel, 0x8Fu);
+        float3 reflection = ReflectedRadiance(g_pass.input0, position + float3(0.0, 0.0, 2.0), normalize(direction), g_frame.skyColor * g_frame.indirectScale,
+            seed, hitDistance);
+        output[pixel] = float4(reflection * strength, hitDistance);
+        WriteGuides(pixel, saturate(strength), 0.0, hitDistance);
+        return;
+    }
     HitInfo hit;
     if (!VisibleHit(pixel, hit))
         return;

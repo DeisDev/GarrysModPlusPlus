@@ -171,10 +171,18 @@ static const uint kMaterialRimBoostShift = 2;
 static const uint kMaterialRimBoostMask = 31;
 static const uint kMaterialLightWarp = 128;
 static const uint kMaterialWarpTotal = 64;
+// Textured water (shaders/water_textured_surface.hlsl, without rim light): the normal target holds the water's slope,
+// reflection strength and eye angle (shaders/water.hlsli) instead of a normal.
+static const uint kMaterialWaterSurface = 32;
 
 float RimScale(float4 flags)
 {
     return saturate((flags.r - 0.5) * 2.0);
+}
+
+bool IsWaterSurface(uint bits)
+{
+    return (bits & (kMaterialRimLight | kMaterialWaterSurface)) == kMaterialWaterSurface;
 }
 
 bool WarpsTotalLight(uint bits)
