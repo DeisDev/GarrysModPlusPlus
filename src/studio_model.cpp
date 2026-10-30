@@ -1,6 +1,7 @@
 #include "studio_model.h"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cstring>
 #include <format>
@@ -519,7 +520,7 @@ std::optional<bsp::Float3> TextureReflectivity(std::span<const std::byte> vtfHea
 
 namespace {
 
-// VTF image formats (ImageFormat in the Source SDK's bitmap/imageformat.h).
+// VTF image formats (ImageFormat in the Source SDK's bitmap/imageformat.h; channels are named in memory order).
 struct VtfFormat {
     int32_t id;
     TextureFormat format;
@@ -527,10 +528,30 @@ struct VtfFormat {
     uint32_t blockBytes;
     uint32_t texelBytes;
     bool alpha;
+    // For formats converted to Rgba8: the source byte of red, green, blue and alpha, or -1 for 255.
+    std::array<int8_t, 4> convert = {-1, -1, -1, -1};
+    bool converted = false;
 };
 constexpr VtfFormat kFormats[] = {{0, TextureFormat::Rgba8, 0, 4, true}, {5, TextureFormat::R8, 0, 1, false}, {12, TextureFormat::Bgra8, 0, 4, true},
     {13, TextureFormat::Bc1, 8, 0, true}, {14, TextureFormat::Bc2, 16, 0, true}, {15, TextureFormat::Bc3, 16, 0, true},
-    {16, TextureFormat::Bgrx8, 0, 4, false}, {20, TextureFormat::Bc1, 8, 0, true}};
+    {16, TextureFormat::Bgrx8, 0, 4, false}, {20, TextureFormat::Bc1, 8, 0, true},
+    // ABGR8888, RGB888, BGR888, IA88, A8 and ARGB8888, converted on load.
+    {1, TextureFormat::Rgba8, 0, 4, true, {3, 2, 1, 0}, true}, {2, TextureFormat::Rgba8, 0, 3, false, {0, 1, 2, -1}, true},
+    {3, TextureFormat::Rgba8, 0, 3, false, {2, 1, 0, -1}, true}, {6, TextureFormat::Rgba8, 0, 2, true, {0, 0, 0, 1}, true},
+    {8, TextureFormat::Rgba8, 0, 1, true, {-1, -1, -1, 0}, true}, {11, TextureFormat::Rgba8, 0, 4, true, {1, 2, 3, 0}, true}};
+
+std::vector<std::byte> ConvertToRgba8(const VtfFormat& format, std::span<const std::byte> source)
+{
+    const size_t texels = source.size() / format.texelBytes;
+    std::vector<std::byte> rgba(texels * 4);
+    for (size_t t = 0; t < texels; ++t) {
+        for (size_t c = 0; c < 4; ++c) {
+            const int8_t from = format.convert[c];
+            rgba[t * 4 + c] = from < 0 ? std::byte{0xFF} : source[t * format.texelBytes + static_cast<size_t>(from)];
+        }
+    }
+    return rgba;
+}
 constexpr VtfFormat kLowResFormat = {13, TextureFormat::Bc1, 8, 0, true};
 constexpr uint32_t kVtfEnvmapFlag = 0x4000;
 constexpr uint32_t kVtfHighResResource = 0x30;
@@ -621,6 +642,13 @@ std::optional<TextureImage> ReadTexture(std::span<const std::byte> bytes, uint32
         }
         image.mips[m - chosen] = bytes.subspan(offset, size);
         offset += size * *frames;
+    }
+    if (info->converted) {
+        image.converted.reserve(image.mips.size());
+        for (std::span<const std::byte>& mip : image.mips) {
+            image.converted.push_back(ConvertToRgba8(*info, mip));
+            mip = image.converted.back();
+        }
     }
     return image;
 }

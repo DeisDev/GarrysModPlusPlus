@@ -80,6 +80,8 @@ struct TextureImage {
     bool alpha;
     // Largest first.
     std::vector<std::span<const std::byte>> mips;
+    // Mips converted from a format textures do not take, which `mips` then views.
+    std::vector<std::vector<std::byte>> converted;
 };
 
 // A 2D VTF's mips no bigger than `maxSize` texels on a side, or nothing with a reason.
