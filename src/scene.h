@@ -107,7 +107,7 @@ static_assert(sizeof(BakedTriangle) == 32);
 
 // The format of the baked residual cache (gmodpp_cache\baked): bump when shaders/baked_residual.hlsl or the data it
 // reads changes.
-inline constexpr uint32_t kBakeVersion = 11;
+inline constexpr uint32_t kBakeVersion = 12;
 
 // VRAD's baked light on the GPU (indirect_lighting = 1): raw views of bsp::BakedLighting and of the world's
 // BakedTriangles, and the residual shaders/baked_residual.hlsl writes: the baked light less the direct light VRAD
@@ -119,6 +119,7 @@ struct BakedBuffers {
     UINT facesView = DescriptorHeap::kInvalid;
     UINT trianglesView = DescriptorHeap::kInvalid;
     UINT luxelsView = DescriptorHeap::kInvalid;
+    UINT neighboursView = DescriptorHeap::kInvalid;
     UINT leafAmbientView = DescriptorHeap::kInvalid;
     UINT ambientSamplesView = DescriptorHeap::kInvalid;
     UINT ambientSamplesUav = DescriptorHeap::kInvalid;
@@ -129,12 +130,16 @@ struct BakedBuffers {
     UINT residualUav = DescriptorHeap::kInvalid;
     UINT filteredView = DescriptorHeap::kInvalid;
     UINT filteredUav = DescriptorHeap::kInvalid;
-    // Clamped luxels, luxels the filter changed by more than a tenth, luxels without a VRAD sample and ambient
-    // samples clamped (shaders/baked_residual.hlsl).
+    // Clamped luxels, luxels the filter changed by more than a tenth, luxels without a VRAD sample, ambient samples
+    // clamped and samples supersampled, then clamped luxels per lightmap from byte 32 (shaders/baked_residual.hlsl).
     UINT countersUav = DescriptorHeap::kInvalid;
     UINT luxelCount = 0;
     UINT leafCount = 0;
-    // Progress of the bake, which Lighting runs a part of each main view: luxels done, then the filter.
+    // Progress of the bake, which Lighting runs a part of each main view: the samples' direct light, rounds of marking
+    // and supersampling samples, then the gather and filter. `bakedLuxels` counts the luxels done in a stage.
+    enum class Stage { Direct, Mark, Supersample, Gather };
+    Stage stage = Stage::Direct;
+    UINT supersamplePass = 0;
     UINT bakedLuxels = 0;
     bool filtered = false;
     // Where the filtered residual is saved once baked; empty when it was loaded from there.

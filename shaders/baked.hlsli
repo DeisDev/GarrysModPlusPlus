@@ -19,6 +19,10 @@ struct FaceLightmap
     float unused1;
     float3 normal;
     float unused2;
+    float3 luxelS;
+    float unused3;
+    float3 luxelT;
+    float unused4;
 };
 
 // Mirrors bsp::BakeLuxel in src/bsp.h.
@@ -30,6 +34,17 @@ struct BakeLuxel
     uint luxel;
     // bsp::BakeLuxel::weights, unorm16.
     uint2 weights;
+    uint subsamples;
+    uint neighbourEnd;
+};
+
+// Mirrors bsp::BakeNeighbour in src/bsp.h.
+struct BakeNeighbour
+{
+    uint lightmap;
+    uint cell;
+    float weight;
+    uint unused;
 };
 
 // Mirrors gmodpp::BakedTriangle in src/scene.h.
@@ -62,7 +77,7 @@ static const float3 kBumpBasis[3] = {
 FaceLightmap LoadFace(uint view, uint face)
 {
     ByteAddressBuffer faces = ResourceDescriptorHeap[view];
-    return faces.Load<FaceLightmap>(face * 64);
+    return faces.Load<FaceLightmap>(face * 96);
 }
 
 // ColorRGBExp32: c * 2^exponent / 255 (TexLightToLinear in mathlib/mathlib.h).

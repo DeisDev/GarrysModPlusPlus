@@ -130,21 +130,41 @@ struct FaceLightmap {
     float unused1;
     Float3 normal;
     float unused2;
+    // World units per luxel along s and t (LuxelSpaceToWorld).
+    Float3 luxelS;
+    float unused3;
+    Float3 luxelT;
+    float unused4;
 };
-static_assert(sizeof(FaceLightmap) == 64);
+static_assert(sizeof(FaceLightmap) == 96);
 
-// A style-0 luxel of a world face, `luxel` = s + t * width in the face's lightmap, with the point where VRAD sampled
-// the cell from it to the next luxel (its luxel point when VRAD had none there). `weights` (unorm16) mix the samples
-// of the cells at (s - 1, t - 1), (s, t - 1), (s - 1, t) and (s, t) into the luxel; all zero when none reaches it.
-// Mirrors BakeLuxel in shaders/baked.hlsli.
+// A style-0 luxel of a world face, `luxel` = s + t * width in the face's lightmap, with the point and normal where
+// VRAD sampled the cell from it to the next luxel (its luxel point when VRAD had none there). `weights` (unorm16) mix
+// the samples of the cells at (s - 1, t - 1), (s, t - 1), (s - 1, t) and (s, t) into the luxel, and
+// BakedLighting::neighbours up to `neighbourEnd` (from the previous luxel's) add those of neighbouring faces; all
+// zero when no sample reaches the luxel. `subsamples`: bit 31 when the cell has a sample, bits 0-15 the points VRAD
+// would supersample it at (see LuxelCell in src/bsp.cpp). Mirrors BakeLuxel in shaders/baked.hlsli.
 struct BakeLuxel {
     Float3 position;
     uint32_t face;
     Float3 normal;
     uint32_t luxel;
     std::array<uint16_t, 4> weights = {0, 0, 0, 0xFFFF};
+    uint32_t subsamples = 0;
+    uint32_t neighbourEnd = 0;
 };
-static_assert(sizeof(BakeLuxel) == 40);
+static_assert(sizeof(BakeLuxel) == 48);
+
+// A sample of a neighbouring face that VRAD's radial filter added to a luxel (BuildLuxelRadial in
+// src/utils/vrad/radial.cpp): cell `cell` of the FaceLightmap `lightmap`, with its share of the luxel. Mirrors
+// BakeNeighbour in shaders/baked.hlsli.
+struct BakeNeighbour {
+    uint32_t lightmap;
+    uint32_t cell;
+    float weight;
+    uint32_t unused;
+};
+static_assert(sizeof(BakeNeighbour) == 16);
 
 // A leaf ambient sample (dleafambientlighting_t): the light arriving from each axis direction (+x, -x, +y, -y,
 // +z, -z) at a point of a leaf. Mirrors AmbientSample in shaders/baked.hlsli.
@@ -171,6 +191,7 @@ struct BakedLighting {
     bool hdr = false;
     std::vector<FaceLightmap> faces;
     std::vector<BakeLuxel> luxels;
+    std::vector<BakeNeighbour> neighbours;
     // Per BSP leaf (Visibility::leaves): its first sample in `ambientSamples` and their number.
     std::vector<std::array<uint32_t, 2>> leafAmbient;
     std::vector<AmbientSample> ambientSamples;

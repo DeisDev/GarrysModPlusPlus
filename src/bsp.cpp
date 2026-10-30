@@ -275,6 +275,40 @@ float DistanceSquared(Float3 a, Float3 b)
     return d.x * d.x + d.y * d.y + d.z * d.z;
 }
 
+// A VRAD sample of a flat face (BuildFacesamples in src/utils/vrad/lightmap.cpp): the face's part in one lightmap
+// cell, in luxel coordinates, and which of SupersampleLightAtPoint's points VRAD would use (bits 0-15: the 4x4 points
+// for direct light, 16-19: the 2x2 for ambient light; none when either set is empty, as VRAD then keeps the sample).
+struct LuxelCell {
+    bool sampled = false;
+    Float2 centroid;
+    Float2 mins;
+    Float2 maxs;
+    uint32_t subsamples = 0;
+};
+
+// VRAD's smoothing of a face with its neighbours (PairEdges in src/utils/vrad/lightmap.cpp).
+struct FaceSmoothing {
+    std::vector<uint32_t> neighbours;
+    std::vector<Float3> vertexNormals;
+    Float3 centre = {};
+    bool flat = true;
+};
+
+// A flat face's VRAD samples while the map loads, for WeightLuxels.
+struct FaceSampling {
+    uint32_t face = 0;
+    uint32_t lightmap = 0;
+    size_t firstLuxel = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    // Luxel coordinates (s, t) to world: origin + s * toWorldS + t * toWorldT.
+    Float3 origin = {};
+    Float3 toWorldS = {};
+    Float3 toWorldT = {};
+    std::vector<LuxelCell> cells;
+    Float3 ToWorld(Float2 luxel) const;
+};
+
 struct Lumps {
     std::span<const Float3> vertices;
     std::span<const int32_t> surfedges;
@@ -288,6 +322,8 @@ struct Lumps {
     // The faces whose lighting offsets index `baked->samples` (LUMP_FACES_HDR for HDR lighting when present).
     std::span<const Face> lightFaces;
     BakedLighting* baked = nullptr;
+    const std::vector<FaceSmoothing>* smoothing = nullptr;
+    std::vector<FaceSampling>* sampling = nullptr;
 };
 
 float Dot(Float3 a, Float3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
@@ -308,19 +344,30 @@ Float2 FaceLuxel(const Lumps& lumps, const Face& face, Float3 p)
         v[1][0] * p.x + v[1][1] * p.y + v[1][2] * p.z + v[1][3] - static_cast<float>(face.lightmapMins[1])};
 }
 
-// A VRAD sample of a flat face (BuildFacesamples in src/utils/vrad/lightmap.cpp): the face's part in one lightmap
-// cell, in luxel coordinates.
-struct LuxelCell {
-    bool sampled = false;
-    Float2 centroid;
-    Float2 mins;
-    Float2 maxs;
-};
+Float3 FaceSampling::ToWorld(Float2 luxel) const
+{
+    return Add(Add(origin, Scale(toWorldS, luxel.u)), Scale(toWorldT, luxel.v));
+}
+
+bool InConvexPolygon(std::span<const Float2> polygon, Float2 p)
+{
+    bool positive = false;
+    bool negative = false;
+    for (size_t i = 0; i < polygon.size(); ++i) {
+        const Float2 a = polygon[i];
+        const Float2 b = polygon[(i + 1) % polygon.size()];
+        const float side = (b.u - a.u) * (p.v - a.v) - (b.v - a.v) * (p.u - a.u);
+        positive = positive || side > 0.0f;
+        negative = negative || side < 0.0f;
+    }
+    return !(positive && negative);
+}
 
 // BuildFacesamples cuts the face at whole luxel coordinates: cell (s, t) holds [s, s + 1) x [t, t + 1), the first row
 // and column also everything below, and nothing past the last. Each piece is sampled at its centroid
-// (WindingAreaAndBalancePoint).
-LuxelCell ClipLuxelCell(std::span<const Float2> outline, uint32_t s, uint32_t t)
+// (WindingAreaAndBalancePoint). Only pieces smaller than `partialBelow` (a luxel less EQUAL_EPSILON of world area)
+// keep a winding that supersample points must fall in.
+LuxelCell ClipLuxelCell(std::span<const Float2> outline, uint32_t s, uint32_t t, float partialBelow)
 {
     std::vector<Float2> piece(outline.begin(), outline.end());
     std::vector<Float2> kept;
@@ -370,29 +417,148 @@ LuxelCell ClipLuxelCell(std::span<const Float2> outline, uint32_t s, uint32_t t)
     }
     const float count = static_cast<float>(piece.size());
     cell.centroid = area > 1e-8f ? Float2{weighted.u / area, weighted.v / area} : Float2{sum.u / count, sum.v / count};
+    const bool partial = area < partialBelow;
+    const auto inside = [&](float du, float dv) { return !partial || InConvexPolygon(piece, {cell.centroid.u + du, cell.centroid.v + dv}); };
+    for (int a = 0; a < 4; ++a) {
+        for (int b = 0; b < 4; ++b) {
+            if (inside(-0.375f + 0.25f * static_cast<float>(a), -0.375f + 0.25f * static_cast<float>(b)))
+                cell.subsamples |= 1u << (a * 4 + b);
+        }
+    }
+    for (int k = 0; k < 4; ++k) {
+        if (inside(k & 2 ? 0.25f : -0.25f, k & 1 ? 0.25f : -0.25f))
+            cell.subsamples |= 1u << (16 + k);
+    }
+    if ((cell.subsamples & 0xFFFFu) == 0 || (cell.subsamples >> 16) == 0)
+        cell.subsamples = 0;
     return cell;
 }
 
-// How much a cell's sample adds to the luxel at (s, t) (AddDirectToRadial in src/utils/vrad/radial.cpp): the overlap
-// of its bounds with the luxel's two-luxel window over its distance, at least a tenth of a luxel.
-float RadialWeight(const LuxelCell& cell, float s, float t)
+// How much a sample adds to the luxel at (s, t) (AddDirectToRadial in src/utils/vrad/radial.cpp): the overlap of its
+// bounds with the luxel's two-luxel window over its distance, at least a tenth of a luxel.
+float RadialWeight(Float2 coord, Float2 mins, Float2 maxs, float s, float t)
 {
-    if (!cell.sampled)
-        return 0.0f;
-    const float s0 = std::max(cell.mins.u - s, -1.0f);
-    const float s1 = std::min(cell.maxs.u - s, 1.0f);
-    const float t0 = std::max(cell.mins.v - t, -1.0f);
-    const float t1 = std::min(cell.maxs.v - t, 1.0f);
+    const float s0 = std::max(mins.u - s, -1.0f);
+    const float s1 = std::min(maxs.u - s, 1.0f);
+    const float t0 = std::max(mins.v - t, -1.0f);
+    const float t1 = std::min(maxs.v - t, 1.0f);
     const float overlap = (s1 - s0) * (t1 - t0);
     if (overlap <= 0.001f)
         return 0.0f;
-    return overlap / std::max(std::max(std::fabs(cell.centroid.u - s), std::fabs(cell.centroid.v - t)), 0.1f);
+    return overlap / std::max(std::max(std::fabs(coord.u - s), std::fabs(coord.v - t)), 0.1f);
+}
+
+// A face's vertex (EdgeVertex in src/utils/vrad/lightmap.cpp), or -1.
+int64_t EdgeVertex(const Lumps& lumps, const Face& face, int edge)
+{
+    if (face.numEdges <= 0)
+        return -1;
+    const size_t at = static_cast<size_t>(face.firstEdge) + static_cast<size_t>(edge % face.numEdges);
+    if (face.firstEdge < 0 || at >= lumps.surfedges.size())
+        return -1;
+    const int32_t surfedge = lumps.surfedges[at];
+    const size_t index = static_cast<size_t>(surfedge < 0 ? -static_cast<int64_t>(surfedge) : surfedge);
+    if (index * 2 + 1 >= lumps.edges.size())
+        return -1;
+    const uint16_t vertex = lumps.edges[index * 2 + (surfedge < 0 ? 1 : 0)];
+    return vertex < lumps.vertices.size() ? vertex : -1;
+}
+
+// PairEdges in src/utils/vrad/lightmap.cpp: the faces sharing a vertex with each face that VRAD smooths it with
+// (normals within 45 degrees, or a shared smoothing group without the hard-edge bit; displacements only with
+// displacements), its vertex normals (those faces' normals and its own, summed) and its vertex centre. A face whose
+// vertex normals all match its normal is flat.
+std::vector<FaceSmoothing> PairEdges(const Lumps& lumps)
+{
+    constexpr float kSmoothingThreshold = 0.7071067f;
+    constexpr uint32_t kHardEdge = 0x80000000u;
+    const size_t count = lumps.faces.size();
+    std::vector<std::vector<uint32_t>> vertexFaces(lumps.vertices.size());
+    for (uint32_t f = 0; f < count; ++f) {
+        for (int j = 0; j < lumps.faces[f].numEdges; ++j) {
+            const int64_t v = EdgeVertex(lumps, lumps.faces[f], j);
+            if (v >= 0 && (vertexFaces[v].empty() || vertexFaces[v].back() != f))
+                vertexFaces[v].push_back(f);
+        }
+    }
+    const auto normalOf = [&](const Face& face) { return face.planeNum < lumps.planes.size() ? lumps.planes[face.planeNum].normal : Float3{}; };
+    std::vector<FaceSmoothing> result(count);
+    for (uint32_t f = 0; f < count; ++f) {
+        const Face& face = lumps.faces[f];
+        FaceSmoothing& smooth = result[f];
+        const Float3 normal = normalOf(face);
+        const bool displaced = face.dispinfo != -1;
+        smooth.vertexNormals.assign(std::max<int>(face.numEdges, 0), Float3{});
+        Float3 centre = {};
+        for (int j = 0; j < face.numEdges; ++j) {
+            const int64_t v = EdgeVertex(lumps, face, j);
+            if (v < 0)
+                continue;
+            centre = Add(centre, lumps.vertices[v]);
+            for (uint32_t g : vertexFaces[v]) {
+                if (g == f)
+                    continue;
+                const Face& other = lumps.faces[g];
+                if (!displaced && other.dispinfo != -1)
+                    continue;
+                const Float3 otherNormal = normalOf(other);
+                if (!displaced) {
+                    if (face.smoothingGroups == 0 && other.smoothingGroups == 0) {
+                        if (Dot(otherNormal, normal) < kSmoothingThreshold)
+                            continue;
+                    } else {
+                        const uint32_t shared = face.smoothingGroups & other.smoothingGroups;
+                        if ((shared & kHardEdge) != 0 || shared == 0)
+                            continue;
+                    }
+                }
+                smooth.vertexNormals[j] = Add(smooth.vertexNormals[j], otherNormal);
+                if (std::find(smooth.neighbours.begin(), smooth.neighbours.end(), g) == smooth.neighbours.end())
+                    smooth.neighbours.push_back(g);
+            }
+        }
+        if (face.numEdges > 0)
+            smooth.centre = Scale(centre, 1.0f / static_cast<float>(face.numEdges));
+        for (Float3& vertexNormal : smooth.vertexNormals) {
+            vertexNormal = Normalize(Add(vertexNormal, normal));
+            smooth.flat = smooth.flat && Dot(normal, vertexNormal) >= 1.0f - 0.001f;
+        }
+    }
+    return result;
+}
+
+// GetPhongNormal in src/utils/vrad/lightmap.cpp: on a face that is not flat, the normal at `spot` blends the face
+// normal with the vertex normals of the edge whose wedge from the vertex centre holds it.
+Float3 PhongNormal(const Lumps& lumps, const Face& face, const FaceSmoothing& smooth, Float3 normal, Float3 spot)
+{
+    if (smooth.flat)
+        return normal;
+    for (int j = 0; j < face.numEdges; ++j) {
+        const int64_t vertex1 = EdgeVertex(lumps, face, j);
+        const int64_t vertex2 = EdgeVertex(lumps, face, j + 1);
+        if (vertex1 < 0 || vertex2 < 0)
+            continue;
+        const Float3 v1 = Sub(lumps.vertices[vertex1], smooth.centre);
+        const Float3 v2 = Sub(lumps.vertices[vertex2], smooth.centre);
+        const Float3 at = Sub(spot, smooth.centre);
+        const float aa = Dot(v1, v1);
+        const float bb = Dot(v2, v2);
+        const float ab = Dot(v1, v2);
+        const float a1 = (bb * Dot(v1, at) - ab * Dot(at, v2)) / (aa * bb - ab * ab);
+        const float a2 = (Dot(at, v2) - a1 * ab) / bb;
+        if (a1 >= 0.0f && a2 >= 0.0f) {
+            const Float3& n1 = smooth.vertexNormals[j];
+            const Float3& n2 = smooth.vertexNormals[(j + 1) % face.numEdges];
+            return Normalize(Add(Add(Scale(normal, 1.0f - a1 - a2), Scale(n1, a1)), Scale(n2, a2)));
+        }
+    }
+    return normal;
 }
 
 // Adds the style-0 lightmap of a world face to `lumps.baked` and returns its index, or kNoFace when the face has
 // none. Flat faces (their `polygon`) also get their luxels to bake, sampled as VRAD sampled them (CalcFaceVectors,
-// BuildFacesamples and LuxelSpaceToWorld in src/utils/vrad/lightmap.cpp and radial.cpp); displacements add theirs in
-// AddDisplacement.
+// BuildFacesamples, LuxelSpaceToWorld and ComputeIlluminationPointAndNormalsSSE in src/utils/vrad/lightmap.cpp and
+// radial.cpp), and a FaceSampling for WeightLuxels; displacements add theirs in AddDisplacement.
 uint32_t AddFaceLightmap(const Lumps& lumps, size_t faceIndex, std::span<const Float3> polygon)
 {
     if (lumps.baked == nullptr || lumps.baked->samples.empty() || faceIndex >= lumps.lightFaces.size())
@@ -432,56 +598,134 @@ uint32_t AddFaceLightmap(const Lumps& lumps, size_t faceIndex, std::span<const F
     lightmap.tangentS = Normalize(Cross(lightmap.tangentT, plane.normal));
     if (leftHanded)
         lightmap.tangentT = Scale(lightmap.tangentT, -1.0f);
-    const uint32_t index = static_cast<uint32_t>(lumps.baked->faces.size());
-    lumps.baked->faces.push_back(lightmap);
-    if (polygon.empty())
-        return index;
-
     const auto& w = texinfo.lightmapVecs;
     const Float3 w0 = {w[0][0], w[0][1], w[0][2]};
     const Float3 w1 = {w[1][0], w[1][1], w[1][2]};
     const Float3 cross = {w[1][1] * w[0][2] - w[1][2] * w[0][1], w[1][2] * w[0][0] - w[1][0] * w[0][2], w[1][0] * w[0][1] - w[1][1] * w[0][0]};
     const float det = -Dot(plane.normal, cross);
-    if (std::fabs(det) < 1e-20f)
-        return index;
     const Float3& n = plane.normal;
-    const Float3 toWorld0 = {(n.z * w1.y - n.y * w1.z) / det, (n.x * w1.z - n.z * w1.x) / det, (n.y * w1.x - n.x * w1.y) / det};
-    const Float3 toWorld1 = {(n.y * w0.z - n.z * w0.y) / det, (n.z * w0.x - n.x * w0.z) / det, (n.x * w0.y - n.y * w0.x) / det};
-    Float3 origin = Scale(cross, -plane.distance / det);
-    origin = Add(origin, Scale(toWorld0, -w[0][3]));
-    origin = Add(origin, Scale(toWorld1, -w[1][3]));
-    const auto toWorld = [&](float s, float t) {
-        return Add(Add(origin, Scale(toWorld0, s + static_cast<float>(face.lightmapMins[0]))), Scale(toWorld1, t + static_cast<float>(face.lightmapMins[1])));
-    };
+    const bool mapped = std::fabs(det) >= 1e-20f;
+    if (mapped) {
+        lightmap.luxelS = {(n.z * w1.y - n.y * w1.z) / det, (n.x * w1.z - n.z * w1.x) / det, (n.y * w1.x - n.x * w1.y) / det};
+        lightmap.luxelT = {(n.y * w0.z - n.z * w0.y) / det, (n.z * w0.x - n.x * w0.z) / det, (n.x * w0.y - n.y * w0.x) / det};
+    }
+    const uint32_t index = static_cast<uint32_t>(lumps.baked->faces.size());
+    lumps.baked->faces.push_back(lightmap);
+    if (polygon.empty() || !mapped)
+        return index;
+
+    FaceSampling sampling;
+    sampling.face = static_cast<uint32_t>(faceIndex);
+    sampling.lightmap = index;
+    sampling.firstLuxel = lumps.baked->luxels.size();
+    sampling.width = width;
+    sampling.height = height;
+    sampling.toWorldS = lightmap.luxelS;
+    sampling.toWorldT = lightmap.luxelT;
+    sampling.origin = Scale(cross, -plane.distance / det);
+    sampling.origin = Add(sampling.origin, Scale(lightmap.luxelS, -w[0][3] + static_cast<float>(face.lightmapMins[0])));
+    sampling.origin = Add(sampling.origin, Scale(lightmap.luxelT, -w[1][3] + static_cast<float>(face.lightmapMins[1])));
     std::vector<Float2> outline;
     for (const Float3& p : polygon)
         outline.push_back(FaceLuxel(lumps, face, p));
-    std::vector<LuxelCell> cells(luxels);
+    const float partialBelow = 1.0f - 0.001f * std::sqrt(Dot(w0, w0)) * std::sqrt(Dot(w1, w1));
+    sampling.cells.resize(luxels);
     for (uint32_t y = 0; y < height; ++y) {
         for (uint32_t x = 0; x < width; ++x)
-            cells[y * width + x] = ClipLuxelCell(outline, x, y);
+            sampling.cells[y * width + x] = ClipLuxelCell(outline, x, y, partialBelow);
     }
+    const FaceSmoothing& smooth = (*lumps.smoothing)[faceIndex];
+    const Face& geometry = lumps.faces[faceIndex];
     for (uint32_t y = 0; y < height; ++y) {
         for (uint32_t x = 0; x < width; ++x) {
-            const LuxelCell& own = cells[y * width + x];
-            BakeLuxel luxel = {own.sampled ? toWorld(own.centroid.u, own.centroid.v) : toWorld(static_cast<float>(x), static_cast<float>(y)), index,
-                plane.normal, y * width + x};
-            // The cells at (x - 1, y - 1), (x, y - 1), (x - 1, y) and (x, y): no other cell's sample reaches the luxel.
-            std::array<float, 4> weights = {};
-            float total = 0.0f;
-            for (int k = 0; k < 4; ++k) {
-                const int cx = static_cast<int>(x) - 1 + (k & 1);
-                const int cy = static_cast<int>(y) - 1 + (k >> 1);
-                if (cx >= 0 && cy >= 0)
-                    weights[k] = RadialWeight(cells[cy * width + cx], static_cast<float>(x), static_cast<float>(y));
-                total += weights[k];
-            }
-            for (int k = 0; k < 4; ++k)
-                luxel.weights[k] = total > 0.0f ? static_cast<uint16_t>(std::lround(weights[k] / total * 65535.0f)) : 0;
+            const LuxelCell& own = sampling.cells[y * width + x];
+            const Float3 position = own.sampled ? sampling.ToWorld(own.centroid) : sampling.ToWorld({static_cast<float>(x), static_cast<float>(y)});
+            BakeLuxel luxel = {position, index, PhongNormal(lumps, geometry, smooth, plane.normal, position), y * width + x};
+            luxel.subsamples = own.sampled ? own.subsamples | 0x80000000u : 0;
             lumps.baked->luxels.push_back(luxel);
         }
     }
+    lumps.sampling->push_back(std::move(sampling));
     return index;
+}
+
+// The luxels' weights: VRAD's radial filter mixes into each luxel the samples of its face's four cells around it and
+// those of the neighbouring faces whose bounds reach it (BuildLuxelRadial and AddDirectToRadial in
+// src/utils/vrad/radial.cpp), each by RadialWeight, normalised over them all.
+void WeightLuxels(const Lumps& lumps, std::span<const FaceSmoothing> smoothing, std::span<const FaceSampling> sampling)
+{
+    BakedLighting& baked = *lumps.baked;
+    std::vector<int32_t> samplingOf(lumps.faces.size(), -1);
+    for (size_t i = 0; i < sampling.size(); ++i)
+        samplingOf[sampling[i].face] = static_cast<int32_t>(i);
+    constexpr uint32_t kUnset = 0xFFFFFFFFu;
+    for (BakeLuxel& luxel : baked.luxels)
+        luxel.neighbourEnd = kUnset;
+    std::vector<std::vector<BakeNeighbour>> reached;
+    for (const FaceSampling& own : sampling) {
+        const Face& face = lumps.lightFaces[own.face];
+        const uint32_t width = own.width;
+        const uint32_t height = own.height;
+        reached.assign(static_cast<size_t>(width) * height, {});
+        for (uint32_t g : smoothing[own.face].neighbours) {
+            if (samplingOf[g] < 0)
+                continue;
+            const FaceSampling& other = sampling[samplingOf[g]];
+            for (uint32_t c = 0; c < other.cells.size(); ++c) {
+                const LuxelCell& cell = other.cells[c];
+                if (!cell.sampled)
+                    continue;
+                const Float2 coord = FaceLuxel(lumps, face, other.ToWorld(cell.centroid));
+                const Float2 mins = FaceLuxel(lumps, face, other.ToWorld(cell.mins));
+                const Float2 maxs = FaceLuxel(lumps, face, other.ToWorld(cell.maxs));
+                const int sMin = std::max(static_cast<int>(mins.u), 0);
+                const int tMin = std::max(static_cast<int>(mins.v), 0);
+                const int sMax = std::min(static_cast<int>(maxs.u + 0.9999f) + 1, static_cast<int>(width));
+                const int tMax = std::min(static_cast<int>(maxs.v + 0.9999f) + 1, static_cast<int>(height));
+                for (int ls = sMin; ls < sMax; ++ls) {
+                    for (int lt = tMin; lt < tMax; ++lt) {
+                        const float weight = RadialWeight(coord, mins, maxs, static_cast<float>(ls), static_cast<float>(lt));
+                        if (weight > 0.0f)
+                            reached[static_cast<size_t>(lt) * width + ls].push_back({other.lightmap, c, weight, 0});
+                    }
+                }
+            }
+        }
+        for (uint32_t y = 0; y < height; ++y) {
+            for (uint32_t x = 0; x < width; ++x) {
+                BakeLuxel& luxel = baked.luxels[own.firstLuxel + y * width + x];
+                // The cells at (x - 1, y - 1), (x, y - 1), (x - 1, y) and (x, y): no other cell of the face reaches the luxel.
+                std::array<float, 4> weights = {};
+                float total = 0.0f;
+                for (int k = 0; k < 4; ++k) {
+                    const int cx = static_cast<int>(x) - 1 + (k & 1);
+                    const int cy = static_cast<int>(y) - 1 + (k >> 1);
+                    if (cx < 0 || cy < 0)
+                        continue;
+                    const LuxelCell& cell = own.cells[cy * width + cx];
+                    if (cell.sampled)
+                        weights[k] = RadialWeight(cell.centroid, cell.mins, cell.maxs, static_cast<float>(x), static_cast<float>(y));
+                    total += weights[k];
+                }
+                std::vector<BakeNeighbour>& others = reached[y * width + x];
+                for (const BakeNeighbour& other : others)
+                    total += other.weight;
+                for (int k = 0; k < 4; ++k)
+                    luxel.weights[k] = total > 0.0f ? static_cast<uint16_t>(std::lround(weights[k] / total * 65535.0f)) : 0;
+                for (BakeNeighbour& other : others) {
+                    other.weight /= total;
+                    baked.neighbours.push_back(other);
+                }
+                luxel.neighbourEnd = static_cast<uint32_t>(baked.neighbours.size());
+            }
+        }
+    }
+    uint32_t end = 0;
+    for (BakeLuxel& luxel : baked.luxels) {
+        if (luxel.neighbourEnd == kUnset)
+            luxel.neighbourEnd = end;
+        end = luxel.neighbourEnd;
+    }
 }
 
 uint32_t PackUnorm(Float3 c)
@@ -1333,6 +1577,10 @@ bool LoadWorld(std::span<const std::byte> file, WorldGeometry& world, std::strin
         lumps.planes = *planeLump;
     lumps.baked = &world.baked;
     ReadLighting(file, header, lumps, world.baked);
+    const std::vector<FaceSmoothing> smoothing = PairEdges(lumps);
+    std::vector<FaceSampling> sampling;
+    lumps.smoothing = &smoothing;
+    lumps.sampling = &sampling;
     // The scaled-down 3D skybox scene is world geometry placed outside the playable space; it must not
     // occlude the main view's rays, so faces and props in the sky camera's area are kept apart.
     const std::optional<AreaLocator> areas = MakeAreaLocator(file, header);
@@ -1394,6 +1642,8 @@ bool LoadWorld(std::span<const std::byte> file, WorldGeometry& world, std::strin
         AddPolygon(world.mesh, lumps, face, polygon, AddFaceLightmap(lumps, static_cast<size_t>(f), polygon));
         ++world.faceCount;
     }
+    if (!world.baked.luxels.empty())
+        WeightLuxels(lumps, smoothing, sampling);
 
     world.brushModels.resize(models->size());
     for (size_t m = 1; m < models->size(); ++m) {

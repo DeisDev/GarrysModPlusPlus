@@ -525,6 +525,7 @@ bool Scene::LoadBaked(const bsp::BakedLighting& baked, std::span<const BakedTria
     m_baked.samplesView = upload(samples.data(), samples.size() * sizeof(uint32_t));
     m_baked.facesView = upload(baked.faces.data(), baked.faces.size() * sizeof(bsp::FaceLightmap));
     m_baked.luxelsView = upload(baked.luxels.data(), baked.luxels.size() * sizeof(bsp::BakeLuxel));
+    m_baked.neighboursView = upload(baked.neighbours.data(), baked.neighbours.size() * sizeof(bsp::BakeNeighbour));
     std::vector<uint32_t> leafAmbient;
     for (const auto& [first, count] : baked.leafAmbient)
         leafAmbient.insert(leafAmbient.end(), {first, count});
@@ -562,7 +563,7 @@ bool Scene::LoadBaked(const bsp::BakedLighting& baked, std::span<const BakedTria
     }
     m_baked.ambientSampleCount = static_cast<UINT>(baked.ambientSamples.size());
     m_baked.ambientLightCount = static_cast<UINT>(baked.ambientLights.size());
-    m_bakedCounters = CreateBuffer(16 + ((baked.faces.size() * 4 + 15) & ~size_t(15)), D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+    m_bakedCounters = CreateBuffer(32 + ((baked.faces.size() * 4 + 15) & ~size_t(15)), D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     m_bakedFaces.assign(baked.faces.size(), BakedFaceInfo{});
     std::vector<bool> placed(baked.faces.size(), false);
@@ -573,7 +574,8 @@ bool Scene::LoadBaked(const bsp::BakedLighting& baked, std::span<const BakedTria
         }
     }
     const bool uploaded = m_baked.samplesView != DescriptorHeap::kInvalid && m_baked.facesView != DescriptorHeap::kInvalid &&
-        m_baked.luxelsView != DescriptorHeap::kInvalid && m_baked.leafAmbientView != DescriptorHeap::kInvalid &&
+        m_baked.luxelsView != DescriptorHeap::kInvalid && m_baked.neighboursView != DescriptorHeap::kInvalid &&
+        m_baked.leafAmbientView != DescriptorHeap::kInvalid &&
         m_baked.ambientSamplesView != DescriptorHeap::kInvalid && m_baked.ambientLightsView != DescriptorHeap::kInvalid &&
         (cached || ambientBytes == 0 || m_baked.ambientSamplesUav != DescriptorHeap::kInvalid) && trianglesView != DescriptorHeap::kInvalid;
     if (!uploaded || !m_bakedResidual || !m_bakedFiltered || !m_bakedCounters || !Submit()) {
@@ -592,7 +594,7 @@ bool Scene::LoadBaked(const bsp::BakedLighting& baked, std::span<const BakedTria
     m_baked.leafCount = static_cast<UINT>(baked.leafAmbient.size());
     m_baked.trianglesView = trianglesView;
     if (cached) {
-        m_baked.bakedLuxels = m_baked.luxelCount;
+        m_baked.stage = BakedBuffers::Stage::Gather;
         m_baked.filtered = true;
         log::Info("Scene: the baked light's residual was loaded from the cache");
     }
@@ -603,7 +605,7 @@ bool Scene::LoadBaked(const bsp::BakedLighting& baked, std::span<const BakedTria
 
 void Scene::Clear()
 {
-    for (UINT* view : {&m_baked.samplesView, &m_baked.facesView, &m_baked.trianglesView, &m_baked.luxelsView, &m_baked.leafAmbientView,
+    for (UINT* view : {&m_baked.samplesView, &m_baked.facesView, &m_baked.trianglesView, &m_baked.luxelsView, &m_baked.neighboursView, &m_baked.leafAmbientView,
              &m_baked.ambientSamplesView, &m_baked.ambientSamplesUav, &m_baked.ambientLightsView, &m_baked.residualView, &m_baked.residualUav, &m_baked.filteredView, &m_baked.filteredUav, &m_baked.countersUav}) {
         if (*view != DescriptorHeap::kInvalid)
             m_descriptors->Free(*view);

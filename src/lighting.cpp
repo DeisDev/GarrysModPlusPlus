@@ -153,6 +153,8 @@ constexpr uint32_t kTimingSamples = 120;
 constexpr UINT kProbeBytes = 32;
 // Luxels the residual bake handles per main view, which keeps each part well below the GPU timeout.
 constexpr UINT kBakeLuxelsPerView = 1 << 17;
+// VRAD's extrapasses: rounds of supersampling at light gradients.
+constexpr UINT kSupersamplePasses = 4;
 constexpr UINT kMaxGroups = 65535;
 
 unsigned Hex(HRESULT hr) { return static_cast<unsigned>(hr); }
@@ -949,19 +951,41 @@ void Lighting::BakeStep(Scene& scene, const FrameConstants& constants, D3D12_GPU
     bake.sunColor[2] = sun.color.z;
     m_list->SetComputeRootConstantBufferView(0, m_bakeConstants->GetGPUVirtualAddress());
     const D3D12_RESOURCE_BARRIER countersBarrier = {D3D12_RESOURCE_BARRIER_TYPE_UAV, D3D12_RESOURCE_BARRIER_FLAG_NONE, {.UAV = {scene.BakedCounters()}}};
-    if (baked.bakedLuxels < baked.luxelCount) {
+    // Until the gather, the filtered buffer holds each sample's direct light and the residual buffer the supersampling
+    // state.
+    const D3D12_RESOURCE_BARRIER bakeBarriers[] = {
+        {D3D12_RESOURCE_BARRIER_TYPE_UAV, D3D12_RESOURCE_BARRIER_FLAG_NONE, {.UAV = {scene.BakedFiltered()}}},
+        {D3D12_RESOURCE_BARRIER_TYPE_UAV, D3D12_RESOURCE_BARRIER_FLAG_NONE, {.UAV = {scene.BakedResidual()}}},
+    };
+    const D3D12_RESOURCE_BARRIER& directBarrier = bakeBarriers[0];
+    if (baked.stage == BakedBuffers::Stage::Direct || baked.stage == BakedBuffers::Stage::Supersample) {
+        const bool direct = baked.stage == BakedBuffers::Stage::Direct;
+        if (baked.bakedLuxels == 0)
+            m_list->ResourceBarrier(2, bakeBarriers);
         const UINT count = std::min(kBakeLuxelsPerView, baked.luxelCount - baked.bakedLuxels);
-        // The filtered buffer holds each sample's direct light until the filter overwrites it.
         DispatchGroups(Pass::Baked, {.input0 = baked.luxelsView, .input2 = baked.facesView, .input3 = baked.bakedLuxels, .input4 = count,
-            .output0 = baked.filteredUav, .step = 0}, (count + 63) / 64, 1, 1);
+            .output0 = baked.filteredUav, .output1 = baked.residualUav, .output2 = baked.countersUav, .step = direct ? 0u : 5u}, (count + 63) / 64, 1, 1);
         baked.bakedLuxels += count;
+        if (baked.bakedLuxels == baked.luxelCount) {
+            baked.bakedLuxels = 0;
+            baked.stage = direct || ++baked.supersamplePass < kSupersamplePasses ? BakedBuffers::Stage::Mark : BakedBuffers::Stage::Gather;
+        }
+    } else if (baked.stage == BakedBuffers::Stage::Mark) {
+        m_list->ResourceBarrier(2, bakeBarriers);
+        for (UINT first = 0; first < baked.luxelCount; first += kMaxGroups * 64) {
+            const UINT count = std::min(kMaxGroups * 64, baked.luxelCount - first);
+            DispatchGroups(Pass::Baked, {.input0 = baked.luxelsView, .input2 = baked.facesView, .input3 = first, .input4 = count,
+                .output0 = baked.filteredUav, .output1 = baked.residualUav, .step = 4}, (count + 63) / 64, 1, 1);
+        }
+        baked.stage = BakedBuffers::Stage::Supersample;
     } else {
-        const D3D12_RESOURCE_BARRIER directBarrier = {D3D12_RESOURCE_BARRIER_TYPE_UAV, D3D12_RESOURCE_BARRIER_FLAG_NONE, {.UAV = {scene.BakedFiltered()}}};
-        m_list->ResourceBarrier(1, &directBarrier);
+        m_list->ResourceBarrier(2, bakeBarriers);
+        m_list->ResourceBarrier(1, &countersBarrier);
         for (UINT first = 0; first < baked.luxelCount; first += kMaxGroups * 64) {
             const UINT count = std::min(kMaxGroups * 64, baked.luxelCount - first);
             DispatchGroups(Pass::Baked, {.input0 = baked.luxelsView, .input1 = baked.samplesView, .input2 = baked.facesView, .input3 = first, .input4 = count,
-                .output0 = baked.residualUav, .output1 = baked.countersUav, .output2 = baked.filteredUav, .step = 3}, (count + 63) / 64, 1, 1);
+                .output0 = baked.residualUav, .output1 = baked.countersUav, .output2 = baked.filteredUav, .output3 = baked.neighboursView, .step = 3},
+                (count + 63) / 64, 1, 1);
         }
         const D3D12_RESOURCE_BARRIER gathered[] = {
             Transition(scene.BakedResidual(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
@@ -1732,23 +1756,24 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     if (m_bakeLogPending) {
         m_bakeLogPending = false;
         WaitForGpu();
-        uint32_t counters[4] = {};
+        uint32_t counters[8] = {};
         const std::vector<Scene::BakedFaceInfo>& faces = scene.BakedFaces();
         std::vector<uint32_t> faceClamps(faces.size());
         void* mapped = nullptr;
         const D3D12_RANGE range = {0, static_cast<SIZE_T>(m_bakeReadback->GetDesc().Width)};
         if (SUCCEEDED(m_bakeReadback->Map(0, &range, &mapped))) {
             std::memcpy(counters, mapped, sizeof(counters));
-            if (16 + faceClamps.size() * 4 <= range.End)
-                std::memcpy(faceClamps.data(), static_cast<const std::byte*>(mapped) + 16, faceClamps.size() * 4);
+            if (32 + faceClamps.size() * 4 <= range.End)
+                std::memcpy(faceClamps.data(), static_cast<const std::byte*>(mapped) + 32, faceClamps.size() * 4);
             const D3D12_RANGE written = {0, 0};
             m_bakeReadback->Unmap(0, &written);
         }
         const UINT luxels = std::max(scene.Baked().luxelCount, 1u);
         const UINT sampled = std::max(scene.Baked().luxelCount - std::min(counters[2], scene.Baked().luxelCount), 1u);
         log::Info("Baked light: {} of {} sampled luxels clamped where the recomputed direct light exceeded the baked light ({:.1f}%), {} without a VRAD "
-                  "sample; the filter changed {} ({:.1f}%) by more than a tenth; {} of {} leaf ambient samples clamped after taking out {} surface lights",
-            counters[0], sampled, 100.0 * counters[0] / sampled, counters[2], counters[1], 100.0 * counters[1] / luxels, counters[3],
+                  "sample, {} samples supersampled; the filter changed {} ({:.1f}%) by more than a tenth; {} of {} leaf ambient samples clamped after "
+                  "taking out {} surface lights",
+            counters[0], sampled, 100.0 * counters[0] / sampled, counters[2], counters[4], counters[1], 100.0 * counters[1] / luxels, counters[3],
             scene.Baked().ambientSampleCount, scene.Baked().ambientLightCount);
         std::vector<uint32_t> order(faceClamps.size());
         std::iota(order.begin(), order.end(), 0u);
