@@ -129,7 +129,9 @@ bool IsUnlitMaterial(void* material)
     const char* shader = Slot<const char*(__fastcall*)(void*)>(material, kGetShaderNameSlot)(material);
     std::string name = shader != nullptr ? shader : "";
     std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    entry->second = name == "unlitgeneric" || name == "unlittwotexture" || name == "monitorscreen";
+    // Shaders with DirectX 9 versions are named after them (UnlitTwoTexture_DX9, MonitorScreen_DX9).
+    const std::string base = name.substr(0, name.find("_dx"));
+    entry->second = base == "unlitgeneric" || base == "unlittwotexture" || base == "monitorscreen";
     if (GetOptions().devMode && entry->second && g_loggedMaterials < 8) {
         ++g_loggedMaterials;
         const char* materialName = Slot<const char*(__fastcall*)(void*)>(material, kGetMaterialNameSlot)(material);

@@ -69,6 +69,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Fixed UnlitTwoTexture and MonitorScreen materials being lit in the native renderer.
 - Fixed jagged shadow shards on characters where their surface turns away from a light.
 - Fixed bright green or white specks in the lighting, most visible with DLSS.
 - Fixed signs, screens and other unlit materials being lit.
