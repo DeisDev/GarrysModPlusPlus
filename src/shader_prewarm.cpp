@@ -4,6 +4,7 @@
 #include "shader_cache.h"
 #include "shader_compiler.h"
 #include "shader_translator.h"
+#include "shader_twins.h"
 #include "vcs.h"
 #include "vpk.h"
 
@@ -52,7 +53,7 @@ std::optional<std::string> MarkerText(const std::filesystem::path& gameDirectory
     const auto time = std::filesystem::last_write_time(vpk, error);
     if (error)
         return std::nullopt;
-    return std::format("{} {} {}", shader_cache::kTranslatorVersion, size, time.time_since_epoch().count());
+    return std::format("{} {} {} {:016x}", shader_cache::kTranslatorVersion, size, time.time_since_epoch().count(), twins::SourceHash());
 }
 
 struct FileResult {
@@ -64,8 +65,13 @@ struct FileResult {
 
 struct FileWork {
     std::string name;
+    vcs::Header header = {};
     std::vector<vcs::Combo> combos;
     std::vector<const vcs::Combo*> work;
+    // The shipped combos (static, dynamic) whose G-buffer twin (shader_twins.h) is compiled after the game's combos;
+    // many share one twin.
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> twinCombos;
+    size_t Items() const { return work.size() + twinCombos.size(); }
     size_t next = 0;
     std::atomic<size_t> remaining = 0;
     FileResult result;
@@ -92,6 +98,14 @@ std::optional<translator::Variant> CompressedVariant(const translator::Translati
         }
     }
     return normal ? std::optional(variant) : std::nullopt;
+}
+
+std::vector<std::pair<std::uint32_t, std::uint32_t>> TwinCombos(const std::vector<vcs::Combo>& combos)
+{
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> result;
+    for (const vcs::Combo& combo : combos)
+        result.emplace_back(combo.staticCombo, combo.dynamicCombo);
+    return result;
 }
 
 std::vector<const vcs::Combo*> UniqueCombos(const std::vector<vcs::Combo>& combos)
@@ -142,10 +156,9 @@ void PrewarmShaders(const std::filesystem::path& gameDirectory, const std::files
         if (entry.path.starts_with(kShaderDirectory) && entry.path.ends_with(".vcs"))
             files.push_back(&entry);
     }
-    auto readCombos = [&](const Vpk::Entry& entry, std::vector<vcs::Combo>& combos) {
+    auto readCombos = [&](const Vpk::Entry& entry, std::vector<vcs::Combo>& combos, vcs::Header& header) {
         std::string reason;
         auto bytes = vpk.Read(entry, reason);
-        vcs::Header header;
         if (bytes && vcs::ReadCombos(*bytes, header, combos, reason))
             return true;
         log::Info("Shader prewarm: {}: {}", entry.path, reason);
@@ -154,8 +167,12 @@ void PrewarmShaders(const std::filesystem::path& gameDirectory, const std::files
     size_t total = 0;
     for (const Vpk::Entry* entry : files) {
         std::vector<vcs::Combo> combos;
-        if (readCombos(*entry, combos))
+        vcs::Header header;
+        if (readCombos(*entry, combos, header)) {
             total += UniqueCombos(combos).size();
+            if (twins::HasTwin(entry->path.substr(kShaderDirectory.size())))
+                total += combos.size();
+        }
         if (progress.cancel)
             return;
     }
@@ -208,6 +225,9 @@ void PrewarmShaders(const std::filesystem::path& gameDirectory, const std::files
                 file.result.compileFailures.load(), file.result.firstError);
     };
 
+    // Twins already built: shipped combos share them (twins::GBufferShader keeps each twin at one address).
+    std::mutex twinsMutex;
+    std::unordered_set<const DWORD*> builtTwins;
     std::mutex queueMutex;
     std::condition_variable queueChanged;
     std::deque<std::shared_ptr<FileWork>> queue;
@@ -215,12 +235,14 @@ void PrewarmShaders(const std::filesystem::path& gameDirectory, const std::files
     std::jthread reader([&] {
         for (const Vpk::Entry* entry : files) {
             auto file = std::make_shared<FileWork>();
-            if (!readCombos(*entry, file->combos))
+            if (!readCombos(*entry, file->combos, file->header))
                 continue;
             file->name = entry->path.substr(kShaderDirectory.size());
             file->work = UniqueCombos(file->combos);
-            file->remaining = file->work.size();
-            if (file->work.empty())
+            if (twins::HasTwin(file->name))
+                file->twinCombos = TwinCombos(file->combos);
+            file->remaining = file->Items();
+            if (file->Items() == 0)
                 continue;
             std::unique_lock lock(queueMutex);
             queueChanged.wait(lock, [&] { return queue.size() < kFilesAhead || progress.cancel; });
@@ -245,10 +267,29 @@ void PrewarmShaders(const std::filesystem::path& gameDirectory, const std::files
                     break;
                 file = queue.front();
                 index = file->next++;
-                if (file->next == file->work.size()) {
+                if (file->next == file->Items()) {
                     queue.pop_front();
                     queueChanged.notify_all();
                 }
+            }
+            if (index >= file->work.size()) {
+                const auto [staticCombo, dynamicCombo] = file->twinCombos[index - file->work.size()];
+                const std::span<const DWORD> twin = twins::GBufferShader(file->name, file->header,
+                    static_cast<int>(staticCombo) * std::max(file->header.dynamicCombos, 1), static_cast<int>(dynamicCombo));
+                bool first = false;
+                if (!twin.empty()) {
+                    std::scoped_lock lock(twinsMutex);
+                    first = builtTwins.insert(twin.data()).second;
+                }
+                if (first) {
+                    translator::Translation translation;
+                    bool available = false;
+                    build(*file, vcs::Combo{ staticCombo, dynamicCombo, std::vector<DWORD>(twin.begin(), twin.end()) }, {}, translation, available);
+                }
+                ++progress.done;
+                if (--file->remaining == 0)
+                    finish(*file);
+                continue;
             }
             const vcs::Combo& combo = *file->work[index];
             translator::Translation translation;

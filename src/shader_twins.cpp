@@ -13,6 +13,7 @@
 #include <format>
 #include <fstream>
 #include <map>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <tuple>
@@ -50,6 +51,10 @@ struct Family {
     std::uint32_t sourceCrc32;
     // Combos the twin leaves to the game's shader.
     bool (*keepGame)(const Values& values);
+    // Dynamic combos the G-buffer output does not depend on (lights, fog, alpha writes, envmap contrast), compiled as
+    // 0 so their combos share one twin. LIGHTING_PREVIEW is always 0: the game binds its preview combos during a
+    // capture, whose pow(x, 2.2) would convert the sRGB-decoded textures again.
+    std::string_view ignoredDynamics;
 };
 
 // Flashlight passes are skipped in real-time mode; GMod's lightmap switch is not in the twin yet; unlit combos keep
@@ -67,12 +72,14 @@ bool KeepNone(const Values&) { return false; }
 
 constexpr Family kFamilies[] = {
     { "vertexlit_and_unlit_generic_ps20b", "vertexlit_and_unlit_generic_ps2x.fxc", "ps20b", "ps_2_b", "SHADER_MODEL_PS_2_B", 377487360, 12, 0x6e13aa07,
-        &KeepVertexLitGeneric },
+        &KeepVertexLitGeneric, "" },
     { "vertexlit_and_unlit_generic_bump_ps20b", "vertexlit_and_unlit_generic_bump_ps2x.fxc", "ps20b", "ps_2_b", "SHADER_MODEL_PS_2_B", 860160, 20,
-        0x7df2bfaa, &KeepBump },
-    { "skin_ps20b", "skin_ps20b.fxc", "ps20b", "ps_2_b", "SHADER_MODEL_PS_2_B", 6881280, 80, 0xa7b42ee9, &KeepSkin },
+        0x7df2bfaa, &KeepBump, "NUM_LIGHTS AMBIENT_LIGHT" },
+    { "skin_ps20b", "skin_ps20b.fxc", "ps20b", "ps_2_b", "SHADER_MODEL_PS_2_B", 6881280, 80, 0xa7b42ee9, &KeepSkin,
+        "WRITEWATERFOGTODESTALPHA PIXELFOGTYPE NUM_LIGHTS WRITE_DEPTH_TO_DESTALPHA" },
     // GMod's total of 2,717,908,992 combos wraps in the header's 32-bit signed field.
-    { "lightmappedgeneric_ps30", "lightmappedgeneric_ps2x.fxc", "ps30", "ps_3_0", "SHADER_MODEL_PS_3_0", -1577058304, 96, 0x3b558d77, &KeepNone },
+    { "lightmappedgeneric_ps30", "lightmappedgeneric_ps2x.fxc", "ps30", "ps_3_0", "SHADER_MODEL_PS_3_0", -1577058304, 96, 0x3b558d77, &KeepNone,
+        "FASTPATHENVMAPCONTRAST WRITEWATERFOGTODESTALPHA PIXELFOGTYPE WRITE_DEPTH_TO_DESTALPHA" },
 };
 
 std::filesystem::path TwinDirectory() { return GetOptions().gameDirectory / L"bin" / L"win64" / L"gmodpp" / L"twins"; }
@@ -231,19 +238,20 @@ LoadedFamily* FamilyFor(std::string_view file, const vcs::Header& header)
             header.dynamicCombos, header.totalCombos);
         return nullptr;
     }
-    std::vector<std::filesystem::path> files;
-    std::error_code error;
-    for (const auto& item : std::filesystem::directory_iterator(TwinDirectory(), error))
-        files.push_back(item.path());
-    std::sort(files.begin(), files.end());
-    entry.contentHash = Fnv(family->profile);
-    for (const std::filesystem::path& path : files) {
-        std::string text;
-        if (ReadText(path, text))
-            entry.contentHash = Fnv(text, Fnv(path.filename().string(), entry.contentHash));
-    }
+    entry.contentHash = Fnv(family->profile, SourceHash());
     entry.usable = Compiler() != nullptr;
     return entry.usable ? &entry : nullptr;
+}
+
+std::uint64_t Encode(const std::vector<Switch>& switches, const Values& values)
+{
+    std::uint64_t index = 0;
+    std::uint64_t stride = 1;
+    for (const Switch& s : switches) {
+        index += static_cast<std::uint64_t>(ValueOf(values, s.name) - s.low) * stride;
+        stride *= static_cast<std::uint64_t>(s.count);
+    }
+    return index;
 }
 
 void Decode(std::uint64_t index, const std::vector<Switch>& switches, Values& values)
@@ -304,38 +312,71 @@ bool Compile(LoadedFamily& entry, const Values& values, std::vector<DWORD>& code
 
 std::span<const DWORD> GBufferShader(std::string_view file, const vcs::Header& header, int staticIndex, int dynamicIndex)
 {
-    LoadedFamily* entry = FamilyFor(file, header);
+    // The prewarm compiles twins on worker threads while nothing draws; the render thread uses them alone later.
+    static std::mutex mutex;
+    static std::map<std::tuple<const LoadedFamily*, int, int>, std::vector<DWORD>> compiled;
+    LoadedFamily* entry = nullptr;
+    {
+        std::scoped_lock lock(mutex);
+        entry = FamilyFor(file, header);
+    }
     if (entry == nullptr || staticIndex < 0 || dynamicIndex < 0)
         return {};
-    static std::map<std::tuple<const LoadedFamily*, int, int>, std::vector<DWORD>> compiled;
-    const auto key = std::tuple(static_cast<const LoadedFamily*>(entry), staticIndex, dynamicIndex);
-    auto found = compiled.find(key);
-    if (found == compiled.end()) {
-        Values values;
-        Decode(static_cast<std::uint64_t>(dynamicIndex), entry->dynamics, values);
-        Decode(static_cast<std::uint64_t>(staticIndex) / static_cast<std::uint64_t>(std::max(header.dynamicCombos, 1)), entry->statics, values);
-        // The game binds its lighting preview combos during a capture; a twin is the shader's real path with its own
-        // outputs, and the preview path's pow(x, 2.2) would convert the already sRGB-decoded textures again.
-        if (values.contains("LIGHTING_PREVIEW"))
-            values["LIGHTING_PREVIEW"] = 0;
-        std::vector<DWORD> code;
-        if (!entry->family->keepGame(values)) {
-            std::string error;
-            if (!Compile(*entry, values, code, error) && !entry->loggedFailure) {
-                entry->loggedFailure = true;
-                // The compiler lists warnings before the error.
-                const size_t at = error.find("error");
-                const size_t line = at == std::string::npos ? 0 : error.rfind('\n', at) + 1;
-                log::Info("Twins: compiling {} for combo {} / {} failed; the game's shader is drawn: {}", entry->family->source, staticIndex, dynamicIndex,
-                    error.substr(line, error.find('\n', line) - line));
-            } else if (!code.empty() && !entry->loggedUse) {
-                entry->loggedUse = true;
-                log::Info("Twins: {} draws its G-buffer twin", entry->family->gameFile);
-            }
-        }
-        found = compiled.emplace(key, std::move(code)).first;
+    Values values;
+    Decode(static_cast<std::uint64_t>(dynamicIndex), entry->dynamics, values);
+    Decode(static_cast<std::uint64_t>(staticIndex) / static_cast<std::uint64_t>(std::max(header.dynamicCombos, 1)), entry->statics, values);
+    const bool keepGame = entry->family->keepGame(values);
+    for (const Switch& s : entry->dynamics) {
+        if (s.name == "LIGHTING_PREVIEW" || (" " + std::string(entry->family->ignoredDynamics) + " ").find(" " + s.name + " ") != std::string::npos)
+            values[s.name] = 0;
     }
-    return found->second;
+    const auto key = std::tuple(static_cast<const LoadedFamily*>(entry), staticIndex, static_cast<int>(Encode(entry->dynamics, values)));
+    {
+        std::scoped_lock lock(mutex);
+        if (const auto found = compiled.find(key); found != compiled.end())
+            return found->second;
+    }
+    std::vector<DWORD> code;
+    std::string error;
+    const bool failed = !keepGame && !Compile(*entry, values, code, error);
+    std::scoped_lock lock(mutex);
+    if (failed && !entry->loggedFailure) {
+        entry->loggedFailure = true;
+        // The compiler lists warnings before the error.
+        const size_t at = error.find("error");
+        const size_t line = at == std::string::npos ? 0 : error.rfind('\n', at) + 1;
+        log::Info("Twins: compiling {} for combo {} / {} failed; the game's shader is drawn: {}", entry->family->source, staticIndex, dynamicIndex,
+            error.substr(line, error.find('\n', line) - line));
+    } else if (!code.empty() && !entry->loggedUse) {
+        entry->loggedUse = true;
+        log::Info("Twins: {} draws its G-buffer twin", entry->family->gameFile);
+    }
+    return compiled.try_emplace(key, std::move(code)).first->second;
+}
+
+std::uint64_t SourceHash()
+{
+    std::vector<std::filesystem::path> files;
+    std::error_code error;
+    for (const auto& item : std::filesystem::directory_iterator(TwinDirectory(), error))
+        files.push_back(item.path());
+    std::sort(files.begin(), files.end());
+    std::uint64_t hash = Fnv("");
+    for (const std::filesystem::path& path : files) {
+        std::string text;
+        if (ReadText(path, text))
+            hash = Fnv(text, Fnv(path.filename().string(), hash));
+    }
+    return hash;
+}
+
+bool HasTwin(std::string_view file)
+{
+    std::string key(file);
+    std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (key.ends_with(".vcs"))
+        key.resize(key.size() - 4);
+    return std::any_of(std::begin(kFamilies), std::end(kFamilies), [&](const Family& f) { return f.gameFile == key; });
 }
 
 }
