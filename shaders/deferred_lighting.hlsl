@@ -33,21 +33,27 @@ float3 ApplyFog(float3 color, float3 position)
     return lerp(color, g_frame.fogColor, g_frame.fogParams.y > 0.0 ? fog : fog * fog);
 }
 
-// The sun highlight of GMod's brush Phong (shaders/twins/lightmappedgeneric_ps2_3_x.h): GMod's lightmappedgeneric_ps30
+// The sun's Phong highlight. Brushes (shaders/twins/lightmappedgeneric_ps2_3_x.h): GMod's lightmappedgeneric_ps30
 // computes pow(|N.H|, exponent) * sqrt(N.L) * strength * L * saturate(L) toward g_LightDir, with L the lightmap; here L
-// is the traced direct sunlight. The exponent is in the emissive target's alpha, the strength in the flags' blue.
+// is the traced direct sunlight. Models (skin, a negative exponent): Source's SpecularAndRimTerms,
+// pow(R.L, exponent) * N.L * light * strength. The exponent is in the emissive target's alpha, the strength in the
+// flags' blue.
 float3 PhongHighlight(int2 pixel, float3 normal, float3 position, float sunVisibility, bool unlit)
 {
     Texture2D<float4> emissives = ResourceDescriptorHeap[g_frame.emissiveView];
     float exponent = emissives.Load(int3(pixel, 0)).a;
-    if (unlit || exponent <= 0.0 || g_frame.sunEnabled == 0.0 || sunVisibility <= 0.0)
+    if (unlit || exponent == 0.0 || g_frame.sunEnabled == 0.0 || sunVisibility <= 0.0)
         return 0.0;
     Texture2D<float4> flags = ResourceDescriptorHeap[g_frame.flagsView];
     float strength = flags.Load(int3(pixel, 0)).b;
     float3 toEye = normalize(g_frame.eyePosition - position);
-    float3 halfway = normalize(toEye + g_frame.sunDirection);
     float lambert = saturate(dot(normal, g_frame.sunDirection));
     float3 sunlight = g_frame.sunColor * (sunVisibility * lambert);
+    if (exponent < 0.0) {
+        float3 reflected = 2.0 * normal * dot(normal, toEye) - toEye;
+        return sunlight * (strength * pow(saturate(dot(reflected, g_frame.sunDirection)), -exponent));
+    }
+    float3 halfway = normalize(toEye + g_frame.sunDirection);
     return sunlight * saturate(sunlight) * (strength * sqrt(lambert) * pow(saturate(abs(dot(normal, halfway))), exponent));
 }
 

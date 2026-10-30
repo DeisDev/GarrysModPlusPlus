@@ -49,7 +49,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - In third person, your own flashlight is treated like your first-person flashlight, so your body no longer blocks it.
 - In the native renderer, glass and other translucent surfaces get sharp shadows from the sun and nearby lights.
 - In the native renderer, eyes and teeth are lit by real-time light.
-- In the native renderer, brushes with `$phong` get their sun highlight, shadowed by ray-traced sun visibility.
+- In the native renderer, brushes and models with `$phong` get their sun highlight, shadowed by ray-traced sun visibility.
 - Reflections of materials with `$envmaplightscale` fade where the surface is dark, as in the game.
 
 ### Removed
