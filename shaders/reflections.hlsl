@@ -6,7 +6,7 @@
 // Reflected surfaces visible last frame reuse last frame's shaded colour. Others get the sun, one local light
 // picked by SampleLight and, as their indirect light, the denoised light of the reflecting pixel.
 // input0: last frame's shaded colour of the main view (linear when outputLinear); input1: this frame's denoised
-// light, or none; output0: added radiance, before the tonemap scale, and the reflection's hit distance (0 without
+// light, or none; input2: the exact direct light (shaders/direct.hlsl); output0: added radiance, before the tonemap scale, and the reflection's hit distance (0 without
 // one) for shaders/reflection_temporal.hlsl; output1, output2, output3 (or none):
 // specular albedo, roughness and specular hit distance guides for Ray Reconstruction.
 
@@ -74,6 +74,13 @@ void main(uint3 id : SV_DispatchThreadID)
             material.envmapTint * reflectivity;
         specular = lerp(specular, specular * specular, material.envmapContrast);
         specular = lerp(dot(specular, float3(0.299, 0.587, 0.114)), specular, material.envmapSaturation);
+        if (material.envmapLightScale > 0.0) {
+            // GMod's CUBEMAP 2 combos fade the reflection where the lightmap is dark; the pixel's light stands in for it.
+            Texture2D<float4> direct = ResourceDescriptorHeap[g_pass.input2];
+            float3 light = direct.Load(int3(pixel, 0)).rgb + ambient * g_frame.indirectScale;
+            float3 fade = saturate((light - material.envmapLightMin) * material.envmapLightRange);
+            specular *= lerp(1.0, fade, material.envmapLightScale);
+        }
         result += specular;
         reflectionDistance = hitDistance;
         // Source's env_cubemap reflections are mirrors.

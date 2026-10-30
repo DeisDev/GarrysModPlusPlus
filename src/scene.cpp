@@ -27,7 +27,7 @@ struct Scene::InstanceRecord {
     uint32_t flags;
     uint32_t padding[3];
 };
-static_assert(sizeof(GpuMaterial) == 48);
+static_assert(sizeof(GpuMaterial) == 64);
 
 // Mirrors AlphaTriangle in shaders/scene.hlsli: an alpha-tested or translucent triangle's ModelGeometry::alphaTriangles
 // entry with its texture coordinates, so a candidate's alpha test reads one record.

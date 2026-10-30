@@ -319,7 +319,7 @@ bool IsUnlitShader(std::string_view shader) { return shader == "unlitgeneric" ||
 
 // The scene material for a VMT's env_cubemap reflection and self-illumination (as LightmappedGeneric and
 // VertexLitGeneric compute their masks) and whether it is unlit, or Scene::kNoMaterial when it has none of them.
-uint32_t SceneMaterial(std::string_view vmt, const std::string& baseTexture, bool unlit)
+uint32_t SceneMaterial(std::string_view vmt, std::string_view shader, const std::string& baseTexture, bool unlit)
 {
     auto enabled = [&](std::string_view key) {
         const std::optional<std::string> value = studio::MaterialValue(vmt, key);
@@ -353,6 +353,14 @@ uint32_t SceneMaterial(std::string_view vmt, const std::string& baseTexture, boo
         material.envmapTint[2] = tint.z;
         material.envmapContrast = MaterialColor(vmt, "$envmapcontrast", {0.0f, 0.0f, 0.0f}).x;
         material.envmapSaturation = MaterialColor(vmt, "$envmapsaturation", {1.0f, 1.0f, 1.0f}).x;
+        // LightmappedGeneric's defaults (lightmappedgeneric_dx9.cpp): scale 0, min-max [0 1]; its shader multiplies
+        // the reflection by lerp(1, saturate((lightmap - x) * (x + y)), scale).
+        if (shader == "lightmappedgeneric" || shader == "worldvertextransition") {
+            material.envmapLightScale = MaterialFloat(vmt, "$envmaplightscale", 0.0f);
+            const bsp::Float3 minMax = MaterialColor(vmt, "$envmaplightscaleminmax", {0.0f, 1.0f, 0.0f});
+            material.envmapLightMin = minMax.x;
+            material.envmapLightRange = minMax.x + minMax.y;
+        }
     }
     material.selfIllumMask = Scene::kMaskOff;
     if (selfIllum) {
@@ -415,7 +423,7 @@ const std::optional<MaterialInfo>& MaterialFor(const std::string& vmtPath)
         if (std::optional<bsp::Float3> reflectivity = studio::TextureReflectivity(header))
             entry->reflectivity = *reflectivity;
     }
-    entry->sceneMaterial = SceneMaterial(text, entry->baseTexture, IsUnlitShader(shader));
+    entry->sceneMaterial = SceneMaterial(text, shader, entry->baseTexture, IsUnlitShader(shader));
     if (const std::optional<SwayMaterial> sway = MaterialSway(text)) {
         entry->swayMaterial = static_cast<uint32_t>(g_state.swayMaterials.size());
         g_state.swayMaterials.push_back(*sway);

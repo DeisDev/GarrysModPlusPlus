@@ -272,7 +272,10 @@ struct Material
     float envmapContrast;
     float envmapSaturation;
     uint flags;
-    float padding;
+    float envmapLightScale;
+    float envmapLightMin;
+    float envmapLightRange;
+    float2 padding;
 };
 
 static const uint kNoMaterial = 0xFFFFFFFFu;
@@ -290,7 +293,7 @@ uint MaterialFlags(HitInfo hit)
     if (index == kNoMaterial)
         return 0;
     ByteAddressBuffer table = ResourceDescriptorHeap[g_frame.materialsView];
-    return table.Load(index * 48 + 40);
+    return table.Load(index * 64 + 40);
 }
 
 // The triangle a G-buffer pixel shows, from shaders/primary.hlsl; false where none matches.
@@ -323,7 +326,7 @@ bool HitMaterial(HitInfo hit, out Material material, out float2 uv, out float uv
     if (index == kNoMaterial)
         return false;
     ByteAddressBuffer table = ResourceDescriptorHeap[g_frame.materialsView];
-    material = table.Load<Material>(index * 48);
+    material = table.Load<Material>(index * 64);
     if (record.uvs != kNoView) {
         ByteAddressBuffer indices = ResourceDescriptorHeap[record.indices];
         ByteAddressBuffer uvs = ResourceDescriptorHeap[record.uvs];

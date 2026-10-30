@@ -1504,7 +1504,8 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     if (constants.traceMask != 0) {
         Use(m_lit[previous], read);
         Use(m_reflections, write);
-        PassArgs args = {.input0 = m_lit[previous].srv, .output0 = m_reflections.uav};
+        Use(m_direct[current], read);
+        PassArgs args = {.input0 = m_lit[previous].srv, .input2 = m_direct[current].srv, .output0 = m_reflections.uav};
         if (indirect != nullptr) {
             Use(*indirect, read);
             args.input1 = indirect->srv;

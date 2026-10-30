@@ -63,7 +63,12 @@ struct GpuMaterial {
     float envmapSaturation;
     // Scene::kMaterialUnlit.
     uint32_t flags;
-    float padding;
+    // LightmappedGeneric's $envmaplightscale and the threshold and scale its shader applies to the lightmap
+    // ($envmaplightscaleminmax x, and x + y): reflections fade where the surface is dark.
+    float envmapLightScale;
+    float envmapLightMin;
+    float envmapLightRange;
+    float padding[2];
 };
 
 // A convex hull that blocks a map light (index into bsp::WorldGeometry::lights) wherever the straight path from
