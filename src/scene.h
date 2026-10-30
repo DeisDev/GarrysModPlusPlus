@@ -105,7 +105,7 @@ static_assert(sizeof(BakedTriangle) == 32);
 
 // The format of the baked residual cache (gmodpp_cache\baked): bump when shaders/baked_residual.hlsl or the data it
 // reads changes.
-inline constexpr uint32_t kBakeVersion = 5;
+inline constexpr uint32_t kBakeVersion = 7;
 
 // VRAD's baked light on the GPU (indirect_lighting = 1): raw views of bsp::BakedLighting and of the world's
 // BakedTriangles, and the residual shaders/baked_residual.hlsl writes: the baked light less the direct light VRAD

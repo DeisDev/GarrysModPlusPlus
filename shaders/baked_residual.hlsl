@@ -20,6 +20,33 @@ static const uint kVradOccluders = 0x01 | 0x40;
 // A luxel counts as clamped when the direct light exceeds the baked light by more than this share of it.
 static const float kClampTolerance = 0.05;
 
+// VRAD's shadows: every triangle of its occluders blocks, alpha-tested and translucent world faces included. VRAD
+// traces brushes without alpha (AddBrushToRaytraceEnvironment in src/utils/vrad/trace.cpp), and blocking translucent
+// faces too matched de_investment's lightmaps better (18.2% of luxels clamped instead of 19.4%).
+float SolidTransmittance(float3 origin, float3 direction, float tMax, uint mask)
+{
+    SCENE_RAY_QUERY(RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER | RAY_FLAG_FORCE_OPAQUE) query;
+    RayDesc ray;
+    ray.Origin = origin;
+    ray.Direction = direction;
+    ray.TMin = 0.01;
+    ray.TMax = tMax;
+    query.TraceRayInline(g_scene, RAY_FLAG_NONE, mask, ray);
+    query.Proceed();
+    return query.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? 0.0 : 1.0;
+}
+
+// SunVisibility (shaders/scene.hlsli) with SolidTransmittance, through the 3D skybox as VRAD's TestLine_DoesHitSky.
+float SolidSunVisibility(float3 origin)
+{
+    float visibility = SolidTransmittance(origin, g_frame.sunDirection, 65536.0, kVradOccluders);
+    if (visibility > 0.0 && g_frame.worldToSky > 0.0) {
+        float3 camera = float3(g_frame.skyCameraX, g_frame.skyCameraY, g_frame.skyCameraZ);
+        visibility *= SolidTransmittance(camera + origin * g_frame.worldToSky, g_frame.sunDirection, 65536.0, kSkyboxMask);
+    }
+    return visibility;
+}
+
 // The direct light of style-0 lights and the sun at a luxel, for its flat normal (direct[0]) and, when bumped,
 // its three bump basis normals (direct[1-3]), as VRAD gathers it (GatherSampleLightSSE and
 // GatherSampleStandardLightSSE in src/utils/vrad/lightmap.cpp): a light behind the flat face or blocked adds nothing
@@ -35,7 +62,7 @@ void DirectLight(BakeLuxel luxel, FaceLightmap face, out float3 direct[4])
         direct[n] = 0.0;
     float3 origin = luxel.position + luxel.normal * 0.5;
     if (g_frame.sunEnabled != 0.0 && dot(normals[0], g_frame.sunDirection) > 0.0) {
-        float visibility = SunVisibility(origin, kVradOccluders);
+        float visibility = SolidSunVisibility(origin);
         for (uint n = 0; n < count && visibility > 0.0; ++n)
             direct[n] += g_frame.sunColor * saturate(dot(normals[n], g_frame.sunDirection)) * visibility;
     }
@@ -50,7 +77,7 @@ void DirectLight(BakeLuxel luxel, FaceLightmap face, out float3 direct[4])
         float3 flat = LightIrradiance(light, luxel.position, normals[0], toLight, distance);
         if (all(flat <= 0.0))
             continue;
-        float visibility = Transmittance(origin, toLight, ShadowRayLength(kLightClearance, distance), kVradOccluders);
+        float visibility = SolidTransmittance(origin, toLight, ShadowRayLength(kLightClearance, distance), kVradOccluders);
         if (visibility <= 0.0)
             continue;
         direct[0] += flat * visibility;
@@ -152,7 +179,7 @@ void RemoveAmbientLights(uint index)
         float emitter = -dot(toLight, light.normal.xyz);
         if (emitter <= 0.01)
             continue;
-        float visibility = Transmittance(position, toLight, ShadowRayLength(kLightClearance, distance), kVradOccluders);
+        float visibility = SolidTransmittance(position, toLight, ShadowRayLength(kLightClearance, distance), kVradOccluders);
         if (visibility <= 0.0)
             continue;
         float ratio = emitter * visibility / max(distanceSquared, 1.0);
