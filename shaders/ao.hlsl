@@ -32,14 +32,27 @@ float2 History(int2 pixel, float4 surface)
     Texture2D<float2> motion = ResourceDescriptorHeap[g_frame.motionView];
     Texture2D<float> previousDistance = ResourceDescriptorHeap[g_frame.previousDistanceView];
     Texture2D<float2> history = ResourceDescriptorHeap[g_pass.input0];
-    int2 previous = int2(floor(float2(pixel) + 0.5 + motion.Load(int3(pixel, 0))));
-    if (any(previous < 0) || any(previous >= int2(g_frame.size)))
-        return 0.0;
-    float4 previousSurface = SurfaceAt(g_frame.prevSurfaceView, previous);
+    // Bilinear taps, each rejected where the surface differs, as gi_temporal.hlsl reads its history: the nearest
+    // pixel alone lost the history at every subpixel move.
+    float2 previous = float2(pixel) + motion.Load(int3(pixel, 0));
+    int2 base = int2(floor(previous));
+    float2 f = previous - float2(base);
     float distance = previousDistance.Load(int3(pixel, 0));
-    if (previousSurface.w <= 0.0 || abs(previousSurface.w - distance) > 2.0 + distance * 0.01 || dot(previousSurface.xyz, surface.xyz) < 0.9)
-        return 0.0;
-    return history.Load(int3(previous, 0));
+    float2 accumulated = 0.0;
+    float weightSum = 0.0;
+    [unroll]
+    for (int i = 0; i < 4; ++i) {
+        int2 tap = base + int2(i & 1, i >> 1);
+        if (any(tap < 0) || any(tap >= int2(g_frame.size)))
+            continue;
+        float4 previousSurface = SurfaceAt(g_frame.prevSurfaceView, tap);
+        if (previousSurface.w <= 0.0 || abs(previousSurface.w - distance) > 2.0 + distance * 0.01 || dot(previousSurface.xyz, surface.xyz) < 0.9)
+            continue;
+        float weight = (i & 1 ? f.x : 1.0 - f.x) * (i >> 1 ? f.y : 1.0 - f.y);
+        accumulated += history.Load(int3(tap, 0)) * weight;
+        weightSum += weight;
+    }
+    return weightSum < 1e-3 ? 0.0 : accumulated / weightSum;
 }
 
 float Blur(int2 pixel, float4 surface)
