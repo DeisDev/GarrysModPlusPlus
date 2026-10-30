@@ -28,6 +28,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - In the native renderer, GMod's Advanced video options have settings for anti-aliasing (TAA or DLSS), the DLSS mode, real-time lighting, ray tracing quality and indirect light. MSAA and Direct3D 9Ex are hidden there, and MSAA is turned off when the options are applied.
 - In the native renderer, camera screens, mirrors and scopes that draw the world into a texture get real-time light ("Cameras and mirrors" in the menu; about 1 ms for a 512x512 view). The water's own views keep the game's light.
 - The menu says why real-time lighting is paused: no ray tracing support, MSAA on, or multicore rendering on.
+- In the native renderer, flowing water (`$flowmap`) gets ray-traced reflections like still water.
 - In the native renderer, models with a light warp texture (Alyx's skin, the crowbar and gravity gun, Chell) take real-time light through it as in the game.
 
 ### Changed

@@ -120,6 +120,9 @@ add_d3d9_shader(shaders/forward_snippet.hlsl main g_forwardSnippetPS)
 add_d3d9_shader(shaders/forward_snippet.hlsl main g_forwardSnippetPS2 PROFILE ps_2_b /D FORWARD_PS2=1)
 add_d3d9_shader(shaders/water_surface.hlsl main g_waterSurfacePS PROFILE ps_2_b)
 add_d3d9_shader(shaders/water_surface.hlsl main g_waterSurfaceAlphaFogPS PROFILE ps_2_b /D REFRACT_ALPHA_FOG=1)
+add_d3d9_shader(shaders/water_flow_surface.hlsl main g_waterFlowSurfacePS PROFILE ps_2_b)
+add_d3d9_shader(shaders/water_flow_surface.hlsl main g_waterFlowSurfaceAlphaFogPS PROFILE ps_2_b /D REFRACT_ALPHA_FOG=1)
+add_d3d9_shader(shaders/water_flow_surface.hlsl main g_waterFlowSurfaceLightmapFogPS PROFILE ps_2_b /D REFRACT_ALPHA_FOG=1 /D LIGHTMAP_FOG=1)
 
 # NVIDIA DLSS SDK (Ray Reconstruction): headers, the NGX static library for the static runtime, and the
 # release feature DLL, each pinned by hash.
