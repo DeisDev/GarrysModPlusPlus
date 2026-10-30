@@ -33,30 +33,6 @@ float3 ApplyFog(float3 color, float3 position)
     return lerp(color, g_frame.fogColor, g_frame.fogParams.y > 0.0 ? fog : fog * fog);
 }
 
-// The sun's Phong highlight. Brushes (shaders/twins/lightmappedgeneric_ps2_3_x.h): GMod's lightmappedgeneric_ps30
-// computes pow(|N.H|, exponent) * sqrt(N.L) * strength * L * saturate(L) toward g_LightDir, with L the lightmap; here L
-// is the traced direct sunlight. Models (skin, a negative exponent): Source's SpecularAndRimTerms,
-// pow(R.L, exponent) * N.L * light * strength. The exponent is in the emissive target's alpha, the strength in the
-// flags' blue.
-float3 PhongHighlight(int2 pixel, float3 normal, float3 position, float sunVisibility, bool unlit)
-{
-    Texture2D<float4> emissives = ResourceDescriptorHeap[g_frame.emissiveView];
-    float exponent = emissives.Load(int3(pixel, 0)).a;
-    if (unlit || exponent == 0.0 || g_frame.sunEnabled == 0.0 || sunVisibility <= 0.0)
-        return 0.0;
-    Texture2D<float4> flags = ResourceDescriptorHeap[g_frame.flagsView];
-    float strength = flags.Load(int3(pixel, 0)).b;
-    float3 toEye = normalize(g_frame.eyePosition - position);
-    float lambert = saturate(dot(normal, g_frame.sunDirection));
-    float3 sunlight = g_frame.sunColor * (sunVisibility * lambert);
-    if (exponent < 0.0) {
-        float3 reflected = 2.0 * normal * dot(normal, toEye) - toEye;
-        return sunlight * (strength * pow(saturate(dot(reflected, g_frame.sunDirection)), -exponent));
-    }
-    float3 halfway = normalize(toEye + g_frame.sunDirection);
-    return sunlight * saturate(sunlight) * (strength * sqrt(lambert) * pow(saturate(abs(dot(normal, halfway))), exponent));
-}
-
 [RootSignature(ROOT_SIGNATURE)]
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID)
@@ -146,7 +122,16 @@ void main(uint3 id : SV_DispatchThreadID)
     }
     case 7: result = directLight.a; break;
     case 8: result = Encode(Decode(lightTexture.Load(int3(pixel, 0)).rgb)); break;
-    case 9: result = Encode(added * g_frame.tonemapScale); break;
+    case 9: {
+        // Reflections, self-illumination from the material table and Phong highlights.
+        float3 highlights = 0.0;
+        if (g_frame.specularView != kNoView) {
+            Texture2D<float4> specularTexture = ResourceDescriptorHeap[g_frame.specularView];
+            highlights = specularTexture.Load(int3(pixel, 0)).rgb;
+        }
+        result = Encode((added + highlights) * g_frame.tonemapScale);
+        break;
+    }
     case 11: result = ambientOcclusion; break;
     case 10: {
         // Red and green: motion towards last frame (a tenth of a pixel per step); blue: unlit material.
@@ -159,8 +144,12 @@ void main(uint3 id : SV_DispatchThreadID)
         Texture2D<uint> pixelFlags = ResourceDescriptorHeap[g_frame.pixelFlagsView];
         bool unlit = (pixelFlags.Load(int3(pixel, 0)) & kPixelUnlit) != 0;
         float3 light = unlit ? 1.0 : direct + indirect;
-        float3 shaded = ApplyFog((albedo * light + emissive + added + PhongHighlight(pixel, surface.xyz, position, directLight.a, unlit)) * g_frame.tonemapScale,
-            position) + additive + VolumetricLight(pixel);
+        float3 specular = 0.0;
+        if (!unlit && g_frame.specularView != kNoView) {
+            Texture2D<float4> highlights = ResourceDescriptorHeap[g_frame.specularView];
+            specular = highlights.Load(int3(pixel, 0)).rgb;
+        }
+        float3 shaded = ApplyFog((albedo * light + emissive + added + specular) * g_frame.tonemapScale, position) + additive + VolumetricLight(pixel);
         result = g_frame.outputLinear != 0 ? shaded : Encode(shaded);
         break;
     }

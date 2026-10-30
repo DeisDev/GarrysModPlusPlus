@@ -75,6 +75,55 @@ void ConsiderLight(uint i, float3 irradiance, inout uint top[kExactLights], inou
     }
 }
 
+// A pixel's Phong highlight from its twin (shaders/twins): the exponent in the emissive target's alpha (negative for
+// Source's model specular, positive for GMod's brush Phong, 0 for none) and the strength in the flags' blue.
+struct Phong
+{
+    float exponent;
+    float strength;
+    float3 normal;
+    float3 toEye;
+};
+
+Phong PhongAt(int2 pixel, bool lit, float3 position, float3 normal)
+{
+    Phong phong = (Phong)0;
+    if (!lit)
+        return phong;
+    Texture2D<float4> emissive = ResourceDescriptorHeap[g_frame.emissiveView];
+    phong.exponent = emissive.Load(int3(pixel, 0)).a;
+    if (phong.exponent == 0.0)
+        return phong;
+    Texture2D<float4> flags = ResourceDescriptorHeap[g_frame.flagsView];
+    phong.strength = flags.Load(int3(pixel, 0)).b;
+    phong.normal = normal;
+    phong.toEye = normalize(g_frame.eyePosition - position);
+    return phong;
+}
+
+// Models: Source's SpecularAndRimTerms (common_vertexlitgeneric_dx9.h), pow(R.L, exponent) times the light reaching
+// the surface (with its N.L), as the skin shader sums it over its lights.
+float3 ModelHighlight(Phong phong, float3 light, float3 toLight)
+{
+    if (phong.exponent >= 0.0)
+        return 0.0;
+    float3 reflected = 2.0 * phong.normal * dot(phong.normal, phong.toEye) - phong.toEye;
+    return light * (phong.strength * pow(saturate(dot(reflected, toLight)), -phong.exponent));
+}
+
+// The sun's highlight. Brushes: GMod's lightmappedgeneric_ps30 PHONG combos compute pow(|N.H|, exponent) * sqrt(N.L) *
+// strength * L * saturate(L) toward the sun (g_LightDir), with L the lightmap; here L is the traced direct sunlight.
+float3 SunHighlight(Phong phong, float3 sunlight)
+{
+    if (phong.exponent < 0.0)
+        return ModelHighlight(phong, sunlight, g_frame.sunDirection);
+    if (phong.exponent == 0.0)
+        return 0.0;
+    float lambert = saturate(dot(phong.normal, g_frame.sunDirection));
+    float3 halfway = normalize(phong.toEye + g_frame.sunDirection);
+    return sunlight * saturate(sunlight) * (phong.strength * sqrt(lambert) * pow(saturate(abs(dot(phong.normal, halfway))), phong.exponent));
+}
+
 [RootSignature(ROOT_SIGNATURE)]
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID)
@@ -93,11 +142,14 @@ void main(uint3 id : SV_DispatchThreadID)
     float3 lightNormal = lit && (pixelFlags.Load(int3(pixel, 0)) & kPixelIgnoreNormals) != 0 ? 0.0 : normal;
 
     float3 exact = 0.0;
+    float3 specular = 0.0;
+    Phong phong = PhongAt(pixel, lit && inside, position, normal);
     float sunVisibility = 0.0;
     float lambert = Lambert(lightNormal, g_frame.sunDirection);
     if (lit && g_frame.sunEnabled != 0.0 && lambert > 0.0) {
         sunVisibility = SunVisibility(origin, g_frame.sunShadowMask);
         exact += g_frame.sunColor * lambert * sunVisibility;
+        specular += SunHighlight(phong, g_frame.sunColor * (lambert * sunVisibility));
     }
 
     LightSet set = (LightSet)0;
@@ -163,7 +215,9 @@ void main(uint3 id : SV_DispatchThreadID)
         float3 toLight;
         float distance;
         float3 light = SetLightIrradiance(set, top[k], position, lightNormal, toLight, distance);
-        exact += light * LightTransmittance(set, top[k], origin, toLight, distance);
+        float3 shadowed = light * LightTransmittance(set, top[k], origin, toLight, distance);
+        exact += shadowed;
+        specular += ModelHighlight(phong, shadowed, toLight);
     }
     float3 sampled = 0.0;
     if (remainder > 0.0) {
@@ -184,6 +238,10 @@ void main(uint3 id : SV_DispatchThreadID)
     RWTexture2D<float4> remainderOutput = ResourceDescriptorHeap[g_pass.output1];
     exactOutput[pixel] = float4(exact, sunVisibility);
     remainderOutput[pixel] = float4(sampled, 1.0);
+    if (g_pass.output2 != kNoView) {
+        RWTexture2D<float4> specularOutput = ResourceDescriptorHeap[g_pass.output2];
+        specularOutput[pixel] = float4(specular, 0.0);
+    }
     if (g_frame.probeView != kNoView && all(uint2(pixel) == uint2(g_frame.probePixel & 0xFFFF, g_frame.probePixel >> 16))) {
         RWByteAddressBuffer probe = ResourceDescriptorHeap[g_frame.probeView];
         HitInfo hit;

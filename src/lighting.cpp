@@ -610,6 +610,7 @@ bool Lighting::EnsureTargets(UINT width, UINT height)
     for (Texture& texture : m_direct)
         ok = ok && CreateTarget(texture, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT);
     ok = ok && CreateTarget(m_directRemainder, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT);
+    ok = ok && CreateTarget(m_specular, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT);
     ok = ok && CreateTarget(m_giRaw, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT);
     for (Texture& texture : m_giHistory)
         ok = ok && CreateTarget(texture, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT);
@@ -1208,6 +1209,7 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     constants.previousDistanceView = m_previousDistance.srv;
     constants.pixelFlagsView = m_pixelFlags.srv;
     constants.geometricNormalView = m_geometricNormal.srv;
+    constants.specularView = m_specular.srv;
     const bool probe = main && m_probeRequested && m_probeBuffer;
     constants.probeView = probe ? m_probeUav : kInvalidView;
     constants.probePixel = m_probePixel;
@@ -1411,8 +1413,10 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     Texture& direct = m_direct[current];
     Use(direct, write);
     Use(m_directRemainder, write);
+    Use(m_specular, write);
     const bool wideLightSets = constants.exactLights > 4 || constants.sampledLightRays > 2;
-    Dispatch(wideLightSets ? Pass::DirectWide : Pass::Direct, {.output0 = direct.uav, .output1 = m_directRemainder.uav});
+    Dispatch(wideLightSets ? Pass::DirectWide : Pass::Direct, {.output0 = direct.uav, .output1 = m_directRemainder.uav, .output2 = m_specular.uav});
+    Use(m_specular, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     if (probe) {
         D3D12_RESOURCE_BARRIER barrier = Transition(m_probeBuffer.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
         m_list->ResourceBarrier(1, &barrier);

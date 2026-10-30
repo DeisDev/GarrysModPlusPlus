@@ -112,6 +112,9 @@ struct FrameConstants {
     float skyCameraY;
     float skyCameraZ;
     float worldToSky;
+    // Phong highlights (shaders/direct.hlsl), added unlit by shaders/deferred_lighting.hlsl.
+    uint32_t specularView;
+    uint32_t padding3[3];
 };
 
 // What blocks the sun at a pixel of the main view (Lighting::RequestProbe).
@@ -309,6 +312,7 @@ private:
     // Exact direct light of the main view's current and last frame (shaders/direct.hlsl), and its sampled remainder.
     std::array<Texture, 2> m_direct;
     Texture m_directRemainder;
+    Texture m_specular;
     Texture m_giRaw;
     std::array<Texture, 2> m_giHistory;
     std::array<Texture, 2> m_giMoments;
