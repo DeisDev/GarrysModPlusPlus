@@ -515,14 +515,15 @@ uint32_t PackAlbedo(const bsp::Float3& c)
     return channel(c.x) | channel(c.y) << 8 | channel(c.z) << 16 | 0xFF000000u;
 }
 
-// Loads a model once: a BLAS in its bind pose for rigid use, plus skinning data for multi-bone models.
+// Loads a model once per skin family: a BLAS in its bind pose for rigid use, plus skinning data for multi-bone models.
 // Brush entity models ("*N") come from the map.
-const ModelEntry& ModelFor(const std::string& mdlPath)
+const ModelEntry& ModelFor(const std::string& mdlPath, int skin = 0)
 {
-    auto cached = g_state.models.find(mdlPath);
+    const std::string key = skin != 0 ? std::format("{}#{}", mdlPath, skin) : mdlPath;
+    auto cached = g_state.models.find(key);
     if (cached != g_state.models.end())
         return cached->second;
-    ModelEntry& entry = g_state.models[mdlPath];
+    ModelEntry& entry = g_state.models[key];
     if (mdlPath.starts_with('*')) {
         size_t number = 0;
         const auto [end, ec] = std::from_chars(mdlPath.data() + 1, mdlPath.data() + mdlPath.size(), number);
@@ -571,7 +572,7 @@ const ModelEntry& ModelFor(const std::string& mdlPath)
                 break;
             }
         }
-        if (studio::BuildGeometry(mdl, vvd, vtx, skip, geometry, error) && !geometry.indices.empty()) {
+        if (studio::BuildGeometry(mdl, vvd, vtx, skip, geometry, error, skin) && !geometry.indices.empty()) {
             std::vector<uint32_t> triangleAlbedo(geometry.triangleTextures.size());
             std::vector<uint32_t> triangleAlpha(geometry.triangleTextures.size());
             for (size_t i = 0; i < triangleAlbedo.size(); ++i) {
@@ -890,7 +891,7 @@ void UpdateScene()
             std::vector<SwayingProp> swayingProps;
             const auto addProps = [&](const std::vector<bsp::StaticProp>& props, UINT mask) {
                 for (const bsp::StaticProp& prop : props) {
-                    const ModelEntry& model = ModelFor(world.propModels[prop.model]);
+                    const ModelEntry& model = ModelFor(world.propModels[prop.model], prop.skin);
                     SceneInstance instance;
                     instance.model = model.sceneModel;
                     instance.mask = mask == 0 && prop.noShadow ? kShadowlessPropMask : mask;

@@ -1223,6 +1223,8 @@ void ReadStaticProps(std::span<const std::byte> file, const Header& header, Worl
             PropTransform(*origin, *angles, staticProp.transform);
             staticProp.noShadow = (propFlags.value_or(0) & kStaticPropNoShadow) != 0;
             staticProp.ignoreNormals = (propFlags.value_or(0) & kStaticPropIgnoreNormals) != 0;
+            // StaticPropLump_t in the Source SDK's public/gamebspfile.h: m_Skin follows m_Solid and the flags byte.
+            staticProp.skin = ReadAt<int32_t>(data, prop + 32).value_or(0);
             world.props.push_back(staticProp);
         }
         return;

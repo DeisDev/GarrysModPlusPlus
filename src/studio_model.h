@@ -24,7 +24,7 @@ struct Geometry {
     std::vector<bsp::Float2> uvs;
     std::vector<VertexWeights> weights;
     std::vector<uint32_t> indices;
-    // Skin 0 texture index of each triangle, or kNoTexture.
+    // Texture index of each triangle in the skin family built, or kNoTexture.
     std::vector<uint16_t> triangleTextures;
 };
 
@@ -48,9 +48,10 @@ bool ReadPoseToBone(std::span<const std::byte> mdl, std::vector<Matrix3x4>& pose
 // Candidate material paths ("materials/<cdtexture><texture>.vmt") for each texture of the model.
 bool ReadMaterialPaths(std::span<const std::byte> mdl, std::vector<std::vector<std::string>>& texturePaths, std::string& error);
 
-// Builds LOD0 triangles of body group 0, skipping meshes whose (skin 0) texture is marked in `skipTexture`.
+// Builds LOD0 triangles of body group 0 with the textures of skin family `skin` (family 0 when the model has no such
+// family), skipping meshes whose texture is marked in `skipTexture`.
 bool BuildGeometry(std::span<const std::byte> mdl, std::span<const std::byte> vvd, std::span<const std::byte> vtx,
-    const std::vector<bool>& skipTexture, Geometry& geometry, std::string& error);
+    const std::vector<bool>& skipTexture, Geometry& geometry, std::string& error, int skin = 0);
 
 // The convex pieces of a .phy collision model's first solid, each as its points in model space (inches, Source
 // axes); the pieces are convex hulls of these points.

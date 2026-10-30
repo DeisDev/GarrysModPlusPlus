@@ -25,6 +25,7 @@ constexpr size_t kHeaderTextureIndex = 208;
 constexpr size_t kHeaderNumCdTextures = 212;
 constexpr size_t kHeaderCdTextureIndex = 216;
 constexpr size_t kHeaderNumSkinRef = 220;
+constexpr size_t kHeaderNumSkinFamilies = 224;
 constexpr size_t kHeaderSkinIndex = 228;
 constexpr size_t kHeaderNumBodyParts = 232;
 constexpr size_t kHeaderBodyPartIndex = 236;
@@ -313,7 +314,7 @@ bool ReadMaterialPaths(std::span<const std::byte> mdlBytes, std::vector<std::vec
 }
 
 bool BuildGeometry(std::span<const std::byte> mdlBytes, std::span<const std::byte> vvdBytes, std::span<const std::byte> vtxBytes,
-    const std::vector<bool>& skipTexture, Geometry& geometry, std::string& error)
+    const std::vector<bool>& skipTexture, Geometry& geometry, std::string& error, int skin)
 {
     Reader mdl(mdlBytes);
     Reader vvd(vvdBytes);
@@ -326,6 +327,9 @@ bool BuildGeometry(std::span<const std::byte> mdlBytes, std::span<const std::byt
     auto bodyPartIndex = mdl.At<int32_t>(kHeaderBodyPartIndex);
     auto numSkinRef = mdl.At<int32_t>(kHeaderNumSkinRef);
     auto skinIndex = mdl.At<int32_t>(kHeaderSkinIndex);
+    // The skin table holds numskinfamilies rows of numskinref texture indices (studiohdr_t::pSkinref).
+    const int32_t families = mdl.At<int32_t>(kHeaderNumSkinFamilies).value_or(1);
+    const size_t family = skin > 0 && skin < families ? static_cast<size_t>(skin) : 0;
     auto vtxBodyParts = vtx.At<int32_t>(kVtxNumBodyParts);
     auto vtxBodyPartOffset = vtx.At<int32_t>(kVtxBodyPartOffset);
     if (!numBodyParts || !bodyPartIndex || !numSkinRef || !skinIndex || !vtxBodyParts || !vtxBodyPartOffset || *vtxBodyParts != *numBodyParts) {
@@ -374,7 +378,7 @@ bool BuildGeometry(std::span<const std::byte> mdlBytes, std::span<const std::byt
                 }
                 std::optional<int16_t> texture;
                 if (*material >= 0 && *material < *numSkinRef)
-                    texture = mdl.At<int16_t>(*skinIndex + static_cast<size_t>(*material) * sizeof(int16_t));
+                    texture = mdl.At<int16_t>(*skinIndex + (family * static_cast<size_t>(*numSkinRef) + static_cast<size_t>(*material)) * sizeof(int16_t));
                 if (texture && *texture >= 0 && static_cast<size_t>(*texture) < skipTexture.size() && skipTexture[*texture])
                     continue;
                 const size_t vtxMesh = vtxLod + *vtxMeshOffset + static_cast<size_t>(m) * 9;

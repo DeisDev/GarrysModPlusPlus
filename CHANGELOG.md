@@ -95,6 +95,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fixed dark patches in the "Baked" indirect light option where the map's baked shadows differ from the ray-traced ones.
 - Fixed ray-traced lighting possibly reading the wrong textures or materials on some GPUs.
 - Fixed ray-traced shadows ignoring the transparent parts of textures stored in less common formats.
+- Fixed static props with a non-default skin being lit as their first skin, which could make them glow at full brightness.
 - Fixed NPC eyes showing no iris with real-time lighting in the native renderer.
 - Fixed window glass turning white in the flashlight.
 - Fixed the underwater fog being grey instead of the water's colour.

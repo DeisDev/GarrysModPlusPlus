@@ -99,6 +99,8 @@ struct StaticProp {
     bool noShadow = false;
     // STATIC_PROP_IGNORE_NORMALS: VRAD lit the prop the same from every direction, as foliage usually is.
     bool ignoreNormals = false;
+    // The model's skin family (m_Skin).
+    int32_t skin = 0;
 };
 
 struct Mesh {
