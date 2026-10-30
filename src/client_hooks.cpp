@@ -1,8 +1,8 @@
 #include "client_hooks.h"
 
-#include "effects.h"
 #include "log.h"
 #include "module_scan.h"
+#include "view_events.h"
 
 #include <MinHook.h>
 

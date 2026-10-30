@@ -2,6 +2,7 @@
 
 #include "command_line.h"
 #include "log.h"
+#include "shaderapi_capture.h"
 #include "shader_cache.h"
 #include "shader_compiler.h"
 #include "shader_translator.h"
@@ -889,17 +890,47 @@ void DrawPass(const ShadowState& shadow, const MeshDraw& mesh)
                 depthOnly ? "none" : shadow.pixelShader->name, shadow.pixelStaticIndex);
         return;
     }
+    const DynamicState::BlendOverride& colorOverride = dynamic.blendOverride;
+    const DynamicState::BlendOverride& alphaOverride = dynamic.alphaBlendOverride;
+    const int source = colorOverride.active ? colorOverride.source : shadow.srcBlend;
+    const int destination = colorOverride.active ? colorOverride.destination : shadow.dstBlend;
+    const int op = colorOverride.active ? colorOverride.op : shadow.blendOp;
+    const bool blendEnabled = colorOverride.active ? colorOverride.enable : shadow.blend != 0;
+
+    // During a G-buffer capture or the forward lighting after it, the pass may draw other code into other targets.
+    const capture::Pass pass =
+        capture::Prepare(vertexCode, pixelCode, depthOnly ? nullptr : shadow.pixelShader->name.c_str(), shadow.depthTest != 0, blendEnabled, source, destination,
+            shadow.srgbWrite != 0, static_cast<std::uint32_t>(shadow.srgbRead));
+    if (pass.route == capture::Pass::Route::Skip)
+        return;
+    const std::span<const DWORD> drawnPixelCode = pass.pixelCode.empty() ? pixelCode : pass.pixelCode;
+    const char* pixelName = !pass.pixelCode.empty() ? pass.pixelName : depthOnly ? "none" : shadow.pixelShader->name.c_str();
+
     const CompiledShader* vertexBase = BaseInfo(vertexCode);
-    const CompiledShader* pixelBase = depthOnly ? nullptr : BaseInfo(pixelCode);
+    const CompiledShader* pixelBase = depthOnly ? nullptr : BaseInfo(drawnPixelCode);
     if (vertexBase == nullptr || (pixelBase == nullptr && !depthOnly))
         return;
 
-    const Targets targets = PrepareTargets(shadow.srgbWrite != 0);
+    const Targets targets = pass.route == capture::Pass::Route::Game ? PrepareTargets(shadow.srgbWrite != 0) : capture::BindTargets(pass, shadow.srgbWrite != 0);
 
     StateBuffer pixelState = {};
     translator::Variant pixelVariant;
     if (pixelBase != nullptr)
         BindSamplers(*pixelBase, dynamic.textures.data(), kSamplers, shadow.srgbRead, pixelState, &pixelVariant.shadowSamplers);
+    if (pass.probes) {
+        D3D12_SAMPLER_DESC probeSampler = {};
+        probeSampler.Filter = D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT;
+        probeSampler.AddressU = probeSampler.AddressV = probeSampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        probeSampler.MaxLOD = D3D12_FLOAT32_MAX;
+        for (size_t i = 0; i < pass.probeSamplers.size(); ++i) {
+            const UINT s = pass.probeSamplers[i];
+            if (s >= static_cast<UINT>(kSamplers))
+                continue;
+            pixelState.textures[s] = capture::ProbeView(i);
+            pixelState.samplers[s] = backend.SamplerIndex(probeSampler);
+            pixelVariant.shadowSamplers &= static_cast<std::uint16_t>(~(1u << s));
+        }
+    }
     if (shadow.alphaTest)
         pixelVariant.alphaTest = static_cast<std::uint8_t>(shadow.alphaFunc + 1);
     StateBuffer vertexState = {};
@@ -932,19 +963,14 @@ void DrawPass(const ShadowState& shadow, const MeshDraw& mesh)
     }
     vertexVariant.clipPlanes = static_cast<std::uint8_t>(UserClipPlanes(vertexState.clipPlanes));
     const CompiledShader* vertexShader = Compiled(vertexCode, vertexVariant, shadow.vertexShader->name.c_str());
-    const CompiledShader* pixelShader = depthOnly ? nullptr : Compiled(pixelCode, pixelVariant, shadow.pixelShader->name.c_str());
+    const CompiledShader* pixelShader = depthOnly ? nullptr : Compiled(drawnPixelCode, pixelVariant, pixelName);
     if (vertexShader == nullptr || (pixelShader == nullptr && !depthOnly))
         return;
     key.vertexShader = vertexShader;
     key.pixelShader = pixelShader;
 
     D3D12_RENDER_TARGET_BLEND_DESC& blend = key.blend.RenderTarget[0];
-    const DynamicState::BlendOverride& colorOverride = dynamic.blendOverride;
-    const DynamicState::BlendOverride& alphaOverride = dynamic.alphaBlendOverride;
-    const int source = colorOverride.active ? colorOverride.source : shadow.srcBlend;
-    const int destination = colorOverride.active ? colorOverride.destination : shadow.dstBlend;
-    const int op = colorOverride.active ? colorOverride.op : shadow.blendOp;
-    blend.BlendEnable = colorOverride.active ? colorOverride.enable : shadow.blend != 0;
+    blend.BlendEnable = blendEnabled;
     blend.SrcBlend = Blend(source, false);
     blend.DestBlend = Blend(destination, false);
     blend.BlendOp = BlendOp(op);
@@ -958,6 +984,17 @@ void DrawPass(const ShadowState& shadow, const MeshDraw& mesh)
     // Direct3D 9 has alpha to coverage only through NVIDIA's ATOC render state, which needs multisampling; without
     // it the pass is just alpha tested, where Direct3D 12 would dither instead.
     key.blend.AlphaToCoverageEnable = shadow.alphaToCoverage != 0 && targets.samples > 1;
+    if (pass.route == capture::Pass::Route::GBuffer) {
+        // Direct3D 9 blends every target alike; the game leaves COLORWRITEENABLE1-3 at their default, and the
+        // self-illumination target takes colour only from the shaders that write it.
+        key.blend.IndependentBlendEnable = TRUE;
+        for (UINT i = 1; i < targets.count; ++i) {
+            key.blend.RenderTarget[i] = blend;
+            key.blend.RenderTarget[i].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        }
+        key.blend.RenderTarget[gbuffer::kEmissiveTarget].RenderTargetWriteMask =
+            pass.emissive ? D3D12_COLOR_WRITE_ENABLE_RED | D3D12_COLOR_WRITE_ENABLE_GREEN | D3D12_COLOR_WRITE_ENABLE_BLUE : 0;
+    }
 
     D3D12_RASTERIZER_DESC& raster = key.raster;
     raster.FillMode = shadow.polyModeFront == 1 ? D3D12_FILL_MODE_WIREFRAME : D3D12_FILL_MODE_SOLID;
@@ -1059,20 +1096,33 @@ void DrawPass(const ShadowState& shadow, const MeshDraw& mesh)
         g_cache.boundPipeline = pipeline;
     }
     auto floats = [&](const CompiledShader& shader, const Float4* registers, UINT registerCount, std::uint64_t version, ConstantUpload& last,
-                      D3D12_GPU_VIRTUAL_ADDRESS fallback) {
+                      D3D12_GPU_VIRTUAL_ADDRESS fallback, std::span<const capture::RegisterPatch> patches) {
         const UINT first = std::min(shader.info.firstFloatConstant, registerCount);
         const UINT count = std::min(shader.info.floatConstantCount, registerCount - first);
         if (count == 0)
             return fallback;
+        if (!patches.empty()) {
+            Backend::Upload upload = backend.AllocateUpload(count * sizeof(Float4), kConstantAlignment);
+            if (upload.data == nullptr)
+                return fallback;
+            auto* copy = reinterpret_cast<Float4*>(upload.data);
+            std::memcpy(copy, registers + first, count * sizeof(Float4));
+            for (const capture::RegisterPatch& patch : patches) {
+                if (patch.reg >= first && patch.reg < first + count)
+                    std::copy(patch.value.begin(), patch.value.end(), copy[patch.reg - first].v);
+            }
+            last.generation = ~0ull;
+            return upload.buffer->GetGPUVirtualAddress() + upload.offset;
+        }
         if (last.generation != backend.ListGeneration() || last.version != version || last.first != first || last.count < count)
             last = { backend.ListGeneration(), version, first, count, UploadConstants(registers + first, count * sizeof(Float4)) };
         return last.address;
     };
     const D3D12_GPU_VIRTUAL_ADDRESS vertexStateAddress = UploadConstants(&vertexState, sizeof(vertexState));
     const D3D12_GPU_VIRTUAL_ADDRESS pixelStateAddress = UploadConstants(&pixelState, sizeof(pixelState));
-    commands->SetGraphicsRootConstantBufferView(0, floats(*vertexShader, dynamic.vertexFloats.data(), kVertexFloatConstants, dynamic.vertexFloatsVersion, g_cache.vertexConstants, vertexStateAddress));
+    commands->SetGraphicsRootConstantBufferView(0, floats(*vertexShader, dynamic.vertexFloats.data(), kVertexFloatConstants, dynamic.vertexFloatsVersion, g_cache.vertexConstants, vertexStateAddress, pass.vertexPatches));
     commands->SetGraphicsRootConstantBufferView(1, vertexStateAddress);
-    commands->SetGraphicsRootConstantBufferView(2, pixelShader != nullptr ? floats(*pixelShader, dynamic.pixelFloats.data(), kPixelFloatConstants, dynamic.pixelFloatsVersion, g_cache.pixelConstants, pixelStateAddress) : pixelStateAddress);
+    commands->SetGraphicsRootConstantBufferView(2, pixelShader != nullptr ? floats(*pixelShader, dynamic.pixelFloats.data(), kPixelFloatConstants, dynamic.pixelFloatsVersion, g_cache.pixelConstants, pixelStateAddress, pass.pixelPatches) : pixelStateAddress);
     commands->SetGraphicsRootConstantBufferView(3, pixelStateAddress);
 
     commands->RSSetViewports(1, &viewport);

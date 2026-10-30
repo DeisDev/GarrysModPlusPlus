@@ -66,6 +66,7 @@ function(add_shader source entry profile variable)
         COMMAND "${DXC_EXECUTABLE}" -nologo -T ${profile} -E ${entry} -O3 -HV 2021 ${ARGN} -Fh "${output}" -Vn ${variable} "${CMAKE_CURRENT_SOURCE_DIR}/${source}"
         DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/${source}" "${CMAKE_CURRENT_SOURCE_DIR}/shaders/common.hlsli" "${CMAKE_CURRENT_SOURCE_DIR}/shaders/scene.hlsli"
             "${CMAKE_CURRENT_SOURCE_DIR}/shaders/reflection.hlsli" "${CMAKE_CURRENT_SOURCE_DIR}/shaders/water.hlsli"
+            "${CMAKE_CURRENT_SOURCE_DIR}/shaders/baked.hlsli"
         COMMENT "Compiling ${source} (${entry})"
         VERBATIM
     )
@@ -100,6 +101,7 @@ endforeach()
 add_shader(shaders/direct.hlsl main cs_6_6 g_directWideCS -D WIDE_LIGHT_SETS=1)
 add_shader(shaders/direct.hlsl main cs_6_9 g_directWideOmmCS -D WIDE_LIGHT_SETS=1 -D OPACITY_MICROMAPS=1)
 add_shader(shaders/reflection_temporal.hlsl main cs_6_6 g_reflectionTemporalCS)
+add_shader(shaders/baked_residual.hlsl main cs_6_6 g_bakedResidualCS)
 add_shader(shaders/sway.hlsl main cs_6_6 g_swayCS)
 add_shader(shaders/dlss_inputs.hlsl main cs_6_6 g_dlssInputsCS)
 add_shader(shaders/dlss_resolve.hlsl main cs_6_6 g_dlssResolveCS)
@@ -188,9 +190,11 @@ add_library(gmodpp_d3d9 SHARED
     src/descriptor_heap.cpp
     src/shader_bytecode.cpp
     src/gbuffer.cpp
+    src/gbuffer_shaders.cpp
     src/dlss.cpp
     src/lighting.cpp
     src/effects.cpp
+    src/world.cpp
     ${SHADER_HEADERS}
 )
 # NVIDIA DLSS SDK (Ray Reconstruction): headers, the NGX static library for the static runtime, and the
@@ -316,13 +320,35 @@ add_library(gmodpp SHARED
     src/shaderapi_pipelines.cpp
     src/shaderapi_shadow.cpp
     src/shaderapi_textures.cpp
+    src/shaderapi_capture.cpp
     src/watchdog.cpp
+    # Real-time lighting, shared with d3d9.dll.
+    src/native_lighting.cpp
+    src/world.cpp
+    src/lighting.cpp
+    src/gbuffer_shaders.cpp
+    src/scene.cpp
+    src/bsp.cpp
+    src/studio_model.cpp
+    src/convex_hull.cpp
+    src/opacity_micromaps.cpp
+    src/skinned_casters.cpp
+    src/swaying_props.cpp
+    src/ropes.cpp
+    src/settings.cpp
+    src/dlss.cpp
+    src/entities.cpp
+    src/engine_interfaces.cpp
+    src/client_hooks.cpp
+    src/light_queries.cpp
+    src/overlay.cpp
+    ${SHADER_HEADERS}
 )
 target_compile_definitions(gmodpp PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
 target_compile_options(gmodpp PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4 /permissive- /utf-8>)
 target_include_directories(gmodpp BEFORE PRIVATE "${AGILITY_SDK_DIR}/build/native/include")
-target_include_directories(gmodpp PRIVATE "${DXC_DIR}/inc")
-target_link_libraries(gmodpp PRIVATE d3d12 dxgi dxguid lzma_dec dbghelp comctl32)
+target_include_directories(gmodpp PRIVATE "${DXC_DIR}/inc" "${SHADER_OUTPUT_DIR}" "${DLSS_SDK_DIR}/include")
+target_link_libraries(gmodpp PRIVATE d3d12 dxgi dxguid lzma_dec dbghelp comctl32 minhook imgui "${DLSS_SDK_DIR}/lib/Windows_x86_64/x64/nvsdk_ngx_s.lib")
 
 if(GMOD_DIR)
     add_custom_target(deploy

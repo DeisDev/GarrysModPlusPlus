@@ -6,7 +6,7 @@
 #define ROOT_SIGNATURE "RootFlags(CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED), CBV(b0), SRV(t0), RootConstants(num32BitConstants = 12, b1), " \
     "StaticSampler(s0, filter = FILTER_MIN_MAG_MIP_LINEAR, addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP), "     "StaticSampler(s2, filter = FILTER_MIN_MAG_MIP_LINEAR, addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP)"
 
-// Mirrors gmodpp::FrameConstants in src/effects.h.
+// Mirrors gmodpp::FrameConstants in src/lighting.h.
 struct FrameConstants
 {
     row_major float4x4 invViewProj;
@@ -112,6 +112,13 @@ struct FrameConstants
     uint additiveAfterResolve;
     // The main view's shaded colour of last frame, for reflections of what was on screen (shaders/water.hlsli), or kNoView.
     uint previousLitView;
+    // indirect_lighting = 1 once the map's baked light is ready (shaders/baked.hlsli): the world's BakedTriangles, the
+    // faces' lightmaps, the filtered residual, and the leaf ambient ranges and samples; kNoView otherwise.
+    uint bakedTrianglesView;
+    uint bakedFacesView;
+    uint bakedResidualView;
+    uint leafAmbientView;
+    uint ambientSamplesView;
 };
 
 // Per-pass descriptor indices and parameters; mirrors Lighting::PassArgs in src/lighting.h.

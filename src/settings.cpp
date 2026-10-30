@@ -3,11 +3,14 @@
 #include "log.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <iterator>
+#include <optional>
 #include <string>
+#include <utility>
 #include <variant>
 
 namespace gmodpp {
@@ -15,7 +18,7 @@ namespace gmodpp {
 namespace {
 
 using Field = std::variant<bool Settings::*, float Settings::*, int Settings::*, DebugView Settings::*, AntiAliasing Settings::*, DlssMode Settings::*,
-    QualityPreset Settings::*, FoliageShadows Settings::*>;
+    QualityPreset Settings::*, FoliageShadows Settings::*, IndirectLighting Settings::*>;
 
 template <class Enum>
 Enum EnumValue(double value, Enum fallback)
@@ -67,6 +70,7 @@ constexpr NamedField kFields[] = {
     {"volume_rays", &Settings::volumeRays, {8.0f, 64.0f}},
     {"volumetric_steps", &Settings::volumetricSteps, {4.0f, 32.0f}},
     {"foliage_shadows", &Settings::foliageShadows},
+    {"indirect_lighting", &Settings::indirectLighting},
     {"fast_alpha_tests", &Settings::fastAlphaTests},
     {"opacity_micromaps", &Settings::opacityMicromaps},
 };
@@ -81,14 +85,15 @@ struct PresetValues {
     int volumetricSteps;
     FoliageShadows foliageShadows;
     bool fastAlphaTests;
+    IndirectLighting indirectLighting;
 };
 
 // Low, Medium, High (the original quality) and Ultra.
 constexpr PresetValues kPresets[] = {
-    {1, 1, 1, 1, 1, 16, 8, FoliageShadows::Sun, true},
-    {2, 1, 1, 2, 1, 24, 12, FoliageShadows::SunAndIndirect, true},
-    {4, 2, 1, 2, 1, 32, 16, FoliageShadows::SunAndIndirect, false},
-    {8, 4, 2, 3, 2, 64, 32, FoliageShadows::SunAndIndirect, false},
+    {1, 1, 1, 1, 1, 16, 8, FoliageShadows::Sun, true, IndirectLighting::Baked},
+    {2, 1, 1, 2, 1, 24, 12, FoliageShadows::SunAndIndirect, true, IndirectLighting::RayTraced},
+    {4, 2, 1, 2, 1, 32, 16, FoliageShadows::SunAndIndirect, false, IndirectLighting::RayTraced},
+    {8, 4, 2, 3, 2, 64, 32, FoliageShadows::SunAndIndirect, false, IndirectLighting::RayTraced},
 };
 static_assert(std::size(kPresets) == static_cast<size_t>(QualityPreset::Custom));
 
@@ -124,6 +129,7 @@ void ApplyPreset(Settings& settings, QualityPreset preset)
     settings.volumetricSteps = values.volumetricSteps;
     settings.foliageShadows = values.foliageShadows;
     settings.fastAlphaTests = values.fastAlphaTests;
+    settings.indirectLighting = values.indirectLighting;
 }
 
 Settings& GetSettings()
@@ -217,10 +223,15 @@ void SyncSettingsFile(const std::filesystem::path& path)
         log::Info("Settings: loaded {}", path.string());
 }
 
-void RecordFrameTime(float milliseconds)
+void RecordFrameInterval()
 {
+    static std::optional<std::chrono::steady_clock::time_point> previous;
+    const auto now = std::chrono::steady_clock::now();
+    const std::optional<std::chrono::steady_clock::time_point> last = std::exchange(previous, now);
+    if (!last)
+        return;
     Statistics& statistics = GetStatistics();
-    statistics.frameMs[statistics.nextFrame] = milliseconds;
+    statistics.frameMs[statistics.nextFrame] = std::chrono::duration<float, std::milli>(now - *last).count();
     statistics.nextFrame = (statistics.nextFrame + 1) % Statistics::kFrameHistory;
     statistics.frameCount = std::min(statistics.frameCount + 1, Statistics::kFrameHistory);
 }

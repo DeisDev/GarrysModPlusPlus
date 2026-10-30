@@ -1,6 +1,7 @@
 #include "shaderapi_textures.h"
 
 #include "log.h"
+#include "native_lighting.h"
 #include "shaderapi.h"
 #include "shaderapi_pipelines.h"
 
@@ -506,6 +507,7 @@ void ReadTarget(int x, int y, int width, int height, unsigned char* data, int fo
         targetWidth = static_cast<UINT>(texture->width);
         targetHeight = static_cast<UINT>(texture->height);
     } else {
+        realtime::OnBackBufferRead();
         source = &backend.ResolvedBackBuffer();
     }
     const UINT left = static_cast<UINT>(std::clamp(x, 0, static_cast<int>(targetWidth)));
@@ -678,6 +680,8 @@ bool TargetSurface(int id, bool read, CopySurface& surface)
         return false;
     const std::intptr_t handle = Dynamic().colorTargets[static_cast<size_t>(id)];
     if (id == 0 && handle == kDefaultTarget) {
+        if (read)
+            realtime::OnBackBufferRead();
         Backend& backend = GetBackend();
         TrackedResource& resource = read ? backend.ResolvedBackBuffer() : backend.BackBuffer();
         surface = { &resource, backend.BackBufferTexture(), backend.BackBufferView(false), Backend::kBackBufferFormat, backend.Width(),

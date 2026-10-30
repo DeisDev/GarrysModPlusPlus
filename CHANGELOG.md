@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- A "Baked" indirect light option that reuses the map's own bounce light instead of tracing it, for faster frames; the Low preset uses it.
 - Glass and other translucent surfaces are lit by real-time light instead of baked light.
 - Ray-traced ambient occlusion, with an on/off switch and strength in the menu.
 - Volumetric light from the sun and flashlights, with an on/off switch and strength in the menu.

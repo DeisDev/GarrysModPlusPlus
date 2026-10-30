@@ -118,7 +118,7 @@ bool Presenter::Initialize(IDirect3DDevice9* device, HWND fallbackWindow, const 
         return false;
     }
     m_rtvIncrement = d3d12->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-    overlay::Initialize(m_window, m_renderer, DXGI_FORMAT_B8G8R8A8_UNORM, kBufferCount);
+    overlay::Initialize(m_window, m_renderer.Device(), m_renderer.Queue(), m_renderer.Descriptors(), DXGI_FORMAT_B8G8R8A8_UNORM, kBufferCount);
 
     m_active = true;
     log::Info("Presenter: flip-model swap chain {}x{} on window {}, sync interval {}", m_width, m_height,

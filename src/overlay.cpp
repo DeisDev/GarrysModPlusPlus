@@ -1,8 +1,7 @@
 #include "overlay.h"
 
 #include "log.h"
-#include "mod.h"
-#include "renderer.h"
+#include "options.h"
 #include "settings.h"
 #include "ui_text.h"
 
@@ -350,6 +349,23 @@ void DrawRayTracingTab(Settings& settings)
     }
     ImGui::SeparatorText(Text(TextId::SectionIndirect));
     if (BeginOptionTable("indirect")) {
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn();
+        ImGui::TextUnformatted(Text(TextId::IndirectSource));
+        ImGui::TableNextColumn();
+        const TextId sources[] = {TextId::IndirectRayTraced, TextId::IndirectBaked};
+        static_assert(std::size(sources) == static_cast<size_t>(IndirectLighting::Count));
+        const int source = static_cast<int>(settings.indirectLighting);
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        if (ImGui::BeginCombo("##indirectSource", Text(sources[source]))) {
+            for (int i = 0; i < static_cast<int>(std::size(sources)); ++i) {
+                if (ImGui::Selectable(Text(sources[i]), i == source) && i != source) {
+                    settings.indirectLighting = static_cast<IndirectLighting>(i);
+                    settings.qualityPreset = QualityPreset::Custom;
+                }
+            }
+            ImGui::EndCombo();
+        }
         IntSliderRow(TextId::IndirectRays, settings, &Settings::indirectRays);
         IntSliderRow(TextId::IndirectBounces, settings, &Settings::indirectBounces);
         IntSliderRow(TextId::AoRays, settings, &Settings::aoRays);
@@ -502,12 +518,12 @@ bool HookInputFunctions()
 
 }
 
-bool Initialize(HWND window, Renderer& renderer, DXGI_FORMAT format, UINT framesInFlight)
+bool Initialize(HWND window, ID3D12Device* device, ID3D12CommandQueue* queue, DescriptorHeap& descriptors, DXGI_FORMAT format, UINT framesInFlight)
 {
     if (g_state.initialized)
         return true;
     g_state.window = window;
-    g_state.descriptors = &renderer.Descriptors();
+    g_state.descriptors = &descriptors;
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
@@ -518,8 +534,8 @@ bool Initialize(HWND window, Renderer& renderer, DXGI_FORMAT format, UINT frames
     ImGui::StyleColorsDark();
 
     ImGui_ImplDX12_InitInfo info;
-    info.Device = renderer.Device();
-    info.CommandQueue = renderer.Queue();
+    info.Device = device;
+    info.CommandQueue = queue;
     info.NumFramesInFlight = static_cast<int>(framesInFlight);
     info.RTVFormat = format;
     info.SrvDescriptorHeap = g_state.descriptors->Heap();

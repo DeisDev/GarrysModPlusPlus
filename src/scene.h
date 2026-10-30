@@ -10,6 +10,7 @@
 #include <wrl/client.h>
 
 #include <array>
+#include <filesystem>
 #include <optional>
 #include <span>
 #include <string>
@@ -86,6 +87,45 @@ struct SceneInstance {
     UINT previousPositionsView = DescriptorHeap::kInvalid;
 };
 
+// A world triangle's lightmap and its corners' luxel coordinates. Mirrors BakedTriangle in shaders/baked.hlsli.
+struct BakedTriangle {
+    // bsp::BakedLighting::faces index, or bsp::kNoFace.
+    uint32_t face;
+    float luxels[3][2];
+    uint32_t unused;
+};
+static_assert(sizeof(BakedTriangle) == 32);
+
+// The format of the baked residual cache (gmodpp_cache\baked): bump when shaders/baked_residual.hlsl or the data it
+// reads changes.
+inline constexpr uint32_t kBakeVersion = 1;
+
+// VRAD's baked light on the GPU (indirect_lighting = 1): raw views of bsp::BakedLighting and of the world's
+// BakedTriangles, and the residual shaders/baked_residual.hlsl writes: the baked light less the direct light VRAD
+// summed into it, per lightmap sample, as half4, then filtered within each face.
+struct BakedBuffers {
+    UINT samplesView = DescriptorHeap::kInvalid;
+    UINT facesView = DescriptorHeap::kInvalid;
+    UINT trianglesView = DescriptorHeap::kInvalid;
+    UINT luxelsView = DescriptorHeap::kInvalid;
+    UINT leafAmbientView = DescriptorHeap::kInvalid;
+    UINT ambientSamplesView = DescriptorHeap::kInvalid;
+    UINT residualView = DescriptorHeap::kInvalid;
+    UINT residualUav = DescriptorHeap::kInvalid;
+    UINT filteredView = DescriptorHeap::kInvalid;
+    UINT filteredUav = DescriptorHeap::kInvalid;
+    // Clamped luxels, luxels the filter changed by more than a tenth, and luxels baked (shaders/baked_residual.hlsl).
+    UINT countersUav = DescriptorHeap::kInvalid;
+    UINT luxelCount = 0;
+    UINT leafCount = 0;
+    // Progress of the bake, which Lighting runs a part of each main view: luxels done, then the filter.
+    UINT bakedLuxels = 0;
+    bool filtered = false;
+    // Where the filtered residual is saved once baked; empty when it was loaded from there.
+    std::filesystem::path cachePath;
+    bool Ready() const { return filtered; }
+};
+
 struct SceneFrame {
     D3D12_GPU_VIRTUAL_ADDRESS tlas = 0;
     // Descriptor of this frame's InstanceRecord buffer, indexed by InstanceID().
@@ -109,6 +149,15 @@ public:
     // The map's lights and sun come from `world`, with the hulls that block some lights; its triangles from
     // `worldGeometry`.
     bool LoadMap(const std::string& name, const bsp::WorldGeometry& world, std::span<const LightHull> lightHulls, const ModelGeometry& worldGeometry);
+    // Uploads the map's baked light for indirect_lighting = 1, with the world model's triangles in their BLAS order;
+    // false (logged) when the map has none or the upload fails. A filtered residual from an earlier bake of the same
+    // map (`cachedResidual`, empty for none) makes the bake unnecessary.
+    bool LoadBaked(const bsp::BakedLighting& baked, std::span<const BakedTriangle> triangles, std::span<const std::byte> cachedResidual);
+    bool HasBaked() const { return m_baked.trianglesView != DescriptorHeap::kInvalid; }
+    BakedBuffers& Baked() { return m_baked; }
+    ID3D12Resource* BakedResidual() const { return m_bakedResidual.Get(); }
+    ID3D12Resource* BakedFiltered() const { return m_bakedFiltered.Get(); }
+    ID3D12Resource* BakedCounters() const { return m_bakedCounters.Get(); }
     // Builds a BLAS for the geometry and returns its model id, or -1 when the geometry is empty or fails.
     int AddModel(const ModelGeometry& geometry);
     // A texture for alpha tests and material masks: VTF mips in their stored layout, largest first. Returns its
@@ -294,6 +343,11 @@ private:
     Microsoft::WRL::ComPtr<ID3D12Resource> m_lightIndices;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_bspNodes;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_leafClusters;
+    BakedBuffers m_baked;
+    std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> m_bakedInputs;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_bakedResidual;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_bakedFiltered;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_bakedCounters;
 };
 
 }

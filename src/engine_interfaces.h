@@ -51,6 +51,10 @@ ComputeLightingFn ComputeLightingFunction();
 // (2 = G-buffer outputs). Returns false when the material system is unavailable.
 bool SetFixedLighting(int mode);
 
+// Whether a material draws unlit (UnlitGeneric, UnlitTwoTexture, MonitorScreen), whose preview combos leave out vertex
+// colour.
+bool IsUnlitMaterial(void* material);
+
 // While enabled, each material the game binds switches fixed lighting between 2 and 0: unlit materials (UnlitGeneric
 // and its relatives) are drawn with their own shaders, the others with the G-buffer outputs. For the forward pass.
 void SetUnlitFilter(bool enabled);

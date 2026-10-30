@@ -1,6 +1,8 @@
 #include "shaderapi.h"
 
 #include "log.h"
+#include "native_lighting.h"
+#include "shaderapi_capture.h"
 #include "shaderapi_commands.h"
 #include "shaderapi_device.h"
 #include "shaderapi_pipelines.h"
@@ -454,6 +456,7 @@ void SetViewports(NativeObject*, int count, const int* viewports)
     g_api.viewportRaw[2] = w;
     g_api.viewportRaw[3] = h;
     g_dynamic.viewport = { static_cast<float>(viewports[1]), static_cast<float>(viewports[2]), static_cast<float>(w), static_cast<float>(h), depth[0], depth[1] };
+    realtime::OnViewport(depth[0], depth[1]);
 }
 
 int GetViewports(NativeObject*, int* viewports, int max)
@@ -862,6 +865,12 @@ void SetIntRenderingParameter(NativeObject*, int parameter, int value)
 
 int GetIntRenderingParameter(NativeObject*, int parameter)
 {
+    // The capture selects the stock shaders' LIGHTING_PREVIEW combos through INT_RENDERPARM_ENABLE_FIXED_LIGHTING.
+    constexpr int kEnableFixedLighting = 0;
+    if (parameter == kEnableFixedLighting) {
+        if (const int fixedLighting = capture::FixedLighting(); fixedLighting >= 0)
+            return fixedLighting;
+    }
     return parameter >= 0 && parameter < kRenderParameters ? g_api.intParameters[static_cast<size_t>(parameter)] : 0;
 }
 
@@ -1465,6 +1474,7 @@ bool SetMode(ShaderApiObject* self, void* window, int, const ShaderDeviceInfo& i
     if (!GetBackend().SetMode(static_cast<HWND>(window), info))
         return false;
     ResetRenderState(self, true);
+    realtime::OnDeviceReady();
     return true;
 }
 
@@ -1613,6 +1623,14 @@ const char* BoundMaterialName()
 {
     constexpr unsigned kMaterialGetName = 0;
     return g_api.material != nullptr ? MaterialSlot<const char* (*)(void*)>(g_api.material, kMaterialGetName)(g_api.material) : "none";
+}
+
+const char* BoundShaderName()
+{
+    // IMaterial::GetShaderName (the IMaterial:GetShader Lua binding calls it; engine_interfaces.cpp).
+    constexpr unsigned kMaterialGetShaderName = 49;
+    const char* name = g_api.material != nullptr ? MaterialSlot<const char* (*)(void*)>(g_api.material, kMaterialGetShaderName)(g_api.material) : nullptr;
+    return name != nullptr ? name : "none";
 }
 
 // 0x1800112c0: decals use the reciprocals of MaterialSystem_Config_t's decal factors (slope 0x5c, bias 0x60; SDK

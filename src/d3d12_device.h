@@ -12,4 +12,14 @@ namespace gmodpp {
 // cannot do that.
 Microsoft::WRL::ComPtr<ID3D12DeviceFactory> AgilityDeviceFactory(const std::filesystem::path& runtimeDirectory);
 
+struct RaytracingSupport {
+    D3D12_RAYTRACING_TIER tier = D3D12_RAYTRACING_TIER_NOT_SUPPORTED;
+    D3D_SHADER_MODEL shaderModel = D3D_SHADER_MODEL_5_1;
+    // Inline ray tracing in Shader Model 6.6, which the lighting needs.
+    bool inlineRaytracing = false;
+    // Raytracing tier 1.2 and Shader Model 6.9, through the Agility SDK runtime.
+    bool opacityMicromaps = false;
+};
+RaytracingSupport QueryRaytracing(ID3D12Device* device);
+
 }

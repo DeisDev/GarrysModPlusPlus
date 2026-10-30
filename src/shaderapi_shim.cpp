@@ -2,6 +2,7 @@
 #include "command_line.h"
 #include "log.h"
 #include "module_scan.h"
+#include "options.h"
 #include "shader_prewarm.h"
 #include "shaderapi_native.h"
 #include "shaderapi_commands.h"
@@ -971,6 +972,24 @@ void* CreateInterfaceExport(const char* name, int* returnCode)
     }
     // This factory is in the engine's global chain, so most requests are other modules' interfaces.
     return WrapIfKnown(name, shim->gameCreateInterface(name, returnCode));
+}
+
+}
+
+namespace gmodpp {
+
+const Options& GetOptions()
+{
+    static const Options options = [] {
+        Options loaded;
+        loaded.enabled = HasArgument(L"-insecure");
+        loaded.devMode = HasArgument(L"-gmodpp_dev");
+        loaded.d3d12Debug = HasArgument(L"-gmodpp_debug");
+        loaded.gpuValidation = HasArgument(L"-gmodpp_gbv");
+        loaded.gameDirectory = ExecutablePath().parent_path();
+        return loaded;
+    }();
+    return options;
 }
 
 }

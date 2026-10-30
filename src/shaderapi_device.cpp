@@ -3,6 +3,8 @@
 #include "command_line.h"
 #include "d3d12_device.h"
 #include "log.h"
+#include "native_lighting.h"
+#include "overlay.h"
 #include "shader_prewarm.h"
 #include "shaderapi.h"
 #include "shaderapi_meshes.h"
@@ -254,6 +256,7 @@ void ApplyPendingMode()
 
 void Present(NativeObject*)
 {
+    realtime::OnPresent();
     GetBackend().Present();
     if (g_pendingMode)
         ApplyPendingMode();
@@ -425,7 +428,7 @@ bool Backend::CreateDepthBuffer()
     desc.Height = m_height;
     desc.DepthOrArraySize = 1;
     desc.MipLevels = 1;
-    desc.Format = kDepthFormat;
+    desc.Format = kDepthResourceFormat;
     desc.SampleDesc.Count = m_samples;
     desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
     D3D12_CLEAR_VALUE clear = {};
@@ -440,7 +443,10 @@ bool Backend::CreateDepthBuffer()
     m_depthBuffer.state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
     if (m_depthView.ptr == 0)
         m_depthView = m_dsvs.Allocate();
-    m_device->CreateDepthStencilView(m_depthBuffer.resource.Get(), nullptr, m_depthView);
+    D3D12_DEPTH_STENCIL_VIEW_DESC view = {};
+    view.Format = kDepthFormat;
+    view.ViewDimension = m_samples > 1 ? D3D12_DSV_DIMENSION_TEXTURE2DMS : D3D12_DSV_DIMENSION_TEXTURE2D;
+    m_device->CreateDepthStencilView(m_depthBuffer.resource.Get(), &view, m_depthView);
     return true;
 }
 
@@ -587,7 +593,12 @@ void Backend::Present()
         }
         LimitDraws(limit);
     }
-    Transition(ResolvedBackBuffer(), D3D12_RESOURCE_STATE_PRESENT);
+    TrackedResource& presented = ResolvedBackBuffer();
+    if (overlay::Open()) {
+        Transition(presented, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        overlay::Render(m_commandList.Get(), m_backBufferViews[m_swapChain->GetCurrentBackBufferIndex() * 2]);
+    }
+    Transition(presented, D3D12_RESOURCE_STATE_PRESENT);
     m_commandList->Close();
     m_recording = false;
     ID3D12CommandList* lists[] = { m_commandList.Get() };
@@ -637,6 +648,19 @@ void Backend::Flush()
     m_stagingUsed = 0;
     frame.allocator->Reset();
     m_commandList->Reset(frame.allocator.Get(), nullptr);
+    ++m_listGeneration;
+}
+
+void Backend::Submit()
+{
+    if (!m_recording)
+        return;
+    RunPending();
+    m_commandList->Close();
+    ID3D12CommandList* lists[] = { m_commandList.Get() };
+    m_queue->ExecuteCommandLists(1, lists);
+    // A command list can be reset while it executes; its allocator keeps both recordings until the frame is done.
+    m_commandList->Reset(m_frames[m_frame].allocator.Get(), nullptr);
     ++m_listGeneration;
 }
 

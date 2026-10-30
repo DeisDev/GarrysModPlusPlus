@@ -1,4 +1,4 @@
-#include "scene.hlsli"
+#include "baked.hlsli"
 
 // Cosine-weighted diffuse bounces per pixel. The result is an irradiance estimate: a sky miss returns
 // the sky irradiance, a hit returns its albedo times the light reaching it. Where the hit was on screen last
@@ -8,6 +8,8 @@
 // The sampled remainder of the direct light (direct.hlsl) is added, so the denoiser handles both.
 // input0: last frame's denoised light, or none; input1: sampled direct remainder; input2: last frame's exact direct
 // light; output0: raw estimate; step: samples per pixel.
+// With indirect_lighting = 1 (g_frame.bakedTrianglesView) nothing is traced: the world takes VRAD's baked bounce
+// light (shaders/baked.hlsli), other surfaces the leaf ambient light, and the denoiser still gets the remainder.
 
 static const float kMaxDistance = 16384.0;
 
@@ -129,6 +131,16 @@ void main(uint3 id : SV_DispatchThreadID)
     // surfaces start on the far side.
     Texture2D<uint> pixelFlags = ResourceDescriptorHeap[g_frame.pixelFlagsView];
     bool ignoreNormals = (pixelFlags.Load(int3(pixel, 0)) & kPixelIgnoreNormals) != 0;
+    Texture2D<float4> remainder = ResourceDescriptorHeap[g_pass.input1];
+    if (g_frame.bakedTrianglesView != kNoView) {
+        float3 baked = BakedIrradiance(pixel, normal);
+        if (baked.x < 0.0)
+            baked = LeafAmbient(position, ignoreNormals ? 0.0 : normal);
+        if (baked.x < 0.0)
+            baked = g_frame.skyColor;
+        output[pixel] = float4(baked + remainder.Load(int3(pixel, 0)).rgb, 1.0);
+        return;
+    }
     uint samples = max(g_pass.step, 1u);
     float3 estimate = 0.0;
     for (uint s = 0; s < samples; ++s) {
@@ -140,6 +152,5 @@ void main(uint3 id : SV_DispatchThreadID)
         else
             estimate += g_frame.skyColor;
     }
-    Texture2D<float4> remainder = ResourceDescriptorHeap[g_pass.input1];
     output[pixel] = float4(estimate / samples + remainder.Load(int3(pixel, 0)).rgb, 1.0);
 }

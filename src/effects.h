@@ -1,5 +1,7 @@
 #pragma once
 
+#include "view_events.h"
+
 #include <d3d9.h>
 
 namespace gmodpp::effects {
@@ -10,11 +12,6 @@ void OnDeviceReady(IDirect3DDevice9* device, const D3DPRESENT_PARAMETERS& params
 void OnBeforeReset();
 void OnPresent();
 
-// Called from client.dll around each view's opaque pass (DrawWorld until DrawTranslucentRenderables).
-void OnViewOpaqueBegin();
-void OnViewOpaqueEnd(bool inSkybox);
-// After DrawTranslucentRenderables: ends the forward lighting of the view's translucent surfaces.
-void OnViewTranslucentEnd();
 // The viewmodel is drawn with its own depth range (viewport z 0..0.1); its capture follows that range.
 void OnViewport(const D3DVIEWPORT9& viewport);
 // Before the game copies `source` (StretchRect); post-processing copies the back buffer straight after the viewmodel.

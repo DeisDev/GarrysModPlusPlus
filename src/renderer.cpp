@@ -131,19 +131,9 @@ Renderer* Renderer::Create(LUID adapterLuid, const Options& options)
     if (!renderer->m_descriptors.Initialize(renderer->m_device.Get(), kDescriptorCapacity))
         return nullptr;
 
-    D3D12_FEATURE_DATA_D3D12_OPTIONS5 options5 = {};
-    renderer->m_device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5, &options5, sizeof(options5));
-    // A runtime that does not know the shader model asked about fails the query, so ask for 6.6 after 6.9.
-    D3D12_FEATURE_DATA_SHADER_MODEL shaderModel = {D3D_SHADER_MODEL_5_1};
-    for (D3D_SHADER_MODEL highest : {D3D_SHADER_MODEL_6_9, D3D_SHADER_MODEL_6_6}) {
-        D3D12_FEATURE_DATA_SHADER_MODEL query = {highest};
-        if (SUCCEEDED(renderer->m_device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &query, sizeof(query)))) {
-            shaderModel = query;
-            break;
-        }
-    }
-    renderer->m_raytracing = options5.RaytracingTier >= D3D12_RAYTRACING_TIER_1_1 && shaderModel.HighestShaderModel >= D3D_SHADER_MODEL_6_6;
-    renderer->m_opacityMicromaps = options5.RaytracingTier >= D3D12_RAYTRACING_TIER_1_2 && shaderModel.HighestShaderModel >= D3D_SHADER_MODEL_6_9;
+    const RaytracingSupport support = QueryRaytracing(renderer->m_device.Get());
+    renderer->m_raytracing = support.inlineRaytracing;
+    renderer->m_opacityMicromaps = support.opacityMicromaps;
 
     if (options.d3d12Debug && SUCCEEDED(renderer->m_device.As(&renderer->m_infoQueue))) {
         D3D12_MESSAGE_SEVERITY hidden[] = {D3D12_MESSAGE_SEVERITY_INFO, D3D12_MESSAGE_SEVERITY_MESSAGE, D3D12_MESSAGE_SEVERITY_WARNING};
@@ -154,7 +144,7 @@ Renderer* Renderer::Create(LUID adapterLuid, const Options& options)
     }
 
     log::Info("D3D12 device on '{}': raytracing tier {:#x}, shader model {:#x}, inline raytracing {}, opacity micromaps {}", adapterName,
-        static_cast<int>(options5.RaytracingTier), static_cast<int>(shaderModel.HighestShaderModel),
+        static_cast<int>(support.tier), static_cast<int>(support.shaderModel),
         renderer->m_raytracing ? "available" : "unavailable", renderer->m_opacityMicromaps ? "available" : "unavailable");
 
     g_renderer = renderer.release();

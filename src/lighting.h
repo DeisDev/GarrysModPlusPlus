@@ -1,26 +1,23 @@
 #pragma once
 
-#include "gbuffer.h"
 #include "dlss.h"
 #include "scene.h"
 #include "settings.h"
 #include "skinned_casters.h"
 #include "swaying_props.h"
+#include "view_types.h"
 
 #include <d3d12.h>
-#include <d3d9.h>
-#include <d3d9on12.h>
 #include <wrl/client.h>
 
 #include <array>
+#include <filesystem>
 #include <optional>
 #include <span>
 #include <utility>
 #include <vector>
 
 namespace gmodpp {
-
-class Renderer;
 
 // Mirrors FrameConstants in shaders/common.hlsli.
 struct FrameConstants {
@@ -106,6 +103,11 @@ struct FrameConstants {
     uint32_t lightStylesView;
     uint32_t additiveAfterResolve;
     uint32_t previousLitView;
+    uint32_t bakedTrianglesView;
+    uint32_t bakedFacesView;
+    uint32_t bakedResidualView;
+    uint32_t leafAmbientView;
+    uint32_t ambientSamplesView;
 };
 
 // What blocks the sun at a pixel of the main view (Lighting::RequestProbe).
@@ -120,17 +122,19 @@ struct ProbeResult {
     uint32_t mask;
 };
 
-// The game's D3D9 resources one view rendered: its colour target, which keeps what the G-buffer does not
-// cover, and the G-buffer.
+// What one view rendered: its colour target, which keeps what the G-buffer does not cover, and the G-buffer, with
+// the capture's state. Every resource is in D3D12_RESOURCE_STATE_COMMON when Run starts and when its commands end.
 struct ViewInputs {
-    IDirect3DSurface9* color;
-    IDirect3DTexture9* depth;
-    IDirect3DTexture9* normal;
-    IDirect3DTexture9* flags;
-    IDirect3DTexture9* light;
-    IDirect3DTexture9* albedo;
-    IDirect3DTexture9* emissive;
+    ID3D12Resource* color;
+    ID3D12Resource* depth;
+    ID3D12Resource* normal;
+    ID3D12Resource* flags;
+    ID3D12Resource* light;
+    ID3D12Resource* albedo;
+    ID3D12Resource* emissive;
     std::span<const gbuffer::ProjectedLight> projected;
+    // Each projected light's cookie texture, or null for a round spot.
+    std::span<ID3D12Resource* const> cookies;
     gbuffer::ViewKind kind;
     // The viewport depth range the view was drawn with.
     float depthMin;
@@ -139,10 +143,21 @@ struct ViewInputs {
     // How far the view's image is shifted by the jitter, in render pixels (x right, y down).
     float jitterX = 0.0f;
     float jitterY = 0.0f;
-    // Where the main view's irradiance volume goes for the game's forward-lit draws (gbuffer::ProbeTextures).
-    std::array<IDirect3DVolumeTexture9*, 3> probes = {};
+    // Where the main view's irradiance volume goes for the game's forward-lit draws: copies of the red, green and
+    // blue volumes, or none.
+    std::array<ID3D12Resource*, 3> probes = {};
     // The local player's origin (its feet), when its model is known.
     std::optional<std::array<float, 3>> localPlayer;
+    // Source's view-projection rows (c8-c11) the G-buffer was drawn with, without the jitter, and the jitter added
+    // to them (clip-space offsets, NDC units).
+    gbuffer::Matrix4 viewProj = {};
+    std::array<float, 2> jitter = {};
+    // The tonemap scale Source multiplies lit colours by (cLightScale.x), and whether the colour target holds sRGB.
+    float tonemapScale = 1.0f;
+    bool outputSrgb = false;
+    gbuffer::Fog fog;
+    // When the game last drew a swaying model.
+    gbuffer::SwayClock sway;
 };
 
 // Lights a view's G-buffer on the D3D12 queue the game shares and writes the result back into its colour
@@ -150,8 +165,14 @@ struct ViewInputs {
 // frames and denoised. The 3D skybox is lit without tracing.
 class Lighting {
 public:
-    bool Initialize(Renderer& renderer, IDirect3DDevice9* device);
+    // `dlssDirectory` holds nvngx_dlssd.dll.
+    bool Initialize(ID3D12Device5* device, ID3D12CommandQueue* queue, DescriptorHeap& descriptors, bool opacityMicromaps,
+        const std::filesystem::path& dlssDirectory);
+    // Submits the view's commands to the queue. The game's commands that wrote the inputs must be submitted first.
     void Run(const ViewInputs& inputs, Scene& scene, std::span<const SceneInstance> dynamic, const std::vector<SkinnedEntity>& skinned);
+    // The fence and value the commands submitted so far signal.
+    ID3D12Fence* Fence() const { return m_fence.Get(); }
+    uint64_t FenceValue() const { return m_fenceValue; }
     SkinnedCasters& Skinned() { return m_skinned; }
     SwayingProps& Sway() { return m_sway; }
     // The resolution the main view's ray tracing runs at when DLSS Ray Reconstruction is in use; false when the
@@ -182,7 +203,7 @@ private:
         D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     };
     // DirectWide is Direct for more exact lights or shared shadow rays than the High preset's.
-    enum class Pass { Surface, Primary, Probes, Ao, Volumetrics, Direct, GiTrace, GiTemporal, GiFilter, Lighting, TemporalAntiAliasing, Sharpen, Reflections, ReflectionTemporal, DlssInputs, DlssResolve, DirectWide, Sway, TranslucentDepth, ViewRect, Count };
+    enum class Pass { Surface, Primary, Probes, Ao, Volumetrics, Direct, GiTrace, GiTemporal, GiFilter, Lighting, TemporalAntiAliasing, Sharpen, Reflections, ReflectionTemporal, DlssInputs, DlssResolve, DirectWide, Sway, TranslucentDepth, ViewRect, Baked, Count };
     // Mirrors PassConstants in shaders/common.hlsli: descriptor indices (none by default) and a parameter.
     struct PassArgs {
         UINT input0 = DescriptorHeap::kInvalid;
@@ -205,22 +226,23 @@ private:
     bool CreateTarget(Texture& texture, UINT width, UINT height, DXGI_FORMAT format, UINT depth = 0);
     void DispatchGroups(Pass pass, const PassArgs& args, UINT x, UINT y, UINT z);
     // Moves the swaying props near the eye to this frame's sway (SwayingProps).
-    void UpdateSway(const Scene& scene, UINT slot, const float (&eye)[3], D3D12_GPU_VIRTUAL_ADDRESS frameConstants);
+    void UpdateSway(const Scene& scene, UINT slot, const gbuffer::SwayClock& clock, const float (&eye)[3], D3D12_GPU_VIRTUAL_ADDRESS frameConstants);
     // Hands the slot's copy of the irradiance volume to light_queries.
     void PublishVolume(UINT slot);
     void Use(Texture& texture, D3D12_RESOURCE_STATES state);
     void Dispatch(Pass pass, const PassArgs& args);
     bool FillConstants(FrameConstants& constants, const Scene& scene, const ViewInputs& inputs);
-    void ReturnResources(std::span<IDirect3DResource9* const> resources, UINT count);
+    // Records the next part of the map's residual bake (shaders/baked_residual.hlsl) with the view's constants changed
+    // to the lights' baked strength, then puts `frameConstants` back.
+    void BakeStep(Scene& scene, const FrameConstants& constants, D3D12_GPU_VIRTUAL_ADDRESS frameConstants);
     bool EnsureDepthPipeline(DXGI_FORMAT format);
     UINT WriteProjectors(UINT slot, std::span<const gbuffer::ProjectedLight> projected, std::span<ID3D12Resource* const> cookies, UINT cookieViews,
         const FrameConstants& constants, const std::optional<std::array<float, 3>>& localPlayer);
 
-    Renderer* m_renderer = nullptr;
     ID3D12Device5* m_device = nullptr;
+    ID3D12CommandQueue* m_queue = nullptr;
     DescriptorHeap* m_descriptors = nullptr;
-    Microsoft::WRL::ComPtr<IDirect3DDevice9On12> m_device9On12;
-    Microsoft::WRL::ComPtr<IDirect3DQuery9> m_flushQuery;
+    bool m_opacityMicromaps = false;
     static constexpr UINT kSlots = Scene::kFrameSlots;
     std::array<Microsoft::WRL::ComPtr<ID3D12CommandAllocator>, kSlots> m_allocators;
     std::array<uint64_t, kSlots> m_slotFenceValues = {};
@@ -233,6 +255,13 @@ private:
     UINT m_slotViews = DescriptorHeap::kInvalid;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_constants;
     std::byte* m_constantsMapped = nullptr;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_bakeConstants;
+    std::byte* m_bakeConstantsMapped = nullptr;
+    // The bake's counters, read once it is done to log how much the direct light exceeded the baked light.
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_bakeReadback;
+    bool m_bakeLogPending = false;
+    // The filtered residual on its way to the cache (BakedBuffers::cachePath).
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_bakeCacheReadback;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_projectors;
     std::byte* m_projectorsMapped = nullptr;
     std::array<UINT, kSlots> m_projectorViews = {};

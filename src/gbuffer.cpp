@@ -1,44 +1,10 @@
 #include "gbuffer.h"
 
 #include "engine_interfaces.h"
+#include "gbuffer_shaders.h"
 #include "log.h"
 #include "settings.h"
 #include "shader_bytecode.h"
-
-#include <g_forwardBumpPS.h>
-#include <g_forwardBumpSelfIllumFresnelPS.h>
-#include <g_forwardBumpSelfIllumPS.h>
-#include <g_forwardSkinDetailPS.h>
-#include <g_forwardSkinDetailSelfIllumFresnelPS.h>
-#include <g_forwardSkinDetailSelfIllumPS.h>
-#include <g_forwardSkinNoBumpDetailPS.h>
-#include <g_forwardSkinNoBumpDetailSelfIllumFresnelPS.h>
-#include <g_forwardSkinNoBumpDetailSelfIllumPS.h>
-#include <g_forwardSkinNoBumpPS.h>
-#include <g_forwardSkinNoBumpSelfIllumFresnelPS.h>
-#include <g_forwardSkinNoBumpSelfIllumPS.h>
-#include <g_forwardSkinPS.h>
-#include <g_forwardSkinSelfIllumFresnelPS.h>
-#include <g_forwardSkinSelfIllumPS.h>
-#include <g_forwardSnippetPS.h>
-#include <g_forwardSnippetPS2.h>
-#include <g_waterSurfaceAlphaFogPS.h>
-#include <g_waterSurfacePS.h>
-#include <g_gbufferBumpPS.h>
-#include <g_gbufferBumpSelfIllumFresnelPS.h>
-#include <g_gbufferBumpSelfIllumPS.h>
-#include <g_gbufferSkinDetailPS.h>
-#include <g_gbufferSkinDetailSelfIllumFresnelPS.h>
-#include <g_gbufferSkinDetailSelfIllumPS.h>
-#include <g_gbufferSkinNoBumpDetailPS.h>
-#include <g_gbufferSkinNoBumpDetailSelfIllumFresnelPS.h>
-#include <g_gbufferSkinNoBumpDetailSelfIllumPS.h>
-#include <g_gbufferSkinNoBumpPS.h>
-#include <g_gbufferSkinNoBumpSelfIllumFresnelPS.h>
-#include <g_gbufferSkinNoBumpSelfIllumPS.h>
-#include <g_gbufferSkinPS.h>
-#include <g_gbufferSkinSelfIllumFresnelPS.h>
-#include <g_gbufferSkinSelfIllumPS.h>
 
 #include <wrl/client.h>
 
@@ -64,46 +30,13 @@ constexpr D3DFORMAT kNormalFormat = D3DFMT_A16B16G16R16F;
 constexpr D3DFORMAT kFlagsFormat = D3DFMT_A8R8G8B8;
 // Same format as the back buffer, so flashlight passes write it exactly as they would the back buffer.
 constexpr D3DFORMAT kLightFormat = D3DFMT_A8R8G8B8;
-constexpr DWORD kNormalTarget = 1;
-constexpr DWORD kEmissiveTarget = 2;
-constexpr DWORD kFlagsTarget = 3;
-// The Water shader's g_WaterFogColor (shaders/water_surface.hlsl).
-constexpr UINT kWaterFogColorRegister = 6;
 constexpr DWORD kDefaultColorWrite = 0x0F;
 constexpr DWORD kColorWriteRgb = D3DCOLORWRITEENABLE_RED | D3DCOLORWRITEENABLE_GREEN | D3DCOLORWRITEENABLE_BLUE;
-constexpr UINT kLightScaleRegister = 30;
-constexpr UINT kFogColorRegister = 29;
-constexpr UINT kVertexFogRegister = 16;
 constexpr UINT kTrackedRegisters = 32;
 constexpr UINT kTrackedVertexRegisters = 256;
-constexpr DWORD kTextureStages = 16;
 constexpr size_t kMaxProjectedLights = 8;
-// Source's model-view-projection (c4-c7) and view-projection (c8-c11) rows; clip = dot(row, position).
-constexpr UINT kModelViewProjection = 4;
-constexpr UINT kViewProjection = 8;
-constexpr UINT kProjectionRegisters = 8;
-// Hammer's lighting preview assumes gamma-space textures and converts with pow(x, 2.2); the game samples
-// them as sRGB already, so the conversion is turned into pow(x, 1).
-constexpr float kPreviewGamma = 2.2f;
-// LightmappedGeneric's g_TintValuesAndLightmapScale: $color times $color2 times the lightmap scale, which
-// cLightScale.y also holds. The game multiplies its lightmap by it; the lighting preview leaves it out of the albedo.
-constexpr UINT kLightmapTintRegister = 12;
-
-// ProjectedShadow: Source's render-to-texture prop shadows, which would darken the albedo; ray-traced shadows
-// replace them.
-// Water: the refracting combos of the Water shader, whose surface shaders/water_surface.hlsl writes into the G-buffer.
-enum class ShaderKind { Other, GBuffer, Flashlight, ProjectedShadow, Water };
 // The render targets a capture draw writes: the game's, the G-buffer, or the albedo alone (decals that multiply it).
 enum class Targets { Game, GBuffer, Albedo };
-
-// Where a flashlight shader keeps the projected light's parameters, or -1.
-struct FlashlightRegisters {
-    int position = -1;
-    int worldToTexture = -1;
-    int attenuation = -1;
-    int color = -1;
-    int cookie = -1;
-};
 
 struct ShaderInfo {
     ShaderKind kind = ShaderKind::Other;
@@ -119,32 +52,7 @@ struct ShaderInfo {
     int detailMode = -1;
 };
 
-enum class SelfIllum { None, Mask, Fresnel };
-
-// Indexed by [shader][SelfIllum].
-enum class ReplacedShader { Bump, Skin, SkinNoBump, SkinDetail, SkinNoBumpDetail, Count };
-const BYTE* const kReplacementCode[][3] = {
-    {g_gbufferBumpPS, g_gbufferBumpSelfIllumPS, g_gbufferBumpSelfIllumFresnelPS},
-    {g_gbufferSkinPS, g_gbufferSkinSelfIllumPS, g_gbufferSkinSelfIllumFresnelPS},
-    {g_gbufferSkinNoBumpPS, g_gbufferSkinNoBumpSelfIllumPS, g_gbufferSkinNoBumpSelfIllumFresnelPS},
-    {g_gbufferSkinDetailPS, g_gbufferSkinDetailSelfIllumPS, g_gbufferSkinDetailSelfIllumFresnelPS},
-    {g_gbufferSkinNoBumpDetailPS, g_gbufferSkinNoBumpDetailSelfIllumPS, g_gbufferSkinNoBumpDetailSelfIllumFresnelPS},
-};
-const BYTE* const kForwardReplacementCode[][3] = {
-    {g_forwardBumpPS, g_forwardBumpSelfIllumPS, g_forwardBumpSelfIllumFresnelPS},
-    {g_forwardSkinPS, g_forwardSkinSelfIllumPS, g_forwardSkinSelfIllumFresnelPS},
-    {g_forwardSkinNoBumpPS, g_forwardSkinNoBumpSelfIllumPS, g_forwardSkinNoBumpSelfIllumFresnelPS},
-    {g_forwardSkinDetailPS, g_forwardSkinDetailSelfIllumPS, g_forwardSkinDetailSelfIllumFresnelPS},
-    {g_forwardSkinNoBumpDetailPS, g_forwardSkinNoBumpDetailSelfIllumPS, g_forwardSkinNoBumpDetailSelfIllumFresnelPS},
-};
-using Replacements = std::array<std::array<ComPtr<IDirect3DPixelShader9>, 3>, static_cast<size_t>(ReplacedShader::Count)>;
-// The samplers shaders/gbuffer_models.hlsl reads the probe volume from in its FORWARD variants.
-constexpr std::array<UINT, 3> kModelProbeSamplers = {5, 6, 7};
-// The pixel shader constants shaders/forward_light.hlsli reads: c217-c223 in our ps_3_0 shaders, c0-c6 in the
-// ps_2_b snippet before the patch moves them.
-constexpr UINT kForwardConstants = 217;
 constexpr UINT kForwardConstantCount = bytecode::kForwardUniforms;
-constexpr std::array<UINT, kForwardConstantCount> kModelForwardUniforms = {217, 218, 219, 220, 221, 222, 223};
 // Sampler states a forward draw changes on its probe samplers, which are put back afterwards.
 constexpr D3DSAMPLERSTATETYPE kProbeSamplerStates[] = {D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_ADDRESSW, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER,
     D3DSAMP_MIPFILTER, D3DSAMP_SRGBTEXTURE};
@@ -180,12 +88,10 @@ struct State {
     // Set while this module calls the device, so the hooks do not take its calls for the game's.
     bool ownCall = false;
     D3DVIEWPORT9 viewport = {};
-    Replacements replacements;
-    // shaders/water_surface.hlsl for combos that fog by depth and by the refraction's alpha.
-    std::array<ComPtr<IDirect3DPixelShader9>, 2> waterSurfaces;
+    // Our shaders drawn in place of the game's (PixelShaderClass::replacement and forwardReplacement), by their code.
+    std::unordered_map<const DWORD*, ComPtr<IDirect3DPixelShader9>> replacements;
     // g_WaterFogColor of the last water surface drawn in this capture.
     std::optional<std::array<float, 3>> waterFogColor;
-    Replacements forwardReplacements;
     // Forward variants of the patched preview shaders, by the shader they replace.
     std::unordered_map<IDirect3DPixelShader9*, ComPtr<IDirect3DPixelShader9>> forwardVariants;
     std::array<ComPtr<IDirect3DVolumeTexture9>, 3> probeTextures;
@@ -193,24 +99,22 @@ struct State {
     std::array<std::array<float, 4>, kForwardConstantCount> forwardConstants = {};
     // The game's sampler states on each stage (kProbeSamplerStates).
     std::array<std::array<DWORD, kTrackedSamplerStates>, kTextureStages> samplerStates = {};
-    uint32_t forwardShaders = 0;
-    // Skin shaders seen with each detail blend mode (-1 counted at 7).
-    std::array<uint32_t, 8> detailModes = {};
+    // Forward variants the device rejected.
     uint32_t forwardFailures = 0;
-    uint32_t tintFailures = 0;
     uint32_t forwardDraws = 0;
     uint32_t forwardLogged = 0;
     std::unordered_map<IDirect3DPixelShader9*, ShaderInfo> shaders;
-    std::unordered_map<IDirect3DVertexShader9*, FlashlightRegisters> vertexShaders;
+    std::unordered_map<IDirect3DVertexShader9*, VertexShaderClass> vertexShaders;
     FlashlightRegisters boundVertex;
-    // Each tree sway vertex shader's g_vMiscParams2 register (y time, zw wind), and the bound shader's or -1.
-    std::unordered_map<IDirect3DVertexShader9*, int> swayRegisters;
+    // The bound vertex shader's sway register, or -1.
     int boundSwayRegister = -1;
     SwayClock swayClock;
     std::array<std::array<float, 4>, kTrackedVertexRegisters> vertexConstants = {};
     std::array<IDirect3DBaseTexture9*, kTextureStages> textures = {};
     std::vector<ProjectedLight> projected;
+    std::vector<ComPtr<IDirect3DBaseTexture9>> projectedCookies;
     std::vector<ProjectedLight> lastProjected;
+    std::vector<ComPtr<IDirect3DBaseTexture9>> lastCookies;
     uint32_t flashlightDraws = 0;
     float jitter[2] = {};
     Matrix4 viewProj = {};
@@ -233,119 +137,10 @@ struct State {
     uint32_t linearDraws = 0;
     bool outputSrgb = true;
     bool loggedSrgb = false;
-    uint32_t patchedShaders = 0;
-    uint32_t replacedShaders = 0;
     bool loggedCounts = false;
 };
 
 State g_state;
-
-bool HasConstant(const std::vector<bytecode::Constant>& constants, std::string_view name)
-{
-    return std::any_of(constants.begin(), constants.end(), [&](const bytecode::Constant& c) { return c.name == name; });
-}
-
-bool IsFlashlightPass(const std::vector<bytecode::Constant>& constants)
-{
-    return std::any_of(constants.begin(), constants.end(), [](const bytecode::Constant& c) {
-        return c.set == bytecode::RegisterSet::Sampler && (c.name.find("Flashlight") != std::string::npos || c.name == "SpotSampler");
-    });
-}
-
-// Skin (phong) shader constants that VertexLitGeneric's other shaders do not use.
-bool IsSkinShader(const std::vector<bytecode::Constant>& constants)
-{
-    constexpr std::string_view kSkinOnly[] = {"NormalMapSampler", "SpecExponentSampler", "SpecularWarpSampler", "g_FresnelSpecParams",
-        "g_SpecularRimParams", "g_EnvMapFresnel", "g_SelfIllumTint_and_DetailBlendFactorOrPhongAlbedoBoost"};
-    return HasConstant(constants, "g_DiffuseModulation") &&
-        std::any_of(std::begin(kSkinOnly), std::end(kSkinOnly), [&](std::string_view name) { return HasConstant(constants, name); });
-}
-
-bool HasRegister(const std::vector<bytecode::Constant>& constants, std::string_view name, bytecode::RegisterSet set, UINT index)
-{
-    return std::any_of(constants.begin(), constants.end(), [&](const bytecode::Constant& c) { return c.name == name && c.set == set && c.index == index; });
-}
-
-// The Water shader's combos that refract (water_ps20b), with the inputs and registers shaders/water_surface.hlsl reads.
-// Flowing, lightmapped and textured water keep the game's shader.
-bool IsRefractingWater(const std::vector<bytecode::Constant>& constants)
-{
-    using bytecode::RegisterSet;
-    return HasRegister(constants, "RefractSampler", RegisterSet::Sampler, 0) && HasRegister(constants, "NormalSampler", RegisterSet::Sampler, 4) &&
-        HasRegister(constants, "g_ReflectRefractScale", RegisterSet::Float4, 5) && HasRegister(constants, "g_WaterFogColor", RegisterSet::Float4, 6) &&
-        !HasConstant(constants, "FlowmapSampler") && !HasConstant(constants, "LightmapSampler") && !HasConstant(constants, "BaseTextureSampler");
-}
-
-// The replacements read self-illumination from the registers the stock shaders use, so a shader whose
-// registers differ gets no self-illumination rather than wrong values.
-SelfIllum BumpSelfIllum(const std::vector<bytecode::Constant>& constants)
-{
-    using bytecode::RegisterSet;
-    if (!HasRegister(constants, "g_SelfIllumTint_and_BlendFactor", RegisterSet::Float4, 4))
-        return SelfIllum::None;
-    if (HasRegister(constants, "g_SelfIllumScaleBiasExpBrightness", RegisterSet::Float4, 11))
-        return SelfIllum::Fresnel;
-    // With a detail texture the tint register also holds the detail blend factor, so it does not show whether
-    // the material is self-illuminated.
-    return HasConstant(constants, "DetailSampler") ? SelfIllum::None : SelfIllum::Mask;
-}
-
-constexpr UINT kSkinDetailSampler = 13;
-// The skin shader's g_SelfIllumTint_and_DetailBlendFactor (its .w is the detail blend factor).
-constexpr UINT kSkinDetailFactor = 0;
-// A post-lighting detail add comes after the lighting math; a pre-lighting one right after the sample.
-constexpr size_t kLateDetailGap = 12;
-// g_SkinDetailMode in shaders/gbuffer_models.hlsl.
-constexpr UINT kDetailModeRegister = 216;
-
-SelfIllum SkinSelfIllum(const std::vector<bytecode::Constant>& constants)
-{
-    using bytecode::RegisterSet;
-    if (!HasRegister(constants, "g_SelfIllumTint_and_DetailBlendFactorOrPhongAlbedoBoost", RegisterSet::Float4, 0))
-        return SelfIllum::None;
-    if (HasRegister(constants, "SelfIllumMaskSampler", RegisterSet::Sampler, 14) && HasRegister(constants, "g_EnvMapFresnel", RegisterSet::Float4, 10))
-        return SelfIllum::Mask;
-    if (HasRegister(constants, "g_SelfIllumScaleBiasExpBrightness", RegisterSet::Float4, 3))
-        return SelfIllum::Fresnel;
-    return SelfIllum::None;
-}
-
-IDirect3DPixelShader9* EnsureReplacement(IDirect3DDevice9* device, ReplacedShader shader, SelfIllum selfIllum, CreatePixelShaderFn create,
-    bool forward = false)
-{
-    const size_t s = static_cast<size_t>(shader);
-    const size_t v = static_cast<size_t>(selfIllum);
-    ComPtr<IDirect3DPixelShader9>& slot = (forward ? g_state.forwardReplacements : g_state.replacements)[s][v];
-    if (!slot && FAILED(create(device, reinterpret_cast<const DWORD*>((forward ? kForwardReplacementCode : kReplacementCode)[s][v]), &slot)))
-        log::Info("G-buffer: creating a replacement pixel shader failed");
-    return slot.Get();
-}
-
-int RegisterOf(const std::vector<bytecode::Constant>& constants, std::initializer_list<std::string_view> names, bytecode::RegisterSet set, UINT limit)
-{
-    for (const bytecode::Constant& c : constants) {
-        if (c.set != set || c.index >= limit)
-            continue;
-        for (std::string_view name : names) {
-            if (c.name == name)
-                return static_cast<int>(c.index);
-        }
-    }
-    return -1;
-}
-
-FlashlightRegisters FlashlightRegistersOf(const std::vector<bytecode::Constant>& constants, UINT limit)
-{
-    using bytecode::RegisterSet;
-    FlashlightRegisters r;
-    r.position = RegisterOf(constants, {"g_FlashlightPos", "g_FlashlightPos_RimBoost", "g_vFlashlightPos"}, RegisterSet::Float4, limit);
-    r.worldToTexture = RegisterOf(constants, {"g_FlashlightWorldToTexture"}, RegisterSet::Float4, limit - 3);
-    r.attenuation = RegisterOf(constants, {"g_FlashlightAttenuationFactors", "g_FlashlightAttenuationFactors_RimMask", "g_FlashlightAttenuation",
-        "g_vFlashlightAttenuationFactors"}, RegisterSet::Float4, limit);
-    r.color = RegisterOf(constants, {"cFlashlightColor"}, RegisterSet::Float4, limit);
-    r.cookie = RegisterOf(constants, {"FlashlightSampler", "SpotSampler", "g_tFlashlightCookieSampler"}, RegisterSet::Sampler, kTextureStages);
-    return r;
-}
 
 // Rebuilds the projected light a flashlight pass is drawing from the constants and textures bound for it.
 void CaptureProjectedLight()
@@ -356,6 +151,7 @@ void CaptureProjectedLight()
     if (ps.attenuation < 0 || ps.color < 0)
         return;
     ProjectedLight light;
+    ComPtr<IDirect3DBaseTexture9> cookie;
     const float* origin = ps.position >= 0 ? g_state.constants[ps.position].data()
         : vs.position >= 0                 ? g_state.vertexConstants[vs.position].data()
                                            : nullptr;
@@ -377,7 +173,7 @@ void CaptureProjectedLight()
     light.farZ = attenuation[3];
     light.color = {color[0], color[1], color[2]};
     if (ps.cookie >= 0) {
-        light.cookie = g_state.textures[ps.cookie];
+        cookie = g_state.textures[ps.cookie];
         light.cookieSrgb = g_state.samplerStates[ps.cookie][kSrgbTextureState] != FALSE;
     }
     for (const ProjectedLight& existing : g_state.projected) {
@@ -394,8 +190,20 @@ void CaptureProjectedLight()
                 light.attenuation[1], light.attenuation[2], light.color[0], light.color[1], light.color[2], light.cookieSrgb, m[0][0], m[0][1], m[0][2], m[0][3],
                 m[1][0], m[1][1], m[1][2], m[1][3], m[2][0], m[2][1], m[2][2], m[2][3], m[3][0], m[3][1], m[3][2], m[3][3]);
         }
-        g_state.projected.push_back(std::move(light));
+        g_state.projected.push_back(light);
+        g_state.projectedCookies.push_back(std::move(cookie));
     }
+}
+
+// The device's shader for one of ours, created on first use; null when there is none or the device rejects it.
+IDirect3DPixelShader9* Replacement(IDirect3DDevice9* device, std::span<const DWORD> code, CreatePixelShaderFn create)
+{
+    if (code.empty())
+        return nullptr;
+    ComPtr<IDirect3DPixelShader9>& slot = g_state.replacements[code.data()];
+    if (!slot && FAILED(create(device, code.data(), &slot)))
+        log::Info("G-buffer: creating a replacement pixel shader failed");
+    return slot.Get();
 }
 
 void Register(IDirect3DPixelShader9* shader, ShaderKind kind, IDirect3DPixelShader9* substitute,
@@ -495,43 +303,19 @@ HRESULT CreatePixelShader(IDirect3DDevice9* device, const DWORD* code, IDirect3D
     const size_t tokens = code != nullptr ? bytecode::TokenCount(code) : 0;
     if (tokens == 0)
         return create(device, code, shader);
-    std::span<const DWORD> original(code, tokens);
-    const std::vector<bytecode::Constant> constants = bytecode::ConstantTable(original);
-
-    if (bytecode::WritesColorOutput(original, kNormalTarget) && bytecode::WritesColorOutput(original, kFlagsTarget)) {
-        std::vector<DWORD> patched(original.begin(), original.end());
-        bytecode::ReplaceDefLiteral(patched, kPreviewGamma, 1.0f);
-        if (HasRegister(constants, "g_TintValuesAndLightmapScale", bytecode::RegisterSet::Float4, kLightmapTintRegister)) {
-            if (std::optional<std::vector<DWORD>> tinted = bytecode::TintColorOutput(patched, kLightmapTintRegister, kLightScaleRegister))
-                patched = std::move(*tinted);
-            else if (++g_state.tintFailures <= 5)
-                log::Info("G-buffer: a LightmappedGeneric preview shader keeps its albedo without $color and $color2");
-        }
-        HRESULT hr = create(device, patched.data(), shader);
+    const PixelShaderClass shaderClass = ClassifyPixelShader({code, tokens}, kTrackedRegisters);
+    if (!shaderClass.patched.empty()) {
+        HRESULT hr = create(device, shaderClass.patched.data(), shader);
         if (SUCCEEDED(hr)) {
-            // The same shader lights translucent surfaces after the capture once the snippet takes its outputs.
             ComPtr<IDirect3DPixelShader9> forward;
-            std::array<UINT, 3> samplers = {};
-            std::array<UINT, kForwardConstantCount> uniforms = {};
-            const bool shaderModel3 = D3DSHADER_VERSION_MAJOR(patched[0]) >= 3;
-            const auto* snippet = reinterpret_cast<const DWORD*>(shaderModel3 ? g_forwardSnippetPS : g_forwardSnippetPS2);
-            const char* reason = "the device rejected the patched shader";
-            if (const std::optional<bytecode::ForwardPatch> patch =
-                    bytecode::AppendForwardLighting(patched, {snippet, bytecode::TokenCount(snippet)}, shaderModel3 ? kForwardConstants : 0, reason);
-                patch && SUCCEEDED(create(device, patch->code.data(), &forward))) {
-                samplers = patch->samplers;
-                uniforms = patch->uniforms;
-                ++g_state.forwardShaders;
-            } else {
+            if (!shaderClass.forward.empty() && FAILED(create(device, shaderClass.forward.data(), &forward))) {
                 forward.Reset();
                 if (++g_state.forwardFailures <= 5)
-                    log::Info("G-buffer: a preview shader gets no forward-lit variant: {}", reason);
+                    log::Info("G-buffer: a preview shader gets no forward-lit variant: the device rejected the patched shader");
             }
-            Register(*shader, ShaderKind::GBuffer, nullptr, {}, false, forward.Get(), samplers, uniforms);
+            Register(*shader, ShaderKind::GBuffer, nullptr, {}, false, forward.Get(), shaderClass.probeSamplers, shaderClass.forwardUniforms);
             if (forward)
                 g_state.forwardVariants[*shader] = std::move(forward);
-            ++g_state.patchedShaders;
-            ++GetStatistics().gbufferShaders;
         }
         return hr;
     }
@@ -539,51 +323,13 @@ HRESULT CreatePixelShader(IDirect3DDevice9* device, const DWORD* code, IDirect3D
     HRESULT hr = create(device, code, shader);
     if (FAILED(hr))
         return hr;
-    if (HasConstant(constants, "ShadowSampler") && HasConstant(constants, "g_ShadowColor")) {
-        Register(*shader, ShaderKind::ProjectedShadow, nullptr);
-        return hr;
-    }
-    if (IsFlashlightPass(constants)) {
-        Register(*shader, ShaderKind::Flashlight, nullptr, FlashlightRegistersOf(constants, kTrackedRegisters));
-        return hr;
-    }
-    if (IsRefractingWater(constants)) {
-        const bool alphaFog = !HasRegister(constants, "g_WaterFogParams", bytecode::RegisterSet::Float4, 7);
-        ComPtr<IDirect3DPixelShader9>& surface = g_state.waterSurfaces[alphaFog ? 1 : 0];
-        if (!surface && FAILED(create(device, reinterpret_cast<const DWORD*>(alphaFog ? g_waterSurfaceAlphaFogPS : g_waterSurfacePS), &surface)))
-            log::Info("G-buffer: the water surface shader could not be created; water keeps the game's shader");
-        Register(*shader, surface ? ShaderKind::Water : ShaderKind::Other, surface.Get());
-        return hr;
-    }
-    IDirect3DPixelShader9* substitute = nullptr;
-    IDirect3DPixelShader9* forward = nullptr;
-    SelfIllum selfIllum = SelfIllum::None;
-    int detailMode = -1;
-    if (HasConstant(constants, "g_DiffuseModulation") && HasConstant(constants, "BumpmapSampler")) {
-        selfIllum = BumpSelfIllum(constants);
-        substitute = EnsureReplacement(device, ReplacedShader::Bump, selfIllum, create);
-        forward = EnsureReplacement(device, ReplacedShader::Bump, selfIllum, create, true);
-    } else if (IsSkinShader(constants)) {
-        selfIllum = SkinSelfIllum(constants);
-        const bool normalMap = HasConstant(constants, "NormalMapSampler");
-        // Detail blend modes the replacement does not know leave the base texture alone.
-        if (HasRegister(constants, "DetailSampler", bytecode::RegisterSet::Sampler, kSkinDetailSampler)) {
-            detailMode = bytecode::DetailBlendMode(original, kSkinDetailSampler, kSkinDetailFactor, kLateDetailGap);
-            if (g_state.detailModes[detailMode >= 0 ? detailMode : 7]++ == 0)
-                log::Info("G-buffer: skin shader with detail blend mode {}", detailMode);
-        }
-        const bool detail = detailMode >= 0;
-        const ReplacedShader replaced = detail ? (normalMap ? ReplacedShader::SkinDetail : ReplacedShader::SkinNoBumpDetail)
-                                               : (normalMap ? ReplacedShader::Skin : ReplacedShader::SkinNoBump);
-        substitute = EnsureReplacement(device, replaced, selfIllum, create);
-        forward = EnsureReplacement(device, replaced, selfIllum, create, true);
-    }
-    if (substitute != nullptr) {
-        ++g_state.replacedShaders;
-        ++GetStatistics().replacedShaders;
-    }
-    Register(*shader, substitute != nullptr ? ShaderKind::GBuffer : ShaderKind::Other, substitute, {},
-        substitute != nullptr && (selfIllum != SelfIllum::None || detailMode == 5), forward, kModelProbeSamplers, kModelForwardUniforms, detailMode);
+    IDirect3DPixelShader9* substitute = Replacement(device, shaderClass.replacement, create);
+    IDirect3DPixelShader9* forward = Replacement(device, shaderClass.forwardReplacement, create);
+    // Without its replacement a shader is drawn as the game's.
+    const bool replaced = shaderClass.kind == ShaderKind::GBuffer || shaderClass.kind == ShaderKind::Water;
+    const ShaderKind kind = replaced && substitute == nullptr ? ShaderKind::Other : shaderClass.kind;
+    Register(*shader, kind, substitute, shaderClass.flashlight, substitute != nullptr && shaderClass.emissive, forward, shaderClass.probeSamplers,
+        shaderClass.forwardUniforms, shaderClass.detailMode);
     return hr;
 }
 
@@ -750,19 +496,16 @@ HRESULT CreateVertexShader(IDirect3DDevice9* device, const DWORD* code, IDirect3
     if (FAILED(hr))
         return hr;
     const size_t tokens = code != nullptr ? bytecode::TokenCount(code) : 0;
-    const std::vector<bytecode::Constant> constants = tokens != 0 ? bytecode::ConstantTable(std::span<const DWORD>(code, tokens)) : std::vector<bytecode::Constant>{};
-    g_state.vertexShaders[*shader] = FlashlightRegistersOf(constants, kTrackedVertexRegisters);
-    if (HasConstant(constants, "g_vMiscParams4"))
-        g_state.swayRegisters[*shader] = RegisterOf(constants, {"g_vMiscParams2"}, bytecode::RegisterSet::Float4, kTrackedVertexRegisters);
+    g_state.vertexShaders[*shader] = ClassifyVertexShader(tokens != 0 ? std::span<const DWORD>(code, tokens) : std::span<const DWORD>(), kTrackedVertexRegisters);
     return hr;
 }
 
 void OnVertexShader(IDirect3DVertexShader9* shader)
 {
     auto info = g_state.vertexShaders.find(shader);
-    g_state.boundVertex = info != g_state.vertexShaders.end() ? info->second : FlashlightRegisters{};
-    const auto sway = g_state.swayRegisters.find(shader);
-    g_state.boundSwayRegister = sway != g_state.swayRegisters.end() ? sway->second : -1;
+    const VertexShaderClass bound = info != g_state.vertexShaders.end() ? info->second : VertexShaderClass{};
+    g_state.boundVertex = bound.flashlight;
+    g_state.boundSwayRegister = bound.swayRegister;
 }
 
 void OnVertexShaderConstants(UINT start, const float* data, UINT count)
@@ -794,22 +537,6 @@ const float* JitterVertexConstants(UINT start, const float* data, UINT count, st
 }
 
 const Matrix4& LastCaptureViewProj() { return g_state.viewProj; }
-
-std::optional<std::array<float, 3>> EyePosition(const Matrix4& m)
-{
-    // The eye is where clip x, y and w are all zero: solve rows 0, 1 and 3 with Cramer's rule.
-    const auto& a = m[0];
-    const auto& b = m[1];
-    const auto& c = m[3];
-    auto det = [](float a0, float a1, float a2, float b0, float b1, float b2, float c0, float c1, float c2) {
-        return a0 * (b1 * c2 - b2 * c1) - a1 * (b0 * c2 - b2 * c0) + a2 * (b0 * c1 - b1 * c0);
-    };
-    const float d = det(a[0], a[1], a[2], b[0], b[1], b[2], c[0], c[1], c[2]);
-    if (std::fabs(d) < 1e-12f)
-        return std::nullopt;
-    return std::array<float, 3>{det(-a[3], a[1], a[2], -b[3], b[1], b[2], -c[3], c[1], c[2]) / d,
-        det(a[0], -a[3], a[2], b[0], -b[3], b[2], c[0], -c[3], c[2]) / d, det(a[0], a[1], -a[3], b[0], b[1], -b[3], c[0], c[1], -c[3]) / d};
-}
 
 void SetJitter(float x, float y)
 {
@@ -873,7 +600,7 @@ void EndForward(IDirect3DDevice9* device)
     if (g_state.forwardLogged < 3) {
         ++g_state.forwardLogged;
         log::Info("G-buffer: {} forward-lit draws ({} preview shaders have a forward variant, {} could not take one)", g_state.forwardDraws,
-            g_state.forwardShaders, g_state.forwardFailures);
+            ShaderStatistics().forward, ShaderStatistics().forwardFailures + g_state.forwardFailures);
     }
 }
 
@@ -914,6 +641,8 @@ void EndForwardDraw(IDirect3DDevice9* device)
 }
 
 std::span<const ProjectedLight> ProjectedLights() { return g_state.lastProjected; }
+
+std::span<const ComPtr<IDirect3DBaseTexture9>> ProjectedCookies() { return g_state.lastCookies; }
 
 const SwayClock& LastSwayClock() { return g_state.swayClock; }
 
@@ -962,12 +691,13 @@ bool Begin(IDirect3DDevice9* device)
     // The view's projection was set before the capture began; send it again so it picks up the jitter.
     device->SetVertexShaderConstantF(kModelViewProjection, g_state.vertexConstants[kModelViewProjection].data(), kProjectionRegisters);
     g_state.projected.clear();
+    g_state.projectedCookies.clear();
     g_state.srgbDraws = 0;
     g_state.linearDraws = 0;
     device->SetPixelShader(g_state.requested);
     if (!g_state.loggedCounts) {
         g_state.loggedCounts = true;
-        log::Info("G-buffer: {} preview shaders patched, {} model shaders replaced so far", g_state.patchedShaders, g_state.replacedShaders);
+        log::Info("G-buffer: {} preview shaders patched, {} model shaders replaced so far", ShaderStatistics().patched, ShaderStatistics().replaced);
     }
     return true;
 }
@@ -1004,19 +734,22 @@ void End(IDirect3DDevice9* device, ViewKind kind)
         if (projection != g_state.loggedProjection) {
             g_state.loggedProjection = projection;
             log::Info("G-buffer: {} projected light(s) from {} flashlight draw(s)", g_state.projected.size(), g_state.flashlightDraws);
-            for (const ProjectedLight& light : g_state.projected) {
+            for (size_t i = 0; i < g_state.projected.size(); ++i) {
+                const ProjectedLight& light = g_state.projected[i];
                 const auto& m = light.worldToTexture;
                 log::Info("  origin ({:.1f} {:.1f} {:.1f}) far {:.1f} color ({:.3f} {:.3f} {:.3f}) attenuation ({:.3f} {:.3f} {:.3f}) cookie {}; rows "
                           "({:.4f} {:.4f} {:.4f} {:.4f}) ({:.4f} {:.4f} {:.4f} {:.4f}) ({:.4f} {:.4f} {:.4f} {:.4f}) ({:.4f} {:.4f} {:.4f} {:.4f})",
                     light.origin[0], light.origin[1], light.origin[2], light.farZ, light.color[0], light.color[1], light.color[2], light.attenuation[0],
-                    light.attenuation[1], light.attenuation[2], static_cast<void*>(light.cookie.Get()), m[0][0], m[0][1], m[0][2], m[0][3], m[1][0], m[1][1],
+                    light.attenuation[1], light.attenuation[2], static_cast<void*>(g_state.projectedCookies[i].Get()), m[0][0], m[0][1], m[0][2], m[0][3], m[1][0], m[1][1],
                     m[1][2], m[1][3], m[2][0], m[2][1], m[2][2], m[2][3], m[3][0], m[3][1], m[3][2], m[3][3]);
             }
         }
         g_state.lastProjected = std::move(g_state.projected);
+        g_state.lastCookies = std::move(g_state.projectedCookies);
     }
     g_state.flashlightDraws = 0;
     g_state.projected.clear();
+    g_state.projectedCookies.clear();
     engine::SetFixedLighting(0);
     BindTargets(device, Targets::Game);
     SetDeviceState(device, D3DRS_SRGBWRITEENABLE, g_state.srgbWrite, g_state.srgbWrite.game);

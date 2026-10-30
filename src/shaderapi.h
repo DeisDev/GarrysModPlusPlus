@@ -111,5 +111,7 @@ void DrawMesh(const MeshDraw& mesh);
 void* BoundMaterial();
 // Its name (IMaterial::GetName, slot 0), or "none".
 const char* BoundMaterialName();
+// The bound material's shader (IMaterial::GetShaderName), or "none".
+const char* BoundShaderName();
 
 }

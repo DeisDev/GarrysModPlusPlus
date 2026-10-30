@@ -43,4 +43,23 @@ ComPtr<ID3D12DeviceFactory> AgilityDeviceFactory(const std::filesystem::path& ru
     return factory;
 }
 
+RaytracingSupport QueryRaytracing(ID3D12Device* device)
+{
+    RaytracingSupport support;
+    D3D12_FEATURE_DATA_D3D12_OPTIONS5 options5 = {};
+    device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5, &options5, sizeof(options5));
+    support.tier = options5.RaytracingTier;
+    // A runtime that does not know the shader model asked about fails the query, so ask for 6.6 after 6.9.
+    for (D3D_SHADER_MODEL highest : {D3D_SHADER_MODEL_6_9, D3D_SHADER_MODEL_6_6}) {
+        D3D12_FEATURE_DATA_SHADER_MODEL query = {highest};
+        if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &query, sizeof(query)))) {
+            support.shaderModel = query.HighestShaderModel;
+            break;
+        }
+    }
+    support.inlineRaytracing = support.tier >= D3D12_RAYTRACING_TIER_1_1 && support.shaderModel >= D3D_SHADER_MODEL_6_6;
+    support.opacityMicromaps = support.tier >= D3D12_RAYTRACING_TIER_1_2 && support.shaderModel >= D3D_SHADER_MODEL_6_9;
+    return support;
+}
+
 }

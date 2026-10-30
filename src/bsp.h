@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <span>
 #include <string>
@@ -16,6 +17,7 @@ struct Float2 {
 };
 
 inline constexpr uint32_t kNoMaterial = 0xFFFFFFFF;
+inline constexpr uint32_t kNoFace = 0xFFFFFFFF;
 
 struct SunLight {
     bool present = false;
@@ -96,6 +98,58 @@ struct Mesh {
     std::vector<uint32_t> triangleAlbedo;
     // Each triangle's index into WorldGeometry::materials, or kNoMaterial.
     std::vector<uint32_t> triangleMaterials;
+    // Each triangle's index into BakedLighting::faces, or kNoFace, and each vertex's luxel coordinates in that
+    // face's lightmap.
+    std::vector<uint32_t> triangleFaces;
+    std::vector<Float2> luxels;
+};
+
+// The style-0 lightmap of a world face as VRAD stored it (src/utils/vrad/lightmap.cpp, ExportLightmaps): `width` x
+// `height` luxels from `sample` on, then, when `bumped`, three more of the same size for the bump basis
+// (GetBumpNormals: tangent space `tangentS`, `tangentT`, `normal`). Mirrors FaceLightmap in shaders/baked.hlsli.
+struct FaceLightmap {
+    uint32_t sample;
+    uint32_t width;
+    uint32_t height;
+    uint32_t bumped;
+    Float3 tangentS;
+    float unused0;
+    Float3 tangentT;
+    float unused1;
+    Float3 normal;
+    float unused2;
+};
+static_assert(sizeof(FaceLightmap) == 64);
+
+// A style-0 luxel of a world face where VRAD sampled it: `luxel` is s + t * width in the face's lightmap. Mirrors
+// BakeLuxel in shaders/baked.hlsli.
+struct BakeLuxel {
+    Float3 position;
+    uint32_t face;
+    Float3 normal;
+    uint32_t luxel;
+};
+static_assert(sizeof(BakeLuxel) == 32);
+
+// A leaf ambient sample (dleafambientlighting_t): the light arriving from each axis direction (+x, -x, +y, -y,
+// +z, -z) at a point of a leaf. Mirrors AmbientSample in shaders/baked.hlsli.
+struct AmbientSample {
+    float position[4];
+    float cube[6][4];
+};
+static_assert(sizeof(AmbientSample) == 112);
+
+// VRAD's baked light: the lightmaps of style 0 (direct light from style-0 lights, sky ambient and bounced light,
+// summed) and the leaf ambient samples, HDR when the map has them.
+struct BakedLighting {
+    // ColorRGBExp32 samples (r, g, b, exponent): c * 2^exponent / 255.
+    std::vector<uint32_t> samples;
+    bool hdr = false;
+    std::vector<FaceLightmap> faces;
+    std::vector<BakeLuxel> luxels;
+    // Per BSP leaf (Visibility::leaves): its first sample in `ambientSamples` and their number.
+    std::vector<std::array<uint32_t, 2>> leafAmbient;
+    std::vector<AmbientSample> ambientSamples;
 };
 
 struct WorldGeometry {
@@ -118,6 +172,7 @@ struct WorldGeometry {
     // only rays of the skybox view meet it.
     Mesh skybox;
     std::vector<StaticProp> skyboxProps;
+    BakedLighting baked;
     // The sky camera's area (BspLeaf::area), or -1, and the bounds of its leaves.
     int32_t skyArea = -1;
     Float3 skyMins = {};

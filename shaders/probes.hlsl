@@ -1,4 +1,4 @@
-#include "scene.hlsli"
+#include "baked.hlsli"
 
 // Irradiance volume for surfaces lit outside the G-buffer (the translucent surfaces the game draws after the
 // capture, shaders/forward_light.hlsli). A grid of kProbeGrid probes around the camera holds irradiance as
@@ -17,6 +17,9 @@
 // inside walls, and every probe adds the direct light at it: the sun and the kProbeLights strongest point lights,
 // each with a shadow ray (projected lights are left to the game). Only the output has it, as hits add their own
 // direct light. input0-3: this frame's coefficients and cells; output0-2: the volume the game samples.
+//
+// Baked fill (step 2, a thread per probe, indirect_lighting = 1): instead of tracing, each probe takes the leaf
+// ambient light at it (L1 of its ambient cube) and adds the direct light as the fill does. output0-2: the volume.
 
 static const uint3 kProbeGrid = uint3(32, 32, 16);
 // Probes away from the camera are traced every this many frames.
@@ -254,12 +257,41 @@ void Fill(uint3 id)
     blueOut[texel] = value[2];
 }
 
+void BakedFill(uint3 id)
+{
+    int3 cell = g_frame.probeOrigin + int3(id);
+    uint3 texel = Texel(cell);
+    float3 position = (float3(cell) + 0.5) * g_frame.probeSpacing;
+    float3 cube[6];
+    if (!LeafAmbientCube(position, cube)) {
+        for (uint side = 0; side < 6; ++side)
+            cube[side] = g_frame.skyColor;
+    }
+    // a + b.n: the mean of the six directions, and half the difference along each axis.
+    float3 mean = (cube[0] + cube[1] + cube[2] + cube[3] + cube[4] + cube[5]) / 6.0;
+    float3 slopeX = (cube[0] - cube[1]) * 0.5;
+    float3 slopeY = (cube[2] - cube[3]) * 0.5;
+    float3 slopeZ = (cube[4] - cube[5]) * 0.5;
+    float4 value[3] = {float4(mean.r, slopeX.r, slopeY.r, slopeZ.r), float4(mean.g, slopeX.g, slopeY.g, slopeZ.g), float4(mean.b, slopeX.b, slopeY.b, slopeZ.b)};
+    AddDirectLight(position, value);
+    RWTexture3D<float4> redOut = ResourceDescriptorHeap[g_pass.output0];
+    RWTexture3D<float4> greenOut = ResourceDescriptorHeap[g_pass.output1];
+    RWTexture3D<float4> blueOut = ResourceDescriptorHeap[g_pass.output2];
+    redOut[texel] = value[0];
+    greenOut[texel] = value[1];
+    blueOut[texel] = value[2];
+}
+
 [RootSignature(ROOT_SIGNATURE)]
 [numthreads(kProbeThreads, 1, 1)]
 void main(uint3 group : SV_GroupID, uint thread : SV_GroupIndex, uint3 id : SV_DispatchThreadID)
 {
     if (g_pass.step == 0)
         Trace(ProbeId(group.x), thread);
-    else if (id.x < kProbeCount)
+    else if (id.x >= kProbeCount)
+        return;
+    else if (g_pass.step == 1)
         Fill(ProbeId(id.x));
+    else
+        BakedFill(ProbeId(id.x));
 }

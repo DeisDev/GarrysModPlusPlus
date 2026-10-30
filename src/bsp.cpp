@@ -35,6 +35,13 @@ constexpr int kLumpDispVerts = 33;
 constexpr int kLumpTexdataStringData = 43;
 constexpr int kLumpTexdataStringTable = 44;
 constexpr int kLumpWorldLightsHdr = 54;
+constexpr int kLumpLighting = 8;
+constexpr int kLumpLeafAmbientIndexHdr = 51;
+constexpr int kLumpLeafAmbientIndex = 52;
+constexpr int kLumpLightingHdr = 53;
+constexpr int kLumpLeafAmbientLightingHdr = 55;
+constexpr int kLumpLeafAmbientLighting = 56;
+constexpr int kLumpFacesHdr = 58;
 
 constexpr int32_t kSurfSky2D = 0x0002;
 constexpr int32_t kSurfSky = 0x0004;
@@ -44,6 +51,11 @@ constexpr int32_t kSurfNoDraw = 0x0080;
 constexpr int32_t kSurfHint = 0x0100;
 constexpr int32_t kSurfSkip = 0x0200;
 constexpr int32_t kSkippedSurfaces = kSurfSky2D | kSurfSky | kSurfWarp | kSurfTrigger | kSurfNoDraw | kSurfHint | kSurfSkip;
+// bspflags.h: no lightmap (VRAD's TEX_SPECIAL is SURF_SKY | SURF_NOLIGHT), and three more lightmaps for the bump basis.
+constexpr int32_t kSurfNoLight = 0x0400;
+constexpr int32_t kSurfBumpLight = 0x0800;
+// mathlib/bumpvects.h: g_localBumpBasis.
+constexpr Float3 kLocalBumpBasis[3] = {{0.81649661f, 0.0f, 0.57735026f}, {-0.40824822f, 0.70710677f, 0.57735026f}, {-0.40824822f, -0.70710677f, 0.57735026f}};
 
 constexpr int32_t kStaticPropLumpId = ('s' << 24) | ('p' << 16) | ('r' << 8) | 'p';
 constexpr size_t kStaticPropNameLength = 128;
@@ -162,6 +174,17 @@ struct DispInfo {
     uint32_t allowedVerts[10];
 };
 
+struct LeafAmbientIndex {
+    uint16_t sampleCount;
+    uint16_t firstSample;
+};
+
+// dleafambientlighting_t: a CompressedLightCube and the sample's place as fractions of the leaf's bounds (0-255).
+struct LeafAmbientLighting {
+    uint8_t cube[6][4];
+    uint8_t x, y, z, padding;
+};
+
 struct WorldLight {
     Float3 origin;
     Float3 intensity;
@@ -237,7 +260,100 @@ struct Lumps {
     std::span<const Texdata> texdatas;
     std::span<const DispInfo> dispinfos;
     std::span<const DispVert> dispVerts;
+    std::span<const Plane> planes;
+    // The faces whose lighting offsets index `baked->samples` (LUMP_FACES_HDR for HDR lighting when present).
+    std::span<const Face> lightFaces;
+    BakedLighting* baked = nullptr;
 };
+
+float Dot(Float3 a, Float3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+Float3 Cross(Float3 a, Float3 b) { return {a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x}; }
+Float3 Normalize(Float3 a)
+{
+    const float length = std::sqrt(Dot(a, a));
+    return length > 0.0f ? Scale(a, 1.0f / length) : a;
+}
+
+// A face's luxel coordinates of a point on it (WorldToLuxelSpace in src/utils/vrad/radial.cpp): its texinfo's
+// lightmap vectors, less the lightmap's mins.
+Float2 FaceLuxel(const Lumps& lumps, const Face& face, Float3 p)
+{
+    const Texinfo& texinfo = lumps.texinfos[face.texinfo];
+    const auto& v = texinfo.lightmapVecs;
+    return {v[0][0] * p.x + v[0][1] * p.y + v[0][2] * p.z + v[0][3] - static_cast<float>(face.lightmapMins[0]),
+        v[1][0] * p.x + v[1][1] * p.y + v[1][2] * p.z + v[1][3] - static_cast<float>(face.lightmapMins[1])};
+}
+
+// Adds the style-0 lightmap of a world face to `lumps.baked` and returns its index, or kNoFace when the face has
+// none. Flat faces also get their luxels to bake, placed as VRAD placed them (CalcFaceVectors and LuxelSpaceToWorld
+// in src/utils/vrad/lightmap.cpp and radial.cpp); displacements add theirs in AddDisplacement.
+uint32_t AddFaceLightmap(const Lumps& lumps, size_t faceIndex, bool displacement)
+{
+    if (lumps.baked == nullptr || lumps.baked->samples.empty() || faceIndex >= lumps.lightFaces.size())
+        return kNoFace;
+    const Face& face = lumps.lightFaces[faceIndex];
+    if (face.lightOffset < 0 || face.texinfo < 0 || static_cast<size_t>(face.texinfo) >= lumps.texinfos.size() || face.planeNum >= lumps.planes.size())
+        return kNoFace;
+    const Texinfo& texinfo = lumps.texinfos[face.texinfo];
+    if ((texinfo.flags & (kSurfSky | kSurfNoLight)) != 0)
+        return kNoFace;
+    uint32_t style = 0;
+    while (style < 4 && face.styles[style] != 0 && face.styles[style] != 255)
+        ++style;
+    if (style == 4 || face.styles[style] != 0 || face.lightmapSize[0] < 0 || face.lightmapSize[1] < 0)
+        return kNoFace;
+    const bool bumped = (texinfo.flags & kSurfBumpLight) != 0;
+    const uint32_t width = static_cast<uint32_t>(face.lightmapSize[0]) + 1;
+    const uint32_t height = static_cast<uint32_t>(face.lightmapSize[1]) + 1;
+    const size_t luxels = static_cast<size_t>(width) * height;
+    const size_t perStyle = luxels * (bumped ? 4 : 1);
+    const size_t sample = static_cast<size_t>(face.lightOffset) / 4 + style * perStyle;
+    if (sample + perStyle > lumps.baked->samples.size())
+        return kNoFace;
+
+    const Plane& plane = lumps.planes[face.planeNum];
+    FaceLightmap lightmap = {};
+    lightmap.sample = static_cast<uint32_t>(sample);
+    lightmap.width = width;
+    lightmap.height = height;
+    lightmap.bumped = bumped ? 1u : 0u;
+    lightmap.normal = plane.normal;
+    // GetBumpNormals (src/mathlib/bumpvects.cpp) around the face normal.
+    const Float3 s = {texinfo.textureVecs[0][0], texinfo.textureVecs[0][1], texinfo.textureVecs[0][2]};
+    const Float3 t = {texinfo.textureVecs[1][0], texinfo.textureVecs[1][1], texinfo.textureVecs[1][2]};
+    const bool leftHanded = Dot(plane.normal, Cross(s, t)) < 0.0f;
+    lightmap.tangentT = Normalize(Cross(plane.normal, s));
+    lightmap.tangentS = Normalize(Cross(lightmap.tangentT, plane.normal));
+    if (leftHanded)
+        lightmap.tangentT = Scale(lightmap.tangentT, -1.0f);
+    const uint32_t index = static_cast<uint32_t>(lumps.baked->faces.size());
+    lumps.baked->faces.push_back(lightmap);
+    if (displacement)
+        return index;
+
+    const auto& w = texinfo.lightmapVecs;
+    const Float3 w0 = {w[0][0], w[0][1], w[0][2]};
+    const Float3 w1 = {w[1][0], w[1][1], w[1][2]};
+    const Float3 cross = {w[1][1] * w[0][2] - w[1][2] * w[0][1], w[1][2] * w[0][0] - w[1][0] * w[0][2], w[1][0] * w[0][1] - w[1][1] * w[0][0]};
+    const float det = -Dot(plane.normal, cross);
+    if (std::fabs(det) < 1e-20f)
+        return index;
+    const Float3& n = plane.normal;
+    const Float3 toWorld0 = {(n.z * w1.y - n.y * w1.z) / det, (n.x * w1.z - n.z * w1.x) / det, (n.y * w1.x - n.x * w1.y) / det};
+    const Float3 toWorld1 = {(n.y * w0.z - n.z * w0.y) / det, (n.z * w0.x - n.x * w0.z) / det, (n.x * w0.y - n.y * w0.x) / det};
+    Float3 origin = Scale(cross, -plane.distance / det);
+    origin = Add(origin, Scale(toWorld0, -w[0][3]));
+    origin = Add(origin, Scale(toWorld1, -w[1][3]));
+    for (uint32_t y = 0; y < height; ++y) {
+        for (uint32_t x = 0; x < width; ++x) {
+            const float sCoord = static_cast<float>(x + face.lightmapMins[0]);
+            const float tCoord = static_cast<float>(static_cast<int32_t>(y) + face.lightmapMins[1]);
+            const Float3 position = Add(Add(origin, Scale(toWorld0, sCoord)), Scale(toWorld1, tCoord));
+            lumps.baked->luxels.push_back({position, index, plane.normal, y * width + x});
+        }
+    }
+    return index;
+}
 
 uint32_t PackUnorm(Float3 c)
 {
@@ -323,7 +439,8 @@ bool FacePolygon(const Lumps& lumps, const Face& face, std::vector<Float3>& poly
     return polygon.size() >= 3;
 }
 
-void AddPolygon(Mesh& mesh, const Lumps& lumps, const Face& face, const std::vector<Float3>& polygon)
+// `lightmap` is the face's AddFaceLightmap entry, or kNoFace.
+void AddPolygon(Mesh& mesh, const Lumps& lumps, const Face& face, const std::vector<Float3>& polygon, uint32_t lightmap = kNoFace)
 {
     const uint32_t albedo = FaceAlbedo(lumps, face);
     const uint32_t material = FaceMaterial(lumps, face);
@@ -331,6 +448,7 @@ void AddPolygon(Mesh& mesh, const Lumps& lumps, const Face& face, const std::vec
     for (const Float3& p : polygon) {
         mesh.positions.push_back(p);
         mesh.uvs.push_back(FaceUv(lumps, face, p));
+        mesh.luxels.push_back(lightmap != kNoFace ? FaceLuxel(lumps, face, p) : Float2{});
     }
     for (uint32_t i = 1; i + 1 < polygon.size(); ++i) {
         mesh.indices.push_back(base);
@@ -338,10 +456,14 @@ void AddPolygon(Mesh& mesh, const Lumps& lumps, const Face& face, const std::vec
         mesh.indices.push_back(base + i + 1);
         mesh.triangleAlbedo.push_back(albedo);
         mesh.triangleMaterials.push_back(material);
+        mesh.triangleFaces.push_back(lightmap);
     }
 }
 
-bool AddDisplacement(Mesh& mesh, const Lumps& lumps, const Face& face, const DispInfo& disp, const std::vector<Float3>& corners)
+// A displacement's luxels span its grid from the start corner (CCoreDispSurface::CalcLuxelCoords and
+// CCoreDispInfo::GenerateDispSurf in src/public/builddisp.cpp): vertex (row i, column j) of n per side is at luxel
+// (width * j / (n - 1), height * i / (n - 1)), counting the lightmap's luxels less one.
+bool AddDisplacement(Mesh& mesh, const Lumps& lumps, const Face& face, const DispInfo& disp, const std::vector<Float3>& corners, uint32_t lightmap = kNoFace)
 {
     const uint32_t albedo = FaceAlbedo(lumps, face);
     const uint32_t material = FaceMaterial(lumps, face);
@@ -378,6 +500,34 @@ bool AddDisplacement(Mesh& mesh, const Lumps& lumps, const Face& face, const Dis
             Float3 flat = Add(end0, Scale(segment, static_cast<float>(j)));
             mesh.positions.push_back(Add(flat, Scale(dv.vec, dv.dist)));
             mesh.uvs.push_back(FaceUv(lumps, face, flat));
+            mesh.luxels.push_back({static_cast<float>(face.lightmapSize[0]) * static_cast<float>(j) * step,
+                static_cast<float>(face.lightmapSize[1]) * static_cast<float>(i) * step});
+        }
+    }
+    if (lightmap != kNoFace) {
+        const FaceLightmap& entry = lumps.baked->faces[lightmap];
+        const Float3* grid = mesh.positions.data() + base;
+        auto at = [&](int i, int j) { return grid[std::clamp(i, 0, post - 1) * post + std::clamp(j, 0, post - 1)]; };
+        auto normalAt = [&](int i, int j) {
+            Float3 normal = Normalize(Cross(Sub(at(i + 1, j), at(i - 1, j)), Sub(at(i, j + 1), at(i, j - 1))));
+            return Dot(normal, entry.normal) < 0.0f ? Scale(normal, -1.0f) : normal;
+        };
+        const float spanS = std::max(static_cast<float>(entry.width - 1), 1.0f);
+        const float spanT = std::max(static_cast<float>(entry.height - 1), 1.0f);
+        for (uint32_t y = 0; y < entry.height; ++y) {
+            for (uint32_t x = 0; x < entry.width; ++x) {
+                const float gj = static_cast<float>(x) / spanS * static_cast<float>(post - 1);
+                const float gi = static_cast<float>(y) / spanT * static_cast<float>(post - 1);
+                const int i0 = std::min(static_cast<int>(gi), post - 2);
+                const int j0 = std::min(static_cast<int>(gj), post - 2);
+                const float fi = gi - static_cast<float>(i0);
+                const float fj = gj - static_cast<float>(j0);
+                auto bilinear = [&](auto value) {
+                    return Add(Add(Scale(value(i0, j0), (1 - fi) * (1 - fj)), Scale(value(i0, j0 + 1), (1 - fi) * fj)),
+                        Add(Scale(value(i0 + 1, j0), fi * (1 - fj)), Scale(value(i0 + 1, j0 + 1), fi * fj)));
+                };
+                lumps.baked->luxels.push_back({bilinear(at), lightmap, Normalize(bilinear(normalAt)), y * entry.width + x});
+            }
         }
     }
     for (int i = 0; i + 1 < post; ++i) {
@@ -394,6 +544,7 @@ bool AddDisplacement(Mesh& mesh, const Lumps& lumps, const Face& face, const Dis
                 mesh.indices.insert(mesh.indices.end(), {a, c, d, a, d, b});
             mesh.triangleAlbedo.insert(mesh.triangleAlbedo.end(), {albedo, albedo});
             mesh.triangleMaterials.insert(mesh.triangleMaterials.end(), {material, material});
+            mesh.triangleFaces.insert(mesh.triangleFaces.end(), {lightmap, lightmap});
         }
     }
     return true;
@@ -672,6 +823,52 @@ void ReadStaticProps(std::span<const std::byte> file, const Header& header, Worl
     }
 }
 
+// The lighting lump the engine uses (HDR first) and the faces that index it.
+void ReadLighting(std::span<const std::byte> file, const Header& header, Lumps& lumps, BakedLighting& baked)
+{
+    auto hdr = LumpArray<uint32_t>(file, header, kLumpLightingHdr);
+    auto ldr = LumpArray<uint32_t>(file, header, kLumpLighting);
+    baked.hdr = hdr && !hdr->empty();
+    const std::optional<std::span<const uint32_t>> samples = baked.hdr ? hdr : ldr;
+    if (!samples || samples->empty())
+        return;
+    baked.samples.assign(samples->begin(), samples->end());
+    lumps.lightFaces = lumps.faces;
+    auto hdrFaces = LumpArray<Face>(file, header, kLumpFacesHdr);
+    if (baked.hdr && hdrFaces && hdrFaces->size() == lumps.faces.size())
+        lumps.lightFaces = *hdrFaces;
+}
+
+// The leaf ambient samples (LUMP_LEAF_AMBIENT_*, HDR first), placed in their leaves' bounds.
+void ReadLeafAmbient(std::span<const std::byte> file, const Header& header, const Visibility& visibility, BakedLighting& baked)
+{
+    const bool hdr = header.lumps[kLumpLeafAmbientIndexHdr].length > 0;
+    auto indices = LumpArray<LeafAmbientIndex>(file, header, hdr ? kLumpLeafAmbientIndexHdr : kLumpLeafAmbientIndex);
+    auto lighting = LumpArray<LeafAmbientLighting>(file, header, hdr ? kLumpLeafAmbientLightingHdr : kLumpLeafAmbientLighting);
+    if (!indices || !lighting || indices->size() != visibility.leaves.size())
+        return;
+    baked.leafAmbient.reserve(indices->size());
+    for (size_t leaf = 0; leaf < indices->size(); ++leaf) {
+        const LeafAmbientIndex& index = (*indices)[leaf];
+        const BspLeaf& bounds = visibility.leaves[leaf];
+        const uint32_t first = static_cast<uint32_t>(baked.ambientSamples.size());
+        for (uint32_t i = 0; i < index.sampleCount && static_cast<size_t>(index.firstSample) + i < lighting->size(); ++i) {
+            const LeafAmbientLighting& source = (*lighting)[index.firstSample + i];
+            AmbientSample& sample = baked.ambientSamples.emplace_back();
+            const float fraction[3] = {source.x / 255.0f, source.y / 255.0f, source.z / 255.0f};
+            sample.position[0] = bounds.mins.x + fraction[0] * (bounds.maxs.x - bounds.mins.x);
+            sample.position[1] = bounds.mins.y + fraction[1] * (bounds.maxs.y - bounds.mins.y);
+            sample.position[2] = bounds.mins.z + fraction[2] * (bounds.maxs.z - bounds.mins.z);
+            for (int side = 0; side < 6; ++side) {
+                const float scale = std::ldexp(1.0f / 255.0f, static_cast<int8_t>(source.cube[side][3]));
+                for (int c = 0; c < 3; ++c)
+                    sample.cube[side][c] = source.cube[side][c] * scale;
+            }
+        }
+        baked.leafAmbient.push_back({first, static_cast<uint32_t>(baked.ambientSamples.size()) - first});
+    }
+}
+
 void ReadLights(std::span<const std::byte> file, const Header& header, WorldGeometry& world)
 {
     for (int lumpIndex : {kLumpWorldLightsHdr, kLumpWorldLights}) {
@@ -839,6 +1036,11 @@ bool LoadWorld(std::span<const std::byte> file, WorldGeometry& world, std::strin
     lumps.dispVerts = *dispVerts;
 
     world = {};
+    auto planeLump = LumpArray<Plane>(file, header, kLumpPlanes);
+    if (planeLump)
+        lumps.planes = *planeLump;
+    lumps.baked = &world.baked;
+    ReadLighting(file, header, lumps, world.baked);
     // The scaled-down 3D skybox scene is world geometry placed outside the playable space; it must not
     // occlude the main view's rays, so faces and props in the sky camera's area are kept apart.
     const std::optional<AreaLocator> areas = MakeAreaLocator(file, header);
@@ -875,11 +1077,18 @@ bool LoadWorld(std::span<const std::byte> file, WorldGeometry& world, std::strin
             }
         }
         if (face.dispinfo >= 0 && static_cast<size_t>(face.dispinfo) < lumps.dispinfos.size()) {
-            if (AddDisplacement(world.mesh, lumps, face, lumps.dispinfos[face.dispinfo], polygon))
+            const DispInfo& disp = lumps.dispinfos[face.dispinfo];
+            const size_t luxels = world.baked.luxels.size();
+            const uint32_t lightmap = AddFaceLightmap(lumps, static_cast<size_t>(f), true);
+            if (AddDisplacement(world.mesh, lumps, face, disp, polygon, lightmap)) {
                 ++world.displacementCount;
+            } else if (lightmap != kNoFace) {
+                world.baked.faces.pop_back();
+                world.baked.luxels.resize(luxels);
+            }
             continue;
         }
-        AddPolygon(world.mesh, lumps, face, polygon);
+        AddPolygon(world.mesh, lumps, face, polygon, AddFaceLightmap(lumps, static_cast<size_t>(f), false));
         ++world.faceCount;
     }
 
@@ -898,6 +1107,7 @@ bool LoadWorld(std::span<const std::byte> file, WorldGeometry& world, std::strin
     ReadMaterialNames(file, header, lumps.texdatas, world.materials);
     ReadLights(file, header, world);
     ReadVisibility(file, header, world.visibility);
+    ReadLeafAmbient(file, header, world.visibility, world.baked);
     ReadStaticProps(file, header, world);
     if (skyArea >= 0) {
         for (const StaticProp& prop : world.props) {

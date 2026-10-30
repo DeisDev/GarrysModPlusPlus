@@ -1,8 +1,8 @@
 #include "engine_interfaces.h"
 
 #include "log.h"
-#include "mod.h"
 #include "module_scan.h"
+#include "options.h"
 
 #include <MinHook.h>
 
@@ -109,23 +109,6 @@ void* CreateFrom(const wchar_t* moduleName, const char* interfaceName, HMODULE& 
     return create(interfaceName, &code);
 }
 
-bool IsUnlitMaterial(void* material)
-{
-    auto [entry, added] = g_unlitMaterials.try_emplace(material, false);
-    if (!added)
-        return entry->second;
-    const char* shader = Slot<const char*(__fastcall*)(void*)>(material, kGetShaderNameSlot)(material);
-    std::string name = shader != nullptr ? shader : "";
-    std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    entry->second = name == "unlitgeneric" || name == "unlittwotexture" || name == "monitorscreen";
-    if (GetOptions().devMode && entry->second && g_loggedMaterials < 8) {
-        ++g_loggedMaterials;
-        const char* materialName = Slot<const char*(__fastcall*)(void*)>(material, kGetMaterialNameSlot)(material);
-        log::Info("Forward lighting: '{}' ({}) is drawn unlit", materialName != nullptr ? materialName : "?", shader != nullptr ? shader : "?");
-    }
-    return entry->second;
-}
-
 void SetFixedLightingOn(void* context, int mode)
 {
     if (g_fixedLighting == mode)
@@ -180,6 +163,23 @@ const int32_t* FindLightStyleValues(HMODULE engine)
     return reinterpret_cast<const int32_t*>(found);
 }
 
+}
+
+bool IsUnlitMaterial(void* material)
+{
+    auto [entry, added] = g_unlitMaterials.try_emplace(material, false);
+    if (!added)
+        return entry->second;
+    const char* shader = Slot<const char*(__fastcall*)(void*)>(material, kGetShaderNameSlot)(material);
+    std::string name = shader != nullptr ? shader : "";
+    std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    entry->second = name == "unlitgeneric" || name == "unlittwotexture" || name == "monitorscreen";
+    if (GetOptions().devMode && entry->second && g_loggedMaterials < 8) {
+        ++g_loggedMaterials;
+        const char* materialName = Slot<const char*(__fastcall*)(void*)>(material, kGetMaterialNameSlot)(material);
+        log::Info("Forward lighting: '{}' ({}) is drawn unlit", materialName != nullptr ? materialName : "?", shader != nullptr ? shader : "?");
+    }
+    return entry->second;
 }
 
 void TryInitialize()

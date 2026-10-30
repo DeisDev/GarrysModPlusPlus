@@ -84,19 +84,6 @@ bool CalledFromShaderApi(void* returnAddress)
 
 bool IsGameDevice(IDirect3DDevice9* device) { return device == g_gameDevice.load(std::memory_order_relaxed); }
 
-void RecordFrameInterval()
-{
-    static LARGE_INTEGER frequency = {};
-    static LARGE_INTEGER previous = {};
-    LARGE_INTEGER now;
-    QueryPerformanceCounter(&now);
-    if (frequency.QuadPart == 0)
-        QueryPerformanceFrequency(&frequency);
-    else
-        RecordFrameTime(static_cast<float>(static_cast<double>(now.QuadPart - previous.QuadPart) * 1000.0 / static_cast<double>(frequency.QuadPart)));
-    previous = now;
-}
-
 HWND PresentFrame(IDirect3DDevice9* device, HWND requestedWindow)
 {
     static uint64_t frame = 0;

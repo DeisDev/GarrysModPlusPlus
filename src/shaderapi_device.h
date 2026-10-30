@@ -49,6 +49,8 @@ public:
     static constexpr UINT kFrames = 2;
     static constexpr DXGI_FORMAT kBackBufferFormat = DXGI_FORMAT_B8G8R8A8_UNORM;
     static constexpr DXGI_FORMAT kDepthFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    // The depth buffer's resource format, which shader resource views can read.
+    static constexpr DXGI_FORMAT kDepthResourceFormat = DXGI_FORMAT_R24G8_TYPELESS;
 
     struct Upload {
         ID3D12Resource* buffer;
@@ -61,9 +63,13 @@ public:
     // Submits the commands recorded so far and waits for the GPU, then continues recording. For readbacks, and to
     // reclaim staging memory while the game loads many resources between two presents.
     void Flush();
+    // Submits the commands recorded so far without waiting and continues recording, so work submitted to the queue
+    // next runs after them.
+    void Submit();
 
     bool HasDevice() const { return m_device != nullptr; }
     ID3D12Device* Device() const { return m_device.Get(); }
+    ID3D12CommandQueue* Queue() const { return m_queue.Get(); }
     ID3D12GraphicsCommandList* Commands() const { return m_commandList.Get(); }
     DescriptorHeap& Descriptors() { return m_descriptors; }
     CpuDescriptorPool& RenderTargetViews() { return m_rtvs; }

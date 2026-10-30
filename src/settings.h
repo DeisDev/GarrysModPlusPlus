@@ -34,6 +34,10 @@ enum class QualityPreset : uint32_t { Low = 0, Medium, High, Ultra, Custom, Coun
 // lighting; the sun; or the sun and the first bounce of indirect light. Later bounces always pass through them.
 enum class FoliageShadows : uint32_t { Off = 0, Sun, SunAndIndirect, Count };
 
+// Where indirect light comes from: traced bounces, or VRAD's baked bounce light with the direct light it held taken
+// out (cheaper; the sun and local lights are still traced).
+enum class IndirectLighting : uint32_t { RayTraced = 0, Baked, Count };
+
 // Options shown in the in-game menu. Read on the render thread; the menu edits them on the same thread.
 struct Settings {
     bool realtimeLighting = true;
@@ -79,6 +83,7 @@ struct Settings {
     int volumeRays = 32;
     int volumetricSteps = 16;
     FoliageShadows foliageShadows = FoliageShadows::SunAndIndirect;
+    IndirectLighting indirectLighting = IndirectLighting::RayTraced;
     // Indirect light and ambient occlusion rays take alpha-tested surfaces from their opacity micromaps alone.
     bool fastAlphaTests = false;
     bool opacityMicromaps = true;
@@ -138,6 +143,7 @@ struct Statistics {
 };
 
 Statistics& GetStatistics();
-void RecordFrameTime(float milliseconds);
+// Records the time since the last call as a frame's; call once per presented frame.
+void RecordFrameInterval();
 
 }
