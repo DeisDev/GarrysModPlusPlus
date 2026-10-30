@@ -3,6 +3,7 @@
 #include "gbuffer_shaders.h"
 #include "lighting.h"
 #include "shaderapi_pipelines.h"
+#include "vcs.h"
 #include "view_types.h"
 
 #include <d3d12.h>
@@ -57,10 +58,17 @@ struct Pass {
     bool probes = false;
 };
 
+// The game's pixel shader combo a pass draws: its shader file's header and combo indices (shader_twins.h).
+struct ComboId {
+    const vcs::Header* header = nullptr;
+    int staticIndex = 0;
+    int dynamicIndex = 0;
+};
+
 // Decides a pass of the draw being recorded. `vertexCode` and `pixelCode` are the game's combos, from the shader file
 // `pixelFile` (null without a pixel shader).
-Pass Prepare(std::span<const DWORD> vertexCode, std::span<const DWORD> pixelCode, const char* pixelFile, bool depthTest, bool blend, int sourceBlend,
-    int destinationBlend, bool srgbWrite, std::uint32_t srgbRead);
+Pass Prepare(std::span<const DWORD> vertexCode, std::span<const DWORD> pixelCode, const char* pixelFile, const ComboId& pixelCombo, bool depthTest,
+    bool blend, int sourceBlend, int destinationBlend, bool srgbWrite, std::uint32_t srgbRead);
 // Binds the capture's targets for a pass routed to them.
 Targets BindTargets(const Pass& pass, bool srgb);
 // The probe volume's red, green or blue texture for a probe sampler of a forward draw, ready to be read.

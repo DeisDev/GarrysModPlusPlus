@@ -899,8 +899,9 @@ void DrawPass(const ShadowState& shadow, const MeshDraw& mesh)
 
     // During a G-buffer capture or the forward lighting after it, the pass may draw other code into other targets.
     const capture::Pass pass =
-        capture::Prepare(vertexCode, pixelCode, depthOnly ? nullptr : shadow.pixelShader->name.c_str(), shadow.depthTest != 0, blendEnabled, source, destination,
-            shadow.srgbWrite != 0, static_cast<std::uint32_t>(shadow.srgbRead));
+        capture::Prepare(vertexCode, pixelCode, depthOnly ? nullptr : shadow.pixelShader->name.c_str(),
+            depthOnly ? capture::ComboId() : capture::ComboId{ &shadow.pixelShader->directory.header, shadow.pixelStaticIndex, dynamic.pixelShaderIndex },
+            shadow.depthTest != 0, blendEnabled, source, destination, shadow.srgbWrite != 0, static_cast<std::uint32_t>(shadow.srgbRead));
     if (pass.route == capture::Pass::Route::Skip)
         return;
     const std::span<const DWORD> drawnPixelCode = pass.pixelCode.empty() ? pixelCode : pass.pixelCode;

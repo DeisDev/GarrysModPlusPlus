@@ -241,6 +241,31 @@ foreach(entry IN LISTS LZMA_SDK_FILES)
         EXPECTED_HASH SHA256=${hash} TLS_VERIFY ON)
 endforeach()
 add_library(lzma_dec STATIC "${LZMA_SDK_DIR}/LzmaDec.c")
+
+# The Source SDK 2013 shader headers the G-buffer twins (shaders/twins) include, from the commit GMod's shaders derive
+# from, each file pinned by hash. They are compiled at runtime with the twins.
+set(SDK_SHADERS_COMMIT 7309a5f13f63fdcc7b1e090f6c176113a9d95061)
+set(SDK_SHADERS_DIR "${CMAKE_CURRENT_BINARY_DIR}/_deps/sdk2013-shaders")
+set(SDK_SHADER_FILES
+    "common_flashlight_fxc.h|d111736b5496f50c3ccc8c37519cb2bb428be1761e7f6614bdd3e98e911f7fc8"
+    "common_vertexlitgeneric_dx9.h|a60fbc9211f740961a0bfd76aeb158d5e2ba8853b32589e9f246fa2dcb085952"
+    "common_ps_fxc.h|9ec1c3ebbd9b9c06aa89906c91cc1464cd2be903afc38401aa2b45339ce9b556"
+    "common_fxc.h|91c2beb8b06e007169ea0abf4f16687dfff122005658bc5eb7a3dc55296b5a11"
+    "common_pragmas.h|a4a844949c9b352627e6f3e00d18c32a132451a0d011b62bd0a4d8e269186235"
+    "common_lightmappedgeneric_fxc.h|dc1c9afbd858d3315daea70cd1f26eff226a9f2f4081f0b5538c81fe2102ef3a"
+    "common_hlsl_cpp_consts.h|147d39bfdf6d0266be3fd6b60dcdbbaf839e2be7853349bac0813d5605de68c5"
+    "shader_constant_register_map.h|2f26fec6bf575edb22aed53862faea49f8b2054338728e80c6edb5bc14b4dc7a"
+)
+set(SDK_SHADER_PATHS "")
+foreach(entry IN LISTS SDK_SHADER_FILES)
+    string(REPLACE "|" ";" parts "${entry}")
+    list(GET parts 0 file)
+    list(GET parts 1 hash)
+    file(DOWNLOAD "https://raw.githubusercontent.com/ValveSoftware/source-sdk-2013/${SDK_SHADERS_COMMIT}/mp/src/materialsystem/stdshaders/${file}"
+        "${SDK_SHADERS_DIR}/${file}" EXPECTED_HASH SHA256=${hash} TLS_VERIFY ON)
+    list(APPEND SDK_SHADER_PATHS "${SDK_SHADERS_DIR}/${file}")
+endforeach()
+file(GLOB TWIN_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/twins/*.fxc" "${CMAKE_CURRENT_SOURCE_DIR}/shaders/twins/*.h")
 target_include_directories(lzma_dec PUBLIC "${LZMA_SDK_DIR}")
 
 set_target_properties(gmodpp_d3d9 PROPERTIES OUTPUT_NAME d3d9)
@@ -321,6 +346,7 @@ add_library(gmodpp SHARED
     src/shaderapi_shadow.cpp
     src/shaderapi_textures.cpp
     src/shaderapi_capture.cpp
+    src/shader_twins.cpp
     src/watchdog.cpp
     # Real-time lighting, shared with d3d9.dll.
     src/native_lighting.cpp
@@ -362,7 +388,9 @@ if(GMOD_DIR)
         COMMAND ${CMAKE_COMMAND} -E make_directory "${GMOD_DIR}/bin/win64/gmodpp"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:gmodpp> "${GMOD_DIR}/bin/win64/gmodpp/gmodpp.dll"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different "${DXC_DIR}/bin/x64/dxcompiler.dll" "${GMOD_DIR}/bin/win64/gmodpp/dxcompiler.dll"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${GMOD_DIR}/bin/win64/gmodpp/twins"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${TWIN_SOURCES} ${SDK_SHADER_PATHS} "${GMOD_DIR}/bin/win64/gmodpp/twins/"
         DEPENDS gmodpp_d3d9 gmodpp_loader gmodpp
-        COMMENT "Deploying d3d9.dll, nvngx_dlssd.dll, the Agility SDK runtime, winmm.dll and gmodpp.dll to ${GMOD_DIR}"
+        COMMENT "Deploying d3d9.dll, nvngx_dlssd.dll, the Agility SDK runtime, winmm.dll, gmodpp.dll and the shader twins to ${GMOD_DIR}"
     )
 endif()

@@ -4,6 +4,7 @@
 #include "log.h"
 #include "shaderapi.h"
 #include "shaderapi_textures.h"
+#include "shader_twins.h"
 
 #include <algorithm>
 #include <cmath>
@@ -40,8 +41,8 @@ constexpr int kBlendSourceColor = 9;
 constexpr uint64_t kCoverageViews = 600;
 
 // How the capture handled a material shader's pixel shader file (Phase 3's coverage report).
-enum class Path { Preview, Replaced, Water, Unlit, Decal, Additive, Flashlight, ProjectedShadow, Forward, ForwardUnlit, Count };
-constexpr const char* kPathNames[] = {"G-buffer (lighting preview)", "G-buffer (replacement)", "G-buffer (water surface)", "game shader, unlit",
+enum class Path { Preview, Replaced, Twin, Water, Unlit, Decal, Additive, Flashlight, ProjectedShadow, Forward, ForwardUnlit, Count };
+constexpr const char* kPathNames[] = {"G-buffer (lighting preview)", "G-buffer (replacement)", "G-buffer (twin)", "G-buffer (water surface)", "game shader, unlit",
     "albedo decal", "additive light", "flashlight (ray traced)", "projected shadow (skipped)", "forward lit", "translucent, game shader"};
 static_assert(std::size(kPathNames) == static_cast<size_t>(Path::Count));
 
@@ -452,8 +453,8 @@ int FixedLighting()
     return -1;
 }
 
-Pass Prepare(std::span<const DWORD> vertexCode, std::span<const DWORD> pixelCode, const char* pixelFile, bool depthTest, bool blend, int sourceBlend,
-    int destinationBlend, bool srgbWrite, std::uint32_t srgbRead)
+Pass Prepare(std::span<const DWORD> vertexCode, std::span<const DWORD> pixelCode, const char* pixelFile, const ComboId& pixelCombo, bool depthTest,
+    bool blend, int sourceBlend, int destinationBlend, bool srgbWrite, std::uint32_t srgbRead)
 {
     Pass pass;
     if (!g_state.active && !g_state.forwardActive)
@@ -534,8 +535,14 @@ Pass Prepare(std::span<const DWORD> vertexCode, std::span<const DWORD> pixelCode
             Count(pixelFile, modulate ? Path::Decal : Path::Unlit);
         return pass;
     }
-    Count(pixelFile, water ? Path::Water : !shaderClass.patched.empty() ? Path::Preview : Path::Replaced);
-    if (!shaderClass.patched.empty()) {
+    const std::span<const DWORD> twin = !water && pixelFile != nullptr && pixelCombo.header != nullptr
+        ? twins::GBufferShader(pixelFile, *pixelCombo.header, pixelCombo.staticIndex, pixelCombo.dynamicIndex)
+        : std::span<const DWORD>();
+    Count(pixelFile, water ? Path::Water : !twin.empty() ? Path::Twin : !shaderClass.patched.empty() ? Path::Preview : Path::Replaced);
+    if (!twin.empty()) {
+        pass.pixelCode = twin;
+        pass.emissive = true;
+    } else if (!shaderClass.patched.empty()) {
         pass.pixelCode = shaderClass.patched;
     } else {
         pass.pixelCode = shaderClass.replacement;
