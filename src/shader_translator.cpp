@@ -989,6 +989,9 @@ std::string Translator::Assemble()
         if ((m_out.colorOutputs & (1u << i)) && (!forward || i == 0))
             text += std::format(", out float4 gmodpp_target{0} : SV_Target{0}", i);
     }
+    const bool clearCoverage = m_variant.clearCoverage != 0 && m_out.colorOutputs == 1;
+    if (clearCoverage)
+        text += ", out float4 gmodpp_coverage : SV_Target1";
     if (m_out.writesDepth)
         text += ", out float gmodpp_depth : SV_Depth";
     text += ")\n{\n";
@@ -1016,6 +1019,8 @@ std::string Translator::Assemble()
                 text += std::format("    gmodpp_target{0} = oC{0};\n", i);
         }
     }
+    if (clearCoverage)
+        text += "    gmodpp_coverage = 0;\n";
     if (m_out.writesDepth)
         text += "    gmodpp_depth = oDepth.x;\n";
     return text + "}\n";

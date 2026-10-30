@@ -81,5 +81,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fixed the physics gun's glow on held objects flickering.
 - Fixed thin bright lines along the edges of white window frames, as on gm_skywatching.
 - Fixed baked indirect light counting dim light-emitting surfaces twice.
+- Fixed NPC eyes showing no iris with real-time lighting in the native renderer.
 - Fixed window glass turning white in the flashlight.
 - Fixed the underwater fog being grey instead of the water's colour.

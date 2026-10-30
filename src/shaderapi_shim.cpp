@@ -1002,6 +1002,19 @@ extern "C" void gmodpp_TraceCall(void* wrapper, DWORD slot, const std::uint64_t*
     TraceLine(SlotLabel(info, slot), args);
     if (&info == &kInterfaces[kShaderApi] && slot == kShaderApiExecuteCommandBuffer)
         TraceCommandBuffer(reinterpret_cast<const std::uint8_t*>(regs[1]), 0);
+    // Constants set directly (not through a command buffer) are logged with their values, as command buffers' are.
+    const char* name = SlotName(info, slot);
+    if (&info == &kInterfaces[kShaderApi] && name != nullptr &&
+        (std::string_view(name) == "SetVertexShaderConstant" || std::string_view(name) == "SetPixelShaderConstant")) {
+        float values[kTracedCommandFloats] = {};
+        const int shown = std::clamp(static_cast<int>(regs[3]) * 4, 0, kTracedCommandFloats);
+        if (ReadBytes(reinterpret_cast<const std::uint8_t*>(regs[2]), values, shown * sizeof(float))) {
+            std::string text = "values=";
+            for (int i = 0; i < shown; ++i)
+                text += std::format("{}{}", i == 0 ? "" : " ", values[i]);
+            TraceLine("  CONST", text);
+        }
+    }
 }
 
 extern "C" void gmodpp_TraceObjectCall(const ObjectSlot* slot, const std::uint64_t* regs, const std::uint64_t* stack)

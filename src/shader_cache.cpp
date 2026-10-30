@@ -71,6 +71,8 @@ std::uint64_t Key(std::span<const DWORD> code, const translator::Variant& varian
         const std::uint64_t headers = LightingHeadersHash();
         key = Fnv(&headers, sizeof(headers), Fnv("forward", 7, key));
     }
+    if (variant.clearCoverage != 0)
+        key = Fnv("coverage", 8, key);
     return Fnv(&kTranslatorVersion, sizeof(kTranslatorVersion), key);
 }
 

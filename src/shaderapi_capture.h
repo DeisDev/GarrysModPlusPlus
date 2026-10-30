@@ -56,6 +56,9 @@ struct Pass {
     // Samplers that read the probe volume instead of the game's textures.
     std::array<UINT, 3> probeSamplers = {};
     bool probes = false;
+    // An opaque draw of the game's own shader into a captured view: what it draws hides the G-buffer behind it (an
+    // eyeball over the face mesh behind it), so it clears the coverage there (translator::Variant::clearCoverage).
+    bool clearsCoverage = false;
     // A forward twin, lit in the shader from these frame constants and scene (translator::Variant::forwardLighting).
     D3D12_GPU_VIRTUAL_ADDRESS forwardFrame = 0;
     D3D12_GPU_VIRTUAL_ADDRESS forwardScene = 0;
@@ -74,6 +77,8 @@ Pass Prepare(std::span<const DWORD> vertexCode, std::span<const DWORD> pixelCode
     bool blend, int sourceBlend, int destinationBlend, bool srgbWrite, std::uint32_t srgbRead);
 // Binds the capture's targets for a pass routed to them.
 Targets BindTargets(const Pass& pass, bool srgb);
+// Adds the G-buffer's coverage target to a pass's targets as render target 1, for a pass with clearsCoverage.
+void AddCoverageTarget(Targets& targets);
 // The probe volume's red, green or blue texture for a probe sampler of a forward draw, ready to be read.
 UINT ProbeView(size_t index);
 

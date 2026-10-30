@@ -554,6 +554,7 @@ Pass Prepare(std::span<const DWORD> vertexCode, std::span<const DWORD> pixelCode
     if (!gbuffer) {
         if (gameTarget && pixel != nullptr)
             Count(pixelFile, modulate ? Path::Decal : Path::Unlit);
+        pass.clearsCoverage = gameTarget && pixel != nullptr && depthTest && !blend;
         return pass;
     }
     const std::span<const DWORD> twin = !water && pixelFile != nullptr && pixelCombo.header != nullptr
@@ -576,6 +577,17 @@ Pass Prepare(std::span<const DWORD> vertexCode, std::span<const DWORD> pixelCode
     for (UINT r = 0; r < 4; ++r)
         std::copy_n(VertexRegister(gbuffer::kViewProjection + r).v, 4, g_state.viewProj[r].begin());
     return pass;
+}
+
+void AddCoverageTarget(Targets& targets)
+{
+    Backend& backend = GetBackend();
+    Target& target = g_state.targets[kFlags];
+    backend.Transition(target.resource, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    targets.colors[targets.count] = target.view;
+    targets.colorFormats[targets.count] = kTargetFormats[kFlags];
+    ++targets.count;
+    backend.Commands()->OMSetRenderTargets(targets.count, targets.colors, FALSE, targets.depth.ptr != 0 ? &targets.depth : nullptr);
 }
 
 Targets BindTargets(const Pass& pass, bool srgb)

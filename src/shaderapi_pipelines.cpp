@@ -936,7 +936,12 @@ void DrawPass(const ShadowState& shadow, const MeshDraw& mesh)
     if (vertexBase == nullptr || (pixelBase == nullptr && !depthOnly))
         return;
 
-    const Targets targets = pass.route == capture::Pass::Route::Game ? PrepareTargets(shadow.srgbWrite != 0) : capture::BindTargets(pass, shadow.srgbWrite != 0);
+    Targets targets = pass.route == capture::Pass::Route::Game ? PrepareTargets(shadow.srgbWrite != 0) : capture::BindTargets(pass, shadow.srgbWrite != 0);
+    const bool depthWrite = dynamic.overrideDepthEnable ? dynamic.depthEnable : shadow.depthWrite != 0;
+    const bool clearCoverage = pass.clearsCoverage && depthWrite && colorWrite && pixelBase != nullptr && pixelBase->info.colorOutputs == 1 &&
+        targets.count == 1 && targets.samples == 1 && targets.depth.ptr != 0;
+    if (clearCoverage)
+        capture::AddCoverageTarget(targets);
 
     StateBuffer pixelState = {};
     translator::Variant pixelVariant;
@@ -959,6 +964,7 @@ void DrawPass(const ShadowState& shadow, const MeshDraw& mesh)
     if (shadow.alphaTest)
         pixelVariant.alphaTest = static_cast<std::uint8_t>(shadow.alphaFunc + 1);
     pixelVariant.forwardLighting = pass.forwardFrame != 0 ? 1 : 0;
+    pixelVariant.clearCoverage = clearCoverage ? 1 : 0;
     StateBuffer vertexState = {};
     BindSamplers(*vertexBase, dynamic.vertexTextures.data(), kVertexSamplers, 0, vertexState, nullptr);
 
@@ -1010,6 +1016,10 @@ void DrawPass(const ShadowState& shadow, const MeshDraw& mesh)
     // Direct3D 9 has alpha to coverage only through NVIDIA's ATOC render state, which needs multisampling; without
     // it the pass is just alpha tested, where Direct3D 12 would dither instead.
     key.blend.AlphaToCoverageEnable = shadow.alphaToCoverage != 0 && targets.samples > 1;
+    if (clearCoverage) {
+        key.blend.IndependentBlendEnable = TRUE;
+        key.blend.RenderTarget[1].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    }
     if (pass.route == capture::Pass::Route::GBuffer) {
         // Direct3D 9 blends every target alike; the game leaves COLORWRITEENABLE1-3 at their default, and the
         // self-illumination target takes colour only from the shaders that write it.
@@ -1039,7 +1049,6 @@ void DrawPass(const ShadowState& shadow, const MeshDraw& mesh)
     D3D12_DEPTH_STENCIL_DESC& depth = key.depthStencil;
     const bool reverse = false;
     depth.DepthEnable = shadow.depthTest != 0 && targets.depth.ptr != 0;
-    const bool depthWrite = dynamic.overrideDepthEnable ? dynamic.depthEnable : shadow.depthWrite != 0;
     depth.DepthWriteMask = depthWrite ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
     depth.DepthFunc = dynamic.forceDepthFuncEquals ? D3D12_COMPARISON_FUNC_EQUAL : DepthFunc(shadow.depthFunc, reverse);
     depth.StencilEnable = dynamic.stencilEnable && targets.depthFormat == DXGI_FORMAT_D24_UNORM_S8_UINT;
