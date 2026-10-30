@@ -520,7 +520,7 @@ Pass Prepare(std::span<const DWORD> vertexCode, std::span<const DWORD> pixelCode
     // Opaque shaders with a twin but no preview combo (eyes, teeth) are drawn into the G-buffer by their twin.
     const bool twinOnly = shaderClass.kind == ShaderKind::Other && !blend && pixelFile != nullptr && twins::HasTwin(pixelFile);
     const bool gbuffer = (shaderClass.kind == ShaderKind::GBuffer || water || twinOnly) && depthTest && gameTarget;
-    if (shaderClass.kind == ShaderKind::GBuffer && !gbuffer && !g_state.loggedOtherTarget) {
+    if (shaderClass.kind == ShaderKind::GBuffer && !gameTarget && !g_state.loggedOtherTarget) {
         g_state.loggedOtherTarget = true;
         log::Info("G-buffer: a G-buffer draw went to another render target during a capture; it is drawn there unlit");
     }
