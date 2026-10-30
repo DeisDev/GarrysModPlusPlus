@@ -10,7 +10,8 @@
 // by the tonemap scale twice; some of those combos (OPAQUE_FOG) draw the lit fog colour alone, without the refraction.
 // Textured flowing water (FLOW_COLOR, no refraction or lightmap) flows its base texture the same way with its own
 // period, parallax-shifted by the normal map's alpha, and fades from the fog colour to it by its alpha times the flow
-// map's; the reflection's share fades out where that alpha is high (combo 74 of GMod's water_ps20b).
+// map's; the reflection's share fades out where that alpha is high (combo 74 of GMod's water_ps20b). With
+// $lightmapwaterfog (LIGHTMAP_FOG) the lightmap lights both colours (combo 842).
 
 sampler RefractSampler : register(s0);
 sampler BaseTextureSampler : register(s1);
@@ -89,7 +90,12 @@ Output main(Input input)
     float4 color = colorFirst * pow(abs(2.0 * frac(colorShifted) - 1.0), g_ColorFlowParams.w) +
         colorSecond * pow(abs(2.0 * frac(colorPhase) - 1.0), g_ColorFlowParams.w);
     float opacity = color.a * flowSample.a;
-    output.refraction = float4(lerp(g_WaterFogColor.rgb, color.rgb * flowSample.a, saturate(2.0 * opacity)), 1.0);
+#if LIGHTMAP_FOG
+    float3 light = tex2D(LightmapSampler, input.lightmapCoord).rgb * cLightScale.y * cLightScale.x;
+#else
+    float3 light = 1.0;
+#endif
+    output.refraction = float4(lerp(g_WaterFogColor.rgb * light, color.rgb * flowSample.a * light, saturate(2.0 * opacity)), 1.0);
     output.flags = float4(0.0, 1.0, 0.0, 1.0 - smoothstep(0.5, 0.7, opacity));
     return output;
 #else

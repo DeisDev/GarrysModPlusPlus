@@ -125,6 +125,7 @@ add_d3d9_shader(shaders/water_surface.hlsl main g_waterSurfaceOpaqueFogPS PROFIL
 add_d3d9_shader(shaders/water_textured_surface.hlsl main g_waterTexturedSurfacePS PROFILE ps_2_b)
 add_d3d9_shader(shaders/water_flow_surface.hlsl main g_waterFlowSurfacePS PROFILE ps_2_b)
 add_d3d9_shader(shaders/water_flow_surface.hlsl main g_waterFlowSurfaceColorPS PROFILE ps_2_b /D FLOW_COLOR=1)
+add_d3d9_shader(shaders/water_flow_surface.hlsl main g_waterFlowSurfaceColorLightmapPS PROFILE ps_2_b /D FLOW_COLOR=1 /D LIGHTMAP_FOG=1)
 add_d3d9_shader(shaders/water_flow_surface.hlsl main g_waterFlowSurfaceAlphaFogPS PROFILE ps_2_b /D REFRACT_ALPHA_FOG=1)
 add_d3d9_shader(shaders/water_flow_surface.hlsl main g_waterFlowSurfaceLightmapFogPS PROFILE ps_2_b /D REFRACT_ALPHA_FOG=1 /D LIGHTMAP_FOG=1)
 add_d3d9_shader(shaders/water_flow_surface.hlsl main g_waterFlowSurfaceOpaqueFogPS PROFILE ps_2_b /D REFRACT_ALPHA_FOG=1 /D LIGHTMAP_FOG=1 /D OPAQUE_FOG=1)

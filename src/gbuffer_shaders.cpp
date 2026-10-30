@@ -6,6 +6,7 @@
 #include <g_forwardSnippetPS.h>
 #include <g_forwardSnippetPS2.h>
 #include <g_waterFlowSurfaceAlphaFogPS.h>
+#include <g_waterFlowSurfaceColorLightmapPS.h>
 #include <g_waterFlowSurfaceColorPS.h>
 #include <g_waterFlowSurfaceLightmapFogPS.h>
 #include <g_waterFlowSurfaceOpaqueFogPS.h>
@@ -108,8 +109,8 @@ bool IsTexturedWater(const std::vector<bytecode::Constant>& constants)
         !HasConstant(constants, "FlowmapSampler");
 }
 
-// The flowing textured combos without a lightmap, which flow their base texture instead of refracting
-// (shaders/water_flow_surface.hlsl, FLOW_COLOR).
+// The flowing textured combos, which flow their base texture instead of refracting (shaders/water_flow_surface.hlsl,
+// FLOW_COLOR).
 bool IsFlowingColorWater(const std::vector<bytecode::Constant>& constants)
 {
     using bytecode::RegisterSet;
@@ -118,7 +119,8 @@ bool IsFlowingColorWater(const std::vector<bytecode::Constant>& constants)
         HasRegister(constants, "g_vReflectTint", RegisterSet::Float4, 4) && HasRegister(constants, "g_WaterFogColor", RegisterSet::Float4, 6) &&
         HasRegister(constants, "g_EyePos", RegisterSet::Float4, 9) && HasRegister(constants, "g_vFlowParams1", RegisterSet::Float4, 13) &&
         HasRegister(constants, "g_vFlowParams2", RegisterSet::Float4, 14) && HasRegister(constants, "g_vColorFlowParams1", RegisterSet::Float4, 26) &&
-        !HasConstant(constants, "RefractSampler") && !HasConstant(constants, "LightmapSampler");
+        !HasConstant(constants, "RefractSampler") &&
+        (!HasConstant(constants, "LightmapSampler") || HasRegister(constants, "LightmapSampler", RegisterSet::Sampler, 3));
 }
 
 // Which of a water replacement's variants (still or flowing) matches a combo: depth or alpha fog, and with
@@ -212,7 +214,7 @@ PixelShaderClass ClassifyPixelShader(std::span<const DWORD> code, UINT registerL
     }
     if (IsFlowingColorWater(constants)) {
         result.kind = ShaderKind::Water;
-        result.replacement = Code(g_waterFlowSurfaceColorPS);
+        result.replacement = Code(HasConstant(constants, "LightmapSampler") ? g_waterFlowSurfaceColorLightmapPS : g_waterFlowSurfaceColorPS);
         return result;
     }
     if (IsTexturedWater(constants)) {
