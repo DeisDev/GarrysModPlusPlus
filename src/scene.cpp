@@ -167,6 +167,7 @@ uint32_t Scene::AddMaterial(const GpuMaterial& material)
     if (m_materialCount == kMaxMaterials)
         return kNoMaterial;
     m_mappedMaterials[m_materialCount] = material;
+    m_selfIllumMaterials.push_back(material.selfIllumMask != kMaskOff);
     return m_materialCount++;
 }
 
@@ -353,8 +354,11 @@ int Scene::AddModel(const ModelGeometry& geometry)
         }
         model.alpha = UploadToDefault(records.data(), records.size() * sizeof(AlphaTriangle), staging);
     }
-    if (materials)
+    if (materials) {
         model.materials = UploadToDefault(geometry.triangleMaterials.data(), geometry.triangleMaterials.size_bytes(), staging);
+        model.selfIllum = std::any_of(geometry.triangleMaterials.begin(), geometry.triangleMaterials.end(),
+            [&](uint32_t material) { return material < m_selfIllumMaterials.size() && m_selfIllumMaterials[material]; });
+    }
     if (!model.positions || !model.indices || !model.albedo || (uvs && !model.uvs) || (alphaTriangles != 0 && !model.alpha) ||
         (materials && !model.materials)) {
         m_list->Close();
@@ -628,6 +632,7 @@ void Scene::Clear()
     m_micromapCount = 0;
     m_micromapModels = 0;
     m_materialCount = 0;
+    m_selfIllumMaterials.clear();
     m_staticInstances.clear();
     m_hasSkybox = false;
     m_worldModel = -1;
@@ -894,7 +899,8 @@ SceneFrame Scene::RecordFrame(ID3D12GraphicsCommandList4* list, UINT slot, std::
         instance.AccelerationStructure = blas;
         InstanceRecord& record = frame.mappedRecords[written];
         record = {source.positionsView != DescriptorHeap::kInvalid ? source.positionsView : model.positionsView, model.indicesView, model.albedoView,
-            model.uvsView, model.alphaView, model.opaqueTriangles, model.materialsView, source.previousPositionsView, {}, source.flags, {}};
+            model.uvsView, model.alphaView, model.opaqueTriangles, model.materialsView, source.previousPositionsView, {},
+            source.flags | (model.selfIllum ? kInstanceSelfIllum : 0u), {}};
         std::memcpy(record.previousTransform, source.previousKnown ? source.previousTransform : instance.Transform, sizeof(record.previousTransform));
         m_recorded.emplace_back(source.model, mask);
         ++written;

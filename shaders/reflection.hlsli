@@ -35,7 +35,8 @@ float3 PreviousColor(uint previousView, float4 clip, float distance)
 float3 ReflectedRadiance(uint previousView, float3 origin, float3 direction, float3 ambient, inout uint seed, out float hitDistance)
 {
     HitSurface hit;
-    if (!TraceClosest(origin, direction, kMaxDistance, g_frame.traceMask, hit)) {
+    HitInfo hitInfo;
+    if (!TraceClosest(origin, direction, kMaxDistance, g_frame.traceMask, hit, hitInfo)) {
         hitDistance = kSkyHitDistance;
         // A direction at infinity: w = 0 projects it to where last frame showed that part of the sky.
         float3 sky = PreviousColor(previousView, mul(g_frame.prevViewProj, float4(direction, 0.0)), 0.0);
@@ -57,7 +58,7 @@ float3 ReflectedRadiance(uint previousView, float3 origin, float3 direction, flo
     LightSet set = LightSetAt(hit.position, hit.normal);
     if (SampleLight(set, hit.position, hit.normal, seed, light, toLight, distance, picked))
         irradiance += light * LightTransmittance(set, picked, shadowOrigin, toLight, distance);
-    return ClampSample(hit.albedo * irradiance);
+    return ClampSample(hit.albedo * irradiance + HitEmission(hit, hitInfo, hitDistance));
 }
 
 #endif

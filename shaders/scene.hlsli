@@ -27,13 +27,14 @@ struct InstanceRecord
     uint previousPositions;
     // Last frame's object-to-world transform.
     float4 previousTransform[3];
-    // kInstanceIgnoreNormals.
+    // kInstanceIgnoreNormals, kInstanceSelfIllum.
     uint flags;
     uint3 padding;
 };
 
-// kInstanceIgnoreNormals in src/scene.h.
+// kInstanceIgnoreNormals and kInstanceSelfIllum in src/scene.h.
 static const uint kInstanceIgnoreNormals = 0x01;
+static const uint kInstanceSelfIllum = 0x02;
 
 // Mirrors GpuLight in src/scene.cpp (bsp::Light, VRAD units and falloff).
 struct Light
@@ -91,6 +92,8 @@ struct HitSurface
     float3 position;
     float3 normal;
     float3 albedo;
+    // InstanceRecord::flags.
+    uint flags;
 };
 
 InstanceRecord LoadInstance(uint instance)
@@ -248,18 +251,24 @@ HitSurface SurfaceOf(HitInfo hit, float3 origin, float3 direction)
     surface.position = origin + direction * hit.t;
     surface.normal = normal;
     surface.albedo = UnpackAlbedo(albedo.Load(hit.primitive * 4));
+    surface.flags = record.flags;
     return surface;
 }
 
-// The closest surface along a ray, or false when it reaches tMax.
-bool TraceClosest(float3 origin, float3 direction, float tMax, uint mask, out HitSurface surface, uint rayFlags = RAY_FLAG_NONE)
+// The closest surface along a ray, and the triangle it is on, or false when it reaches tMax.
+bool TraceClosest(float3 origin, float3 direction, float tMax, uint mask, out HitSurface surface, out HitInfo hit, uint rayFlags = RAY_FLAG_NONE)
 {
     surface = (HitSurface)0;
-    HitInfo hit;
     if (!TraceHit(origin, direction, tMax, mask, hit, rayFlags))
         return false;
     surface = SurfaceOf(hit, origin, direction);
     return true;
+}
+
+bool TraceClosest(float3 origin, float3 direction, float tMax, uint mask, out HitSurface surface, uint rayFlags = RAY_FLAG_NONE)
+{
+    HitInfo hit;
+    return TraceClosest(origin, direction, tMax, mask, surface, hit, rayFlags);
 }
 
 // Mirrors GpuMaterial in src/scene.h.
@@ -357,6 +366,24 @@ float MaskValue(uint mask, float2 uv, float footprint)
     float lod = log2(max(footprint * max(width, height), 1e-6));
     float value = texture.SampleLevel(g_linearWrap, uv, lod)[(mask >> 24) & 3];
     return (mask & (1u << 26)) != 0 ? 1.0 - value : value;
+}
+
+// Texture coordinates a hit's mask sample spans per unit of distance: rays that gather light need no fine detail.
+static const float kHitMaskFootprint = 0.01;
+
+// The light a hit surface gives off itself: Source's self-illumination, its albedo times the material's tint and mask
+// (the G-buffer twins write the same as emissive). `distance` is the ray's length. Only models with such a material
+// (kInstanceSelfIllum) look the material up.
+float3 HitEmission(HitSurface surface, HitInfo hit, float distance)
+{
+    if ((surface.flags & kInstanceSelfIllum) == 0)
+        return 0.0;
+    Material material;
+    float2 uv;
+    float uvPerUnit;
+    if (!HitMaterial(hit, material, uv, uvPerUnit) || material.selfIllumMask == kMaskOff)
+        return 0.0;
+    return material.selfIllumTint * surface.albedo * MaskValue(material.selfIllumMask, uv, uvPerUnit * max(distance, 1.0) * kHitMaskFootprint);
 }
 
 // kSkyboxMask in src/scene.h.

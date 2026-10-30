@@ -38,6 +38,8 @@ constexpr UINT kVradSkyMask = 0x80;
 
 // SceneInstance::flags, read by shaders from the instance record.
 constexpr uint32_t kInstanceIgnoreNormals = 0x01;
+// Set by Scene for models with a self-illuminated material, whose hits add the light it gives off.
+constexpr uint32_t kInstanceSelfIllum = 0x02;
 
 // Triangles for Scene::AddModel. Alpha-tested and translucent triangles come last, from `opaqueTriangles` on; each
 // has an entry in `alphaTriangles` (Scene::PackAlpha or Scene::PackTranslucent), and then the model needs `uvs`.
@@ -282,6 +284,7 @@ private:
         Microsoft::WRL::ComPtr<ID3D12Resource> micromaps;
         Microsoft::WRL::ComPtr<ID3D12Resource> micromapIndices;
         bool hasMicromaps = false;
+        bool selfIllum = false;
         UINT positionsView = DescriptorHeap::kInvalid;
         UINT indicesView = DescriptorHeap::kInvalid;
         UINT albedoView = DescriptorHeap::kInvalid;
@@ -352,6 +355,8 @@ private:
     GpuMaterial* m_mappedMaterials = nullptr;
     UINT m_materialsView = DescriptorHeap::kInvalid;
     UINT m_materialCount = 0;
+    // Which materials are self-illuminated (GpuMaterial::selfIllumMask set).
+    std::vector<bool> m_selfIllumMaterials;
     std::vector<SceneInstance> m_staticInstances;
     std::vector<std::pair<int, UINT>> m_recorded;
     bool m_hasSkybox = false;
