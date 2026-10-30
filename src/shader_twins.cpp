@@ -55,6 +55,8 @@ struct Family {
     // 0 so their combos share one twin. LIGHTING_PREVIEW is always 0: the game binds its preview combos during a
     // capture, whose pow(x, 2.2) would convert the sRGB-decoded textures again.
     std::string_view ignoredDynamics;
+    // The source's DiffuseWarpSampler register, read when LIGHTWARPTEXTURE is 1, or -1.
+    int lightWarpSampler = -1;
 };
 
 // Flashlight passes are skipped in real-time mode; GMod's lightmap switch is not in the twin yet; unlit combos keep
@@ -74,9 +76,9 @@ constexpr Family kFamilies[] = {
     { "vertexlit_and_unlit_generic_ps20b", "vertexlit_and_unlit_generic_ps2x.fxc", "ps20b", "ps_2_b", "SHADER_MODEL_PS_2_B", 377487360, 12, 0x6e13aa07,
         &KeepVertexLitGeneric, "" },
     { "vertexlit_and_unlit_generic_bump_ps20b", "vertexlit_and_unlit_generic_bump_ps2x.fxc", "ps20b", "ps_2_b", "SHADER_MODEL_PS_2_B", 860160, 20,
-        0x7df2bfaa, &KeepBump, "NUM_LIGHTS AMBIENT_LIGHT" },
+        0x7df2bfaa, &KeepBump, "NUM_LIGHTS AMBIENT_LIGHT", 9 },
     { "skin_ps20b", "skin_ps20b.fxc", "ps20b", "ps_2_b", "SHADER_MODEL_PS_2_B", 6881280, 80, 0xa7b42ee9, &KeepSkin,
-        "WRITEWATERFOGTODESTALPHA PIXELFOGTYPE NUM_LIGHTS WRITE_DEPTH_TO_DESTALPHA" },
+        "WRITEWATERFOGTODESTALPHA PIXELFOGTYPE NUM_LIGHTS WRITE_DEPTH_TO_DESTALPHA", 2 },
     // GMod's total of 2,717,908,992 combos wraps in the header's 32-bit signed field.
     { "lightmappedgeneric_ps30", "lightmappedgeneric_ps2x.fxc", "ps30", "ps_3_0", "SHADER_MODEL_PS_3_0", -1577058304, 96, 0x3b558d77, &KeepNone,
         "FASTPATHENVMAPCONTRAST WRITEWATERFOGTODESTALPHA PIXELFOGTYPE WRITE_DEPTH_TO_DESTALPHA" },
@@ -265,6 +267,12 @@ void Decode(std::uint64_t index, const std::vector<Switch>& switches, Values& va
     }
 }
 
+std::mutex& FamilyMutex()
+{
+    static std::mutex mutex;
+    return mutex;
+}
+
 // Compiles a twin for a combo's switch values, or loads it from the cache (gmodpp_cache\twins) when the same files
 // were compiled for the same values before.
 bool Compile(LoadedFamily& entry, const Values& values, bool forward, std::vector<DWORD>& code, std::string& error)
@@ -318,7 +326,7 @@ bool Compile(LoadedFamily& entry, const Values& values, bool forward, std::vecto
 std::span<const DWORD> Twin(std::string_view file, const vcs::Header& header, int staticIndex, int dynamicIndex, bool forward)
 {
     // The prewarm compiles twins on worker threads while nothing draws; the render thread uses them alone later.
-    static std::mutex mutex;
+    std::mutex& mutex = FamilyMutex();
     static std::map<std::tuple<const LoadedFamily*, int, int, bool>, std::vector<DWORD>> compiled;
     LoadedFamily* entry = nullptr;
     {
@@ -385,6 +393,20 @@ std::uint64_t SourceHash()
             hash = Fnv(text, Fnv(path.filename().string(), hash));
     }
     return hash;
+}
+
+int LightWarpSampler(std::string_view file, const vcs::Header& header, int staticIndex)
+{
+    const LoadedFamily* entry = nullptr;
+    {
+        std::scoped_lock lock(FamilyMutex());
+        entry = FamilyFor(file, header);
+    }
+    if (entry == nullptr || entry->family->lightWarpSampler < 0 || staticIndex < 0)
+        return -1;
+    Values values;
+    Decode(static_cast<std::uint64_t>(staticIndex) / static_cast<std::uint64_t>(std::max(header.dynamicCombos, 1)), entry->statics, values);
+    return ValueOf(values, "LIGHTWARPTEXTURE") != 0 ? entry->family->lightWarpSampler : -1;
 }
 
 bool HasTwin(std::string_view file)

@@ -327,7 +327,9 @@ float4 main( PS_INPUT i ) : COLOR
 	twin.flags = float4( i.worldPos_projPosZ.xyz, alpha );
 #else
 	// Green: 1 less the material bits over 255 (shaders/common.hlsli kMaterialHalfLambert).
-	twin.flags = float4( 1, HALFLAMBERT ? 254.0f / 255.0f : 1.0f, 1, alpha );
+	// Green: 1 less the material bits over 255 (shaders/common.hlsli); with light warp the translator puts the warp
+	// texture's slot in alpha.
+	twin.flags = float4( 1, 1.0f - ( ( HALFLAMBERT ? 1.0f : 0.0f ) + ( LIGHTWARPTEXTURE ? 128.0f : 0.0f ) ) / 255.0f, 1, alpha );
 #endif
 	return twin;
 #else

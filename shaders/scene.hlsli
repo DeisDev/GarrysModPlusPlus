@@ -540,6 +540,9 @@ static const float kIgnoredNormalLambert = 0.35;
 // common_vertexlitgeneric_dx9.h).
 static bool g_halfLambert = false;
 
+// Set by a pass for the pixel it lights: the light warp texture ($lightwarptexture), or kNoView.
+static uint g_lightWarpView = kNoView;
+
 float Lambert(float3 normal, float3 toLight)
 {
     if (!any(normal != 0.0))
@@ -549,6 +552,20 @@ float Lambert(float3 normal, float3 toLight)
         return wrapped * wrapped;
     }
     return saturate(dot(normal, toLight));
+}
+
+// What the light warp makes of a light's diffuse term, relative to Lambert's: Source looks the (half-)Lambert term
+// up in the warp texture, doubled, without squaring the half-Lambert term (DiffuseTerm in
+// common_vertexlitgeneric_dx9.h). Highlights keep the plain term.
+float3 LightWarp(float3 normal, float3 toLight)
+{
+    if (g_lightWarpView == kNoView || !any(normal != 0.0))
+        return 1.0;
+    float cosine = dot(normal, toLight);
+    float term = g_halfLambert ? saturate(cosine * 0.5 + 0.5) : saturate(cosine);
+    Texture2D<float4> warp = ResourceDescriptorHeap[NonUniformResourceIndex(g_lightWarpView)];
+    float3 warped = 2.0 * warp.SampleLevel(g_linearClamp, float2(term, 0.5), 0.0).rgb;
+    return warped / max(Lambert(normal, toLight), 1e-6);
 }
 
 // Map lights first, then the engine's dynamic lights.

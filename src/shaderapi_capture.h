@@ -59,6 +59,8 @@ struct Pass {
     // An opaque draw of the game's own shader into a captured view: what it draws hides the G-buffer behind it (an
     // eyeball over the face mesh behind it), so it clears the coverage there (translator::Variant::clearCoverage).
     bool clearsCoverage = false;
+    // The sampler register of a G-buffer twin's light warp texture, or -1 (translator::Variant::lightWarpSlot).
+    int lightWarpSampler = -1;
     // A forward twin, lit in the shader from these frame constants and scene (translator::Variant::forwardLighting).
     D3D12_GPU_VIRTUAL_ADDRESS forwardFrame = 0;
     D3D12_GPU_VIRTUAL_ADDRESS forwardScene = 0;
@@ -79,6 +81,9 @@ Pass Prepare(std::span<const DWORD> vertexCode, std::span<const DWORD> pixelCode
 Targets BindTargets(const Pass& pass, bool srgb);
 // Adds the G-buffer's coverage target to a pass's targets as render target 1, for a pass with clearsCoverage.
 void AddCoverageTarget(Targets& targets);
+// The slot of a light warp texture (its shader resource view) in the view's table, over 255 for the flags target's
+// alpha; 0 when the table is full. The lighting reads the table (ViewInputs::lightWarps) through the slot.
+float LightWarpSlot(UINT view);
 // The probe volume's red, green or blue texture for a probe sampler of a forward draw, ready to be read.
 UINT ProbeView(size_t index);
 

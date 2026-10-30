@@ -31,6 +31,8 @@ enum TargetIndex { kAlbedo, kNormal, kEmissive, kFlags, kLight, kTargetCount };
 constexpr DXGI_FORMAT kTargetFormats[kTargetCount] = {DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16G16B16A16_FLOAT,
     DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_TYPELESS};
 constexpr size_t kMaxProjectedLights = 8;
+// FrameConstants::lightWarpViews in src/lighting.h.
+constexpr size_t kMaxLightWarps = 64;
 // ShaderBlendFactor_t (shaderapi/ishaderdynamic.h): SHADER_BLEND_ONE, SHADER_BLEND_DST_COLOR, SHADER_BLEND_SRC_ALPHA and
 // SHADER_BLEND_SRC_COLOR.
 constexpr int kBlendOne = 1;
@@ -91,6 +93,8 @@ struct State {
     // The view's projected lights and their cookies, for ViewInputs.
     std::vector<gbuffer::ProjectedLight> lights;
     std::vector<ID3D12Resource*> cookies;
+    // The light warp textures of the view's G-buffer twins, by slot - 1 (LightWarpSlot).
+    std::vector<UINT> lightWarps;
     uint32_t flashlightDraws = 0;
     std::pair<uint32_t, size_t> loggedProjection = {0, 0};
     uint64_t sections = 0;
@@ -304,6 +308,7 @@ bool Begin(std::array<float, 2> jitter)
         backend.Commands()->ClearRenderTargetView(g_state.targets[i].view, kZero, 0, nullptr);
     }
     g_state.jitter = jitter;
+    g_state.lightWarps.clear();
     g_state.waterFogColor.reset();
     g_state.projected.clear();
     g_state.srgbDraws = 0;
@@ -389,6 +394,7 @@ bool End(ViewKind kind, ViewInputs& inputs)
     }
     inputs.projected = g_state.lights;
     inputs.cookies = g_state.cookies;
+    inputs.lightWarps = g_state.lightWarps;
     if (kind == ViewKind::Main && g_state.probes[0].resource) {
         for (size_t i = 0; i < g_state.probes.size(); ++i)
             inputs.probes[i] = common(g_state.probes[i]);
@@ -567,6 +573,7 @@ Pass Prepare(std::span<const DWORD> vertexCode, std::span<const DWORD> pixelCode
     if (!twin.empty()) {
         pass.pixelCode = twin;
         pass.emissive = true;
+        pass.lightWarpSampler = twins::LightWarpSampler(pixelFile, *pixelCombo.header, pixelCombo.staticIndex);
     } else if (!shaderClass.patched.empty()) {
         pass.pixelCode = shaderClass.patched;
     } else {
@@ -620,6 +627,17 @@ Targets BindTargets(const Pass& pass, bool srgb)
     targets.depthFormat = Backend::kDepthFormat;
     backend.Commands()->OMSetRenderTargets(targets.count, targets.colors, FALSE, &targets.depth);
     return targets;
+}
+
+float LightWarpSlot(UINT view)
+{
+    auto found = std::find(g_state.lightWarps.begin(), g_state.lightWarps.end(), view);
+    if (found == g_state.lightWarps.end()) {
+        if (g_state.lightWarps.size() >= kMaxLightWarps)
+            return 0.0f;
+        found = g_state.lightWarps.insert(g_state.lightWarps.end(), view);
+    }
+    return static_cast<float>(found - g_state.lightWarps.begin() + 1) / 255.0f;
 }
 
 UINT ProbeView(size_t index)

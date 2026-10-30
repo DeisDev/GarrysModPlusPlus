@@ -161,7 +161,9 @@ void main(uint3 id : SV_DispatchThreadID)
     float3 lightNormal = lit && (pixelFlags.Load(int3(pixel, 0)) & kPixelIgnoreNormals) != 0 ? 0.0 : normal;
     if (lit) {
         Texture2D<float4> gbufferFlags = ResourceDescriptorHeap[g_frame.flagsView];
-        g_halfLambert = (MaterialBits(gbufferFlags.Load(int3(pixel, 0))) & kMaterialHalfLambert) != 0;
+        float4 marks = gbufferFlags.Load(int3(pixel, 0));
+        g_halfLambert = (MaterialBits(marks) & kMaterialHalfLambert) != 0;
+        g_lightWarpView = LightWarpView(marks);
     }
 
     float3 exact = 0.0;
@@ -172,7 +174,7 @@ void main(uint3 id : SV_DispatchThreadID)
     float lambert = Lambert(lightNormal, g_frame.sunDirection);
     if (lit && g_frame.sunEnabled != 0.0 && lambert > 0.0) {
         sunVisibility = SunVisibility(origin, g_frame.sunShadowMask);
-        exact += g_frame.sunColor * lambert * sunVisibility;
+        exact += g_frame.sunColor * lambert * sunVisibility * LightWarp(lightNormal, g_frame.sunDirection);
         specular += SunHighlight(phong, g_frame.sunColor * (lambert * sunVisibility));
         rim += ModelRim(phong, g_frame.sunColor * (lambert * sunVisibility), g_frame.sunDirection);
     }
@@ -241,7 +243,7 @@ void main(uint3 id : SV_DispatchThreadID)
         float distance;
         float3 light = SetLightIrradiance(set, top[k], position, lightNormal, toLight, distance);
         float3 shadowed = light * LightTransmittance(set, top[k], origin, toLight, distance);
-        exact += shadowed;
+        exact += shadowed * LightWarp(lightNormal, toLight);
         specular += ModelHighlight(phong, shadowed, toLight);
         rim += ModelRim(phong, shadowed, toLight);
     }
@@ -255,7 +257,7 @@ void main(uint3 id : SV_DispatchThreadID)
             float distance;
             float3 light = SetLightIrradiance(set, picked[s], position, lightNormal, toLight, distance);
             float transmittance = LightTransmittance(set, picked[s], origin, toLight, distance);
-            sampled += ClampSample(light * (transmittance * remainder / (pickedWeight[s] * g_frame.sampledLightRays)));
+            sampled += ClampSample(light * LightWarp(lightNormal, toLight) * (transmittance * remainder / (pickedWeight[s] * g_frame.sampledLightRays)));
         }
     }
     if (!inside)

@@ -129,7 +129,10 @@ struct FrameConstants
     uint specularView;
     // Where VRAD's sun reached (shaders/baked_residual.hlsl), or kNoView.
     uint sunClustersView;
+    // The light warp textures the G-buffer's flags refer to (LightWarpView).
+    uint lightWarpCount;
     uint2 padding3;
+    uint4 lightWarpViews[16];
 };
 
 // Per-pass descriptor indices and parameters; mirrors Lighting::PassArgs in src/lighting.h.
@@ -158,15 +161,23 @@ static const uint kPixelUnlit = 2;
 static const uint kPixelIgnoreNormals = 4;
 
 // Material bits the twins (shaders/twins) store in the G-buffer flags' green as 1 - bits / 255 on covered pixels.
-// Rim light (skin twin) also stores its boost in eighths from bit kMaterialRimBoostShift, its mask, Fresnel and tint
-// in the flags' red above 0.5 and its exponent in the normal's alpha.
+// Rim light (skin twin) also stores its boost in quarters from bit kMaterialRimBoostShift, its mask, Fresnel and tint
+// in the flags' red above 0.5 and its exponent in the normal's alpha. Light warp ($lightwarptexture) stores its
+// texture's slot in the flags' alpha.
 static const uint kMaterialHalfLambert = 1;
 static const uint kMaterialRimLight = 2;
 static const uint kMaterialRimBoostShift = 2;
+static const uint kMaterialRimBoostMask = 31;
+static const uint kMaterialLightWarp = 128;
 
 float RimScale(float4 flags)
 {
     return saturate((flags.r - 0.5) * 2.0);
+}
+
+float RimBoost(uint bits)
+{
+    return float((bits >> kMaterialRimBoostShift) & kMaterialRimBoostMask) / 4.0;
 }
 
 uint MaterialBits(float4 flags)
@@ -186,6 +197,17 @@ ConstantBuffer<PassConstants> g_pass : GMODPP_REGISTER(b1);
 RaytracingAccelerationStructure g_scene : GMODPP_REGISTER(t0);
 SamplerState g_linearClamp : GMODPP_REGISTER(s0);
 SamplerState g_linearWrap : GMODPP_REGISTER(s2);
+
+// The light warp texture of a covered pixel, or kNoView.
+uint LightWarpView(float4 flags)
+{
+    if ((MaterialBits(flags) & kMaterialLightWarp) == 0)
+        return kNoView;
+    uint slot = uint(round(flags.a * 255.0));
+    if (slot == 0 || slot > g_frame.lightWarpCount)
+        return kNoView;
+    return g_frame.lightWarpViews[(slot - 1) / 4][(slot - 1) % 4];
+}
 
 // The pixel of a pass's thread: views whose G-buffer covers part of the screen (the viewmodel) dispatch their passes
 // over a rectangle around it only.

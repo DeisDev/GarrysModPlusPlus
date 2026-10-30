@@ -1018,6 +1018,8 @@ std::string Translator::Assemble()
             if (m_out.colorOutputs & (1u << i))
                 text += std::format("    gmodpp_target{0} = oC{0};\n", i);
         }
+        if (m_variant.lightWarpSlot != 0 && (m_out.colorOutputs & 8u))
+            text += "    gmodpp_target3.a = gmodpp_alpha.y;\n";
     }
     if (clearCoverage)
         text += "    gmodpp_coverage = 0;\n";

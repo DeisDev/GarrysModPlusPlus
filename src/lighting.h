@@ -116,7 +116,10 @@ struct FrameConstants {
     uint32_t specularView;
     // Scene::LightLists::sunClustersView: where VRAD's sun reached (the bake), or kInvalidView.
     uint32_t sunClustersView;
+    // The light warp textures of the view's G-buffer twins (shaderapi_capture.h, LightWarpSlot).
+    uint32_t lightWarpCount;
     uint32_t padding3[2];
+    uint32_t lightWarpViews[64];
 };
 
 // What blocks the sun at a pixel of the main view (Lighting::RequestProbe).
@@ -144,6 +147,8 @@ struct ViewInputs {
     std::span<const gbuffer::ProjectedLight> projected;
     // Each projected light's cookie texture, or null for a round spot.
     std::span<ID3D12Resource* const> cookies;
+    // Shader resource views of the light warp textures the G-buffer's flags refer to.
+    std::span<const UINT> lightWarps;
     gbuffer::ViewKind kind;
     // The viewport depth range the view was drawn with.
     float depthMin;

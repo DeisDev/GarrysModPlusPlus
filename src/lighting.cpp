@@ -55,6 +55,7 @@ namespace {
 
 constexpr UINT kConstantsStride = 4 * D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT;
 static_assert(sizeof(FrameConstants) <= kConstantsStride);
+static_assert(offsetof(FrameConstants, lightWarpViews) % 16 == 0);
 // Each slot has the view's constants and a copy for the passes Ray Reconstruction runs at render resolution.
 constexpr UINT kConstantsPerSlot = 2;
 // Per slot: colour copy, depth, G-buffer normal, flags, light, albedo and self-illumination views, then projector cookies.
@@ -876,6 +877,8 @@ bool Lighting::FillConstants(FrameConstants& constants, const Scene& scene, cons
     constants.bspNodesView = lists.nodesView;
     constants.leafClustersView = lists.leafClustersView;
     constants.sunClustersView = lists.sunClustersView;
+    constants.lightWarpCount = static_cast<uint32_t>(std::min(inputs.lightWarps.size(), std::size(constants.lightWarpViews)));
+    std::copy_n(inputs.lightWarps.begin(), constants.lightWarpCount, constants.lightWarpViews);
     constants.clusterCount = lists.clusterCount;
     constants.viewmodel = inputs.kind == gbuffer::ViewKind::Viewmodel ? 1u : 0u;
     // The skybox view shares the main view's orientation, so it finds last frame's sky (reflections.hlsl).

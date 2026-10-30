@@ -73,6 +73,8 @@ std::uint64_t Key(std::span<const DWORD> code, const translator::Variant& varian
     }
     if (variant.clearCoverage != 0)
         key = Fnv("coverage", 8, key);
+    if (variant.lightWarpSlot != 0)
+        key = Fnv("lightwarp", 9, key);
     return Fnv(&kTranslatorVersion, sizeof(kTranslatorVersion), key);
 }
 

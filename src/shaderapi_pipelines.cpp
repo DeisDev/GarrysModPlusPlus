@@ -591,6 +591,18 @@ bool IsTarget(const Texture* texture)
     return TextureFromHandle(state.depthTarget) == texture;
 }
 
+// The slot of a G-buffer twin's light warp texture (capture::LightWarpSlot), or 0 without one. The twin itself does not
+// sample it, so its view comes from the bound texture.
+float LightWarpSlot(std::intptr_t handle, bool srgbRead)
+{
+    Texture* texture = TextureFromHandle(handle);
+    if (texture == nullptr || texture->copies.empty() || IsTarget(texture))
+        return 0.0f;
+    Texture::Copy& copy = texture->Current();
+    GetBackend().Transition(copy.resource, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
+    return capture::LightWarpSlot(srgbRead && copy.srgbView != DescriptorHeap::kInvalid ? copy.srgbView : copy.view);
+}
+
 // Fills one stage's texture and sampler indices and moves its textures into a shader resource state.
 void BindSamplers(const CompiledShader& shader, const std::intptr_t* handles, int count, std::int32_t srgbRead, StateBuffer& state,
     std::uint16_t* shadowSamplers)
@@ -965,6 +977,10 @@ void DrawPass(const ShadowState& shadow, const MeshDraw& mesh)
         pixelVariant.alphaTest = static_cast<std::uint8_t>(shadow.alphaFunc + 1);
     pixelVariant.forwardLighting = pass.forwardFrame != 0 ? 1 : 0;
     pixelVariant.clearCoverage = clearCoverage ? 1 : 0;
+    if (pass.route == capture::Pass::Route::GBuffer && pass.lightWarpSampler >= 0 && pass.lightWarpSampler < kSamplers) {
+        pixelVariant.lightWarpSlot = 1;
+        pixelState.alpha[1] = LightWarpSlot(dynamic.textures[static_cast<size_t>(pass.lightWarpSampler)], ((shadow.srgbRead >> pass.lightWarpSampler) & 1) != 0);
+    }
     StateBuffer vertexState = {};
     BindSamplers(*vertexBase, dynamic.vertexTextures.data(), kVertexSamplers, 0, vertexState, nullptr);
 

@@ -42,7 +42,7 @@ float3 AmbientRim(int2 pixel, float3 normal, float3 indirect)
     uint bits = MaterialBits(marks);
     if ((bits & kMaterialRimLight) == 0)
         return 0.0;
-    float boost = float(bits >> kMaterialRimBoostShift) / 8.0;
+    float boost = RimBoost(bits);
     return indirect * (boost * saturate(RimScale(marks) * normal.z));
 }
 

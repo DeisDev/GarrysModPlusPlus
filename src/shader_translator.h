@@ -24,13 +24,16 @@ struct Variant {
     // Pixel shaders: Direct3D 9's alpha test as a D3DCMPFUNC (0 off), against gmodpp_alpha.x (ALPHAREF, 0-255).
     std::uint8_t alphaTest = 0;
     // Vertex shaders: how many of gmodpp_clipPlanes (clip-space user clip planes) clip the output.
-    std::uint8_t clipPlanes : 6 = 0;
+    std::uint8_t clipPlanes : 3 = 0;
     // Pixel shaders writing a forward twin's albedo, normal, emissive and world position (oC0-oC3): the outputs are
     // lit in the shader (shaders/forward_twin.hlsli) and written to SV_Target0 alone.
     std::uint8_t forwardLighting : 1 = 0;
     // Pixel shaders writing oC0 alone that also write 0 to SV_Target1, the G-buffer's coverage, so the lighting leaves
     // what they draw as the game drew it.
     std::uint8_t clearCoverage : 1 = 0;
+    // G-buffer twins of light-warped materials: the flags target's alpha (oC3.a) takes gmodpp_alpha.y, the warp
+    // texture's slot in the view's table (shaderapi_capture.h, LightWarpSlot).
+    std::uint8_t lightWarpSlot : 1 = 0;
 };
 
 struct VertexInput {
