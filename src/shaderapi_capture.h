@@ -56,6 +56,9 @@ struct Pass {
     // Samplers that read the probe volume instead of the game's textures.
     std::array<UINT, 3> probeSamplers = {};
     bool probes = false;
+    // A forward twin, lit in the shader from these frame constants and scene (translator::Variant::forwardLighting).
+    D3D12_GPU_VIRTUAL_ADDRESS forwardFrame = 0;
+    D3D12_GPU_VIRTUAL_ADDRESS forwardScene = 0;
 };
 
 // The game's pixel shader combo a pass draws: its shader file's header and combo indices (shader_twins.h).

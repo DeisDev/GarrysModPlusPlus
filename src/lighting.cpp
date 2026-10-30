@@ -355,6 +355,10 @@ bool Lighting::Initialize(ID3D12Device5* device, ID3D12CommandQueue* queue, Desc
         hr = m_constants ? m_constants->Map(0, nullptr, reinterpret_cast<void**>(&m_constantsMapped)) : E_OUTOFMEMORY;
     }
     if (SUCCEEDED(hr)) {
+        m_forwardConstants = CreateBuffer(m_device, D3D12_HEAP_TYPE_UPLOAD, kConstantsStride * kSlots, D3D12_RESOURCE_STATE_GENERIC_READ);
+        hr = m_forwardConstants ? m_forwardConstants->Map(0, nullptr, reinterpret_cast<void**>(&m_forwardConstantsMapped)) : E_OUTOFMEMORY;
+    }
+    if (SUCCEEDED(hr)) {
         m_bakeConstants = CreateBuffer(m_device, D3D12_HEAP_TYPE_UPLOAD, kConstantsStride, D3D12_RESOURCE_STATE_GENERIC_READ);
         hr = m_bakeConstants ? m_bakeConstants->Map(0, nullptr, reinterpret_cast<void**>(&m_bakeConstantsMapped)) : E_OUTOFMEMORY;
     }
@@ -506,6 +510,12 @@ bool Lighting::Initialize(ID3D12Device5* device, ID3D12CommandQueue* queue, Desc
     }
     for (Texture& texture : m_probeVolume)
         volume = volume && CreateTarget(texture, grid[0], grid[1], DXGI_FORMAT_R16G16B16A16_FLOAT, grid[2]);
+    const UINT indirectUavs = m_descriptors->Reserve(static_cast<UINT>(m_probeIndirect.size()));
+    for (size_t i = 0; i < m_probeIndirect.size() && indirectUavs != DescriptorHeap::kInvalid; ++i) {
+        m_probeIndirect[i].uav = indirectUavs + static_cast<UINT>(i);
+        if (!CreateTarget(m_probeIndirect[i], grid[0], grid[1], DXGI_FORMAT_R16G16B16A16_FLOAT, grid[2]))
+            m_probeIndirect[0].resource.Reset();
+    }
     if (!volume) {
         log::Info("Lighting: creating the irradiance volume failed; translucent surfaces keep their baked light");
         m_probeVolume = {};
@@ -1340,7 +1350,11 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
         if (constants.bakedTrianglesView != kInvalidView) {
             for (Texture& texture : m_probeVolume)
                 Use(texture, write);
-            DispatchGroups(Pass::Probes, {.output0 = m_probeVolume[0].uav, .output1 = m_probeVolume[1].uav, .output2 = m_probeVolume[2].uav, .step = 2},
+            for (Texture& texture : m_probeIndirect)
+                if (texture.resource)
+                    Use(texture, write);
+            DispatchGroups(Pass::Probes, {.output0 = m_probeVolume[0].uav, .output1 = m_probeVolume[1].uav, .output2 = m_probeVolume[2].uav,
+                .output3 = m_probeIndirect[0].resource ? m_probeIndirect[0].uav : kInvalidView, .step = 2},
                 probes / 32, 1, 1);
         } else {
             DispatchGroups(Pass::Probes, {.input0 = last[0].srv, .input1 = last[1].srv, .input2 = last[2].srv, .input3 = last[3].srv,
@@ -1350,8 +1364,12 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
                 Use(texture, read);
             for (Texture& texture : m_probeVolume)
                 Use(texture, write);
+            for (Texture& texture : m_probeIndirect)
+                if (texture.resource)
+                    Use(texture, write);
             DispatchGroups(Pass::Probes, {.input0 = next[0].srv, .input1 = next[1].srv, .input2 = next[2].srv, .input3 = next[3].srv,
-                .output0 = m_probeVolume[0].uav, .output1 = m_probeVolume[1].uav, .output2 = m_probeVolume[2].uav, .step = 1}, probes / 32, 1, 1);
+                .output0 = m_probeVolume[0].uav, .output1 = m_probeVolume[1].uav, .output2 = m_probeVolume[2].uav,
+                .output3 = m_probeIndirect[0].resource ? m_probeIndirect[0].uav : kInvalidView, .step = 1}, probes / 32, 1, 1);
         }
         for (size_t i = 0; i < probeTargets.size(); ++i) {
             Use(m_probeVolume[i], D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -1652,6 +1670,18 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
         m_list->ResourceBarrier(1, &barrier);
     }
     mark();
+    if (main && m_volumeReady && m_probeIndirect[0].resource) {
+        // Forward draws read the indirect volume in their own command lists.
+        for (Texture& texture : m_probeIndirect)
+            Use(texture, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        FrameConstants& forward = *reinterpret_cast<FrameConstants*>(m_forwardConstantsMapped + slot * kConstantsStride);
+        forward = constants;
+        forward.probeRedView = m_probeIndirect[0].srv;
+        forward.probeGreenView = m_probeIndirect[1].srv;
+        forward.probeBlueView = m_probeIndirect[2].srv;
+        m_forwardFrame = m_forwardConstants->GetGPUVirtualAddress() + slot * kConstantsStride;
+        m_forwardScene = frame.tlas;
+    }
     m_list->ResolveQueryData(m_timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, slot * kMarkers, kMarkers, m_timestampReadback.Get(),
         slot * kMarkers * sizeof(uint64_t));
     HRESULT hr = m_list->Close();

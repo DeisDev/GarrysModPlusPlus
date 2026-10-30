@@ -199,7 +199,7 @@ ComPtr<ID3D12Resource> Scene::UploadToDefault(const void* data, UINT64 size, std
     std::memcpy(mapped, data, size);
     upload->Unmap(0, nullptr);
     m_list->CopyBufferRegion(buffer.Get(), 0, upload.Get(), 0, size);
-    D3D12_RESOURCE_BARRIER barrier = Transition(buffer.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    D3D12_RESOURCE_BARRIER barrier = Transition(buffer.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
     m_list->ResourceBarrier(1, &barrier);
     staging.push_back(upload);
     return buffer;
@@ -303,7 +303,7 @@ UINT Scene::AddTexture(DXGI_FORMAT format, UINT width, UINT height, std::span<co
         source.PlacedFootprint = footprints[mip];
         m_list->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
     }
-    D3D12_RESOURCE_BARRIER barrier = Transition(texture.resource.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    D3D12_RESOURCE_BARRIER barrier = Transition(texture.resource.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
     m_list->ResourceBarrier(1, &barrier);
     if (!Submit())
         return DescriptorHeap::kInvalid;

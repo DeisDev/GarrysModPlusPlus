@@ -1,7 +1,12 @@
 #include "shader_cache.h"
 
+#include "options.h"
+
+#include <algorithm>
 #include <format>
 #include <fstream>
+#include <sstream>
+#include <vector>
 
 namespace gmodpp::shader_cache {
 
@@ -16,6 +21,28 @@ std::uint64_t Fnv(const void* data, size_t size, std::uint64_t hash = 1469598103
         hash ^= bytes[i];
         hash *= 1099511628211ull;
     }
+    return hash;
+}
+
+// The lighting headers forward twins include (bin\win64\gmodpp\hlsl), which their translations depend on too.
+std::uint64_t LightingHeadersHash()
+{
+    static const std::uint64_t hash = [] {
+        std::vector<std::filesystem::path> files;
+        std::error_code error;
+        for (const auto& item : std::filesystem::directory_iterator(GetOptions().gameDirectory / L"bin" / L"win64" / L"gmodpp" / L"hlsl", error))
+            files.push_back(item.path());
+        std::sort(files.begin(), files.end());
+        std::uint64_t result = 14695981039346656037ull;
+        for (const std::filesystem::path& path : files) {
+            std::ifstream file(path, std::ios::binary);
+            std::ostringstream contents;
+            contents << file.rdbuf();
+            const std::string text = contents.str();
+            result = Fnv(text.data(), text.size(), result);
+        }
+        return result;
+    }();
     return hash;
 }
 
@@ -38,7 +65,12 @@ std::uint64_t Key(std::span<const DWORD> code, const translator::Variant& varian
     key = Fnv(&variant.integerInputs, sizeof(variant.integerInputs), key);
     key = Fnv(&variant.signedInputs, sizeof(variant.signedInputs), key);
     key = Fnv(&variant.alphaTest, sizeof(variant.alphaTest), key);
-    key = Fnv(&variant.clipPlanes, sizeof(variant.clipPlanes), key);
+    const std::uint8_t clipPlanes = variant.clipPlanes;
+    key = Fnv(&clipPlanes, sizeof(clipPlanes), key);
+    if (variant.forwardLighting != 0) {
+        const std::uint64_t headers = LightingHeadersHash();
+        key = Fnv(&headers, sizeof(headers), Fnv("forward", 7, key));
+    }
     return Fnv(&kTranslatorVersion, sizeof(kTranslatorVersion), key);
 }
 

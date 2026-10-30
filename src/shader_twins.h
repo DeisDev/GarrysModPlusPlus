@@ -19,6 +19,10 @@ std::span<const DWORD> GBufferShader(std::string_view file, const vcs::Header& h
 // Names the twin sources' contents (shaders/twins as deployed), so caches built from them can tell they changed.
 std::uint64_t SourceHash();
 
+// The same twin for translucent draws: its fourth output holds the world position instead of flags, which
+// shaders/forward_twin.hlsli lights (shader_translator.h, Variant::forwardLighting).
+std::span<const DWORD> ForwardShader(std::string_view file, const vcs::Header& header, int staticIndex, int dynamicIndex);
+
 // Whether a game shader file (.vcs name, any case) has a twin.
 bool HasTwin(std::string_view file);
 

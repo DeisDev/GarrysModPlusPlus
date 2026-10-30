@@ -190,6 +190,10 @@ public:
     }
     // Whether the last main view filled the irradiance volume, and the volume's first cell.
     bool VolumeReady() const { return m_volumeReady; }
+    // The last main view's frame constants and scene for forward twins (shaders/forward_twin.hlsli); 0 before one ran
+    // with its irradiance volume.
+    D3D12_GPU_VIRTUAL_ADDRESS ForwardFrame() const { return m_volumeReady ? m_forwardFrame : 0; }
+    D3D12_GPU_VIRTUAL_ADDRESS ForwardScene() const { return m_volumeReady ? m_forwardScene : 0; }
     std::array<int, 3> VolumeOrigin() const { return m_probeOrigin; }
     // Developer tool: the next main view reports what blocks the sun at a pixel (TakeProbe).
     void RequestProbe(UINT x, UINT y)
@@ -259,6 +263,12 @@ private:
     UINT m_slotViews = DescriptorHeap::kInvalid;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_constants;
     std::byte* m_constantsMapped = nullptr;
+    // The last main view's constants with its irradiance volume, per slot, for game draws that light themselves
+    // (forward twins), and the scene they trace.
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_forwardConstants;
+    std::byte* m_forwardConstantsMapped = nullptr;
+    D3D12_GPU_VIRTUAL_ADDRESS m_forwardFrame = 0;
+    D3D12_GPU_VIRTUAL_ADDRESS m_forwardScene = 0;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_bakeConstants;
     std::byte* m_bakeConstantsMapped = nullptr;
     // The bake's counters, read once it is done to log how much the direct light exceeded the baked light.
@@ -319,6 +329,9 @@ private:
     // and the filled volume copied to the game's textures.
     std::array<std::array<Texture, 4>, 2> m_probeHistory;
     std::array<Texture, 3> m_probeVolume;
+    // The volume's indirect light alone, before the fill adds direct light, for forward twins that trace their own;
+    // their UAVs are consecutive (probes.hlsl writes output3 + channel).
+    std::array<Texture, 3> m_probeIndirect;
     std::array<int, 3> m_probeOrigin = {};
     bool m_probeHistoryValid = false;
     bool m_volumeReady = false;

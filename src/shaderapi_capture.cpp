@@ -41,9 +41,9 @@ constexpr int kBlendSourceColor = 9;
 constexpr uint64_t kCoverageViews = 600;
 
 // How the capture handled a material shader's pixel shader file (Phase 3's coverage report).
-enum class Path { Preview, Replaced, Twin, Water, Unlit, Decal, Additive, Flashlight, ProjectedShadow, Forward, ForwardUnlit, Count };
+enum class Path { Preview, Replaced, Twin, Water, Unlit, Decal, Additive, Flashlight, ProjectedShadow, Forward, ForwardTwin, ForwardUnlit, Count };
 constexpr const char* kPathNames[] = {"G-buffer (lighting preview)", "G-buffer (replacement)", "G-buffer (twin)", "G-buffer (water surface)", "game shader, unlit",
-    "albedo decal", "additive light", "flashlight (ray traced)", "projected shadow (skipped)", "forward lit", "translucent, game shader"};
+    "albedo decal", "additive light", "flashlight (ray traced)", "projected shadow (skipped)", "forward lit", "forward twin", "translucent, game shader"};
 static_assert(std::size(kPathNames) == static_cast<size_t>(Path::Count));
 
 struct Target {
@@ -78,6 +78,9 @@ struct State {
     gbuffer::Matrix4 viewProj = {};
     std::array<std::array<float, 4>, bytecode::kForwardUniforms> forwardConstants = {};
     uint32_t forwardDraws = 0;
+    uint32_t forwardTwinDraws = 0;
+    D3D12_GPU_VIRTUAL_ADDRESS twinFrame = 0;
+    D3D12_GPU_VIRTUAL_ADDRESS twinScene = 0;
     uint32_t forwardLogged = 0;
     // Fog of the main view and of the 3D skybox, which has its own.
     std::array<gbuffer::Fog, 2> fog;
@@ -424,8 +427,11 @@ void BeginForward(const gbuffer::ForwardConstants& constants)
         (constants.probeOrigin[2] + kProbeGrid[2] * 0.5f) * kProbeSpacing, 0.0f};
     c[5] = {constants.eye[0], constants.eye[1], constants.eye[2], constants.tonemapScale};
     c[6] = constants.fog.known ? constants.fog.params : std::array<float, 4>{};
+    g_state.twinFrame = constants.twinFrame;
+    g_state.twinScene = constants.twinScene;
     g_state.forwardActive = true;
     g_state.forwardDraws = 0;
+    g_state.forwardTwinDraws = 0;
 }
 
 void EndForward()
@@ -435,8 +441,8 @@ void EndForward()
     g_state.forwardActive = false;
     if (g_state.forwardLogged < 3) {
         ++g_state.forwardLogged;
-        log::Info("G-buffer: {} forward-lit draws ({} preview shaders have a forward variant, {} could not take one)", g_state.forwardDraws,
-            gbuffer::ShaderStatistics().forward, gbuffer::ShaderStatistics().forwardFailures);
+        log::Info("G-buffer: {} forward-lit draws, {} of them by forward twins ({} preview shaders have a forward variant, {} could not take one)",
+            g_state.forwardDraws, g_state.forwardTwinDraws, gbuffer::ShaderStatistics().forward, gbuffer::ShaderStatistics().forwardFailures);
     }
 }
 
@@ -473,6 +479,21 @@ Pass Prepare(std::span<const DWORD> vertexCode, std::span<const DWORD> pixelCode
     const bool additive = blend && destinationBlend == kBlendOne;
 
     if (g_state.forwardActive) {
+        // Forward twins trace their own light; additive draws add light and are shown as drawn.
+        const std::span<const DWORD> twin = !additive && g_state.twinFrame != 0 && g_state.twinScene != 0 && pixelFile != nullptr && pixelCombo.header != nullptr
+            ? twins::ForwardShader(pixelFile, *pixelCombo.header, pixelCombo.staticIndex, pixelCombo.dynamicIndex)
+            : std::span<const DWORD>();
+        if (!twin.empty()) {
+            Count(pixelFile, Path::ForwardTwin);
+            ++g_state.forwardDraws;
+            ++g_state.forwardTwinDraws;
+            pass.pixelCode = twin;
+            pass.pixelName = pixel->forwardName.c_str();
+            pass.forwardFrame = g_state.twinFrame;
+            pass.forwardScene = g_state.twinScene;
+            DetailMode(shaderClass, pass.pixelPatches);
+            return pass;
+        }
         const std::span<const DWORD> forward = !shaderClass.forward.empty() ? std::span<const DWORD>(shaderClass.forward) : shaderClass.forwardReplacement;
         if (forward.empty() || !g_state.probes[0].resource) {
             Count(pixelFile, Path::ForwardUnlit);

@@ -958,6 +958,7 @@ void DrawPass(const ShadowState& shadow, const MeshDraw& mesh)
     }
     if (shadow.alphaTest)
         pixelVariant.alphaTest = static_cast<std::uint8_t>(shadow.alphaFunc + 1);
+    pixelVariant.forwardLighting = pass.forwardFrame != 0 ? 1 : 0;
     StateBuffer vertexState = {};
     BindSamplers(*vertexBase, dynamic.vertexTextures.data(), kVertexSamplers, 0, vertexState, nullptr);
 
@@ -1149,6 +1150,10 @@ void DrawPass(const ShadowState& shadow, const MeshDraw& mesh)
     commands->SetGraphicsRootConstantBufferView(1, vertexStateAddress);
     commands->SetGraphicsRootConstantBufferView(2, pixelShader != nullptr ? floats(*pixelShader, dynamic.pixelFloats.data(), kPixelFloatConstants, dynamic.pixelFloatsVersion, g_cache.pixelConstants, pixelStateAddress, pass.pixelPatches) : pixelStateAddress);
     commands->SetGraphicsRootConstantBufferView(3, pixelStateAddress);
+    if (pass.forwardFrame != 0) {
+        commands->SetGraphicsRootConstantBufferView(kRootForwardFrame, pass.forwardFrame);
+        commands->SetGraphicsRootShaderResourceView(kRootForwardScene, pass.forwardScene);
+    }
 
     commands->RSSetViewports(1, &viewport);
     D3D12_RECT scissor = { 0, 0, static_cast<LONG>(targets.width), static_cast<LONG>(targets.height) };

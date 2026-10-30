@@ -53,25 +53,6 @@ float3 FurtherBounces(HitSurface hit, float3 origin, inout uint seed)
     return irradiance;
 }
 
-// The main view's filled irradiance volume at a point, or -1 where there is none.
-float3 VolumeIrradiance(float3 position, float3 normal)
-{
-    if (g_frame.probeRedView == kNoView)
-        return -1.0;
-    static const float3 kGrid = float3(32.0, 32.0, 16.0);
-    float3 window = (position / g_frame.probeSpacing - 0.5) - float3(g_frame.probeOrigin);
-    if (any(window < 0.0) || any(window > kGrid - 1.0))
-        return -1.0;
-    float3 uvw = position / (g_frame.probeSpacing * kGrid);
-    Texture3D<float4> red = ResourceDescriptorHeap[g_frame.probeRedView];
-    Texture3D<float4> green = ResourceDescriptorHeap[g_frame.probeGreenView];
-    Texture3D<float4> blue = ResourceDescriptorHeap[g_frame.probeBlueView];
-    float4 r = red.SampleLevel(g_linearWrap, uvw, 0.0);
-    float4 g = green.SampleLevel(g_linearWrap, uvw, 0.0);
-    float4 b = blue.SampleLevel(g_linearWrap, uvw, 0.0);
-    return max(float3(r.x + dot(r.yzw, normal), g.x + dot(g.yzw, normal), b.x + dot(b.yzw, normal)), 0.0);
-}
-
 // The projected lights (flashlights) at a hit, which the irradiance volume leaves out.
 float3 ProjectorLight(HitSurface hit, float3 origin)
 {

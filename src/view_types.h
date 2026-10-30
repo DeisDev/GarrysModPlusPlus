@@ -58,6 +58,10 @@ struct ForwardConstants {
     Fog fog;
     // Debug views show the light alone, as if the albedo were white.
     bool lightOnly;
+    // Native forward twins (shaders/forward_twin.hlsli): the GPU addresses of their frame constants and ray-traced
+    // scene, 0 for none.
+    std::uint64_t twinFrame;
+    std::uint64_t twinScene;
 };
 
 }

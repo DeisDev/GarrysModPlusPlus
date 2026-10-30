@@ -47,7 +47,7 @@ uint3 Texel(int3 cell)
 }
 
 // Irradiance from last frame's volume, or the sky's outside the probe window.
-float3 VolumeIrradiance(float3 position, float3 normal)
+float3 LastVolumeIrradiance(float3 position, float3 normal)
 {
     float3 window = (position / g_frame.probeSpacing - 0.5) - float3(g_frame.probeOrigin);
     if (any(window < 0.0) || any(window > float3(kProbeGrid) - 1.0))
@@ -116,7 +116,7 @@ void Trace(uint3 id, uint thread)
             } else {
                 HitSurface surface = SurfaceOf(hit, position, direction);
                 float3 origin = surface.position + surface.normal;
-                float3 irradiance = SunIrradiance(surface, origin, g_frame.bounceMask) + VolumeIrradiance(surface.position, surface.normal) * g_frame.indirectScale;
+                float3 irradiance = SunIrradiance(surface, origin, g_frame.bounceMask) + LastVolumeIrradiance(surface.position, surface.normal) * g_frame.indirectScale;
                 float3 light;
                 float3 toLight;
                 float distance;
@@ -208,6 +208,18 @@ void AddDirectLight(float3 position, inout float4 value[3])
     }
 }
 
+// The indirect light alone, for forward twins that trace their own direct light (shaders/forward_twin.hlsli): steps 1
+// and 2 write it to output3, output3 + 1 and output3 + 2 (red, green, blue) when output3 is set.
+void WriteIndirect(uint3 texel, float4 value[3])
+{
+    if (g_pass.output3 == kNoView)
+        return;
+    for (uint c = 0; c < 3; ++c) {
+        RWTexture3D<float4> output = ResourceDescriptorHeap[g_pass.output3 + c];
+        output[texel] = value[c];
+    }
+}
+
 void Fill(uint3 id)
 {
     int3 cell = g_frame.probeOrigin + int3(id);
@@ -250,6 +262,7 @@ void Fill(uint3 id)
             value[2] = sum[2] / count;
         }
     }
+    WriteIndirect(texel, value);
     if (direct)
         AddDirectLight(directPosition, value);
     redOut[texel] = value[0];
@@ -273,6 +286,7 @@ void BakedFill(uint3 id)
     float3 slopeY = (cube[2] - cube[3]) * 0.5;
     float3 slopeZ = (cube[4] - cube[5]) * 0.5;
     float4 value[3] = {float4(mean.r, slopeX.r, slopeY.r, slopeZ.r), float4(mean.g, slopeX.g, slopeY.g, slopeZ.g), float4(mean.b, slopeX.b, slopeY.b, slopeZ.b)};
+    WriteIndirect(texel, value);
     AddDirectLight(position, value);
     RWTexture3D<float4> redOut = ResourceDescriptorHeap[g_pass.output0];
     RWTexture3D<float4> greenOut = ResourceDescriptorHeap[g_pass.output1];

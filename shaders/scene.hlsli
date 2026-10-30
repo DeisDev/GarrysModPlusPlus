@@ -458,6 +458,26 @@ uint LightRangeIndex(LightRanges ranges, uint i)
 
 // Irradiance below which a light cannot change the encoded result (1/1024 after the tonemap scale), so its
 // shadow ray is not traced. VRAD's falloff never reaches zero, and maps have hundreds of lights.
+// The irradiance volume named by g_frame's probe views at a point, or -1 where there is none: the main view's
+// filled volume, or its indirect light alone for forward twins (shaders/forward_twin.hlsli).
+float3 VolumeIrradiance(float3 position, float3 normal)
+{
+    if (g_frame.probeRedView == kNoView)
+        return -1.0;
+    static const float3 kGrid = float3(32.0, 32.0, 16.0);
+    float3 window = (position / g_frame.probeSpacing - 0.5) - float3(g_frame.probeOrigin);
+    if (any(window < 0.0) || any(window > kGrid - 1.0))
+        return -1.0;
+    float3 uvw = position / (g_frame.probeSpacing * kGrid);
+    Texture3D<float4> red = ResourceDescriptorHeap[g_frame.probeRedView];
+    Texture3D<float4> green = ResourceDescriptorHeap[g_frame.probeGreenView];
+    Texture3D<float4> blue = ResourceDescriptorHeap[g_frame.probeBlueView];
+    float4 r = red.SampleLevel(g_linearWrap, uvw, 0.0);
+    float4 g = green.SampleLevel(g_linearWrap, uvw, 0.0);
+    float4 b = blue.SampleLevel(g_linearWrap, uvw, 0.0);
+    return max(float3(r.x + dot(r.yzw, normal), g.x + dot(g.yzw, normal), b.x + dot(b.yzw, normal)), 0.0);
+}
+
 float VisibleIrradiance() { return (1.0 / 1024.0) / max(g_frame.tonemapScale, 1e-3); }
 
 // Dynamic and projected lights are often attached to a player or weapon (flashlights, muzzle flashes) whose

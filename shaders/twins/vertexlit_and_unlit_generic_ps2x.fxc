@@ -437,7 +437,12 @@ float4 main( PS_INPUT i ) : COLOR
 	twin.albedo = float4( twinAlbedo, alpha );
 	twin.normal = float4( normalize( i.worldSpaceNormal ), alpha );
 	twin.emissive = float4( twinEmissive, alpha );
+#if FORWARD_TWIN
+	// shaders/forward_twin.hlsli lights the draw at its world position.
+	twin.flags = float4( i.worldPos_projPosZ.xyz, alpha );
+#else
 	twin.flags = float4( 1, 1, 1, alpha );
+#endif
 	return twin;
 #else
 

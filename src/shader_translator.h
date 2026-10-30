@@ -24,7 +24,10 @@ struct Variant {
     // Pixel shaders: Direct3D 9's alpha test as a D3DCMPFUNC (0 off), against gmodpp_alpha.x (ALPHAREF, 0-255).
     std::uint8_t alphaTest = 0;
     // Vertex shaders: how many of gmodpp_clipPlanes (clip-space user clip planes) clip the output.
-    std::uint8_t clipPlanes = 0;
+    std::uint8_t clipPlanes : 7 = 0;
+    // Pixel shaders writing a forward twin's albedo, normal, emissive and world position (oC0-oC3): the outputs are
+    // lit in the shader (shaders/forward_twin.hlsli) and written to SV_Target0 alone.
+    std::uint8_t forwardLighting : 1 = 0;
 };
 
 struct VertexInput {

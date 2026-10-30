@@ -233,8 +233,8 @@ std::optional<SwayingProps::Jobs> SwayingProps::BeginUpdate(ID3D12GraphicsComman
     std::memcpy(base, &header, sizeof(header));
     if (!m_verticesWritable) {
         D3D12_RESOURCE_BARRIER barriers[] = {
-            Transition(m_current.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
-            Transition(m_previous.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+            Transition(m_current.Get(), D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+            Transition(m_previous.Get(), D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
         };
         list->ResourceBarrier(2, barriers);
         m_verticesWritable = true;
@@ -245,8 +245,8 @@ std::optional<SwayingProps::Jobs> SwayingProps::BeginUpdate(ID3D12GraphicsComman
 void SwayingProps::FinishUpdate(ID3D12GraphicsCommandList4* list, const Scene& scene)
 {
     D3D12_RESOURCE_BARRIER barriers[] = {
-        Transition(m_current.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
-        Transition(m_previous.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+        Transition(m_current.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE),
+        Transition(m_previous.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE),
     };
     list->ResourceBarrier(2, barriers);
     m_verticesWritable = false;

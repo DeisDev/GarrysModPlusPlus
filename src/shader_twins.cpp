@@ -264,7 +264,7 @@ void Decode(std::uint64_t index, const std::vector<Switch>& switches, Values& va
 
 // Compiles a twin for a combo's switch values, or loads it from the cache (gmodpp_cache\twins) when the same files
 // were compiled for the same values before.
-bool Compile(LoadedFamily& entry, const Values& values, std::vector<DWORD>& code, std::string& error)
+bool Compile(LoadedFamily& entry, const Values& values, bool forward, std::vector<DWORD>& code, std::string& error)
 {
     std::vector<std::string> storage;
     storage.reserve(entry.names.size() * 2 + 4);
@@ -279,6 +279,10 @@ bool Compile(LoadedFamily& entry, const Values& values, std::vector<DWORD>& code
     }
     macros.push_back({ entry.family->model, "1" });
     macros.push_back({ "GBUFFER_TWIN", "1" });
+    if (forward) {
+        macros.push_back({ "FORWARD_TWIN", "1" });
+        key = Fnv("FORWARD_TWIN=1;", key);
+    }
     macros.push_back({ nullptr, nullptr });
     const std::filesystem::path cached = CacheDirectory() / std::format("{:016x}.bin", key);
     if (std::string bytes; ReadText(cached, bytes) && !bytes.empty() && bytes.size() % sizeof(DWORD) == 0) {
@@ -308,13 +312,11 @@ bool Compile(LoadedFamily& entry, const Values& values, std::vector<DWORD>& code
     return SUCCEEDED(hr);
 }
 
-}
-
-std::span<const DWORD> GBufferShader(std::string_view file, const vcs::Header& header, int staticIndex, int dynamicIndex)
+std::span<const DWORD> Twin(std::string_view file, const vcs::Header& header, int staticIndex, int dynamicIndex, bool forward)
 {
     // The prewarm compiles twins on worker threads while nothing draws; the render thread uses them alone later.
     static std::mutex mutex;
-    static std::map<std::tuple<const LoadedFamily*, int, int>, std::vector<DWORD>> compiled;
+    static std::map<std::tuple<const LoadedFamily*, int, int, bool>, std::vector<DWORD>> compiled;
     LoadedFamily* entry = nullptr;
     {
         std::scoped_lock lock(mutex);
@@ -330,7 +332,7 @@ std::span<const DWORD> GBufferShader(std::string_view file, const vcs::Header& h
         if (s.name == "LIGHTING_PREVIEW" || (" " + std::string(entry->family->ignoredDynamics) + " ").find(" " + s.name + " ") != std::string::npos)
             values[s.name] = 0;
     }
-    const auto key = std::tuple(static_cast<const LoadedFamily*>(entry), staticIndex, static_cast<int>(Encode(entry->dynamics, values)));
+    const auto key = std::tuple(static_cast<const LoadedFamily*>(entry), staticIndex, static_cast<int>(Encode(entry->dynamics, values)), forward);
     {
         std::scoped_lock lock(mutex);
         if (const auto found = compiled.find(key); found != compiled.end())
@@ -338,20 +340,32 @@ std::span<const DWORD> GBufferShader(std::string_view file, const vcs::Header& h
     }
     std::vector<DWORD> code;
     std::string error;
-    const bool failed = !keepGame && !Compile(*entry, values, code, error);
+    const bool failed = !keepGame && !Compile(*entry, values, forward, code, error);
     std::scoped_lock lock(mutex);
     if (failed && !entry->loggedFailure) {
         entry->loggedFailure = true;
         // The compiler lists warnings before the error.
         const size_t at = error.find("error");
         const size_t line = at == std::string::npos ? 0 : error.rfind('\n', at) + 1;
-        log::Info("Twins: compiling {} for combo {} / {} failed; the game's shader is drawn: {}", entry->family->source, staticIndex, dynamicIndex,
-            error.substr(line, error.find('\n', line) - line));
+        log::Info("Twins: compiling {} for combo {} / {}{} failed; the game's shader is drawn: {}", entry->family->source, staticIndex, dynamicIndex,
+            forward ? " (forward)" : "", error.substr(line, error.find('\n', line) - line));
     } else if (!code.empty() && !entry->loggedUse) {
         entry->loggedUse = true;
         log::Info("Twins: {} draws its G-buffer twin", entry->family->gameFile);
     }
     return compiled.try_emplace(key, std::move(code)).first->second;
+}
+
+}
+
+std::span<const DWORD> GBufferShader(std::string_view file, const vcs::Header& header, int staticIndex, int dynamicIndex)
+{
+    return Twin(file, header, staticIndex, dynamicIndex, false);
+}
+
+std::span<const DWORD> ForwardShader(std::string_view file, const vcs::Header& header, int staticIndex, int dynamicIndex)
+{
+    return Twin(file, header, staticIndex, dynamicIndex, true);
 }
 
 std::uint64_t SourceHash()

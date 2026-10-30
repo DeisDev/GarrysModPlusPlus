@@ -848,6 +848,8 @@ std::string Interpolants(const std::set<std::string>& centroid)
 std::string Translator::Assemble()
 {
     std::string text = "// Translated by GarrysMod++ from D3D9 shader bytecode.\n";
+    if (m_stage == Stage::Pixel && m_variant.forwardLighting != 0)
+        text += "#define GMODPP_GAME_DRAW 1\n#include \"forward_twin.hlsli\"\n";
     const UINT first = m_floatMin == UINT_MAX ? 0 : m_floatMin;
     m_out.firstFloatConstant = first;
     m_out.floatConstantCount = m_floatMin == UINT_MAX ? 0 : m_floatMax - m_floatMin + 1;
@@ -982,8 +984,9 @@ std::string Translator::Assemble()
     text += "void main(gmodpp_Interpolants input";
     if (m_usesFace)
         text += ", bool gmodpp_front : SV_IsFrontFace";
+    const bool forward = m_variant.forwardLighting != 0;
     for (UINT i = 0; i < 4; ++i) {
-        if (m_out.colorOutputs & (1u << i))
+        if ((m_out.colorOutputs & (1u << i)) && (!forward || i == 0))
             text += std::format(", out float4 gmodpp_target{0} : SV_Target{0}", i);
     }
     if (m_out.writesDepth)
@@ -1005,9 +1008,13 @@ std::string Translator::Assemble()
         text += std::format("    float a = round(saturate(oC0.a) * 255);\n    float r = gmodpp_alpha.x;\n    if (!({}))\n        discard;\n",
             kTests[m_variant.alphaTest]);
     }
-    for (UINT i = 0; i < 4; ++i) {
-        if (m_out.colorOutputs & (1u << i))
-            text += std::format("    gmodpp_target{0} = oC{0};\n", i);
+    if (forward) {
+        text += "    gmodpp_target0 = gmodpp_ForwardTwin(oC0, oC1, oC2, oC3);\n";
+    } else {
+        for (UINT i = 0; i < 4; ++i) {
+            if (m_out.colorOutputs & (1u << i))
+                text += std::format("    gmodpp_target{0} = oC{0};\n", i);
+        }
     }
     if (m_out.writesDepth)
         text += "    gmodpp_depth = oDepth.x;\n";
