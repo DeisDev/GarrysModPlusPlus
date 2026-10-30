@@ -40,6 +40,9 @@ constexpr UINT kVradSkyMask = 0x80;
 constexpr uint32_t kInstanceIgnoreNormals = 0x01;
 // Set by Scene for models with a self-illuminated material, whose hits add the light it gives off.
 constexpr uint32_t kInstanceSelfIllum = 0x02;
+// Set by Scene for dynamic models (kDynamicMask, kLocalPlayerMask), whose back faces shadow rays may skip (their
+// instances allow culling; shaders/direct.hlsl).
+constexpr uint32_t kInstanceModel = 0x04;
 
 // Triangles for Scene::AddModel. Alpha-tested and translucent triangles come last, from `opaqueTriangles` on; each
 // has an entry in `alphaTriangles` (Scene::PackAlpha or Scene::PackTranslucent), and then the model needs `uvs`.

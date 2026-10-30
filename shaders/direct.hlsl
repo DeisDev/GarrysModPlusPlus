@@ -143,6 +143,15 @@ float3 SunHighlight(Phong phong, float3 sunlight)
     return sunlight * saturate(sunlight) * (phong.strength * sqrt(lambert) * pow(saturate(abs(dot(phong.normal, halfway))), phong.exponent));
 }
 
+// On a dynamic model, a shadow ray towards a light its triangle faces away from (where the smoothed normal still faces
+// it) starts into the model and meets the model's far side: shards along the terminator. Those rays skip the model's
+// back faces. DXR's front faces appear clockwise from the ray origin in a left-handed system, so cross(p1 - p0, p2 - p0)
+// points at the origin; Source's point out of the back, so Source's back faces are DXR's front faces.
+uint SelfShadowFlags(bool onModel, float3 faceNormal, float3 toLight)
+{
+    return onModel && dot(faceNormal, toLight) < 0.0 ? RAY_FLAG_CULL_FRONT_FACING_TRIANGLES : RAY_FLAG_NONE;
+}
+
 [RootSignature(ROOT_SIGNATURE)]
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID)
@@ -159,7 +168,12 @@ void main(uint3 id : SV_DispatchThreadID)
     uint seed = PixelSeed(pixel, 0x2Du);
     Texture2D<uint> pixelFlags = ResourceDescriptorHeap[g_frame.pixelFlagsView];
     float3 lightNormal = lit && (pixelFlags.Load(int3(pixel, 0)) & kPixelIgnoreNormals) != 0 ? 0.0 : normal;
+    float3 faceNormal = lit ? GeometricNormalAt(pixel) : 0.0;
+    bool onModel = false;
     if (lit) {
+        Texture2D<uint4> visibility = ResourceDescriptorHeap[g_frame.visibilityView];
+        uint instance = visibility.Load(int3(pixel, 0)).x;
+        onModel = instance != kNoView && (LoadInstance(instance).flags & kInstanceModel) != 0;
         Texture2D<float4> gbufferFlags = ResourceDescriptorHeap[g_frame.flagsView];
         float4 marks = gbufferFlags.Load(int3(pixel, 0));
         g_halfLambert = (MaterialBits(marks) & kMaterialHalfLambert) != 0;
@@ -173,7 +187,7 @@ void main(uint3 id : SV_DispatchThreadID)
     float sunVisibility = 0.0;
     float lambert = Lambert(lightNormal, g_frame.sunDirection);
     if (lit && g_frame.sunEnabled != 0.0 && lambert > 0.0) {
-        sunVisibility = SunVisibility(origin, g_frame.sunShadowMask);
+        sunVisibility = SunVisibility(origin, g_frame.sunShadowMask, SelfShadowFlags(onModel, faceNormal, g_frame.sunDirection));
         exact += g_frame.sunColor * lambert * sunVisibility * LightWarp(lightNormal, g_frame.sunDirection);
         specular += SunHighlight(phong, g_frame.sunColor * (lambert * sunVisibility));
         rim += ModelRim(phong, g_frame.sunColor * (lambert * sunVisibility), g_frame.sunDirection);
@@ -242,7 +256,7 @@ void main(uint3 id : SV_DispatchThreadID)
         float3 toLight;
         float distance;
         float3 light = SetLightIrradiance(set, top[k], position, lightNormal, toLight, distance);
-        float3 shadowed = light * LightTransmittance(set, top[k], origin, toLight, distance);
+        float3 shadowed = light * LightTransmittance(set, top[k], origin, toLight, distance, SelfShadowFlags(onModel, faceNormal, toLight));
         exact += shadowed * LightWarp(lightNormal, toLight);
         specular += ModelHighlight(phong, shadowed, toLight);
         rim += ModelRim(phong, shadowed, toLight);
@@ -256,7 +270,7 @@ void main(uint3 id : SV_DispatchThreadID)
             float3 toLight;
             float distance;
             float3 light = SetLightIrradiance(set, picked[s], position, lightNormal, toLight, distance);
-            float transmittance = LightTransmittance(set, picked[s], origin, toLight, distance);
+            float transmittance = LightTransmittance(set, picked[s], origin, toLight, distance, SelfShadowFlags(onModel, faceNormal, toLight));
             sampled += ClampSample(light * LightWarp(lightNormal, toLight) * (transmittance * remainder / (pickedWeight[s] * g_frame.sampledLightRays)));
         }
     }

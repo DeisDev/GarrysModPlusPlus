@@ -27,14 +27,15 @@ struct InstanceRecord
     uint previousPositions;
     // Last frame's object-to-world transform.
     float4 previousTransform[3];
-    // kInstanceIgnoreNormals, kInstanceSelfIllum.
+    // kInstanceIgnoreNormals, kInstanceSelfIllum, kInstanceModel.
     uint flags;
     uint3 padding;
 };
 
-// kInstanceIgnoreNormals and kInstanceSelfIllum in src/scene.h.
+// kInstanceIgnoreNormals, kInstanceSelfIllum and kInstanceModel in src/scene.h.
 static const uint kInstanceIgnoreNormals = 0x01;
 static const uint kInstanceSelfIllum = 0x02;
+static const uint kInstanceModel = 0x04;
 
 // Mirrors GpuLight in src/scene.cpp (bsp::Light, VRAD units and falloff).
 struct Light
@@ -391,7 +392,7 @@ static const uint kSkyboxMask = 0x10;
 
 // The share of light that gets from `origin` to tMax along a ray: 0 past anything solid, otherwise the product of
 // what each translucent surface crossed lets through.
-float Transmittance(float3 origin, float3 direction, float tMax, uint mask)
+float Transmittance(float3 origin, float3 direction, float tMax, uint mask, uint rayFlags = RAY_FLAG_NONE)
 {
     if (mask == 0)
         return 1.0;
@@ -401,7 +402,7 @@ float Transmittance(float3 origin, float3 direction, float tMax, uint mask)
     ray.Direction = direction;
     ray.TMin = 0.01;
     ray.TMax = tMax;
-    query.TraceRayInline(g_scene, RAY_FLAG_NONE, mask, ray);
+    query.TraceRayInline(g_scene, rayFlags, mask, ray);
     float transmittance = 1.0;
     while (query.Proceed()) {
         bool translucent;
@@ -417,9 +418,9 @@ float Transmittance(float3 origin, float3 direction, float tMax, uint mask)
 // `mask` is g_frame.sunShadowMask, or g_frame.bounceMask for the light of indirect bounces. As VRAD did
 // (TestLine_DoesHitSky in src/utils/vrad/trace.cpp), rays from the map that reach the sky go on through the 3D
 // skybox, whose buildings and terrain shadow the map.
-float SunVisibility(float3 origin, uint mask)
+float SunVisibility(float3 origin, uint mask, uint rayFlags = RAY_FLAG_NONE)
 {
-    float visibility = Transmittance(origin, g_frame.sunDirection, 65536.0, mask);
+    float visibility = Transmittance(origin, g_frame.sunDirection, 65536.0, mask, rayFlags);
     if (visibility > 0.0 && g_frame.worldToSky > 0.0 && (mask & kSkyboxMask) == 0) {
         float3 camera = float3(g_frame.skyCameraX, g_frame.skyCameraY, g_frame.skyCameraZ);
         visibility *= Transmittance(camera + origin * g_frame.worldToSky, g_frame.sunDirection, 65536.0, kSkyboxMask);
@@ -756,11 +757,11 @@ float3 SetLightIrradiance(LightSet set, uint i, float3 position, float3 normal, 
 }
 
 // The share of the i-th light of a LightSet that reaches `origin`, `distance` away along `toLight`.
-float LightTransmittance(LightSet set, uint i, float3 origin, float3 toLight, float distance)
+float LightTransmittance(LightSet set, uint i, float3 origin, float3 toLight, float distance, uint rayFlags = RAY_FLAG_NONE)
 {
     bool attached = IsAttachedLight(set, i);
     float clearance = !attached ? kLightClearance : i >= set.pointLights ? ProjectorClearance(LoadProjector(i - set.pointLights)) : kAttachedLightClearance;
-    return Transmittance(origin, toLight, ShadowRayLength(clearance, distance), ShadowMask(attached));
+    return Transmittance(origin, toLight, ShadowRayLength(clearance, distance), ShadowMask(attached), rayFlags);
 }
 
 static const uint kLightCandidates = 8;

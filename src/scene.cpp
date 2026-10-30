@@ -893,14 +893,15 @@ SceneFrame Scene::RecordFrame(ID3D12GraphicsCommandList4* list, UINT slot, std::
             instance.Transform[0][0] = instance.Transform[1][1] = instance.Transform[2][2] = 1.0f;
         instance.InstanceID = written;
         instance.InstanceMask = mask;
-        instance.Flags = D3D12_RAYTRACING_INSTANCE_FLAG_TRIANGLE_CULL_DISABLE;
+        const bool dynamicModel = (mask & (kDynamicMask | kLocalPlayerMask)) != 0;
+        instance.Flags = dynamicModel ? D3D12_RAYTRACING_INSTANCE_FLAG_NONE : D3D12_RAYTRACING_INSTANCE_FLAG_TRIANGLE_CULL_DISABLE;
         if (model.hasMicromaps && !micromaps)
             instance.Flags |= D3D12_RAYTRACING_INSTANCE_FLAG_DISABLE_OMMS;
         instance.AccelerationStructure = blas;
         InstanceRecord& record = frame.mappedRecords[written];
         record = {source.positionsView != DescriptorHeap::kInvalid ? source.positionsView : model.positionsView, model.indicesView, model.albedoView,
             model.uvsView, model.alphaView, model.opaqueTriangles, model.materialsView, source.previousPositionsView, {},
-            source.flags | (model.selfIllum ? kInstanceSelfIllum : 0u), {}};
+            source.flags | (model.selfIllum ? kInstanceSelfIllum : 0u) | (dynamicModel ? kInstanceModel : 0u), {}};
         std::memcpy(record.previousTransform, source.previousKnown ? source.previousTransform : instance.Transform, sizeof(record.previousTransform));
         m_recorded.emplace_back(source.model, mask);
         ++written;
