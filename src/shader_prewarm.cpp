@@ -1,5 +1,6 @@
 #include "shader_prewarm.h"
 
+#include "engine_interfaces.h"
 #include "log.h"
 #include "shader_cache.h"
 #include "shader_compiler.h"
@@ -12,14 +13,18 @@
 #include <d3d9types.h>
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
+#include <cstring>
 #include <condition_variable>
 #include <deque>
 #include <format>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <string_view>
 #include <thread>
@@ -108,6 +113,94 @@ std::vector<std::pair<std::uint32_t, std::uint32_t>> TwinCombos(const std::vecto
     return result;
 }
 
+// A shader file to prewarm: from the game's VPK, or (without `entry`) read through the game's filesystem.
+struct SourceFile {
+    std::string path;
+    const Vpk::Entry* entry = nullptr;
+};
+
+// The shader files a workshop addon (.gma) holds, from its file index as Facepunch's gmad reads it
+// (AddonReader::Parse): "GMAD", a format version byte, a 64-bit SteamID and timestamp, from version 2 required-content
+// strings up to an empty one, the title, description and author, a 32-bit version, then entries (a 32-bit number,
+// 0 ending the index, the name, a 64-bit size and a 32-bit CRC). Strings end with a zero byte.
+void AddGmaShaderPaths(const std::filesystem::path& path, std::set<std::string>& paths)
+{
+    // The index precedes the file data; this covers it for addons with tens of thousands of files.
+    constexpr std::streamsize kIndexBytes = 8 << 20;
+    std::ifstream file(path, std::ios::binary);
+    std::vector<char> data(static_cast<size_t>(kIndexBytes));
+    file.read(data.data(), kIndexBytes);
+    data.resize(static_cast<size_t>(file.gcount()));
+    size_t at = 0;
+    const auto skip = [&](size_t bytes) { at += bytes; return at <= data.size(); };
+    const auto readString = [&](std::string& text) {
+        const auto end = std::find(data.begin() + std::min(at, data.size()), data.end(), '\0');
+        if (end == data.end())
+            return false;
+        text.assign(data.begin() + at, end);
+        at = static_cast<size_t>(end - data.begin()) + 1;
+        return true;
+    };
+    if (data.size() < 5 || std::string_view(data.data(), 4) != "GMAD")
+        return;
+    const char version = data[4];
+    std::string text;
+    if (!skip(5 + 16))
+        return;
+    if (version > 1) {
+        do {
+            if (!readString(text))
+                return;
+        } while (!text.empty());
+    }
+    for (int i = 0; i < 3; ++i) {
+        if (!readString(text))
+            return;
+    }
+    if (!skip(4))
+        return;
+    while (at + 4 <= data.size()) {
+        std::uint32_t number = 0;
+        std::memcpy(&number, data.data() + at, 4);
+        at += 4;
+        if (number == 0 || !readString(text) || !skip(12))
+            return;
+        std::transform(text.begin(), text.end(), text.begin(), [](char c) { return c == '\\' ? '/' : static_cast<char>(std::tolower(static_cast<unsigned char>(c))); });
+        if (text.starts_with(kShaderDirectory) && text.ends_with(".vcs"))
+            paths.insert(text);
+    }
+}
+
+// Shader files that addons may add: legacy addon folders and the workshop's .gma files. Only those of mounted addons
+// can be read through the game's filesystem.
+std::set<std::string> AddonShaderPaths(const std::filesystem::path& gameDirectory)
+{
+    std::set<std::string> paths;
+    std::error_code error;
+    const std::filesystem::path addons = gameDirectory / L"garrysmod" / L"addons";
+    for (const auto& addon : std::filesystem::directory_iterator(addons, error)) {
+        std::error_code inner;
+        for (const auto& shader : std::filesystem::directory_iterator(addon.path() / L"shaders" / L"fxc", inner)) {
+            if (shader.path().extension() == L".vcs")
+                paths.insert(std::string(kShaderDirectory) + shader.path().filename().string());
+        }
+    }
+    // The workshop's downloads (steamapps/workshop/content/4000) and GMod's own cache of legacy downloads.
+    const std::filesystem::path workshop = gameDirectory.parent_path().parent_path() / L"workshop" / L"content" / L"4000";
+    for (const auto& item : std::filesystem::directory_iterator(workshop, error)) {
+        std::error_code inner;
+        for (const auto& entry : std::filesystem::directory_iterator(item.path(), inner)) {
+            if (entry.path().extension() == L".gma")
+                AddGmaShaderPaths(entry.path(), paths);
+        }
+    }
+    for (const auto& entry : std::filesystem::directory_iterator(gameDirectory / L"garrysmod" / L"cache" / L"workshop", error)) {
+        if (entry.path().extension() == L".gma")
+            AddGmaShaderPaths(entry.path(), paths);
+    }
+    return paths;
+}
+
 std::vector<const vcs::Combo*> UniqueCombos(const std::vector<vcs::Combo>& combos)
 {
     std::vector<const vcs::Combo*> unique;
@@ -151,33 +244,54 @@ void PrewarmShaders(const std::filesystem::path& gameDirectory, const std::files
     std::filesystem::remove_all(failureDirectory);
     std::filesystem::create_directories(failureDirectory);
 
-    std::vector<const Vpk::Entry*> files;
+    std::vector<SourceFile> files;
+    std::set<std::string> shipped;
     for (const Vpk::Entry& entry : vpk.Entries()) {
-        if (entry.path.starts_with(kShaderDirectory) && entry.path.ends_with(".vcs"))
-            files.push_back(&entry);
+        if (entry.path.starts_with(kShaderDirectory) && entry.path.ends_with(".vcs")) {
+            files.push_back({entry.path, &entry});
+            shipped.insert(entry.path);
+        }
     }
-    auto readCombos = [&](const Vpk::Entry& entry, std::vector<vcs::Combo>& combos, vcs::Header& header) {
+    // Addon shaders need the game's filesystem, which exists once the game runs (not for the prewarm at startup).
+    size_t addonFiles = 0;
+    std::map<std::string, std::vector<std::byte>> addonBytes;
+    if (engine::Ready()) {
+        for (const std::string& path : AddonShaderPaths(gameDirectory)) {
+            std::vector<std::byte> bytes;
+            if (!shipped.contains(path) && engine::ReadGameFile(path, bytes) && !bytes.empty()) {
+                addonBytes.emplace(path, std::move(bytes));
+                files.push_back({path, nullptr});
+                ++addonFiles;
+            }
+        }
+    }
+    auto readCombos = [&](const SourceFile& source, std::vector<vcs::Combo>& combos, vcs::Header& header) {
         std::string reason;
-        auto bytes = vpk.Read(entry, reason);
-        if (bytes && vcs::ReadCombos(*bytes, header, combos, reason))
+        if (source.entry != nullptr) {
+            auto bytes = vpk.Read(*source.entry, reason);
+            if (bytes && vcs::ReadCombos(*bytes, header, combos, reason))
+                return true;
+        } else if (const std::vector<std::byte>& bytes = addonBytes.at(source.path);
+                   vcs::ReadCombos({reinterpret_cast<const std::uint8_t*>(bytes.data()), bytes.size()}, header, combos, reason)) {
             return true;
-        log::Info("Shader prewarm: {}: {}", entry.path, reason);
+        }
+        log::Info("Shader prewarm: {}: {}", source.path, reason);
         return false;
     };
     size_t total = 0;
-    for (const Vpk::Entry* entry : files) {
+    for (const SourceFile& source : files) {
         std::vector<vcs::Combo> combos;
         vcs::Header header;
-        if (readCombos(*entry, combos, header)) {
+        if (readCombos(source, combos, header)) {
             total += UniqueCombos(combos).size();
-            if (twins::HasTwin(entry->path.substr(kShaderDirectory.size())))
+            if (twins::HasTwin(source.path.substr(kShaderDirectory.size())))
                 total += combos.size();
         }
         if (progress.cancel)
             return;
     }
     progress.total = total;
-    log::Info("Shader prewarm: {} files, {} unique combos (counted in {:.1f} s)", files.size(), total,
+    log::Info("Shader prewarm: {} files ({} from mounted addons), {} unique combos (counted in {:.1f} s)", files.size(), addonFiles, total,
         std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
 
     // Every logical core compiles while a reader decodes the next files, so no core waits at the end of a file.
@@ -233,11 +347,11 @@ void PrewarmShaders(const std::filesystem::path& gameDirectory, const std::files
     std::deque<std::shared_ptr<FileWork>> queue;
     bool readerDone = false;
     std::jthread reader([&] {
-        for (const Vpk::Entry* entry : files) {
+        for (const SourceFile& source : files) {
             auto file = std::make_shared<FileWork>();
-            if (!readCombos(*entry, file->combos, file->header))
+            if (!readCombos(source, file->combos, file->header))
                 continue;
-            file->name = entry->path.substr(kShaderDirectory.size());
+            file->name = source.path.substr(kShaderDirectory.size());
             file->work = UniqueCombos(file->combos);
             if (twins::HasTwin(file->name))
                 file->twinCombos = TwinCombos(file->combos);
