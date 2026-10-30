@@ -258,6 +258,10 @@ void DrawPerformance(const Statistics& statistics)
 void DrawGeneralTab(Settings& settings)
 {
     ImGui::Checkbox(Text(TextId::RealtimeLighting), &settings.realtimeLighting);
+    constexpr TextId kBlocks[] = {TextId::RealtimeLighting, TextId::RealtimeUnsupported, TextId::RealtimeMultisampling, TextId::RealtimeOtherThread};
+    const RealtimeBlock block = GetStatistics().realtimeBlock;
+    if (settings.realtimeLighting && block != RealtimeBlock::None)
+        ImGui::TextWrapped("%s", Text(kBlocks[static_cast<size_t>(block)]));
     const TextId views[] = {TextId::ViewFinal, TextId::ViewAlbedo, TextId::ViewNormals, TextId::ViewCoverage, TextId::ViewDirectLight,
         TextId::ViewIndirectLight, TextId::ViewIndirectRaw, TextId::ViewSunVisibility, TextId::ViewAdditiveLight,
         TextId::ViewReflections, TextId::ViewMotionVectors, TextId::ViewAmbientOcclusion};

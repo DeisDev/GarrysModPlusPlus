@@ -39,6 +39,8 @@ struct State {
     bool loggedSamples = false;
     bool viewmodelCapture = false;
     float viewmodelDepth[2] = {};
+    // Why the last main view was not captured, for the menu.
+    RealtimeBlock block = RealtimeBlock::None;
     // The last main view's forward lighting, which views drawn into textures reuse, and its map: the GPU addresses in
     // it do not outlive the map's scene.
     std::optional<gbuffer::ForwardConstants> forward;
@@ -55,18 +57,23 @@ bool CanCapture()
     if (!g_state.available || !world::Ready() || capture::Active() || !GetSettings().realtimeLighting)
         return false;
     if (!backend.OnRenderThread()) {
+        g_state.block = RealtimeBlock::OtherThread;
         if (!std::exchange(g_state.loggedThread, true))
             log::Info("Real-time lighting: views are drawn on another thread than the device's (mat_queue_mode != 0); views are left unlit");
         return false;
     }
     // Lighting reads single-sampled targets.
     if (backend.Samples() > 1) {
+        g_state.block = RealtimeBlock::Multisampling;
         if (!std::exchange(g_state.loggedSamples, true))
             log::Info("Real-time lighting is off while the game uses {}x MSAA (mat_antialias 0 turns it on)", backend.Samples());
         return false;
     }
     const DynamicState& dynamic = Dynamic();
-    return dynamic.colorTargets[0] == kDefaultTarget && dynamic.depthTarget == kDefaultTarget;
+    const bool mainTarget = dynamic.colorTargets[0] == kDefaultTarget && dynamic.depthTarget == kDefaultTarget;
+    if (mainTarget)
+        g_state.block = RealtimeBlock::None;
+    return mainTarget;
 }
 
 // Views drawn into a texture (monitors, mirrors, scopes) are not captured; their surfaces are lit while drawn, like
@@ -124,8 +131,10 @@ void OnDeviceReady()
     const RaytracingSupport support = QueryRaytracing(device.Get());
     log::Info("Real-time lighting: raytracing tier {:#x}, shader model {:#x}, inline raytracing {}, opacity micromaps {}", static_cast<int>(support.tier),
         static_cast<int>(support.shaderModel), support.inlineRaytracing ? "available" : "unavailable", support.opacityMicromaps ? "available" : "unavailable");
-    if (!support.inlineRaytracing)
+    if (!support.inlineRaytracing) {
+        g_state.block = RealtimeBlock::Unsupported;
         return;
+    }
     // nvngx_dlssd.dll is deployed next to the game's DLLs.
     const std::filesystem::path dlssDirectory = ExecutablePath().parent_path() / L"bin" / L"win64";
     g_state.available = world::Initialize(device.Get(), backend.Queue(), backend.Descriptors(), support.opacityMicromaps, dlssDirectory);
@@ -173,6 +182,7 @@ void OnPresent()
     }
     capture::EndForward();
     RecordFrameInterval();
+    GetStatistics().realtimeBlock = g_state.block;
     overlay::EnsureWindowHook();
     video_menu::TryInstall();
     Backend& backend = GetBackend();

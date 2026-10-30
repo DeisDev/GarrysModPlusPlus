@@ -116,6 +116,9 @@ void MarkSettingsChanged();
 
 enum class GpuPass : uint32_t { SceneUpdate, Surface, Volume, DirectLight, AmbientOcclusion, IndirectTrace, Accumulation, Denoiser, Reflections, Lighting, Resolve, Count };
 
+// Why real-time lighting is not drawing, if it is on.
+enum class RealtimeBlock : uint8_t { None, Unsupported, Multisampling, OtherThread };
+
 // Figures the renderer reports for the menu.
 struct Statistics {
     static constexpr size_t kFrameHistory = 1000;
@@ -142,6 +145,7 @@ struct Statistics {
     // Alpha-tested and translucent triangles with an opacity micromap, and the micromaps they share.
     uint32_t micromapTriangles = 0;
     uint32_t micromaps = 0;
+    RealtimeBlock realtimeBlock = RealtimeBlock::None;
 };
 
 Statistics& GetStatistics();
