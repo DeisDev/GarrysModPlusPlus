@@ -5,13 +5,16 @@
 // projected reflection (xy) and refraction (wz) coordinates and t3 their w (w) and the water fog depth (z).
 // Combos with g_WaterFogParams fog the refraction by that depth; the others (REFRACT_ALPHA_FOG) by the refraction's
 // alpha, where the refraction view wrote the water's depth, which also scales the distortion and fades reflections out
-// at the shore.
+// at the shore. With $lightmapwaterfog (LIGHTMAP_FOG, with the alpha fog only; t7 the lightmap's coordinates) the fog
+// colour is lit by the lightmap and, as GMod's combos do, scaled by the tonemap scale twice; some of those combos
+// (OPAQUE_FOG) draw the lit fog colour alone, without the refraction.
 // oC0: the refraction fogged by the water, as the game would write it; oC1: the tangent-space normal's slope (xy), the
 // reflect tint's brightness and the direction of the tangent-space eye vector (an angle, or kNoEyeAngle where the game's
 // vertex shader gives none); oC3: g 1 (water), a the share of the reflection the shore leaves. The emissive target is
 // left alone: surfaces drawn over the water later do not write it, and would keep what the water wrote.
 
 sampler RefractSampler : register(s0);
+sampler LightmapSampler : register(s3);
 sampler NormalSampler : register(s4);
 
 float4 g_ReflectTint : register(c4);
@@ -28,6 +31,9 @@ struct Input
     float3 tangentEye : TEXCOORD1;
     float4 reflectRefract : TEXCOORD2;
     float4 projection : TEXCOORD3;
+#if LIGHTMAP_FOG
+    centroid float2 lightmapCoord : TEXCOORD7;
+#endif
 };
 
 struct Output
@@ -59,7 +65,16 @@ Output main(Input input)
     float fog = saturate((input.projection.z - g_WaterFogParams.x) / g_WaterFogParams.y);
     float shore = 1.0;
 #endif
-    refraction.rgb = lerp(refraction.rgb, g_WaterFogColor.rgb * cLightScale.x, fog);
+#if LIGHTMAP_FOG
+    float3 fogColor = tex2D(LightmapSampler, input.lightmapCoord).rgb * cLightScale.y * cLightScale.x * g_WaterFogColor.rgb;
+#else
+    float3 fogColor = g_WaterFogColor.rgb;
+#endif
+#if OPAQUE_FOG
+    refraction.rgb = fogColor;
+#else
+    refraction.rgb = lerp(refraction.rgb, fogColor * cLightScale.x, fog);
+#endif
 
     Output output;
     output.refraction = float4(refraction.rgb, 1.0);

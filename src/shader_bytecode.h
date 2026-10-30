@@ -29,6 +29,10 @@ size_t TokenCount(const DWORD* code);
 // True when the shader writes the given colour output register (oCn).
 bool WritesColorOutput(std::span<const DWORD> code, UINT index);
 
+// True when an instruction reads the colour (rgb) a texld from sampler `sampler` wrote to a temporary register, before
+// it is overwritten; reading alpha alone does not count.
+bool ReadsSampledColor(std::span<const DWORD> code, UINT sampler);
+
 // Replaces every `def` literal equal to `from` with `to`; returns how many were replaced.
 int ReplaceDefLiteral(std::span<DWORD> code, float from, float to);
 

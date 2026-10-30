@@ -7,7 +7,7 @@
 // t4 the world position (xy) and t7 the lightmap coordinates.
 // Combos with g_WaterFogParams fog the refraction by that depth; the others (REFRACT_ALPHA_FOG) by the refraction's
 // alpha. With $lightmapwaterfog (LIGHTMAP_FOG) the fog colour is lit by the lightmap and, as GMod's combos do, scaled
-// by the tonemap scale twice.
+// by the tonemap scale twice; some of those combos (OPAQUE_FOG) draw the lit fog colour alone, without the refraction.
 
 sampler RefractSampler : register(s0);
 sampler LightmapSampler : register(s3);
@@ -85,7 +85,11 @@ Output main(Input input)
 #else
     float3 fogColor = g_WaterFogColor.rgb;
 #endif
+#if OPAQUE_FOG
+    refraction.rgb = fogColor;
+#else
     refraction.rgb = lerp(refraction.rgb, fogColor * cLightScale.x, fog);
+#endif
 
     Output output;
     output.refraction = float4(refraction.rgb, 1.0);

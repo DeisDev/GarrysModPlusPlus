@@ -124,6 +124,42 @@ bool WritesColorOutput(std::span<const DWORD> code, UINT index)
     return writes;
 }
 
+bool ReadsSampledColor(std::span<const DWORD> code, UINT sampler)
+{
+    constexpr DWORD kRgb = 7;
+    std::array<DWORD, 32> live = {};
+    bool reads = false;
+    ForEachInstruction(code, [&](size_t at, size_t length) {
+        const DWORD opcode = Opcode(code[at]);
+        if (reads || opcode == D3DSIO_COMMENT || opcode == D3DSIO_DEF || opcode == D3DSIO_DEFI || opcode == D3DSIO_DEFB || opcode == D3DSIO_DCL ||
+            length == 0)
+            return;
+        const bool destination = opcode != D3DSIO_TEXKILL && opcode != D3DSIO_IF && opcode != D3DSIO_IFC && opcode != D3DSIO_BREAKC &&
+            opcode != D3DSIO_BREAKP && opcode != D3DSIO_CALLNZ && opcode != D3DSIO_REP && opcode != D3DSIO_LOOP && opcode != D3DSIO_CALL;
+        for (size_t p = destination ? 2 : 1; p <= length; ++p) {
+            const DWORD source = code[at + p];
+            const DWORD number = source & D3DSP_REGNUM_MASK;
+            if (RegisterType(source) != D3DSPR_TEMP || number >= live.size() || live[number] == 0)
+                continue;
+            for (DWORD c = 0; c < 4; ++c) {
+                if ((live[number] >> ((source >> (D3DSP_SWIZZLE_SHIFT + 2 * c)) & 3)) & 1)
+                    reads = true;
+            }
+        }
+        if (!destination)
+            return;
+        const DWORD target = code[at + 1];
+        const DWORD number = target & D3DSP_REGNUM_MASK;
+        if (RegisterType(target) != D3DSPR_TEMP || number >= live.size())
+            return;
+        const DWORD mask = (target & D3DSP_WRITEMASK_ALL) >> 16;
+        live[number] &= ~mask;
+        if (opcode == D3DSIO_TEX && length >= 3 && RegisterType(code[at + 3]) == D3DSPR_SAMPLER && (code[at + 3] & D3DSP_REGNUM_MASK) == sampler)
+            live[number] |= mask & kRgb;
+    });
+    return reads;
+}
+
 namespace {
 
 constexpr DWORD kPixelShader30 = 0xFFFF0300;

@@ -7,8 +7,11 @@
 #include <g_forwardSnippetPS2.h>
 #include <g_waterFlowSurfaceAlphaFogPS.h>
 #include <g_waterFlowSurfaceLightmapFogPS.h>
+#include <g_waterFlowSurfaceOpaqueFogPS.h>
 #include <g_waterFlowSurfacePS.h>
 #include <g_waterSurfaceAlphaFogPS.h>
+#include <g_waterSurfaceLightmapFogPS.h>
+#include <g_waterSurfaceOpaqueFogPS.h>
 #include <g_waterSurfacePS.h>
 
 #include <d3d9types.h>
@@ -63,29 +66,52 @@ bool IsSkinShader(const std::vector<bytecode::Constant>& constants)
         std::any_of(std::begin(kSkinOnly), std::end(kSkinOnly), [&](std::string_view name) { return HasConstant(constants, name); });
 }
 
+// A lightmap ($lightmapwaterfog) only comes with the refraction's alpha fog.
+bool LightmapFogFits(const std::vector<bytecode::Constant>& constants)
+{
+    return !HasConstant(constants, "LightmapSampler") ||
+        (HasRegister(constants, "LightmapSampler", bytecode::RegisterSet::Sampler, 3) && !HasConstant(constants, "g_WaterFogParams"));
+}
+
 // The Water shader's combos that refract (water_ps20b), with the inputs and registers shaders/water_surface.hlsl reads.
-// Flowing water has its own replacement (IsFlowingWater); lightmapped and textured water keep the game's shader.
+// Flowing water has its own replacement (IsFlowingWater); textured water keeps the game's shader.
 bool IsRefractingWater(const std::vector<bytecode::Constant>& constants)
 {
     using bytecode::RegisterSet;
     return HasRegister(constants, "RefractSampler", RegisterSet::Sampler, 0) && HasRegister(constants, "NormalSampler", RegisterSet::Sampler, 4) &&
         HasRegister(constants, "g_ReflectRefractScale", RegisterSet::Float4, 5) && HasRegister(constants, "g_WaterFogColor", RegisterSet::Float4, 6) &&
-        !HasConstant(constants, "FlowmapSampler") && !HasConstant(constants, "LightmapSampler") && !HasConstant(constants, "BaseTextureSampler");
+        !HasConstant(constants, "FlowmapSampler") && !HasConstant(constants, "BaseTextureSampler") && LightmapFogFits(constants);
 }
 
 // The flowing ($flowmap) refracting combos without a base texture, with the registers shaders/water_flow_surface.hlsl
-// reads. A lightmap ($lightmapwaterfog) only comes with the refraction's alpha fog.
+// reads.
 bool IsFlowingWater(const std::vector<bytecode::Constant>& constants)
 {
     using bytecode::RegisterSet;
-    const bool lightmap = HasConstant(constants, "LightmapSampler");
     return HasRegister(constants, "RefractSampler", RegisterSet::Sampler, 0) && HasRegister(constants, "NormalSampler", RegisterSet::Sampler, 4) &&
         HasRegister(constants, "FlowmapSampler", RegisterSet::Sampler, 5) && HasRegister(constants, "FlowNoiseSampler", RegisterSet::Sampler, 6) &&
         HasRegister(constants, "g_vReflectTint", RegisterSet::Float4, 4) && HasRegister(constants, "g_ReflectRefractScale", RegisterSet::Float4, 5) &&
         HasRegister(constants, "g_WaterFogColor", RegisterSet::Float4, 6) && HasRegister(constants, "g_EyePos", RegisterSet::Float4, 9) &&
         HasRegister(constants, "g_vFlowParams1", RegisterSet::Float4, 13) && HasRegister(constants, "g_vFlowParams2", RegisterSet::Float4, 14) &&
-        !HasConstant(constants, "BaseTextureSampler") &&
-        (!lightmap || (HasRegister(constants, "LightmapSampler", RegisterSet::Sampler, 3) && !HasConstant(constants, "g_WaterFogParams")));
+        !HasConstant(constants, "BaseTextureSampler") && LightmapFogFits(constants);
+}
+
+// Which of a water replacement's variants (still or flowing) matches a combo: depth or alpha fog, and with
+// $lightmapwaterfog whether the combo blends the refraction's colour or draws the lit fog colour alone. Combos without
+// a lightmap that leave the refraction's colour out have no replacement.
+std::span<const DWORD> WaterReplacement(std::span<const DWORD> code, const std::vector<bytecode::Constant>& constants, bool flowing)
+{
+    const bool refractionColor = bytecode::ReadsSampledColor(code, 0);
+    if (HasConstant(constants, "LightmapSampler")) {
+        if (!refractionColor)
+            return Code(flowing ? g_waterFlowSurfaceOpaqueFogPS : g_waterSurfaceOpaqueFogPS);
+        return Code(flowing ? g_waterFlowSurfaceLightmapFogPS : g_waterSurfaceLightmapFogPS);
+    }
+    if (!refractionColor)
+        return {};
+    if (!HasRegister(constants, "g_WaterFogParams", bytecode::RegisterSet::Float4, 7))
+        return Code(flowing ? g_waterFlowSurfaceAlphaFogPS : g_waterSurfaceAlphaFogPS);
+    return Code(flowing ? g_waterFlowSurfacePS : g_waterSurfacePS);
 }
 
 int RegisterOf(const std::vector<bytecode::Constant>& constants, std::initializer_list<std::string_view> names, bytecode::RegisterSet set, UINT limit)
@@ -159,19 +185,12 @@ PixelShaderClass ClassifyPixelShader(std::span<const DWORD> code, UINT registerL
         result.flashlight = FlashlightRegistersOf(constants, registerLimit);
         return result;
     }
-    if (IsRefractingWater(constants)) {
-        const bool alphaFog = !HasRegister(constants, "g_WaterFogParams", bytecode::RegisterSet::Float4, 7);
-        result.kind = ShaderKind::Water;
-        result.replacement = Code(alphaFog ? g_waterSurfaceAlphaFogPS : g_waterSurfacePS);
-        return result;
-    }
-    if (IsFlowingWater(constants)) {
-        const bool alphaFog = !HasRegister(constants, "g_WaterFogParams", bytecode::RegisterSet::Float4, 7);
-        result.kind = ShaderKind::Water;
-        result.replacement = Code(HasConstant(constants, "LightmapSampler") ? g_waterFlowSurfaceLightmapFogPS
-                : alphaFog                                       ? g_waterFlowSurfaceAlphaFogPS
-                                                                 : g_waterFlowSurfacePS);
-        return result;
+    if (IsRefractingWater(constants) || IsFlowingWater(constants)) {
+        result.replacement = WaterReplacement(code, constants, HasConstant(constants, "FlowmapSampler"));
+        if (!result.replacement.empty()) {
+            result.kind = ShaderKind::Water;
+            return result;
+        }
     }
     // Model shaders without a lighting preview combo (bumped VertexLitGeneric, skin) are drawn by their G-buffer
     // twins (shader_twins.h); without one they keep the game's shader.
