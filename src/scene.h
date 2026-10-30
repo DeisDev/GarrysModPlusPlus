@@ -31,8 +31,10 @@ constexpr UINT kSkyboxMask = 0x10;
 // Static props the map marks as casting no shadows (often foliage). They shadow the sun but not local lights, so a
 // lamp model marked this way still lets its own light out as VRAD did.
 constexpr UINT kShadowlessPropMask = 0x20;
-// Static props as VRAD's shadows saw them (collision models or boxes), traced only by the residual bake.
+// Static props and brushes as VRAD's shadows saw them (collision models or boxes, every side of opaque brushes),
+// traced only by the residual bake; the 3D skybox's brushes have their own mask.
 constexpr UINT kVradOccluderMask = 0x40;
+constexpr UINT kVradSkyboxOccluderMask = 0x80;
 
 // SceneInstance::flags, read by shaders from the instance record.
 constexpr uint32_t kInstanceIgnoreNormals = 0x01;
@@ -105,7 +107,7 @@ static_assert(sizeof(BakedTriangle) == 32);
 
 // The format of the baked residual cache (gmodpp_cache\baked): bump when shaders/baked_residual.hlsl or the data it
 // reads changes.
-inline constexpr uint32_t kBakeVersion = 8;
+inline constexpr uint32_t kBakeVersion = 9;
 
 // VRAD's baked light on the GPU (indirect_lighting = 1): raw views of bsp::BakedLighting and of the world's
 // BakedTriangles, and the residual shaders/baked_residual.hlsl writes: the baked light less the direct light VRAD

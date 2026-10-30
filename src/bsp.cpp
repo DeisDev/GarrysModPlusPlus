@@ -1,11 +1,13 @@
 #include "bsp.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <format>
+#include <functional>
 #include <optional>
 
 #include <LzmaDec.h>
@@ -24,6 +26,11 @@ constexpr int kLumpVisibility = 4;
 constexpr int kLumpNodes = 5;
 constexpr int kLumpLeafs = 10;
 constexpr int kLumpLeafFaces = 16;
+constexpr int kLumpLeafBrushes = 17;
+constexpr int kLumpBrushes = 18;
+constexpr int kLumpBrushSides = 19;
+// bspflags.h: MASK_OPAQUE, the brushes VRAD traces.
+constexpr int32_t kMaskOpaque = 0x1 | 0x80 | 0x4000;
 constexpr int kLumpTexinfo = 6;
 constexpr int kLumpFaces = 7;
 constexpr int kLumpEdges = 12;
@@ -113,6 +120,20 @@ struct Leaf {
     uint16_t firstLeafBrush;
     uint16_t numLeafBrushes;
     int16_t leafWaterDataId;
+};
+
+struct Brush {
+    int32_t firstSide;
+    int32_t sideCount;
+    int32_t contents;
+};
+
+struct BrushSide {
+    uint16_t planeNum;
+    int16_t texinfo;
+    int16_t dispInfo;
+    uint8_t bevel;
+    uint8_t thin;
 };
 
 struct Face {
@@ -956,6 +977,136 @@ void ReadLights(std::span<const std::byte> file, const Header& header, WorldGeom
     }
 }
 
+// A side's polygon: a large square on its plane cut down by the brush's other, non-bevel planes (BaseWindingForPlane
+// and ChopWindingInPlace with the flipped plane, as AddBrushToRaytraceEnvironment does).
+std::vector<std::array<double, 3>> BrushSideWinding(const Plane& plane, std::span<const Plane> cutters)
+{
+    const std::array<double, 3> n = {plane.normal.x, plane.normal.y, plane.normal.z};
+    const int axis = std::fabs(n[2]) >= std::fabs(n[0]) && std::fabs(n[2]) >= std::fabs(n[1]) ? 2 : std::fabs(n[0]) >= std::fabs(n[1]) ? 0 : 1;
+    std::array<double, 3> up = axis == 2 ? std::array<double, 3>{1.0, 0.0, 0.0} : std::array<double, 3>{0.0, 0.0, 1.0};
+    const double along = up[0] * n[0] + up[1] * n[1] + up[2] * n[2];
+    double length = 0.0;
+    for (int i = 0; i < 3; ++i) {
+        up[i] -= n[i] * along;
+        length += up[i] * up[i];
+    }
+    length = std::sqrt(length);
+    for (double& v : up)
+        v /= length;
+    const std::array<double, 3> right = {up[1] * n[2] - up[2] * n[1], up[2] * n[0] - up[0] * n[2], up[0] * n[1] - up[1] * n[0]};
+    constexpr double kSize = 131072.0;
+    std::vector<std::array<double, 3>> winding;
+    for (const auto [r, u] : {std::pair(-1.0, 1.0), std::pair(1.0, 1.0), std::pair(1.0, -1.0), std::pair(-1.0, -1.0)}) {
+        std::array<double, 3> point;
+        for (int i = 0; i < 3; ++i)
+            point[i] = n[i] * plane.distance + (right[i] * r + up[i] * u) * kSize;
+        winding.push_back(point);
+    }
+    for (const Plane& cutter : cutters) {
+        // Keep the brush's inside of the cutter: n.p <= d.
+        const auto side = [&](const std::array<double, 3>& p) {
+            return p[0] * cutter.normal.x + p[1] * cutter.normal.y + p[2] * cutter.normal.z - cutter.distance;
+        };
+        std::vector<std::array<double, 3>> kept;
+        for (size_t i = 0; i < winding.size(); ++i) {
+            const auto& a = winding[i];
+            const auto& b = winding[(i + 1) % winding.size()];
+            const double da = side(a);
+            const double db = side(b);
+            if (da <= 0.0)
+                kept.push_back(a);
+            if ((da < 0.0 && db > 0.0) || (da > 0.0 && db < 0.0)) {
+                const double t = da / (da - db);
+                kept.push_back({a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t});
+            }
+        }
+        winding = std::move(kept);
+        if (winding.size() < 3)
+            return {};
+    }
+    return winding;
+}
+
+void ReadBrushOccluders(std::span<const std::byte> file, const Header& header, const std::function<bool(Float3)>& inSkybox, WorldGeometry& world)
+{
+    auto planes = LumpArray<Plane>(file, header, kLumpPlanes);
+    auto nodes = LumpArray<Node>(file, header, kLumpNodes);
+    auto leafBrushes = LumpArray<uint16_t>(file, header, kLumpLeafBrushes);
+    auto brushes = LumpArray<Brush>(file, header, kLumpBrushes);
+    auto sides = LumpArray<BrushSide>(file, header, kLumpBrushSides);
+    auto texinfos = LumpArray<Texinfo>(file, header, kLumpTexinfo);
+    const Lump& leafLump = header.lumps[kLumpLeafs];
+    const size_t leafStride = leafLump.version == 0 ? kLeafV0Size : kLeafV1Size;
+    if (!planes || !nodes || nodes->empty() || !leafBrushes || !brushes || !sides || !texinfos || leafLump.length <= 0 ||
+        static_cast<size_t>(leafLump.offset) + leafLump.length > file.size())
+        return;
+    const size_t leafCount = static_cast<size_t>(leafLump.length) / leafStride;
+    // The world model's brushes, from the leaves under its head node (GetBrushes_r).
+    std::vector<bool> taken(brushes->size(), false);
+    std::vector<uint32_t> worldBrushes;
+    std::vector<int32_t> stack = {0};
+    while (!stack.empty()) {
+        const int32_t node = stack.back();
+        stack.pop_back();
+        if (node >= 0) {
+            if (static_cast<size_t>(node) >= nodes->size())
+                continue;
+            stack.push_back((*nodes)[node].children[0]);
+            stack.push_back((*nodes)[node].children[1]);
+            continue;
+        }
+        const size_t leafIndex = static_cast<size_t>(-node - 1);
+        if (leafIndex >= leafCount)
+            continue;
+        Leaf leaf;
+        std::memcpy(&leaf, file.data() + leafLump.offset + leafIndex * leafStride, sizeof(leaf));
+        for (uint32_t i = 0; i < leaf.numLeafBrushes; ++i) {
+            const size_t at = static_cast<size_t>(leaf.firstLeafBrush) + i;
+            if (at >= leafBrushes->size() || (*leafBrushes)[at] >= brushes->size() || taken[(*leafBrushes)[at]])
+                continue;
+            taken[(*leafBrushes)[at]] = true;
+            worldBrushes.push_back((*leafBrushes)[at]);
+        }
+    }
+    std::vector<Plane> cutters;
+    for (uint32_t b : worldBrushes) {
+        const Brush& brush = (*brushes)[b];
+        if ((brush.contents & kMaskOpaque) == 0 || brush.firstSide < 0 || brush.sideCount <= 0 ||
+            static_cast<size_t>(brush.firstSide) + brush.sideCount > sides->size())
+            continue;
+        std::vector<Float3> triangles;
+        Float3 sum = {};
+        size_t points = 0;
+        for (int32_t i = 0; i < brush.sideCount; ++i) {
+            const BrushSide& side = (*sides)[brush.firstSide + i];
+            if (side.planeNum >= planes->size() || side.dispInfo != 0)
+                continue;
+            if (side.texinfo >= 0 && static_cast<size_t>(side.texinfo) < texinfos->size() && ((*texinfos)[side.texinfo].flags & kSurfSky) != 0)
+                continue;
+            cutters.clear();
+            for (int32_t j = 0; j < brush.sideCount; ++j) {
+                const BrushSide& other = (*sides)[brush.firstSide + j];
+                if (j != i && !other.bevel && other.planeNum < planes->size())
+                    cutters.push_back((*planes)[other.planeNum]);
+            }
+            const std::vector<std::array<double, 3>> winding = BrushSideWinding((*planes)[side.planeNum], cutters);
+            const auto point = [&](size_t k) {
+                return Float3{static_cast<float>(winding[k][0]), static_cast<float>(winding[k][1]), static_cast<float>(winding[k][2])};
+            };
+            for (size_t k = 2; k < winding.size(); ++k)
+                triangles.insert(triangles.end(), {point(0), point(k - 1), point(k)});
+            for (size_t k = 0; k < winding.size(); ++k) {
+                sum = Add(sum, point(k));
+                ++points;
+            }
+        }
+        if (points == 0)
+            continue;
+        std::vector<Float3>& target = inSkybox(Scale(sum, 1.0f / static_cast<float>(points))) ? world.skyboxBrushOccluders : world.brushOccluders;
+        target.insert(target.end(), triangles.begin(), triangles.end());
+    }
+}
+
 void* LzmaAlloc(ISzAllocPtr, size_t size) { return std::malloc(size); }
 void LzmaFree(ISzAllocPtr, void* address) { std::free(address); }
 const ISzAlloc kLzmaAllocator = {LzmaAlloc, LzmaFree};
@@ -1165,6 +1316,7 @@ bool LoadWorld(std::span<const std::byte> file, WorldGeometry& world, std::strin
             world.baked.ambientLights.push_back({{light.origin.x, light.origin.y, light.origin.z, light.radius},
                 {light.intensity.x, light.intensity.y, light.intensity.z, 0.0f}, {light.normal.x, light.normal.y, light.normal.z, 0.0f}});
     }
+    ReadBrushOccluders(file, header, inSkybox, world);
     ReadStaticProps(file, header, world);
     if (skyArea >= 0) {
         for (const StaticProp& prop : world.props) {

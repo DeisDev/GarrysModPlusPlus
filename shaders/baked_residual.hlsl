@@ -15,7 +15,8 @@
 // AmbientLights; input1: their count; input3: first sample; input4: sample count; output0: ambient samples, changed
 // in place; output1: counters (3: samples with a cube side clamped at zero).
 
-// VRAD's occluders: the world and static props as VRAD shaped them (kWorldMask | kVradOccluderMask in src/scene.h).
+// VRAD's occluders: the world, and static props and brushes as VRAD shaped them (kWorldMask | kVradOccluderMask in
+// src/scene.h).
 static const uint kVradOccluders = 0x01 | 0x40;
 // A luxel counts as clamped when the direct light exceeds the baked light by more than this share of it.
 static const float kClampTolerance = 0.05;
@@ -55,7 +56,8 @@ float SolidSunVisibility(float3 origin)
     float visibility = SolidTransmittance(origin, g_frame.sunDirection, 65536.0, kVradOccluders);
     if (visibility > 0.0 && g_frame.worldToSky > 0.0) {
         float3 camera = float3(g_frame.skyCameraX, g_frame.skyCameraY, g_frame.skyCameraZ);
-        visibility *= SolidTransmittance(camera + origin * g_frame.worldToSky, g_frame.sunDirection, 65536.0, kSkyboxMask);
+        // The 3D skybox's faces and props, and its brushes as VRAD traced them (kVradSkyboxOccluderMask).
+        visibility *= SolidTransmittance(camera + origin * g_frame.worldToSky, g_frame.sunDirection, 65536.0, kSkyboxMask | 0x80);
     }
     return visibility;
 }

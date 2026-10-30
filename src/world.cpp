@@ -793,7 +793,19 @@ void AddVradOccluders(const bsp::WorldGeometry& world, std::vector<SceneInstance
         if (instance.model >= 0)
             instances.push_back(instance);
     }
-    log::Info("Scene: VRAD's prop shadows for the bake: {} props by collision model, {} by box", collisionProps, boxProps);
+    const float identity[3][4] = {{1.0f, 0.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 1.0f, 0.0f}};
+    for (const auto& [triangles, mask] : {std::pair(&world.brushOccluders, kVradOccluderMask), std::pair(&world.skyboxBrushOccluders, kVradSkyboxOccluderMask)}) {
+        if (triangles->empty())
+            continue;
+        SceneInstance instance;
+        instance.model = addModel(*triangles);
+        instance.mask = mask;
+        std::memcpy(instance.transform, identity, sizeof(instance.transform));
+        if (instance.model >= 0)
+            instances.push_back(instance);
+    }
+    log::Info("Scene: VRAD's shadows for the bake: {} props by collision model, {} by box; {} brush triangles, {} in the 3D skybox", collisionProps,
+        boxProps, world.brushOccluders.size() / 3, world.skyboxBrushOccluders.size() / 3);
 }
 
 bool IsFirstPersonModel(const std::string& path)

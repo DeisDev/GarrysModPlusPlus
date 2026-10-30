@@ -194,6 +194,11 @@ struct WorldGeometry {
     // only rays of the skybox view meet it.
     Mesh skybox;
     std::vector<StaticProp> skyboxProps;
+    // VRAD's brush occluders as triangle lists, for the baked light only: every side of every opaque brush of the
+    // world model but sky and displacement sides, whatever its texture (AddBrushesForRayTrace in
+    // src/utils/vrad/trace.cpp), split between the map and the 3D skybox.
+    std::vector<Float3> brushOccluders;
+    std::vector<Float3> skyboxBrushOccluders;
     BakedLighting baked;
     // The sky camera's area (BspLeaf::area), or -1, and the bounds of its leaves.
     int32_t skyArea = -1;
