@@ -21,6 +21,8 @@ inline constexpr uint32_t kNoFace = 0xFFFFFFFF;
 
 struct SunLight {
     bool present = false;
+    // The light_environment's position, whose cluster sees the sky light (BuildVisForLightEnvironment in VRAD).
+    Float3 origin = {};
     Float3 direction = {};
     Float3 color = {};
     Float3 ambient = {};
@@ -73,6 +75,10 @@ struct Visibility {
     std::vector<uint8_t> pvs;
     std::vector<BspNode> nodes;
     std::vector<BspLeaf> leaves;
+    // The clusters VRAD let the sun and sky light reach (one PVS row): those the light_environment's cluster or a
+    // cluster holding a sky face sees (BuildVisForLightEnvironment and PVSCheck in src/utils/vrad/lightmap.cpp).
+    // Empty for every cluster.
+    std::vector<uint8_t> sunClusters;
 
     bool Sees(int32_t from, int32_t to) const
     {

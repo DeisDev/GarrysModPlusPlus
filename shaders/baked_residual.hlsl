@@ -36,6 +36,19 @@ float SolidTransmittance(float3 origin, float3 direction, float tMax, uint mask)
     return query.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? 0.0 : 1.0;
 }
 
+// Whether VRAD let the sun reach a point's cluster: it lights a sample only from lights whose PVS holds the sample's
+// cluster, and the sun's is what the light_environment and the clusters with sky faces see.
+bool SunReaches(float3 position)
+{
+    if (g_frame.sunClustersView == kNoView)
+        return true;
+    uint cluster = ClusterAt(position);
+    if (cluster >= g_frame.clusterCount)
+        return true;
+    ByteAddressBuffer clusters = ResourceDescriptorHeap[g_frame.sunClustersView];
+    return (clusters.Load((cluster >> 5) * 4) & (1u << (cluster & 31))) != 0;
+}
+
 // SunVisibility (shaders/scene.hlsli) with SolidTransmittance, through the 3D skybox as VRAD's TestLine_DoesHitSky.
 float SolidSunVisibility(float3 origin)
 {
@@ -61,7 +74,7 @@ void DirectLight(BakeLuxel luxel, FaceLightmap face, out float3 direct[4])
     for (uint n = 0; n < 4; ++n)
         direct[n] = 0.0;
     float3 origin = luxel.position + luxel.normal * 0.5;
-    if (g_frame.sunEnabled != 0.0 && dot(normals[0], g_frame.sunDirection) > 0.0) {
+    if (g_frame.sunEnabled != 0.0 && dot(normals[0], g_frame.sunDirection) > 0.0 && SunReaches(origin)) {
         float visibility = SolidSunVisibility(origin);
         for (uint n = 0; n < count && visibility > 0.0; ++n)
             direct[n] += g_frame.sunColor * saturate(dot(normals[n], g_frame.sunDirection)) * visibility;

@@ -23,6 +23,7 @@ constexpr int kLumpVertexes = 3;
 constexpr int kLumpVisibility = 4;
 constexpr int kLumpNodes = 5;
 constexpr int kLumpLeafs = 10;
+constexpr int kLumpLeafFaces = 16;
 constexpr int kLumpTexinfo = 6;
 constexpr int kLumpFaces = 7;
 constexpr int kLumpEdges = 12;
@@ -648,7 +649,7 @@ bool DecompressVis(std::span<const std::byte> in, std::span<uint8_t> out)
     return true;
 }
 
-void ReadVisibility(std::span<const std::byte> file, const Header& header, Visibility& visibility)
+void ReadVisibility(std::span<const std::byte> file, const Header& header, const SunLight& sun, Visibility& visibility)
 {
     auto planes = LumpArray<Plane>(file, header, kLumpPlanes);
     auto nodes = LumpArray<Node>(file, header, kLumpNodes);
@@ -676,9 +677,29 @@ void ReadVisibility(std::span<const std::byte> file, const Header& header, Visib
             return;
     }
     std::vector<BspLeaf> leaves;
+    std::vector<uint8_t> sunClusters(row, 0);
+    const auto seeSky = [&](int32_t cluster) {
+        if (cluster < 0 || cluster >= clusterCount)
+            return;
+        for (size_t b = 0; b < row; ++b)
+            sunClusters[b] |= pvs[cluster * row + b];
+    };
+    auto leafFaces = LumpArray<uint16_t>(file, header, kLumpLeafFaces);
+    auto faces = LumpArray<Face>(file, header, kLumpFaces);
+    auto texinfos = LumpArray<Texinfo>(file, header, kLumpTexinfo);
     for (size_t offset = 0; offset < static_cast<size_t>(leafLump.length); offset += leafStride) {
         Leaf leaf;
         std::memcpy(&leaf, file.data() + leafLump.offset + offset, sizeof(leaf));
+        for (uint32_t i = 0; leafFaces && faces && texinfos && i < leaf.numLeafFaces; ++i) {
+            const size_t at = static_cast<size_t>(leaf.firstLeafFace) + i;
+            if (at >= leafFaces->size() || (*leafFaces)[at] >= faces->size())
+                break;
+            const int32_t texinfo = (*faces)[(*leafFaces)[at]].texinfo;
+            if (texinfo >= 0 && static_cast<size_t>(texinfo) < texinfos->size() && ((*texinfos)[texinfo].flags & kSurfSky) != 0) {
+                seeSky(leaf.cluster);
+                break;
+            }
+        }
         leaves.push_back({leaf.cluster < clusterCount ? leaf.cluster : -1, leaf.areaFlags & 0x1FF,
             {static_cast<float>(leaf.mins[0]), static_cast<float>(leaf.mins[1]), static_cast<float>(leaf.mins[2])},
             {static_cast<float>(leaf.maxs[0]), static_cast<float>(leaf.maxs[1]), static_cast<float>(leaf.maxs[2])}});
@@ -696,9 +717,15 @@ void ReadVisibility(std::span<const std::byte> file, const Header& header, Visib
         tree.push_back({plane.normal, plane.distance, {node.children[0], node.children[1]}});
     }
     visibility.clusterCount = static_cast<uint32_t>(clusterCount);
-    visibility.pvs = std::move(pvs);
     visibility.nodes = std::move(tree);
     visibility.leaves = std::move(leaves);
+    if (sun.present) {
+        const int32_t leaf = visibility.LeafAt(sun.origin);
+        if (leaf >= 0)
+            seeSky(visibility.leaves[leaf].cluster);
+        visibility.sunClusters = std::move(sunClusters);
+    }
+    visibility.pvs = std::move(pvs);
 }
 
 }
@@ -903,6 +930,7 @@ void ReadLights(std::span<const std::byte> file, const Header& header, WorldGeom
             switch (static_cast<LightType>(light.type)) {
             case LightType::Sky:
                 world.sun.present = true;
+                world.sun.origin = light.origin;
                 world.sun.direction = Scale(light.normal, -1.0f);
                 world.sun.color = light.intensity;
                 world.sun.style = light.style;
@@ -1130,7 +1158,7 @@ bool LoadWorld(std::span<const std::byte> file, WorldGeometry& world, std::strin
 
     ReadMaterialNames(file, header, lumps.texdatas, world.materials);
     ReadLights(file, header, world);
-    ReadVisibility(file, header, world.visibility);
+    ReadVisibility(file, header, world.sun, world.visibility);
     ReadLeafAmbient(file, header, world.visibility, world.baked);
     for (const Light& light : world.lights) {
         if (light.inAmbientCube)

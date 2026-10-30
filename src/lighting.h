@@ -114,7 +114,9 @@ struct FrameConstants {
     float worldToSky;
     // Phong highlights (shaders/direct.hlsl), added unlit by shaders/deferred_lighting.hlsl.
     uint32_t specularView;
-    uint32_t padding3[3];
+    // Scene::LightLists::sunClustersView: where VRAD's sun reached (the bake), or kInvalidView.
+    uint32_t sunClustersView;
+    uint32_t padding3[2];
 };
 
 // What blocks the sun at a pixel of the main view (Lighting::RequestProbe).

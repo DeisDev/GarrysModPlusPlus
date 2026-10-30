@@ -872,6 +872,7 @@ bool Lighting::FillConstants(FrameConstants& constants, const Scene& scene, cons
     constants.lightIndicesView = lists.indicesView;
     constants.bspNodesView = lists.nodesView;
     constants.leafClustersView = lists.leafClustersView;
+    constants.sunClustersView = lists.sunClustersView;
     constants.clusterCount = lists.clusterCount;
     constants.viewmodel = inputs.kind == gbuffer::ViewKind::Viewmodel ? 1u : 0u;
     // The skybox view shares the main view's orientation, so it finds last frame's sky (reflections.hlsl).

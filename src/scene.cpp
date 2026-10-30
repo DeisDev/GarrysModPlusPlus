@@ -629,11 +629,13 @@ void Scene::Clear()
     m_descriptors->Free(m_lightLists.indicesView);
     m_descriptors->Free(m_lightLists.nodesView);
     m_descriptors->Free(m_lightLists.leafClustersView);
+    m_descriptors->Free(m_lightLists.sunClustersView);
     m_lightLists = {};
     m_lightRanges.Reset();
     m_lightIndices.Reset();
     m_bspNodes.Reset();
     m_leafClusters.Reset();
+    m_sunClusters.Reset();
 }
 
 bool Scene::LoadMap(const std::string& name, const bsp::WorldGeometry& world, std::span<const LightHull> lightHulls, const ModelGeometry& worldGeometry)
@@ -743,6 +745,10 @@ bool Scene::BuildLightLists(std::span<const bsp::Light> lights, const bsp::Visib
     m_leafClusters = UploadToDefault(leafClusters.data(), leafClusters.size() * sizeof(int32_t), staging);
     if (clusterCount > 0)
         m_bspNodes = UploadToDefault(visibility.nodes.data(), visibility.nodes.size() * sizeof(bsp::BspNode), staging);
+    std::vector<uint8_t> sunClusters = visibility.sunClusters;
+    sunClusters.resize((sunClusters.size() + 15) & ~size_t(15));
+    if (!sunClusters.empty())
+        m_sunClusters = UploadToDefault(sunClusters.data(), sunClusters.size(), staging);
     if (!m_lightRanges || !m_lightIndices || !m_leafClusters || (clusterCount > 0 && !m_bspNodes) || !Submit())
         return false;
     LightLists lists;
@@ -751,6 +757,7 @@ bool Scene::BuildLightLists(std::span<const bsp::Light> lights, const bsp::Visib
     lists.indicesView = m_descriptors->CreateRawView(m_lightIndices.Get());
     lists.leafClustersView = m_descriptors->CreateRawView(m_leafClusters.Get());
     lists.nodesView = clusterCount > 0 ? m_descriptors->CreateRawView(m_bspNodes.Get()) : DescriptorHeap::kInvalid;
+    lists.sunClustersView = m_sunClusters ? m_descriptors->CreateRawView(m_sunClusters.Get()) : DescriptorHeap::kInvalid;
     m_lightLists = lists;
     if (lists.rangesView == DescriptorHeap::kInvalid || lists.indicesView == DescriptorHeap::kInvalid ||
         lists.leafClustersView == DescriptorHeap::kInvalid || (clusterCount > 0 && lists.nodesView == DescriptorHeap::kInvalid))

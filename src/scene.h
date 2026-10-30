@@ -105,7 +105,7 @@ static_assert(sizeof(BakedTriangle) == 32);
 
 // The format of the baked residual cache (gmodpp_cache\baked): bump when shaders/baked_residual.hlsl or the data it
 // reads changes.
-inline constexpr uint32_t kBakeVersion = 7;
+inline constexpr uint32_t kBakeVersion = 8;
 
 // VRAD's baked light on the GPU (indirect_lighting = 1): raw views of bsp::BakedLighting and of the world's
 // BakedTriangles, and the residual shaders/baked_residual.hlsl writes: the baked light less the direct light VRAD
@@ -238,6 +238,8 @@ public:
         UINT indicesView = DescriptorHeap::kInvalid;
         UINT nodesView = DescriptorHeap::kInvalid;
         UINT leafClustersView = DescriptorHeap::kInvalid;
+        // bsp::Visibility::sunClusters as bits, or kInvalid for every cluster.
+        UINT sunClustersView = DescriptorHeap::kInvalid;
         UINT clusterCount = 0;
     };
     const LightLists& Lights() const { return m_lightLists; }
@@ -358,6 +360,7 @@ private:
     Microsoft::WRL::ComPtr<ID3D12Resource> m_lightIndices;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_bspNodes;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_leafClusters;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_sunClusters;
     BakedBuffers m_baked;
     std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> m_bakedInputs;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_bakedResidual;
