@@ -13,6 +13,7 @@
 #include <g_waterSurfaceLightmapFogPS.h>
 #include <g_waterSurfaceOpaqueFogPS.h>
 #include <g_waterSurfacePS.h>
+#include <g_waterTexturedSurfacePS.h>
 
 #include <d3d9types.h>
 
@@ -94,6 +95,16 @@ bool IsFlowingWater(const std::vector<bytecode::Constant>& constants)
         HasRegister(constants, "g_WaterFogColor", RegisterSet::Float4, 6) && HasRegister(constants, "g_EyePos", RegisterSet::Float4, 9) &&
         HasRegister(constants, "g_vFlowParams1", RegisterSet::Float4, 13) && HasRegister(constants, "g_vFlowParams2", RegisterSet::Float4, 14) &&
         !HasConstant(constants, "BaseTextureSampler") && LightmapFogFits(constants);
+}
+
+// The Water shader's textured combos ($basetexture), which reflect but do not refract; flowing ones keep the game's
+// shader.
+bool IsTexturedWater(const std::vector<bytecode::Constant>& constants)
+{
+    using bytecode::RegisterSet;
+    return HasRegister(constants, "BaseTextureSampler", RegisterSet::Sampler, 1) && HasRegister(constants, "NormalSampler", RegisterSet::Sampler, 4) &&
+        HasRegister(constants, "g_vReflectTint", RegisterSet::Float4, 4) && !HasConstant(constants, "RefractSampler") &&
+        !HasConstant(constants, "FlowmapSampler");
 }
 
 // Which of a water replacement's variants (still or flowing) matches a combo: depth or alpha fog, and with
@@ -183,6 +194,13 @@ PixelShaderClass ClassifyPixelShader(std::span<const DWORD> code, UINT registerL
     if (IsFlashlightPass(constants)) {
         result.kind = ShaderKind::Flashlight;
         result.flashlight = FlashlightRegistersOf(constants, registerLimit);
+        return result;
+    }
+    if (IsTexturedWater(constants)) {
+        // A surface lit like the world's (shaders/water_textured_surface.hlsl).
+        const std::span<const DWORD> surface = Code(g_waterTexturedSurfacePS);
+        result.kind = ShaderKind::GBuffer;
+        result.patched.assign(surface.begin(), surface.end());
         return result;
     }
     if (IsRefractingWater(constants) || IsFlowingWater(constants)) {

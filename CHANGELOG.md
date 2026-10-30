@@ -29,6 +29,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - In the native renderer, camera screens, mirrors and scopes that draw the world into a texture get real-time light ("Cameras and mirrors" in the menu; about 1 ms for a 512x512 view). The water's own views keep the game's light.
 - The menu says why real-time lighting is paused: no ray tracing support, MSAA on, or multicore rendering on.
 - In the native renderer, flowing water (`$flowmap`) and water with `$lightmapwaterfog` get ray-traced reflections like other water.
+- In the native renderer, textured water (`$basetexture`) is lit in real time instead of by its baked light.
 - In the native renderer, models and world surfaces with a light warp texture take real-time light through it as in the game.
 
 ### Changed
