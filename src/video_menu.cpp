@@ -267,7 +267,8 @@ void ShowSettings(const Added& added)
 }
 
 // Lays the dialog out again around its changes: the anti-aliasing mode takes MSAA's place, the DLSS mode the field of
-// view's when that is hidden, the other settings a new row under HDR, and the Direct3D 9Ex row goes. Positions are
+// view's when that is hidden, the other settings a new row under HDR, the two DirectX level rows become one naming
+// the renderer, and the Direct3D 9Ex row goes. Positions are
 // taken from the dialog's own controls, so proportional scaling carries over.
 bool Extend(void* dialog)
 {
@@ -281,9 +282,10 @@ bool Extend(void* dialog)
     const auto modelDetail = find("ModelDetail"), modelLabel = find("Label3"), waterDetail = find("WaterDetail"), textureDetail = find("TextureDetail"),
                shaderDetail = find("ShaderDetail"), msaa = find("AntialiasingMode"), msaaLabel = find("Label5"), filtering = find("FilteringMode"),
                multicore = find("Multicore"), multicoreLabel = find("MulticoreLabel"), hdr = find("HDR"), divider = find("Divider1"),
-               d3d9ex = find("D3D9Ex"), d3d9exLabel = find("D3D9ExLabel"), dxLevel = find("dxlabel"), fov = find("FovSlider");
+               d3d9ex = find("D3D9Ex"), d3d9exLabel = find("D3D9ExLabel"), dxLevel = find("dxlabel"), dxLevelLabel = find("Label1"),
+               dxInstalled = find("dxinstalledlabel"), dxInstalledLabel = find("Label2"), fov = find("FovSlider");
     if (!modelDetail || !modelLabel || !waterDetail || !textureDetail || !shaderDetail || !msaa || !msaaLabel || !filtering || !multicore ||
-        !multicoreLabel || !hdr || !divider || !d3d9ex || !d3d9exLabel || !dxLevel) {
+        !multicoreLabel || !hdr || !divider || !d3d9ex || !d3d9exLabel || !dxLevel || !dxLevelLabel || !dxInstalled || !dxInstalledLabel) {
         log::Info("Video menu: the Advanced video dialog's layout is not the expected one; left unchanged");
         return false;
     }
@@ -311,18 +313,29 @@ bool Extend(void* dialog)
 
     // Resizing the dialog puts its controls back where the .res file has them, so it comes first.
     const int d3d9exY = RectOf(*d3d9ex).y;
-    const int d3d9exStep = d3d9exY - RectOf(*dxLevel).y;
+    const int dxLevelY = RectOf(*dxLevel).y;
+    const int d3d9exStep = d3d9exY - dxLevelY;
+    const int dxLevelStep = dxLevelY - RectOf(*dxInstalled).y;
     const bool fovSlot = !fov || !CallPanels<bool>(kIsVisible, *fov);
     const int newRows = fovSlot ? 1 : 2;
     const int newRowY = RectOf(*hdr).y + step;
     const int dividerY = RectOf(*divider).y;
-    CallPanels<void>(kSetSize, root, dialogRect.w, dialogRect.h + newRows * step - d3d9exStep);
+    CallPanels<void>(kSetSize, root, dialogRect.w, dialogRect.h + newRows * step - d3d9exStep - dxLevelStep);
 
     // Direct3D 9Ex does nothing natively.
     CallPanels<void>(kSetVisible, *d3d9ex, false);
     CallPanels<void>(kSetVisible, *d3d9exLabel, false);
     shift(d3d9exY + 1, -d3d9exStep);
+    for (VPanel panel : {*dxLevel, *dxLevelLabel, *dxInstalled, *dxInstalledLabel})
+        CallPanels<void>(kSetVisible, panel, false);
+    shift(dxLevelY + 1, -dxLevelStep);
     shift(dividerY, newRows * step);
+    void* renderer = NewLabel(dialog, "GmodppRenderer", ui::Text(ui::TextId::VideoRendererName));
+    void* rendererLabel = NewLabel(dialog, "GmodppRendererLabel", ui::Text(ui::TextId::VideoRenderer));
+    if (renderer != nullptr && rendererLabel != nullptr) {
+        Place(VPanelOf(renderer), RectOf(*dxInstalled));
+        Place(VPanelOf(rendererLabel), RectOf(*dxInstalledLabel));
+    }
 
     Added added;
     const auto add = [&](Row row, const char* name, const char* labelName, ui::TextId label, Rect comboRect, Rect labelRectValue, std::initializer_list<const char*> items) {

@@ -508,7 +508,7 @@ void ReadTarget(int x, int y, int width, int height, unsigned char* data, int fo
         targetHeight = static_cast<UINT>(texture->height);
     } else {
         realtime::OnBackBufferRead();
-        source = &backend.ResolvedBackBuffer();
+        source = &backend.BackBuffer();
     }
     const UINT left = static_cast<UINT>(std::clamp(x, 0, static_cast<int>(targetWidth)));
     const UINT top = static_cast<UINT>(std::clamp(y, 0, static_cast<int>(targetHeight)));
@@ -683,9 +683,8 @@ bool TargetSurface(int id, bool read, CopySurface& surface)
         if (read)
             realtime::OnBackBufferRead();
         Backend& backend = GetBackend();
-        TrackedResource& resource = read ? backend.ResolvedBackBuffer() : backend.BackBuffer();
-        surface = { &resource, backend.BackBufferTexture(), backend.BackBufferView(false), Backend::kBackBufferFormat, backend.Width(),
-            backend.Height(), read ? 1 : backend.Samples() };
+        surface = { &backend.BackBuffer(), backend.BackBufferTexture(), backend.BackBufferView(false), Backend::kBackBufferFormat, backend.Width(),
+            backend.Height() };
         return true;
     }
     Texture* texture = TextureFromHandle(handle);

@@ -117,7 +117,7 @@ void MarkSettingsChanged();
 enum class GpuPass : uint32_t { SceneUpdate, Surface, Volume, DirectLight, AmbientOcclusion, IndirectTrace, Accumulation, Denoiser, Reflections, Lighting, Resolve, Count };
 
 // Why real-time lighting is not drawing, if it is on.
-enum class RealtimeBlock : uint8_t { None, Unsupported, Multisampling, OtherThread };
+enum class RealtimeBlock : uint8_t { None, Unsupported, OtherThread };
 
 // Figures the renderer reports for the menu.
 struct Statistics {

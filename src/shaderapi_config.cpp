@@ -32,7 +32,7 @@ bool GetHdrEnabled(Config* self) { return self->hdrEnabled; }
 int GetHdrType(Config* self) { return self->hdrEnabled ? kHdrInteger : kHdrNone; }
 void SetHdrEnabled(Config* self, bool enable) { self->hdrEnabled = enable; }
 void OverrideStreamOffsetSupport(NativeObject*, bool, bool) {}
-bool IsAAEnabled(NativeObject*) { return GetBackend().Samples() > 1; }
+bool IsAAEnabled(NativeObject*) { return false; }
 
 NativeClass& ConfigClass()
 {

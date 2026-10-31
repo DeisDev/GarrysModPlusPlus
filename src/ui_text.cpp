@@ -17,7 +17,6 @@ constexpr std::array<const char*, static_cast<size_t>(TextId::Count)> kEnglish =
     "Effects",
     "Real-time lighting",
     "This GPU can't ray trace, so real-time lighting is off.",
-    "Real-time lighting needs MSAA off: press Apply in the video options.",
     "Real-time lighting needs multicore rendering off in the video options.",
     "Debug view",
     "Final image",
@@ -127,6 +126,8 @@ constexpr std::array<const char*, static_cast<size_t>(TextId::Count)> kEnglish =
     "Skip",
     "Ray tracing quality",
     "DLSS",
+    "Renderer",
+    "DirectX 12",
 };
 
 }

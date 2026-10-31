@@ -84,15 +84,9 @@ public:
     std::uint64_t PendingFence() const { return m_fenceValue + 1; }
     std::uint64_t CompletedFence() const { return m_fence->GetCompletedValue(); }
 
-    // The samples per pixel of the back buffer and its depth buffer (the game's MSAA setting).
-    UINT Samples() const { return m_samples; }
-    // What draws to the default target render into: the multisampled colour target with MSAA, else the swap chain's
-    // current buffer.
-    TrackedResource& BackBuffer() { return m_samples > 1 ? m_multisampleTarget : SwapChainBuffer(); }
+    // What draws to the default target render into: the swap chain's current buffer.
+    TrackedResource& BackBuffer() { return SwapChainBuffer(); }
     D3D12_CPU_DESCRIPTOR_HANDLE BackBufferView(bool srgb) const;
-    // The swap chain's current buffer holding what has been drawn so far, resolved from the multisampled target with
-    // MSAA, as Direct3D 9 resolves for StretchRect and Present. For copies out of the back buffer.
-    TrackedResource& ResolvedBackBuffer();
     // Its shader resource view.
     UINT BackBufferTexture() const { return m_backBufferTextures[m_swapChain->GetCurrentBackBufferIndex()]; }
     TrackedResource& DepthBuffer() { return m_depthBuffer; }
@@ -141,7 +135,6 @@ private:
     bool CreateDevice();
     bool CreateSwapChain();
     bool CreateDepthBuffer();
-    bool CreateMultisampleTarget();
     TrackedResource& SwapChainBuffer() { return m_backBuffers[m_swapChain->GetCurrentBackBufferIndex()]; }
     void DrainDebugMessages();
     void BeginFrame();
@@ -157,9 +150,6 @@ private:
     std::array<TrackedResource, kBackBuffers> m_backBuffers;
     std::array<D3D12_CPU_DESCRIPTOR_HANDLE, kBackBuffers * 2> m_backBufferViews = {};
     std::array<UINT, kBackBuffers> m_backBufferTextures = { DescriptorHeap::kInvalid, DescriptorHeap::kInvalid, DescriptorHeap::kInvalid };
-    TrackedResource m_multisampleTarget;
-    std::array<D3D12_CPU_DESCRIPTOR_HANDLE, 2> m_multisampleViews = {};
-    UINT m_samples = 1;
     TrackedResource m_depthBuffer;
     D3D12_CPU_DESCRIPTOR_HANDLE m_depthView = {};
     std::array<Frame, kFrames> m_frames;

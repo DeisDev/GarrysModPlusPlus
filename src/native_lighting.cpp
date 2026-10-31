@@ -36,7 +36,6 @@ struct State {
     bool initialized = false;
     bool available = false;
     bool loggedThread = false;
-    bool loggedSamples = false;
     bool viewmodelCapture = false;
     float viewmodelDepth[2] = {};
     // Why the last main view was not captured, for the menu.
@@ -62,13 +61,6 @@ bool CanCapture()
             log::Info("Real-time lighting: views are drawn on another thread than the device's (mat_queue_mode != 0); views are left unlit");
         return false;
     }
-    // Lighting reads single-sampled targets.
-    if (backend.Samples() > 1) {
-        g_state.block = RealtimeBlock::Multisampling;
-        if (!std::exchange(g_state.loggedSamples, true))
-            log::Info("Real-time lighting is off while the game uses {}x MSAA (mat_antialias 0 turns it on)", backend.Samples());
-        return false;
-    }
     const DynamicState& dynamic = Dynamic();
     const bool mainTarget = dynamic.colorTargets[0] == kDefaultTarget && dynamic.depthTarget == kDefaultTarget;
     if (mainTarget)
@@ -81,7 +73,7 @@ bool CanCapture()
 bool CanLightRenderTargetView()
 {
     if (!g_state.forward || engine::LevelName() != g_state.forwardLevel || !GetSettings().renderTargetLighting || !GetSettings().realtimeLighting || !world::Ready() || capture::Active() ||
-        capture::ForwardActive() || !GetBackend().OnRenderThread() || GetBackend().Samples() > 1)
+        capture::ForwardActive() || !GetBackend().OnRenderThread())
         return false;
     const DynamicState& dynamic = Dynamic();
     if (dynamic.colorTargets[0] == kDefaultTarget || dynamic.colorTargets[0] == 0)

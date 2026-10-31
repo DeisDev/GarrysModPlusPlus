@@ -1550,8 +1550,8 @@ const std::uint8_t* GetFlashlightStateEx(ShaderApiObject*, Matrix& worldToTextur
 
 // shaderapidx9.dll 0x180011840: whether the device exists and is not deactivated.
 bool CanDownloadTextures(ShaderApiObject*) { return GetBackend().HasDevice(); }
-// shaderapidx9.dll 0x180015270: render target textures cannot share the multisampled depth buffer.
-bool DoRenderTargetsNeedSeparateDepthBuffer(ShaderApiObject*) { return GetBackend().Samples() > 1; }
+// shaderapidx9.dll 0x180015270: only a multisampled depth buffer needs separate ones, and MSAA is never used.
+bool DoRenderTargetsNeedSeparateDepthBuffer(ShaderApiObject*) { return false; }
 
 void GetBackBufferDimensions(ShaderApiObject*, int& width, int& height)
 {
@@ -1566,7 +1566,8 @@ int GetShadowDepthTextureFormat(NativeObject*) { return kFormatNvDst16; }
 bool SupportsFetch4(NativeObject*) { return false; }
 int GetNullTextureFormat(NativeObject*) { return kFormatNvNull; }
 bool SupportsNormalMapCompression(NativeObject*) { return false; }
-bool SupportsMSAAMode(NativeObject*, int mode) { return mode == 0 || mode == 1 || mode == 2 || mode == 4 || mode == 8; }
+// Real-time lighting reads single-sampled targets, so MSAA is reported unsupported.
+bool SupportsMSAAMode(NativeObject*, int mode) { return mode == 0 || mode == 1; }
 bool SupportsCSAAMode(NativeObject*, int, int) { return false; }
 
 // LinearToGamma_HardwareSpecific and GammaToLinear_HardwareSpecific (0x18003b260, 0x18003b200): the sRGB curves.

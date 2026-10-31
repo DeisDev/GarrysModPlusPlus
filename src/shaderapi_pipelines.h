@@ -18,7 +18,6 @@ struct Targets {
     DXGI_FORMAT depthFormat = DXGI_FORMAT_UNKNOWN;
     UINT width = 0;
     UINT height = 0;
-    UINT samples = 1;
 };
 Targets PrepareTargets(bool srgb);
 
@@ -34,7 +33,6 @@ struct CopySurface {
     DXGI_FORMAT format;
     UINT width;
     UINT height;
-    UINT samples = 1;
 };
 // Copies `sourceRect` of `source` to `destinationRect` of `destination` with linear filtering, as StretchRect with
 // D3DTEXF_LINEAR does: a plain copy when the sizes and formats allow it, otherwise a draw.

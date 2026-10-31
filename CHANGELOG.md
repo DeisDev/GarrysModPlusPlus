@@ -25,15 +25,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Water has ray-traced reflections over the game's refraction, a sun glint and a physical Fresnel term.
 - Underwater, the surface shows the world above through Snell's window and mirrors the water below beyond it, and sunlight scatters in the water's colour.
 - A `winmm.dll` loader in the game folder. With `-insecure -gmodpp_vanilla` it runs the game's own renderer through `gmodpp.dll`, as a reference for the coming native Direct3D 12 renderer.
-- In the native renderer, GMod's Advanced video options have settings for anti-aliasing (TAA or DLSS), the DLSS mode, real-time lighting, ray tracing quality and indirect light. MSAA and Direct3D 9Ex are hidden there, and MSAA is turned off when the options are applied.
+- In the native renderer, GMod's Advanced video options have settings for anti-aliasing (TAA or DLSS), the DLSS mode, real-time lighting, ray tracing quality and indirect light. MSAA and Direct3D 9Ex are hidden there, MSAA is turned off when the options are applied, and the two DirectX level rows are replaced by one that names the renderer (DirectX 12).
 - In the native renderer, camera screens, mirrors and scopes that draw the world into a texture get real-time light ("Cameras and mirrors" in the menu; about 1 ms for a 512x512 view). The water's own views keep the game's light.
-- The menu says why real-time lighting is paused: no ray tracing support, MSAA on, or multicore rendering on.
+- The menu says why real-time lighting is paused: no ray tracing support, or multicore rendering on.
 - In the native renderer, flowing water (`$flowmap`, also with a flowing base texture) and water with `$lightmapwaterfog` get ray-traced reflections like other water.
 - In the native renderer, textured water (`$basetexture`) is lit in real time instead of by its baked light, with its ripples and ray-traced reflections.
 - In the native renderer, models and world surfaces with a light warp texture take real-time light through it as in the game.
 
 ### Changed
 
+- The native renderer always turns MSAA off, so real-time lighting no longer needs it turned off by hand.
 - Shadows of many lights are less noisy: the strongest lights are always traced, and the rest are denoised.
 - Reflections are steadier and sparkle less.
 - Skin materials support more detail texture blend modes.

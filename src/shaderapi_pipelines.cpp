@@ -147,7 +147,6 @@ struct PipelineKey {
     UINT targets;
     DXGI_FORMAT targetFormats[4];
     DXGI_FORMAT depthFormat;
-    UINT samples;
 };
 
 // Keys are zero-filled before use, so their padding compares and hashes equal; semantic names point to static strings.
@@ -540,7 +539,7 @@ ID3D12PipelineState* Pipeline(PipelineKey& key)
     desc.NumRenderTargets = key.targets;
     std::copy(std::begin(key.targetFormats), std::end(key.targetFormats), desc.RTVFormats);
     desc.DSVFormat = key.depthFormat;
-    desc.SampleDesc.Count = key.samples;
+    desc.SampleDesc.Count = 1;
     ComPtr<ID3D12PipelineState> pipeline;
     const std::wstring name = g_cache.library != nullptr ? PipelineName(key) : std::wstring();
     HRESULT hr = g_cache.library != nullptr ? g_cache.library->LoadGraphicsPipeline(name.c_str(), &desc, IID_PPV_ARGS(&pipeline)) : E_FAIL;
@@ -661,9 +660,9 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
 }
 )";
 
-ID3D12PipelineState* BlitPipeline(DXGI_FORMAT format, UINT samples)
+ID3D12PipelineState* BlitPipeline(DXGI_FORMAT format)
 {
-    const std::uint64_t key = static_cast<std::uint64_t>(format) << 32 | samples;
+    const std::uint64_t key = static_cast<std::uint64_t>(format);
     auto found = g_cache.blitPipelines.find(key);
     if (found != g_cache.blitPipelines.end())
         return found->second.Get();
@@ -686,7 +685,7 @@ ID3D12PipelineState* BlitPipeline(DXGI_FORMAT format, UINT samples)
     desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     desc.NumRenderTargets = 1;
     desc.RTVFormats[0] = format;
-    desc.SampleDesc.Count = samples;
+    desc.SampleDesc.Count = 1;
     ComPtr<ID3D12PipelineState> pipeline;
     HRESULT hr = GetBackend().Device()->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pipeline));
     if (FAILED(hr))
@@ -719,7 +718,7 @@ void StretchRect(const CopySurface& source, const D3D12_RECT& sourceRect, const 
     if (width <= 0 || height <= 0 || destinationRect.right <= destinationRect.left || destinationRect.bottom <= destinationRect.top)
         return;
     if (width == destinationRect.right - destinationRect.left && height == destinationRect.bottom - destinationRect.top
-        && Family(source.format) == Family(destination.format) && source.samples == destination.samples) {
+        && Family(source.format) == Family(destination.format)) {
         backend.Transition(*source.resource, D3D12_RESOURCE_STATE_COPY_SOURCE);
         backend.Transition(*destination.resource, D3D12_RESOURCE_STATE_COPY_DEST);
         D3D12_TEXTURE_COPY_LOCATION to = {};
@@ -737,7 +736,7 @@ void StretchRect(const CopySurface& source, const D3D12_RECT& sourceRect, const 
         log::Info("Native: a scaled copy into a texture that is not a render target was skipped");
         return;
     }
-    ID3D12PipelineState* pipeline = BlitPipeline(destination.format, destination.samples);
+    ID3D12PipelineState* pipeline = BlitPipeline(destination.format);
     if (pipeline == nullptr)
         return;
     backend.Transition(*source.resource, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
@@ -863,7 +862,6 @@ Targets PrepareTargets(bool srgb)
             targets.colors[0] = backend.BackBufferView(srgb);
             targets.colorFormats[0] = srgb ? DXGI_FORMAT_B8G8R8A8_UNORM_SRGB : Backend::kBackBufferFormat;
             targets.count = 1;
-            targets.samples = backend.Samples();
             continue;
         }
         Texture* texture = TextureFromHandle(handle);
@@ -876,16 +874,8 @@ Targets PrepareTargets(bool srgb)
         targets.colorFormats[i] = texture->TargetFormat(useSrgb);
         targets.count = i + 1;
     }
-    // Targets must share a sample count. With MSAA the game gives render target textures their own depth buffers
-    // (DoRenderTargetsNeedSeparateDepthBuffer), so a depth buffer that does not match the colour is left out.
     Texture* depth = state.depthTarget == kDefaultTarget ? nullptr : TextureFromHandle(state.depthTarget);
-    const UINT depthSamples = state.depthTarget == kDefaultTarget ? backend.Samples() : 1;
-    if (targets.count != 0 && depthSamples != targets.samples && (state.depthTarget == kDefaultTarget || depth != nullptr)) {
-        static bool logged = false;
-        if (!std::exchange(logged, true))
-            log::Info("Native: a target was drawn with a depth buffer of another sample count, without depth");
-    } else if (state.depthTarget == kDefaultTarget) {
-        targets.samples = depthSamples;
+    if (state.depthTarget == kDefaultTarget) {
         backend.Transition(backend.DepthBuffer(), D3D12_RESOURCE_STATE_DEPTH_WRITE);
         targets.depth = backend.DepthBufferView();
         targets.depthFormat = Backend::kDepthFormat;
@@ -951,7 +941,7 @@ void DrawPass(const ShadowState& shadow, const MeshDraw& mesh)
     Targets targets = pass.route == capture::Pass::Route::Game ? PrepareTargets(shadow.srgbWrite != 0) : capture::BindTargets(pass, shadow.srgbWrite != 0);
     const bool depthWrite = dynamic.overrideDepthEnable ? dynamic.depthEnable : shadow.depthWrite != 0;
     const bool clearCoverage = pass.clearsCoverage && depthWrite && colorWrite && pixelBase != nullptr && pixelBase->info.colorOutputs == 1 &&
-        targets.count == 1 && targets.samples == 1 && targets.depth.ptr != 0;
+        targets.count == 1 && targets.depth.ptr != 0;
     if (clearCoverage)
         capture::AddCoverageTarget(targets);
 
@@ -1029,9 +1019,6 @@ void DrawPass(const ShadowState& shadow, const MeshDraw& mesh)
     blend.LogicOp = D3D12_LOGIC_OP_NOOP;
     blend.RenderTargetWriteMask = static_cast<UINT8>((colorWrite ? D3D12_COLOR_WRITE_ENABLE_RED | D3D12_COLOR_WRITE_ENABLE_GREEN | D3D12_COLOR_WRITE_ENABLE_BLUE : 0)
         | (alphaWrite ? D3D12_COLOR_WRITE_ENABLE_ALPHA : 0));
-    // Direct3D 9 has alpha to coverage only through NVIDIA's ATOC render state, which needs multisampling; without
-    // it the pass is just alpha tested, where Direct3D 12 would dither instead.
-    key.blend.AlphaToCoverageEnable = shadow.alphaToCoverage != 0 && targets.samples > 1;
     if (clearCoverage) {
         key.blend.IndependentBlendEnable = TRUE;
         key.blend.RenderTarget[1].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
@@ -1087,7 +1074,6 @@ void DrawPass(const ShadowState& shadow, const MeshDraw& mesh)
     key.targets = targets.count;
     std::copy(std::begin(targets.colorFormats), std::end(targets.colorFormats), key.targetFormats);
     key.depthFormat = targets.depth.ptr != 0 ? targets.depthFormat : DXGI_FORMAT_UNKNOWN;
-    key.samples = targets.samples;
     ID3D12PipelineState* pipeline = Pipeline(key);
     if (pipeline == nullptr)
         return;

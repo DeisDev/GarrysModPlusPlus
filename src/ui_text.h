@@ -13,7 +13,6 @@ enum class TextId {
     SectionEffects,
     RealtimeLighting,
     RealtimeUnsupported,
-    RealtimeMultisampling,
     RealtimeOtherThread,
     DebugView,
     ViewFinal,
@@ -121,6 +120,8 @@ enum class TextId {
     PrewarmSkip,
     VideoRayTracingQuality,
     VideoAntiAliasingDlss,
+    VideoRenderer,
+    VideoRendererName,
     Count
 };
 

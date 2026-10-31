@@ -225,7 +225,7 @@ int GetCurrentAdapter(NativeObject*) { return static_cast<DeviceManagerObject*>(
 bool IsUsingGraphics(NativeObject*) { return GetBackend().HasDevice(); }
 int StencilBufferBits(NativeObject*) { return 8; }
 // shaderapidx9.dll 0x180018c40: whether the present parameters' MultiSampleType is not D3DMULTISAMPLE_NONE.
-bool IsAAEnabled(NativeObject*) { return GetBackend().Samples() > 1; }
+bool IsAAEnabled(NativeObject*) { return false; }
 template <class Fn>
 Fn UtilSlot(unsigned slot)
 {
@@ -425,9 +425,9 @@ bool Backend::CreateSwapChain()
         view.Texture2D.MipLevels = 1;
         m_device->CreateShaderResourceView(m_backBuffers[i].resource.Get(), &view, m_descriptors.Cpu(m_backBufferTextures[i]));
     }
-    if (!CreateMultisampleTarget() || !CreateDepthBuffer())
+    if (!CreateDepthBuffer())
         return false;
-    log::Info("Native: swap chain {}x{}, {} samples, vsync {}", m_width, m_height, m_samples, m_vsync ? "on" : "off");
+    log::Info("Native: swap chain {}x{}, vsync {}", m_width, m_height, m_vsync ? "on" : "off");
     BeginFrame();
     return true;
 }
@@ -445,7 +445,7 @@ bool Backend::CreateDepthBuffer()
     desc.DepthOrArraySize = 1;
     desc.MipLevels = 1;
     desc.Format = kDepthResourceFormat;
-    desc.SampleDesc.Count = m_samples;
+    desc.SampleDesc.Count = 1;
     desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
     D3D12_CLEAR_VALUE clear = {};
     clear.Format = kDepthFormat;
@@ -461,64 +461,14 @@ bool Backend::CreateDepthBuffer()
         m_depthView = m_dsvs.Allocate();
     D3D12_DEPTH_STENCIL_VIEW_DESC view = {};
     view.Format = kDepthFormat;
-    view.ViewDimension = m_samples > 1 ? D3D12_DSV_DIMENSION_TEXTURE2DMS : D3D12_DSV_DIMENSION_TEXTURE2D;
+    view.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
     m_device->CreateDepthStencilView(m_depthBuffer.resource.Get(), &view, m_depthView);
-    return true;
-}
-
-// Flip-model swap chains cannot be multisampled (DXGI_SWAP_CHAIN_DESC1), so with MSAA the game draws into a
-// multisampled target that is resolved into the swap chain's buffer.
-bool Backend::CreateMultisampleTarget()
-{
-    if (m_multisampleTarget.resource != nullptr)
-        Retire(std::move(m_multisampleTarget.resource));
-    m_multisampleTarget = {};
-    if (m_samples == 1)
-        return true;
-    const D3D12_HEAP_PROPERTIES heap = { D3D12_HEAP_TYPE_DEFAULT };
-    D3D12_RESOURCE_DESC desc = {};
-    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    desc.Width = m_width;
-    desc.Height = m_height;
-    desc.DepthOrArraySize = 1;
-    desc.MipLevels = 1;
-    desc.Format = DXGI_FORMAT_B8G8R8A8_TYPELESS;
-    desc.SampleDesc.Count = m_samples;
-    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-    HRESULT hr = m_device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr,
-        IID_PPV_ARGS(&m_multisampleTarget.resource));
-    if (FAILED(hr)) {
-        log::Info("Native: creating the {}x{} target with {} samples failed: {:#010x}", m_width, m_height, m_samples, Hex(hr));
-        return false;
-    }
-    m_multisampleTarget.state = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    for (UINT srgb = 0; srgb < 2; ++srgb) {
-        if (m_multisampleViews[srgb].ptr == 0)
-            m_multisampleViews[srgb] = m_rtvs.Allocate();
-        D3D12_RENDER_TARGET_VIEW_DESC view = {};
-        view.Format = srgb ? DXGI_FORMAT_B8G8R8A8_UNORM_SRGB : kBackBufferFormat;
-        view.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DMS;
-        m_device->CreateRenderTargetView(m_multisampleTarget.resource.Get(), &view, m_multisampleViews[srgb]);
-    }
     return true;
 }
 
 D3D12_CPU_DESCRIPTOR_HANDLE Backend::BackBufferView(bool srgb) const
 {
-    if (m_samples > 1)
-        return m_multisampleViews[srgb ? 1 : 0];
     return m_backBufferViews[m_swapChain->GetCurrentBackBufferIndex() * 2 + (srgb ? 1 : 0)];
-}
-
-TrackedResource& Backend::ResolvedBackBuffer()
-{
-    TrackedResource& buffer = SwapChainBuffer();
-    if (m_samples == 1)
-        return buffer;
-    Transition(m_multisampleTarget, D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
-    Transition(buffer, D3D12_RESOURCE_STATE_RESOLVE_DEST);
-    m_commandList->ResolveSubresource(buffer.resource.Get(), 0, m_multisampleTarget.resource.Get(), 0, kBackBufferFormat);
-    return buffer;
 }
 
 bool Backend::SetMode(HWND window, const ShaderDeviceInfo& info)
@@ -538,17 +488,9 @@ bool Backend::SetMode(HWND window, const ShaderDeviceInfo& info)
         if (!CreateDevice())
             return false;
     }
-    // D3DMULTISAMPLE_TYPE counts samples; Direct3D 9's vendor quality levels have no Direct3D 12 equivalent, so
-    // aaQuality is not used.
-    const UINT samples = static_cast<UINT>(std::max(info.aaSamples, 1));
-    for (DXGI_FORMAT format : { kBackBufferFormat, kDepthFormat }) {
-        D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS levels = { format, samples };
-        if (FAILED(m_device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &levels, sizeof(levels))) || levels.NumQualityLevels == 0) {
-            log::Info("Native: {} samples per pixel are not supported", samples);
-            return false;
-        }
-    }
-    m_samples = samples;
+    // Real-time lighting reads single-sampled targets, so MSAA is never used (SupportsMSAAMode reports it unsupported).
+    if (info.aaSamples > 1)
+        log::Info("Native: the game asked for {}x MSAA; drawing without it", info.aaSamples);
     return CreateSwapChain();
 }
 
@@ -609,7 +551,7 @@ void Backend::Present()
         }
         LimitDraws(limit);
     }
-    TrackedResource& presented = ResolvedBackBuffer();
+    TrackedResource& presented = SwapChainBuffer();
     if (overlay::Open()) {
         Transition(presented, D3D12_RESOURCE_STATE_RENDER_TARGET);
         overlay::Render(m_commandList.Get(), m_backBufferViews[m_swapChain->GetCurrentBackBufferIndex() * 2]);
