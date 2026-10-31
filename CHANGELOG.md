@@ -25,8 +25,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Water has ray-traced reflections over the game's refraction, a sun glint and a physical Fresnel term.
 - Underwater, the surface shows the world above through Snell's window and mirrors the water below beyond it, and sunlight scatters in the water's colour.
 - A `winmm.dll` loader in the game folder. With `-insecure -gmodpp_vanilla` it runs the game's own renderer through `gmodpp.dll`, as a reference for the coming native Direct3D 12 renderer.
-- In the native renderer, GMod's Advanced video options have settings for anti-aliasing (TAA or DLSS), the upscaling mode next to it and, in their own section, real-time lighting, ray tracing quality, indirect light, foliage shadows, reflections, ambient occlusion, volumetric light, translucent lighting and camera and mirror lighting. MSAA and Direct3D 9Ex are hidden there, MSAA is turned off when the options are applied, shadow detail is greyed out while real-time lighting is on, and the two DirectX level rows are replaced by one that names the renderer (DirectX 12).
-- In the native renderer, a "Display" setting in the Advanced video options moves the game window to another monitor.
+- In the native renderer, GMod's Advanced video options hide MSAA and Direct3D 9Ex, which do nothing there, and keep MSAA off.
+- In the native renderer, a "Display" setting in the menu moves the game window to another monitor.
 - In the native renderer, camera screens, mirrors and scopes that draw the world into a texture get real-time light ("Cameras and mirrors" in the menu, off by default; about 1 ms for a 512x512 view). The water's own views keep the game's light.
 - The menu says why real-time lighting is paused: no ray tracing support, or multicore rendering on.
 - In the native renderer, flowing water (`$flowmap`, also with a flowing base texture) and water with `$lightmapwaterfog` get ray-traced reflections like other water.
@@ -44,6 +44,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- The settings menu has a new look: the game's own fonts, a page list on the left, switches and grouped sections.
 - Sun shadows are soft, sharp near the object and blurring with distance, as the real sun's size makes them.
 - Reflected surfaces are lit with the sun, a lamp and the radiance cache where they are, instead of borrowing the reflecting surface's light or reusing last frame's image.
 - The "Shadow rays" settings apply only to Legacy light sampling, and to Auto with DLSS Ray Reconstruction.

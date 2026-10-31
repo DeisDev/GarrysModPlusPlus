@@ -1,4 +1,4 @@
-﻿cmake_minimum_required(VERSION 3.25)
+cmake_minimum_required(VERSION 3.25)
 project(GarrysModPP LANGUAGES C CXX ASM_MASM)
 
 if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
@@ -436,6 +436,7 @@ add_library(gmodpp SHARED
     src/client_hooks.cpp
     src/light_queries.cpp
     src/overlay.cpp
+    src/overlay_widgets.cpp
     src/restir.cpp
     src/nrd_denoiser.cpp
     "${RTXDI_DIR}/Source/ReSTIRDI.cpp"
