@@ -376,10 +376,14 @@ void DrawRayTracingTab(Settings& settings)
             }
             ImGui::EndCombo();
         }
-        ImGui::BeginDisabled(settings.lightSampling != LightSampling::Legacy);
+        // Auto uses these with DLSS Ray Reconstruction (Lighting::Run).
+        const bool directPass = settings.lightSampling == LightSampling::Legacy ||
+            (settings.lightSampling == LightSampling::Auto && settings.antiAliasing == AntiAliasing::RayReconstruction);
+        ImGui::BeginDisabled(!directPass);
         IntSliderRow(TextId::ExactLights, settings, &Settings::exactLights);
         IntSliderRow(TextId::SampledLightRays, settings, &Settings::sampledLightRays);
         ImGui::EndDisabled();
+        IntSliderRow(TextId::ViewmodelShadowRays, settings, &Settings::viewmodelShadowRays);
         ImGui::TableNextRow();
         ImGui::TableNextColumn();
         ImGui::TextUnformatted(Text(TextId::FoliageShadows));

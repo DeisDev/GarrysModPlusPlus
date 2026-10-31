@@ -73,6 +73,7 @@ constexpr NamedField kFields[] = {
     {"ao_rays", &Settings::aoRays, {1.0f, 4.0f}},
     {"volume_rays", &Settings::volumeRays, {8.0f, 64.0f}},
     {"volumetric_steps", &Settings::volumetricSteps, {4.0f, 32.0f}},
+    {"viewmodel_shadow_rays", &Settings::viewmodelShadowRays, {1.0f, 16.0f}},
     {"foliage_shadows", &Settings::foliageShadows},
     {"indirect_lighting", &Settings::indirectLighting},
     {"emissive_lighting", &Settings::emissiveLighting},
@@ -91,6 +92,7 @@ struct PresetValues {
     int aoRays;
     int volumeRays;
     int volumetricSteps;
+    int viewmodelShadowRays;
     FoliageShadows foliageShadows;
     bool fastAlphaTests;
     IndirectLighting indirectLighting;
@@ -101,10 +103,10 @@ struct PresetValues {
 
 // Low, Medium, High (the original quality) and Ultra.
 constexpr PresetValues kPresets[] = {
-    {1, 1, 1, 1, 1, 16, 8, FoliageShadows::Sun, true, IndirectLighting::Baked, EmissiveLighting::Off, false, LightSampling::Ris},
-    {2, 1, 1, 2, 1, 24, 12, FoliageShadows::SunAndIndirect, true, IndirectLighting::RayTraced, EmissiveLighting::Bounce, true, LightSampling::Auto},
-    {4, 2, 1, 2, 1, 32, 16, FoliageShadows::All, false, IndirectLighting::RayTraced, EmissiveLighting::Full, true, LightSampling::Auto},
-    {8, 4, 2, 3, 2, 64, 32, FoliageShadows::All, false, IndirectLighting::RayTraced, EmissiveLighting::Full, true, LightSampling::Auto},
+    {1, 1, 1, 1, 1, 16, 8, 1, FoliageShadows::Sun, true, IndirectLighting::Baked, EmissiveLighting::Off, false, LightSampling::Ris},
+    {2, 1, 1, 2, 1, 24, 12, 4, FoliageShadows::SunAndIndirect, true, IndirectLighting::RayTraced, EmissiveLighting::Bounce, true, LightSampling::Auto},
+    {4, 2, 1, 2, 1, 32, 16, 8, FoliageShadows::All, false, IndirectLighting::RayTraced, EmissiveLighting::Full, true, LightSampling::Auto},
+    {8, 4, 2, 3, 2, 64, 32, 16, FoliageShadows::All, false, IndirectLighting::RayTraced, EmissiveLighting::Full, true, LightSampling::Auto},
 };
 static_assert(std::size(kPresets) == static_cast<size_t>(QualityPreset::Custom));
 
@@ -138,6 +140,7 @@ void ApplyPreset(Settings& settings, QualityPreset preset)
     settings.aoRays = values.aoRays;
     settings.volumeRays = values.volumeRays;
     settings.volumetricSteps = values.volumetricSteps;
+    settings.viewmodelShadowRays = values.viewmodelShadowRays;
     settings.foliageShadows = values.foliageShadows;
     settings.fastAlphaTests = values.fastAlphaTests;
     settings.indirectLighting = values.indirectLighting;

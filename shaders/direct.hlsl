@@ -87,6 +87,43 @@ void ConsiderLight(uint i, float3 irradiance, bool exact, inout uint top[kExactL
         AddToRemainder(candidate, candidateWeight, candidateWeight, picked, pickedWeight, remainder, seed);
 }
 
+// The viewmodel is lit without a denoiser or temporal resolve, and the world's shadows fall on it wide and soft (its
+// surfaces are inches from the eye), so its shadow rays cover the sun's disc (g_frame.viewmodelShadowRays) and each
+// exact light's sphere (a quarter as many) at once. A single ray aims at the centre: a random point would leave grain.
+
+// The k-th of `count` points spread evenly over a disc (a golden-angle spiral), turned by `turn`, as the area share and
+// angle that DiscPoint and SunDiscDirectionAt take.
+float2 SpiralPoint(uint k, uint count, float2 turn)
+{
+    return float2((float(k) + turn.x) / float(count), frac(float(k) * 0.618034 + turn.y));
+}
+
+float3 ViewmodelSunVisibility(float3 from, uint rayFlags, inout uint seed)
+{
+    uint rays = max(g_frame.viewmodelShadowRays, 1u);
+    if (rays == 1u)
+        return SunVisibility(from, g_frame.sunShadowMask, rayFlags);
+    float2 turn = float2(Random(seed), Random(seed));
+    float3 sum = 0.0;
+    for (uint k = 0; k < rays; ++k)
+        sum += SunVisibilityAlong(from, SunDiscDirectionAt(SpiralPoint(k, rays, turn)), g_frame.sunShadowMask, rayFlags);
+    return sum / float(rays);
+}
+
+// LightTransmittance to a random point of an exact light, or for the viewmodel to its centre or the mean over points
+// spread over it. Attached lights are points.
+float3 ExactLightTransmittance(LightSet set, uint i, float3 from, float3 lightPosition, uint rayFlags, inout uint seed)
+{
+    uint rays = g_frame.viewmodel != 0 && !IsAttachedLight(set, i) ? max(g_frame.viewmodelShadowRays / 4u, 1u) : 1u;
+    float2 turn = float2(Random(seed), Random(seed));
+    if (rays == 1u)
+        return LightTransmittance(set, i, from, lightPosition, g_frame.viewmodel != 0 ? kLightCentre : turn, rayFlags);
+    float3 sum = 0.0;
+    for (uint k = 0; k < rays; ++k)
+        sum += LightTransmittance(set, i, from, lightPosition, SpiralPoint(k, rays, turn), rayFlags);
+    return sum / float(rays);
+}
+
 // The main view's soft sun shadows (shaders/sun_shadow.hlsl) in input0, NRD's translucency encoding: denoised by SIGMA
 // when input1 is 1, which stores the square root (NRD.hlsli, SIGMA_BackEnd_UnpackShadow).
 float3 SunShadowAt(int2 pixel)
@@ -136,8 +173,14 @@ void main(uint3 id : SV_DispatchThreadID)
     float3 sunVisibility = 0.0;
     float lambert = Lambert(lightNormal, g_frame.sunDirection);
     if (lit && g_frame.sunEnabled != 0.0 && lambert > 0.0) {
-        sunVisibility = g_pass.input0 != kNoView ? SunShadowAt(pixel) : SunVisibility(ShadowOrigin(origin, behind, faceNormal, g_frame.sunDirection),
-            g_frame.sunShadowMask, SelfShadowFlags(onModel, faceNormal, g_frame.sunDirection));
+        float3 sunFrom = ShadowOrigin(origin, behind, faceNormal, g_frame.sunDirection);
+        uint sunFlags = SelfShadowFlags(onModel, faceNormal, g_frame.sunDirection);
+        if (g_pass.input0 != kNoView)
+            sunVisibility = SunShadowAt(pixel);
+        else if (g_frame.viewmodel != 0)
+            sunVisibility = ViewmodelSunVisibility(sunFrom, sunFlags, seed);
+        else
+            sunVisibility = SunVisibility(sunFrom, g_frame.sunShadowMask, sunFlags);
         exact += g_frame.sunColor * lambert * sunVisibility * LightWarp(lightNormal, g_frame.sunDirection);
         specular += SunHighlight(phong, g_frame.sunColor * (lambert * sunVisibility));
         rim += ModelRim(phong, g_frame.sunColor * (lambert * sunVisibility), g_frame.sunDirection);
@@ -223,8 +266,8 @@ void main(uint3 id : SV_DispatchThreadID)
         float3 toLight;
         float distance;
         float3 light = SetLightIrradiance(set, top[k], position, lightNormal, toLight, distance);
-        float3 shadowed = light * LightTransmittance(set, top[k], ShadowOrigin(origin, behind, faceNormal, toLight), position + toLight * distance,
-            float2(Random(seed), Random(seed)), SelfShadowFlags(onModel, faceNormal, toLight));
+        float3 shadowed = light * ExactLightTransmittance(set, top[k], ShadowOrigin(origin, behind, faceNormal, toLight), position + toLight * distance,
+            SelfShadowFlags(onModel, faceNormal, toLight), seed);
         exact += shadowed * LightWarp(lightNormal, toLight);
         specular += ModelHighlight(phong, shadowed, toLight);
         rim += ModelRim(phong, shadowed, toLight);

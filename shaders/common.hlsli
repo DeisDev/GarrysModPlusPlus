@@ -161,7 +161,9 @@ struct FrameConstants
     // and NRD's validation overlay (debug view 15), or kNoView.
     uint selfIllumView;
     uint nrdValidationView;
-    uint2 padding;
+    // Shadow rays over the sun's disc for the viewmodel's pixels (shaders/direct.hlsl).
+    uint viewmodelShadowRays;
+    uint padding;
     uint4 lightWarpViews[16];
 };
 

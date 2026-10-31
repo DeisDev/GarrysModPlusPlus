@@ -38,7 +38,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - The settings menu's General tab credits NVIDIA DLSS and says where the licences are.
 - A world-space radiance cache (NVIDIA SHaRC) gives bounced light many bounces at a lower cost, and lights what reflections and water show off screen. "Radiance cache" in the menu; it needs 64-bit atomics and 16-bit shader types.
 - Shiny materials with a Phong exponent get glossy ray-traced reflections instead of mirrors, and DLSS Ray Reconstruction is told their roughness. "Glossy reflections" in the menu.
-- Direct light from the map's lamps, glowing surfaces, dynamic lights and flashlights is chosen with NVIDIA RTXDI (ReSTIR DI with a ReGIR light grid): maps with hundreds of lights get every light's contribution with fewer rays. "Light sampling" in the menu; Auto reuses samples with TAA and uses importance sampling with DLSS Ray Reconstruction.
+- Direct light from the map's lamps, glowing surfaces, dynamic lights and flashlights is chosen with NVIDIA RTXDI (ReSTIR DI with a ReGIR light grid): maps with hundreds of lights get every light's contribution with fewer rays. "Light sampling" in the menu; Auto uses it with TAA, and with DLSS Ray Reconstruction traces the strongest lights directly.
 - Without DLSS Ray Reconstruction, indirect light and reflections are denoised by NVIDIA NRD (RELAX by default, REBLUR as an option), replacing the built-in filter. "Denoiser type" in the menu.
 - Debug views for the radiance cache's voxels, RTXDI's light sample and reused samples per pixel, and NRD's validation overlay.
 
@@ -46,7 +46,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - Sun shadows are soft, sharp near the object and blurring with distance, as the real sun's size makes them.
 - Reflected surfaces are lit with the sun, a lamp and the radiance cache where they are, instead of borrowing the reflecting surface's light or reusing last frame's image.
-- The "Shadow rays" settings apply only to the Legacy light sampling mode.
+- The "Shadow rays" settings apply only to Legacy light sampling, and to Auto with DLSS Ray Reconstruction.
 - The credits name NVIDIA RTXDI, SHaRC and NRD, and their licences are in `gmodplusplus\licenses`.
 - The mod keeps all its files in a `gmodplusplus` folder in the game folder: its DLLs, settings, logs, shader caches and developer files. Only the loader, `winmm.dll`, stays in the game folder itself.
 - In the native renderer, indirect light from the sky takes the skybox's colours from each direction, at the map's sky light brightness.
@@ -96,6 +96,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- With DLSS Ray Reconstruction, map lights and the flashlight are no longer blotchy and noisy.
+- With DLSS Ray Reconstruction, the sky and the 3D skybox keep their texture detail instead of looking smeared.
+- The 3D skybox no longer smears when TAA or DLSS is on and you move.
+- Shadows on the weapon in your hands are soft and smooth instead of grainy and jagged. "Shadow rays on held weapons" in the menu sets their quality (Low keeps hard shadows).
 - Bounced light now carries lamp light past the first bounce; rooms lit only by lamps were darker than they should be.
 - Light on glass and other translucent surfaces near the player updates every frame instead of every fourth.
 - Glowing surfaces light their surroundings with far less speckle on maps with many of them.

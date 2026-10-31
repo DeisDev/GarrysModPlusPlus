@@ -736,6 +736,7 @@ bool Lighting::EnsureTargets(UINT width, UINT height)
     ok = ok && CreateTarget(m_previousDistance, width, height, DXGI_FORMAT_R32_FLOAT);
     ok = ok && CreateTarget(m_pixelFlags, width, height, DXGI_FORMAT_R8_UINT);
     ok = ok && CreateTarget(m_geometricNormal, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT);
+    ok = ok && CreateTarget(m_skyboxDistance, width, height, DXGI_FORMAT_R32_FLOAT);
     for (Texture& texture : m_direct)
         ok = ok && CreateTarget(texture, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT);
     ok = ok && CreateTarget(m_directRemainder, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT);
@@ -1252,6 +1253,7 @@ bool Lighting::FillConstants(FrameConstants& constants, const Scene& scene, cons
     constants.reflectionScale = settings.reflections ? settings.reflectionIntensity : 0.0f;
     constants.exactLights = static_cast<uint32_t>(settings.exactLights);
     constants.sampledLightRays = static_cast<uint32_t>(settings.sampledLightRays);
+    constants.viewmodelShadowRays = static_cast<uint32_t>(settings.viewmodelShadowRays);
     constants.indirectBounces = static_cast<uint32_t>(settings.indirectBounces);
     constants.aoRays = static_cast<uint32_t>(settings.aoRays);
     constants.volumeRays = static_cast<uint32_t>(settings.volumeRays);
@@ -1639,12 +1641,15 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     const bool ambientOcclusion = GetSettings().ambientOcclusion && inputs.kind != gbuffer::ViewKind::Skybox && constants.bakedTrianglesView != kInvalidView;
     // RTXDI samples the main view's local lights (the direct pass then lights with the sun alone). Its resources are made
     // here, before any command refers to the ones they replace; the light PDF leaves room for the frame's dynamic and
-    // projected lights.
+    // projected lights. Auto keeps the direct pass with Ray Reconstruction, which needs samples uncorrelated across the
+    // screen (DLSS-RR Integration Guide 3.5): RTXDI's candidates are shared by screen tiles and ReGIR cells, which it
+    // turned into blotches, and the strongest lights and the flashlight got no exact shadow ray.
     const LightSampling lightSampling = GetSettings().lightSampling;
-    const RestirMode restirMode = lightSampling == LightSampling::Ris || (lightSampling == LightSampling::Auto && rayReconstruction) ? RestirMode::Ris
-                                                                                                                                      : RestirMode::Reuse;
+    const RestirMode restirMode = lightSampling == LightSampling::Ris ? RestirMode::Ris : RestirMode::Reuse;
+    const bool restirWanted = lightSampling == LightSampling::Ris || lightSampling == LightSampling::Restir ||
+        (lightSampling == LightSampling::Auto && !rayReconstruction);
     bool restir = false;
-    if (main && m_restirAvailable && lightSampling != LightSampling::Legacy && scene.Ready()) {
+    if (main && m_restirAvailable && restirWanted && scene.Ready()) {
         const RestirLights capacity{constants.lightCount, constants.emitterCount, 0, 0};
         if (m_restir.NeedsResources(renderWidth, renderHeight, capacity))
             WaitForGpu();
@@ -1876,8 +1881,17 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     Use(m_surface[previous], read);
     for (Texture* texture : {&m_visibility, &m_motion, &m_previousDistance, &m_pixelFlags, &m_geometricNormal})
         Use(*texture, write);
-    Dispatch(Pass::Primary, {.output0 = m_visibility.uav, .output1 = m_motion.uav, .output2 = m_previousDistance.uav, .output3 = m_pixelFlags.uav,
-        .output4 = m_geometricNormal.uav});
+    // The 3D skybox view records its surfaces' distances; the main view of the same frame moves them with them, as they
+    // lie far beyond the far plane its empty depth puts them at.
+    const bool skyboxView = inputs.kind == gbuffer::ViewKind::Skybox;
+    const bool skyboxDistance = skyboxView || (main && m_skyboxDistanceFrame == inputs.frame);
+    if (skyboxDistance)
+        Use(m_skyboxDistance, skyboxView ? write : read);
+    Dispatch(Pass::Primary, {.input0 = skyboxDistance ? (skyboxView ? m_skyboxDistance.uav : m_skyboxDistance.srv) : kInvalidView,
+        .output0 = m_visibility.uav, .output1 = m_motion.uav, .output2 = m_previousDistance.uav, .output3 = m_pixelFlags.uav,
+        .step = skyboxView ? 1u : 0u, .output4 = m_geometricNormal.uav});
+    if (skyboxView)
+        m_skyboxDistanceFrame = inputs.frame;
     for (Texture* texture : {&m_visibility, &m_motion, &m_previousDistance, &m_pixelFlags, &m_geometricNormal})
         Use(*texture, read);
     mark();

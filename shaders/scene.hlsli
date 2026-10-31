@@ -615,29 +615,42 @@ float3 Transmittance(float3 origin, float3 direction, float tMax, uint mask, uin
 // `mask` is g_frame.sunShadowMask, or g_frame.bounceMask for the light of indirect bounces. As VRAD did
 // (TestLine_DoesHitSky in src/utils/vrad/trace.cpp), rays from the map that reach the sky go on through the 3D
 // skybox, whose buildings and terrain shadow the map.
-float3 SunVisibility(float3 origin, uint mask, uint rayFlags = RAY_FLAG_NONE)
+float3 SunVisibilityAlong(float3 origin, float3 direction, uint mask, uint rayFlags)
 {
-    float3 visibility = Transmittance(origin, g_frame.sunDirection, 65536.0, mask, rayFlags);
+    float3 visibility = Transmittance(origin, direction, 65536.0, mask, rayFlags);
     if (any(visibility > 0.0) && g_frame.worldToSky > 0.0 && (mask & kSkyboxMask) == 0) {
         float3 camera = float3(g_frame.skyCameraX, g_frame.skyCameraY, g_frame.skyCameraZ);
-        visibility *= Transmittance(camera + origin * g_frame.worldToSky, g_frame.sunDirection, 65536.0, kSkyboxMask);
+        visibility *= Transmittance(camera + origin * g_frame.worldToSky, direction, 65536.0, kSkyboxMask);
     }
     return visibility;
+}
+
+float3 SunVisibility(float3 origin, uint mask, uint rayFlags = RAY_FLAG_NONE)
+{
+    return SunVisibilityAlong(origin, g_frame.sunDirection, mask, rayFlags);
 }
 
 // The real sun's angular radius (its disc is about 0.53 degrees across), and 1 - its cosine.
 static const float kSunAngularRadius = 0.00465;
 static const float kSunConeSpan = 1.081e-5;
 
-// A direction to a uniformly random point of the sun's disc.
-float3 SunDiscDirection(inout uint seed)
+// The direction to the point of the sun's disc that two numbers in [0, 1) pick: the first the share of the disc's area
+// inside the point's ring, the second its angle.
+float3 SunDiscDirectionAt(float2 coordinates)
 {
-    float cosine = 1.0 - Random(seed) * kSunConeSpan;
+    float cosine = 1.0 - coordinates.x * kSunConeSpan;
     float sine = sqrt(saturate(1.0 - cosine * cosine));
-    float phi = 6.28318530718 * Random(seed);
+    float phi = 6.28318530718 * coordinates.y;
     float3 t, b;
     BuildBasis(g_frame.sunDirection, t, b);
     return normalize(t * (sine * cos(phi)) + b * (sine * sin(phi)) + g_frame.sunDirection * cosine);
+}
+
+// A direction to a uniformly random point of the sun's disc.
+float3 SunDiscDirection(inout uint seed)
+{
+    float area = Random(seed);
+    return SunDiscDirectionAt(float2(area, Random(seed)));
 }
 
 // Transmittance that also finds the nearest surface taking any light (`occluder`, tMax when none), as NRD's shadow

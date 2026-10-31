@@ -94,6 +94,7 @@ enum class TextId {
     SectionShadows,
     ExactLights,
     SampledLightRays,
+    ViewmodelShadowRays,
     FoliageShadows,
     FoliageOff,
     FoliageSun,

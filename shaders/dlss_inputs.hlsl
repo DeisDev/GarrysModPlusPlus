@@ -53,13 +53,21 @@ void main(uint3 id : SV_DispatchThreadID)
     RWTexture2D<float4> lightOut = ResourceDescriptorHeap[g_pass.output0 + 4];
     RWTexture2D<float4> albedoOut = ResourceDescriptorHeap[g_pass.output0 + 5];
     RWTexture2D<float4> emissiveOut = ResourceDescriptorHeap[g_pass.output0 + 6];
-    colorOut[pixel] = color.Load(load);
+    float4 colour = color.Load(load);
+    colorOut[pixel] = colour;
     depthOut[pixel] = depth;
     normalOut[pixel] = normal.Load(load);
     flagsOut[pixel] = coverage;
     lightOut[pixel] = light.Load(load);
-    // Ray Reconstruction expects a neutral albedo where there is no surface. Water (flags g without r) keeps its
-    // refraction there (shaders/water.hlsli), which is also the colour Ray Reconstruction should keep sharp.
-    albedoOut[pixel] = coverage.r > 0.0 || coverage.g > 0.5 ? albedo.Load(load) : float4(0.5, 0.5, 0.5, 1.0);
+    // Water (flags g without r) keeps its refraction (shaders/water.hlsli), which is also the colour Ray Reconstruction
+    // should keep sharp. Mirrors (flags b alone) keep a neutral albedo under their specular guides. Other pixels without
+    // a surface (the sky, the 3D skybox, the game's own shading) are drawn lit and noise-free: their colour is their
+    // albedo, so Ray Reconstruction keeps their texture instead of smoothing it as noisy light.
+    float4 guide = float4(saturate(Decode(colour.rgb)), 1.0);
+    if (coverage.r > 0.0 || coverage.g > 0.5)
+        guide = albedo.Load(load);
+    else if (coverage.b > 0.5)
+        guide = float4(0.5, 0.5, 0.5, 1.0);
+    albedoOut[pixel] = guide;
     emissiveOut[pixel] = emissive.Load(load);
 }

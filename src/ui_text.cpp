@@ -99,6 +99,7 @@ constexpr std::array<const char*, static_cast<size_t>(TextId::Count)> kEnglish =
     "Shadows",
     "Lights with exact shadows",
     "Shadow rays for other lights",
+    "Shadow rays on held weapons",
     "Foliage shadows",
     "Off",
     "Sun",

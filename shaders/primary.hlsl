@@ -8,6 +8,9 @@
 // output1: motion in pixels towards last frame's position; output2: last frame's distance from the eye;
 // output3: kPixelHit, kPixelUnlit and kPixelIgnoreNormals flags; output4: the triangle's face normal facing the eye, or the
 // G-buffer normal without a triangle (the normal map's normal can point into the surface, which rays must not).
+// input0: with step 1 (the 3D skybox view), a UAV for each pixel's distance from the eye in the map's space (0 for
+// none), its surfaces being 1 / worldToSky times nearer in the skybox's; otherwise (the main view) that distance, for
+// the pixels the main view leaves empty, or none.
 
 float3 InterpolatedPosition(uint positionsView, uint3 index, float2 barycentrics)
 {
@@ -42,7 +45,21 @@ void main(uint3 id : SV_DispatchThreadID)
     RWTexture2D<uint> flags = ResourceDescriptorHeap[g_pass.output3];
     RWTexture2D<float4> geometricNormal = ResourceDescriptorHeap[g_pass.output4];
     float4 surface = SurfaceAt(g_frame.surfaceView, pixel);
-    float3 position = WorldPositionFromDepth(pixel, DepthAt(pixel));
+    float depth = DepthAt(pixel);
+    float3 position = WorldPositionFromDepth(pixel, depth);
+    if (g_pass.input0 != kNoView && g_pass.step == 1) {
+        RWTexture2D<float> skyboxDistance = ResourceDescriptorHeap[g_pass.input0];
+        skyboxDistance[pixel] = depth < 1.0 && g_frame.worldToSky > 0.0 ? length(position - g_frame.eyePosition) / g_frame.worldToSky : 0.0;
+    } else if (g_pass.input0 != kNoView && depth >= 1.0) {
+        // The skybox view shares this view's orientation and jitter, and may differ in resolution (Ray Reconstruction).
+        Texture2D<float> skyboxDistance = ResourceDescriptorHeap[g_pass.input0];
+        uint2 skyboxSize;
+        skyboxDistance.GetDimensions(skyboxSize.x, skyboxSize.y);
+        int2 source = min(int2((float2(pixel) + 0.5) * float2(skyboxSize) / float2(g_frame.size)), int2(skyboxSize) - 1);
+        float distance = skyboxDistance.Load(int3(source, 0));
+        if (distance > 0.0)
+            position = g_frame.eyePosition + normalize(position - g_frame.eyePosition) * distance;
+    }
     float3 previous = position;
     uint4 visible = uint4(kNoView, 0, 0, 0);
     uint pixelFlags = 0;

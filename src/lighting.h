@@ -148,7 +148,9 @@ struct FrameConstants {
     // Self-illumination from the material table (shaders/reflections.hlsl) and NRD's validation overlay, or kInvalidView.
     uint32_t selfIllumView;
     uint32_t nrdValidationView;
-    uint32_t padding[2];
+    // Settings::viewmodelShadowRays.
+    uint32_t viewmodelShadowRays;
+    uint32_t padding;
     uint32_t lightWarpViews[64];
 };
 
@@ -500,6 +502,10 @@ private:
     Texture m_pixelFlags;
     // The face normal of each pixel's triangle (shaders/primary.hlsl), which ray origins and directions keep to.
     Texture m_geometricNormal;
+    // How far the 3D skybox's surfaces are from the main view's eye, as the map's space scales them (shaders/primary.hlsl),
+    // written by the skybox view of frame m_skyboxDistanceFrame for the main view's motion.
+    Texture m_skyboxDistance;
+    std::optional<uint64_t> m_skyboxDistanceFrame;
     // Exact direct light of the main view's current and last frame (shaders/direct.hlsl), and its sampled remainder.
     std::array<Texture, 2> m_direct;
     Texture m_directRemainder;
