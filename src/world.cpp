@@ -51,8 +51,9 @@ constexpr bsp::Float3 kDefaultReflectivity = {0.5f, 0.5f, 0.5f};
 constexpr float kDefaultAlphaReference = 0.5f;
 // Alpha and mask textures are read from a mip no larger than this; shadows and reflections need no more detail.
 constexpr uint32_t kSceneTextureSize = 256;
-constexpr uint32_t kOpaqueTriangle = 0xFFFFFFFF;
-// Never a PackAlpha value (they always have a texture view below 0xFFFFFF) nor a PackTranslucent one (bit 31 set).
+// Never PackAlpha values (they always have a texture view below 0xFFFFFF) nor PackTranslucent ones (bit 31 set).
+// 0xFFFFFFFF is PackTranslucent's untextured glass at full opacity (Refract without a tint texture).
+constexpr uint32_t kOpaqueTriangle = 0x00FFFFFF;
 constexpr uint32_t kDroppedTriangle = 0x7FFFFFFF;
 
 constexpr uint32_t kJitterSamples = 8;
