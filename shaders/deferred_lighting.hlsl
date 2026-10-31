@@ -120,7 +120,7 @@ void main(uint3 id : SV_DispatchThreadID)
     Texture2D<float4> directTexture = ResourceDescriptorHeap[g_pass.input3];
     float4 directLight = directTexture.Load(int3(pixel, 0));
     float3 direct = directLight.rgb;
-    float3 indirect = g_frame.skyColor;
+    float3 indirect = SkyLight(surface.xyz);
     if (g_pass.input0 != kNoView) {
         Texture2D<float4> indirectTexture = ResourceDescriptorHeap[g_pass.input0];
         indirect = indirectTexture.Load(int3(pixel, 0)).rgb;

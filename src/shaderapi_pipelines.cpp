@@ -888,6 +888,135 @@ Targets PrepareTargets(bool srgb)
     return targets;
 }
 
+namespace {
+
+// Vertex c12 and c13: the model x view x projection's and view x projection's z rows (CommitVertexShaderTransforms in
+// shaderapi.cpp).
+constexpr UINT kModelViewProjectionZ = 12;
+constexpr UINT kViewProjectionZ = 13;
+
+// The shader's float registers, with the patches applied, or the last upload of them while they are unchanged.
+D3D12_GPU_VIRTUAL_ADDRESS FloatConstants(const CompiledShader& shader, const Float4* registers, UINT registerCount, std::uint64_t version, ConstantUpload& last,
+    D3D12_GPU_VIRTUAL_ADDRESS fallback, std::span<const capture::RegisterPatch> patches)
+{
+    Backend& backend = GetBackend();
+    const UINT first = std::min(shader.info.firstFloatConstant, registerCount);
+    const UINT count = std::min(shader.info.floatConstantCount, registerCount - first);
+    if (count == 0)
+        return fallback;
+    if (!patches.empty()) {
+        Backend::Upload upload = backend.AllocateUpload(count * sizeof(Float4), kConstantAlignment);
+        if (upload.data == nullptr)
+            return fallback;
+        auto* copy = reinterpret_cast<Float4*>(upload.data);
+        std::memcpy(copy, registers + first, count * sizeof(Float4));
+        for (const capture::RegisterPatch& patch : patches) {
+            if (patch.reg >= first && patch.reg < first + count)
+                std::copy(patch.value.begin(), patch.value.end(), copy[patch.reg - first].v);
+        }
+        last.generation = ~0ull;
+        return upload.buffer->GetGPUVirtualAddress() + upload.offset;
+    }
+    if (last.generation != backend.ListGeneration() || last.version != version || last.first != first || last.count < count)
+        last = { backend.ListGeneration(), version, first, count, UploadConstants(registers + first, count * sizeof(Float4)) };
+    return last.address;
+}
+
+void IssueDraws(ID3D12GraphicsCommandList* commands, const MeshDraw& mesh)
+{
+    D3D12_VERTEX_BUFFER_VIEW streams[4] = { mesh.streams[0], mesh.streams[1], mesh.streams[2], { g_cache.zeroBuffer->GetGPUVirtualAddress(), 16, 0 } };
+    commands->IASetVertexBuffers(0, 4, streams);
+    commands->IASetPrimitiveTopology(mesh.topology);
+    if (mesh.indices.SizeInBytes != 0) {
+        commands->IASetIndexBuffer(&mesh.indices);
+        for (const auto& [first, count] : mesh.primitives) {
+            if (count > 0)
+                commands->DrawIndexedInstanced(static_cast<UINT>(count), 1, static_cast<UINT>(first), 0, 0);
+        }
+    } else {
+        for (const auto& [first, count] : mesh.primitives) {
+            if (count > 0)
+                commands->DrawInstanced(static_cast<UINT>(count), 1, static_cast<UINT>(first), 0);
+        }
+    }
+}
+
+// Draws a 2D skybox pass again into each face of the capture's sky cube, with the game's shaders and blending, so
+// lighting sees the whole sky as the game draws it. The tonemap scale (pixel c30.x, which Source's shaders multiply
+// their output by) is left out, so the cube holds the sky's radiance.
+void DrawSkyFaces(PipelineKey key, const CompiledShader& vertexShader, const CompiledShader& pixelShader, StateBuffer vertexState, StateBuffer pixelState,
+    const MeshDraw& mesh)
+{
+    const std::span<const D3D12_CPU_DESCRIPTOR_HANDLE> faces = capture::SkyFaces();
+    if (faces.empty())
+        return;
+    key.targets = 1;
+    std::fill(std::begin(key.targetFormats), std::end(key.targetFormats), DXGI_FORMAT_UNKNOWN);
+    key.targetFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    key.depthFormat = DXGI_FORMAT_UNKNOWN;
+    key.depthStencil.DepthEnable = FALSE;
+    key.depthStencil.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+    key.depthStencil.StencilEnable = FALSE;
+    key.depthStencil.StencilReadMask = key.depthStencil.StencilWriteMask = 0;
+    key.depthStencil.FrontFace = key.depthStencil.BackFace = { D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_COMPARISON_FUNC_ALWAYS };
+    key.raster.CullMode = D3D12_CULL_MODE_NONE;
+    key.raster.DepthBias = 0;
+    key.raster.SlopeScaledDepthBias = 0.0f;
+    key.blend.IndependentBlendEnable = FALSE;
+    for (size_t i = 1; i < std::size(key.blend.RenderTarget); ++i)
+        key.blend.RenderTarget[i] = {};
+    key.blend.RenderTarget[0].RenderTargetWriteMask &= D3D12_COLOR_WRITE_ENABLE_RED | D3D12_COLOR_WRITE_ENABLE_GREEN | D3D12_COLOR_WRITE_ENABLE_BLUE;
+    ID3D12PipelineState* pipeline = Pipeline(key);
+    if (pipeline == nullptr)
+        return;
+
+    Backend& backend = GetBackend();
+    const DynamicState& dynamic = Dynamic();
+    ID3D12GraphicsCommandList* commands = backend.Commands();
+    if (g_cache.boundPipeline != pipeline) {
+        commands->SetPipelineState(pipeline);
+        g_cache.boundPipeline = pipeline;
+    }
+    constexpr float kSize = static_cast<float>(capture::kSkyCubeSize);
+    const float halfPixel[4] = { 1.0f / kSize, -1.0f / kSize, 0, 0 };
+    // User clip planes are in the game's clip space; (0, 0, 0, 1) keeps everything in front of the eye.
+    for (float (&plane)[4] : vertexState.clipPlanes) {
+        plane[0] = plane[1] = plane[2] = 0.0f;
+        plane[3] = 1.0f;
+    }
+    for (StateBuffer* state : { &vertexState, &pixelState })
+        std::memcpy(state->halfPixel, halfPixel, sizeof(halfPixel));
+    const D3D12_GPU_VIRTUAL_ADDRESS vertexStateAddress = UploadConstants(&vertexState, sizeof(vertexState));
+    const D3D12_GPU_VIRTUAL_ADDRESS pixelStateAddress = UploadConstants(&pixelState, sizeof(pixelState));
+    const float* lightScale = dynamic.pixelFloats[gbuffer::kLightScaleRegister].v;
+    const capture::RegisterPatch unscaled = { gbuffer::kLightScaleRegister, { 1.0f, lightScale[1], lightScale[2], 1.0f } };
+    commands->SetGraphicsRootConstantBufferView(1, vertexStateAddress);
+    commands->SetGraphicsRootConstantBufferView(2, FloatConstants(pixelShader, dynamic.pixelFloats.data(), kPixelFloatConstants, dynamic.pixelFloatsVersion,
+        g_cache.pixelConstants, pixelStateAddress, std::span(&unscaled, 1)));
+    commands->SetGraphicsRootConstantBufferView(3, pixelStateAddress);
+    const D3D12_VIEWPORT viewport = { 0, 0, kSize, kSize, 0, 1 };
+    const D3D12_RECT scissor = { 0, 0, static_cast<LONG>(capture::kSkyCubeSize), static_cast<LONG>(capture::kSkyCubeSize) };
+    commands->RSSetViewports(1, &viewport);
+    commands->RSSetScissorRects(1, &scissor);
+    for (int face = 0; face < 6; ++face) {
+        // Source's sky shaders place the faces with c4-c7 (sky_vs20) or c8-c11 (GMod's g_sky_vs20).
+        const CubeFace transform = CubeFaceTransform(face);
+        std::array<capture::RegisterPatch, 10> patches;
+        for (UINT r = 0; r < 4; ++r) {
+            patches[r] = { gbuffer::kModelViewProjection + r, std::to_array(transform.modelViewProjection[r].v) };
+            patches[4 + r] = { gbuffer::kViewProjection + r, std::to_array(transform.viewProjection[r].v) };
+        }
+        patches[8] = { kModelViewProjectionZ, std::to_array(transform.modelViewProjection[2].v) };
+        patches[9] = { kViewProjectionZ, std::to_array(transform.viewProjection[2].v) };
+        commands->SetGraphicsRootConstantBufferView(0, FloatConstants(vertexShader, dynamic.vertexFloats.data(), kVertexFloatConstants, dynamic.vertexFloatsVersion,
+            g_cache.vertexConstants, vertexStateAddress, patches));
+        commands->OMSetRenderTargets(1, &faces[static_cast<size_t>(face)], FALSE, nullptr);
+        IssueDraws(commands, mesh);
+    }
+}
+
+}
+
 void DrawPass(const ShadowState& shadow, const MeshDraw& mesh)
 {
     if (!Initialize())
@@ -1132,34 +1261,11 @@ void DrawPass(const ShadowState& shadow, const MeshDraw& mesh)
         commands->SetPipelineState(pipeline);
         g_cache.boundPipeline = pipeline;
     }
-    auto floats = [&](const CompiledShader& shader, const Float4* registers, UINT registerCount, std::uint64_t version, ConstantUpload& last,
-                      D3D12_GPU_VIRTUAL_ADDRESS fallback, std::span<const capture::RegisterPatch> patches) {
-        const UINT first = std::min(shader.info.firstFloatConstant, registerCount);
-        const UINT count = std::min(shader.info.floatConstantCount, registerCount - first);
-        if (count == 0)
-            return fallback;
-        if (!patches.empty()) {
-            Backend::Upload upload = backend.AllocateUpload(count * sizeof(Float4), kConstantAlignment);
-            if (upload.data == nullptr)
-                return fallback;
-            auto* copy = reinterpret_cast<Float4*>(upload.data);
-            std::memcpy(copy, registers + first, count * sizeof(Float4));
-            for (const capture::RegisterPatch& patch : patches) {
-                if (patch.reg >= first && patch.reg < first + count)
-                    std::copy(patch.value.begin(), patch.value.end(), copy[patch.reg - first].v);
-            }
-            last.generation = ~0ull;
-            return upload.buffer->GetGPUVirtualAddress() + upload.offset;
-        }
-        if (last.generation != backend.ListGeneration() || last.version != version || last.first != first || last.count < count)
-            last = { backend.ListGeneration(), version, first, count, UploadConstants(registers + first, count * sizeof(Float4)) };
-        return last.address;
-    };
     const D3D12_GPU_VIRTUAL_ADDRESS vertexStateAddress = UploadConstants(&vertexState, sizeof(vertexState));
     const D3D12_GPU_VIRTUAL_ADDRESS pixelStateAddress = UploadConstants(&pixelState, sizeof(pixelState));
-    commands->SetGraphicsRootConstantBufferView(0, floats(*vertexShader, dynamic.vertexFloats.data(), kVertexFloatConstants, dynamic.vertexFloatsVersion, g_cache.vertexConstants, vertexStateAddress, pass.vertexPatches));
+    commands->SetGraphicsRootConstantBufferView(0, FloatConstants(*vertexShader, dynamic.vertexFloats.data(), kVertexFloatConstants, dynamic.vertexFloatsVersion, g_cache.vertexConstants, vertexStateAddress, pass.vertexPatches));
     commands->SetGraphicsRootConstantBufferView(1, vertexStateAddress);
-    commands->SetGraphicsRootConstantBufferView(2, pixelShader != nullptr ? floats(*pixelShader, dynamic.pixelFloats.data(), kPixelFloatConstants, dynamic.pixelFloatsVersion, g_cache.pixelConstants, pixelStateAddress, pass.pixelPatches) : pixelStateAddress);
+    commands->SetGraphicsRootConstantBufferView(2, pixelShader != nullptr ? FloatConstants(*pixelShader, dynamic.pixelFloats.data(), kPixelFloatConstants, dynamic.pixelFloatsVersion, g_cache.pixelConstants, pixelStateAddress, pass.pixelPatches) : pixelStateAddress);
     commands->SetGraphicsRootConstantBufferView(3, pixelStateAddress);
     if (pass.forwardFrame != 0) {
         commands->SetGraphicsRootConstantBufferView(kRootForwardFrame, pass.forwardFrame);
@@ -1176,22 +1282,10 @@ void DrawPass(const ShadowState& shadow, const MeshDraw& mesh)
     }
     commands->RSSetScissorRects(1, &scissor);
     commands->OMSetStencilRef(static_cast<UINT>(dynamic.stencilRef) & 0xff);
+    IssueDraws(commands, mesh);
 
-    D3D12_VERTEX_BUFFER_VIEW streams[4] = { mesh.streams[0], mesh.streams[1], mesh.streams[2], { g_cache.zeroBuffer->GetGPUVirtualAddress(), 16, 0 } };
-    commands->IASetVertexBuffers(0, 4, streams);
-    commands->IASetPrimitiveTopology(mesh.topology);
-    if (mesh.indices.SizeInBytes != 0) {
-        commands->IASetIndexBuffer(&mesh.indices);
-        for (const auto& [first, count] : mesh.primitives) {
-            if (count > 0)
-                commands->DrawIndexedInstanced(static_cast<UINT>(count), 1, static_cast<UINT>(first), 0, 0);
-        }
-    } else {
-        for (const auto& [first, count] : mesh.primitives) {
-            if (count > 0)
-                commands->DrawInstanced(static_cast<UINT>(count), 1, static_cast<UINT>(first), 0);
-        }
-    }
+    if (pass.route == capture::Pass::Route::Game && pixelShader != nullptr && capture::DrawsSky())
+        DrawSkyFaces(key, *vertexShader, *pixelShader, vertexState, pixelState, mesh);
 }
 
 }

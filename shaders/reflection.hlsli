@@ -32,6 +32,28 @@ float3 PreviousColor(uint previousView, float4 clip, float distance)
     return (g_frame.outputLinear != 0 ? color : Decode(color)) / g_frame.tonemapScale;
 }
 
+// What a ray that leaves the map sees: as the game draws the 3D skybox behind the map, the ray goes on from the matching
+// point of the skybox (as SunVisibility's do), lit by the sun and the sky and in the skybox's fog, and past it the 2D
+// sky.
+float3 BeyondMap(float3 origin, float3 direction)
+{
+    if (g_frame.worldToSky <= 0.0 || (g_frame.traceMask & kSkyboxMask) != 0)
+        return SkyRadiance(direction);
+    float3 skyOrigin = float3(g_frame.skyCameraX, g_frame.skyCameraY, g_frame.skyCameraZ) + origin * g_frame.worldToSky;
+    HitSurface hit;
+    HitInfo hitInfo;
+    if (!TraceClosest(skyOrigin, direction, kMaxDistance, kSkyboxMask, hit, hitInfo))
+        return SkyRadiance(direction);
+    float distance = length(hit.position - skyOrigin);
+    float3 irradiance = SunIrradiance(hit, hit.position + hit.normal * 0.25, kSkyboxMask) + SkyLight(hit.normal) * g_frame.indirectScale;
+    float3 radiance = ClampSample(hit.albedo * irradiance + HitEmission(hit, hitInfo, distance));
+    if (g_frame.skyboxFogEnabled == 0)
+        return radiance;
+    // The skybox view's range fog (ApplyFog in shaders/deferred_lighting.hlsl), whose colour is after the tonemap scale.
+    float fog = saturate(min(g_frame.skyboxFogParams.z, distance * g_frame.skyboxFogParams.w - g_frame.skyboxFogParams.x));
+    return lerp(radiance, g_frame.skyboxFogColor / g_frame.tonemapScale, g_frame.skyboxFogParams.y > 0.0 ? fog : fog * fog);
+}
+
 float3 ReflectedRadiance(uint previousView, float3 origin, float3 direction, float3 ambient, inout uint seed, out float hitDistance)
 {
     HitSurface hit;
@@ -40,7 +62,7 @@ float3 ReflectedRadiance(uint previousView, float3 origin, float3 direction, flo
         hitDistance = kSkyHitDistance;
         // A direction at infinity: w = 0 projects it to where last frame showed that part of the sky.
         float3 sky = PreviousColor(previousView, mul(g_frame.prevViewProj, float4(direction, 0.0)), 0.0);
-        return sky.x >= 0.0 ? sky : g_frame.skyColor;
+        return sky.x >= 0.0 ? sky : BeyondMap(origin, direction);
     }
     hitDistance = length(hit.position - origin);
     // Positions in the 3D skybox are in its own scaled-down space, which last frame's main view does not show.

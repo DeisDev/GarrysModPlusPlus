@@ -87,6 +87,15 @@ float LightWarpSlot(UINT view);
 // The probe volume's red, green or blue texture for a probe sampler of a forward draw, ready to be read.
 UINT ProbeView(size_t index);
 
+// The 2D skybox the game draws (the engine's "skybox/<name><side>" materials) is drawn again into a cube around the
+// eye, in Direct3D's cube face order, which ViewInputs::skyCube hands to lighting.
+inline constexpr UINT kSkyCubeSize = 512;
+// Whether the pass being drawn is a 2D skybox face during a capture.
+bool DrawsSky();
+// The cube's six face targets (RGBA16F, radiance before the tonemap scale, -1 where nothing was drawn this map),
+// ready to be drawn into; empty when the cube cannot be created.
+std::span<const D3D12_CPU_DESCRIPTOR_HANDLE> SkyFaces();
+
 // Releases the targets (the back buffer's size changes).
 void Release();
 

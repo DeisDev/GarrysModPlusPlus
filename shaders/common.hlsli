@@ -131,7 +131,13 @@ struct FrameConstants
     uint sunClustersView;
     // The light warp textures the G-buffer's flags refer to (LightWarpView).
     uint lightWarpCount;
-    uint2 padding3;
+    // The 2D sky as the game draws it and its blurred light for indirect rays (SkyRadiance, SkyLight), or kNoView.
+    uint skyCubeView;
+    uint skyLightView;
+    // The 3D skybox's fog, for reflected rays that continue into it (shaders/reflection.hlsli).
+    float4 skyboxFogParams;
+    float3 skyboxFogColor;
+    uint skyboxFogEnabled;
     uint4 lightWarpViews[16];
 };
 
@@ -289,6 +295,27 @@ float3 ClampSample(float3 color)
     float limit = kMaxSampleBrightness / max(g_frame.tonemapScale, 1e-3);
     float luminance = Luminance(color);
     return luminance > limit ? color * (limit / luminance) : color;
+}
+
+// The 2D sky in a direction as the game draws it (src/shaderapi_capture.cpp draws it again into a cube), before the
+// tonemap scale; the map's sky light where it has not been drawn.
+float3 SkyRadiance(float3 direction)
+{
+    if (g_frame.skyCubeView == kNoView)
+        return g_frame.skyColor;
+    TextureCube<float4> sky = ResourceDescriptorHeap[g_frame.skyCubeView];
+    float3 radiance = sky.SampleLevel(g_linearClamp, direction, 0.0).rgb;
+    return all(radiance >= 0.0) ? radiance : g_frame.skyColor;
+}
+
+// The sky's light arriving from a direction, for indirect light: the drawn sky blurred, as bright overall as the
+// map's sky light (shaders/sky.hlsl).
+float3 SkyLight(float3 direction)
+{
+    if (g_frame.skyLightView == kNoView)
+        return g_frame.skyColor;
+    TextureCube<float4> sky = ResourceDescriptorHeap[g_frame.skyLightView];
+    return sky.SampleLevel(g_linearClamp, direction, 0.0).rgb;
 }
 
 // The game's additive passes at a surface pixel of the resolved image, linear. They were drawn with the frame's jitter, which

@@ -32,9 +32,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - In the native renderer, flowing water (`$flowmap`, also with a flowing base texture) and water with `$lightmapwaterfog` get ray-traced reflections like other water.
 - In the native renderer, textured water (`$basetexture`) is lit in real time instead of by its baked light, with its ripples and ray-traced reflections.
 - In the native renderer, models and world surfaces with a light warp texture take real-time light through it as in the game.
+- In the native renderer, reflections show the sky as the game draws it, including painted skies, and the 3D skybox, instead of a flat colour.
 
 ### Changed
 
+- In the native renderer, indirect light from the sky takes the skybox's colours from each direction, at the map's sky light brightness.
 - The native renderer always turns MSAA off, so real-time lighting no longer needs it turned off by hand.
 - Shadows of many lights are less noisy: the strongest lights are always traced, and the rest are denoised.
 - Reflections are steadier and sparkle less.

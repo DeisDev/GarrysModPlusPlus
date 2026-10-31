@@ -1626,6 +1626,39 @@ const char* BoundMaterialName()
     return g_api.material != nullptr ? MaterialSlot<const char* (*)(void*)>(g_api.material, kMaterialGetName)(g_api.material) : "none";
 }
 
+CubeFace CubeFaceTransform(int face)
+{
+    // Each face's right, up and forward axes (Cubic Environment Mapping, Microsoft Learn).
+    struct Axes {
+        float right[3];
+        float up[3];
+        float forward[3];
+    };
+    static constexpr Axes kFaces[6] = {{{0, 0, -1}, {0, 1, 0}, {1, 0, 0}}, {{0, 0, 1}, {0, 1, 0}, {-1, 0, 0}}, {{1, 0, 0}, {0, 0, -1}, {0, 1, 0}},
+        {{1, 0, 0}, {0, 0, 1}, {0, -1, 0}}, {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}}, {{-1, 0, 0}, {0, 1, 0}, {0, 0, -1}}};
+    const Axes& axes = kFaces[std::clamp(face, 0, 5)];
+    // Row vectors times this give clip (right, up, forward / 2, forward) relative to the eye.
+    Matrix viewProjection = {};
+    auto column = [&](int c, const float* axis) {
+        for (int i = 0; i < 3; ++i)
+            viewProjection.m[i][c] = axis[i];
+        viewProjection.m[3][c] = -(axis[0] * g_api.eye[0] + axis[1] * g_api.eye[1] + axis[2] * g_api.eye[2]);
+    };
+    column(0, axes.right);
+    column(1, axes.up);
+    column(3, axes.forward);
+    for (int i = 0; i < 4; ++i)
+        viewProjection.m[i][2] = 0.5f * viewProjection.m[i][3];
+    const Matrix viewRows = Transpose(viewProjection);
+    const Matrix modelRows = Transpose(Multiply(Top(kMatrixModel), viewProjection));
+    CubeFace result;
+    for (size_t r = 0; r < 4; ++r) {
+        std::copy_n(viewRows.m[r], 4, result.viewProjection[r].v);
+        std::copy_n(modelRows.m[r], 4, result.modelViewProjection[r].v);
+    }
+    return result;
+}
+
 const char* BoundShaderName()
 {
     // IMaterial::GetShaderName (the IMaterial:GetShader Lua binding calls it; engine_interfaces.cpp).

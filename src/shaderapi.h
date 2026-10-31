@@ -113,5 +113,13 @@ void* BoundMaterial();
 const char* BoundMaterialName();
 // The bound material's shader (IMaterial::GetShaderName), or "none".
 const char* BoundShaderName();
+// The view x projection rows (vertex c8-c11) and model x view x projection rows (c4-c7) that draw into face `face` of
+// a cube centred on the eye, in Direct3D's face order and orientation. Clip z is half of w, so nothing in front of the
+// eye is clipped by depth.
+struct CubeFace {
+    std::array<Float4, 4> viewProjection;
+    std::array<Float4, 4> modelViewProjection;
+};
+CubeFace CubeFaceTransform(int face);
 
 }

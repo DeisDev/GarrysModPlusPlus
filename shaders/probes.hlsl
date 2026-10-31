@@ -51,7 +51,7 @@ float3 LastVolumeIrradiance(float3 position, float3 normal)
 {
     float3 window = (position / g_frame.probeSpacing - 0.5) - float3(g_frame.probeOrigin);
     if (any(window < 0.0) || any(window > float3(kProbeGrid) - 1.0))
-        return g_frame.skyColor;
+        return SkyLight(normal);
     float3 uvw = position / (g_frame.probeSpacing * float3(kProbeGrid));
     Texture3D<float4> red = ResourceDescriptorHeap[g_pass.input0];
     Texture3D<float4> green = ResourceDescriptorHeap[g_pass.input1];
@@ -107,7 +107,7 @@ void Trace(uint3 id, uint thread)
     for (uint r = thread; r < g_frame.volumeRays; r += kProbeThreads) {
         uint seed = Hash(probeSeed + r);
         float3 direction = UniformSphere((r + Random(seed)) / g_frame.volumeRays, Random(seed));
-        float3 radiance = g_frame.skyColor;
+        float3 radiance = SkyLight(direction);
         HitInfo hit;
         if (TraceHit(position, direction, kMaxDistance, g_frame.indirectMask, hit)) {
             if (HitBackFace(hit, direction)) {
@@ -277,8 +277,12 @@ void BakedFill(uint3 id)
     float3 position = (float3(cell) + 0.5) * g_frame.probeSpacing;
     float3 cube[6];
     if (!LeafAmbientCube(position, cube)) {
-        for (uint side = 0; side < 6; ++side)
-            cube[side] = g_frame.skyColor;
+        // Source's ambient cube order: +x, -x, +y, -y, +z, -z.
+        for (uint side = 0; side < 6; ++side) {
+            float3 axis = 0.0;
+            axis[side / 2] = side % 2 == 0 ? 1.0 : -1.0;
+            cube[side] = SkyLight(axis);
+        }
     }
     // a + b.n: the mean of the six directions, and half the difference along each axis.
     float3 mean = (cube[0] + cube[1] + cube[2] + cube[3] + cube[4] + cube[5]) / 6.0;

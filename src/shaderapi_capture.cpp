@@ -7,12 +7,14 @@
 #include "shader_twins.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <format>
 #include <map>
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <tuple>
 #include <unordered_map>
 
@@ -54,6 +56,16 @@ struct Target {
     D3D12_CPU_DESCRIPTOR_HANDLE srgbView = {};
 };
 
+struct SkyCube {
+    TrackedResource resource;
+    std::array<D3D12_CPU_DESCRIPTOR_HANDLE, 6> faces = {};
+    UINT cubeView = DescriptorHeap::kInvalid;
+    UINT facesView = DescriptorHeap::kInvalid;
+    // The map whose sky it holds.
+    std::string level;
+    bool failed = false;
+};
+
 struct PixelShader {
     gbuffer::PixelShaderClass shaderClass;
     std::string name;
@@ -74,6 +86,7 @@ struct State {
     std::array<TrackedResource, 3> probes;
     std::array<UINT, 3> probeViews = {DescriptorHeap::kInvalid, DescriptorHeap::kInvalid, DescriptorHeap::kInvalid};
     bool probesFailed = false;
+    SkyCube sky;
     bool active = false;
     bool forwardActive = false;
     std::array<float, 2> jitter = {};
@@ -217,6 +230,57 @@ void CreateProbeTextures()
         view.Texture3D.MipLevels = 1;
         backend.Device()->CreateShaderResourceView(g_state.probes[i].resource.Get(), &view, backend.Descriptors().Cpu(g_state.probeViews[i]));
     }
+}
+
+bool CreateSkyCube()
+{
+    SkyCube& sky = g_state.sky;
+    if (sky.resource.resource || sky.failed)
+        return !sky.failed;
+    Backend& backend = GetBackend();
+    const D3D12_HEAP_PROPERTIES heap = {D3D12_HEAP_TYPE_DEFAULT};
+    D3D12_RESOURCE_DESC desc = {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = kSkyCubeSize;
+    desc.Height = kSkyCubeSize;
+    desc.DepthOrArraySize = 6;
+    desc.MipLevels = 1;
+    desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    desc.SampleDesc.Count = 1;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    sky.cubeView = backend.Descriptors().Allocate();
+    sky.facesView = backend.Descriptors().Allocate();
+    if (sky.cubeView == DescriptorHeap::kInvalid || sky.facesView == DescriptorHeap::kInvalid
+        || FAILED(backend.Device()->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+            IID_PPV_ARGS(&sky.resource.resource)))) {
+        log::Info("G-buffer: creating the sky cube failed; reflections and indirect light take the map's flat sky light");
+        sky.resource = {};
+        sky.failed = true;
+        return false;
+    }
+    sky.resource.state = D3D12_RESOURCE_STATE_COMMON;
+    D3D12_SHADER_RESOURCE_VIEW_DESC view = {};
+    view.Format = desc.Format;
+    view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
+    view.TextureCube.MipLevels = 1;
+    backend.Device()->CreateShaderResourceView(sky.resource.resource.Get(), &view, backend.Descriptors().Cpu(sky.cubeView));
+    view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+    view.Texture2DArray = {};
+    view.Texture2DArray.MipLevels = 1;
+    view.Texture2DArray.ArraySize = 6;
+    backend.Device()->CreateShaderResourceView(sky.resource.resource.Get(), &view, backend.Descriptors().Cpu(sky.facesView));
+    for (UINT face = 0; face < 6; ++face) {
+        sky.faces[face] = backend.RenderTargetViews().Allocate();
+        D3D12_RENDER_TARGET_VIEW_DESC target = {};
+        target.Format = desc.Format;
+        target.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+        target.Texture2DArray.FirstArraySlice = face;
+        target.Texture2DArray.ArraySize = 1;
+        backend.Device()->CreateRenderTargetView(sky.resource.resource.Get(), &target, sky.faces[face]);
+    }
+    log::Info("G-buffer: {}x{} sky cube ready", kSkyCubeSize, kSkyCubeSize);
+    return true;
 }
 
 // Rebuilds the projected light a flashlight pass is drawing from the constants and textures bound for it.
@@ -399,6 +463,12 @@ bool End(ViewKind kind, ViewInputs& inputs)
         for (size_t i = 0; i < g_state.probes.size(); ++i)
             inputs.probes[i] = common(g_state.probes[i]);
     }
+    if (g_state.sky.resource.resource && g_state.sky.level == engine::LevelName()) {
+        inputs.skyCube = common(g_state.sky.resource);
+        inputs.skyCubeView = g_state.sky.cubeView;
+        inputs.skyFacesView = g_state.sky.facesView;
+    }
+    inputs.skyboxFog = g_state.fog[1];
     inputs.kind = kind;
     inputs.viewProj = g_state.viewProj;
     inputs.jitter = g_state.jitter;
@@ -644,6 +714,36 @@ UINT ProbeView(size_t index)
 {
     GetBackend().Transition(g_state.probes[index], D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
     return g_state.probeViews[index];
+}
+
+// The engine loads the 2D skybox's faces as the materials "skybox/<sv_skyname><side>" (engine.dll 0x180102020, with
+// "skybox/%s%s") and draws all six (face mask 0x3f, 0x180101470 called from the world list draw 0x1800fdc90) inside
+// the views' world passes, which are captured.
+bool DrawsSky()
+{
+    if (!g_state.active)
+        return false;
+    constexpr std::string_view kPrefix = "skybox/";
+    const std::string_view name = BoundMaterialName();
+    return name.size() > kPrefix.size() && std::equal(kPrefix.begin(), kPrefix.end(), name.begin(),
+        [](char a, char b) { return a == std::tolower(static_cast<unsigned char>(b)); });
+}
+
+std::span<const D3D12_CPU_DESCRIPTOR_HANDLE> SkyFaces()
+{
+    if (!CreateSkyCube())
+        return {};
+    SkyCube& sky = g_state.sky;
+    Backend& backend = GetBackend();
+    backend.Transition(sky.resource, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    const std::string level = engine::LevelName();
+    if (level != sky.level) {
+        sky.level = level;
+        constexpr float kUndrawn[4] = {-1.0f, -1.0f, -1.0f, 0.0f};
+        for (const D3D12_CPU_DESCRIPTOR_HANDLE& face : sky.faces)
+            backend.Commands()->ClearRenderTargetView(face, kUndrawn, 0, nullptr);
+    }
+    return sky.faces;
 }
 
 void Release()

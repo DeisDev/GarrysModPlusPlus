@@ -118,7 +118,14 @@ struct FrameConstants {
     uint32_t sunClustersView;
     // The light warp textures of the view's G-buffer twins (shaderapi_capture.h, LightWarpSlot).
     uint32_t lightWarpCount;
-    uint32_t padding3[2];
+    // The 2D sky as the game draws it (ViewInputs::skyCube) and its blurred light for indirect rays (shaders/sky.hlsl),
+    // or kInvalidView.
+    uint32_t skyCubeView;
+    uint32_t skyLightView;
+    // The 3D skybox's fog (ViewInputs::skyboxFog), for reflected rays that continue into it.
+    float skyboxFogParams[4];
+    float skyboxFogColor[3];
+    uint32_t skyboxFogEnabled;
     uint32_t lightWarpViews[64];
 };
 
@@ -170,6 +177,13 @@ struct ViewInputs {
     float tonemapScale = 1.0f;
     bool outputSrgb = false;
     gbuffer::Fog fog;
+    // The 3D skybox view's fog, for reflected rays that continue into the skybox.
+    gbuffer::Fog skyboxFog;
+    // The 2D sky the game drew on this map (capture::SkyFaces), with views of it as a cube and as an array of its
+    // faces; null without one.
+    ID3D12Resource* skyCube = nullptr;
+    UINT skyCubeView = DescriptorHeap::kInvalid;
+    UINT skyFacesView = DescriptorHeap::kInvalid;
     // When the game last drew a swaying model.
     gbuffer::SwayClock sway;
 };
@@ -221,7 +235,7 @@ private:
         D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     };
     // DirectWide is Direct for more exact lights or shared shadow rays than the High preset's.
-    enum class Pass { Surface, Primary, Probes, Ao, Volumetrics, Direct, GiTrace, GiTemporal, GiFilter, Lighting, TemporalAntiAliasing, Sharpen, Reflections, ReflectionTemporal, DlssInputs, DlssResolve, DirectWide, Sway, TranslucentDepth, ViewRect, Baked, Count };
+    enum class Pass { Surface, Primary, Probes, Ao, Volumetrics, Direct, GiTrace, GiTemporal, GiFilter, Lighting, TemporalAntiAliasing, Sharpen, Reflections, ReflectionTemporal, DlssInputs, DlssResolve, DirectWide, Sway, TranslucentDepth, ViewRect, Baked, Sky, Count };
     // Mirrors PassConstants in shaders/common.hlsli: descriptor indices (none by default) and a parameter.
     struct PassArgs {
         UINT input0 = DescriptorHeap::kInvalid;
@@ -242,6 +256,7 @@ private:
 
     bool EnsureTargets(UINT width, UINT height);
     bool CreateTarget(Texture& texture, UINT width, UINT height, DXGI_FORMAT format, UINT depth = 0);
+    bool CreateSkyLight();
     void DispatchGroups(Pass pass, const PassArgs& args, UINT x, UINT y, UINT z);
     // Moves the swaying props near the eye to this frame's sway (SwayingProps).
     void UpdateSway(const Scene& scene, UINT slot, const gbuffer::SwayClock& clock, const float (&eye)[3], D3D12_GPU_VIRTUAL_ADDRESS frameConstants);
@@ -302,6 +317,10 @@ private:
     Microsoft::WRL::ComPtr<ID3D12CommandSignature> m_dispatchSignature;
     Texture m_viewRect;
     bool m_rectDispatch = false;
+    // The sky's light for indirect rays (shaders/sky.hlsl): the drawn sky averaged to a few texels a face, as an array
+    // (uav) and a cube (srv); ready once a main view has made it.
+    Texture m_skyLight;
+    bool m_skyLightReady = false;
     // Writes m_translucentDepth into the game's depth buffer, for its format.
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_depthPipeline;
     DXGI_FORMAT m_depthPipelineFormat = DXGI_FORMAT_UNKNOWN;

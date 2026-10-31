@@ -32,6 +32,7 @@
 #include <g_reflectionTemporalCS.h>
 #include <g_reflectionsCS.h>
 #include <g_reflectionsOmmCS.h>
+#include <g_skyCS.h>
 #include <g_surfaceCS.h>
 #include <g_swayCS.h>
 #include <g_taaCS.h>
@@ -63,6 +64,8 @@ constexpr UINT kInputViews = 7;
 constexpr UINT kMaxProjectors = 8;
 constexpr UINT kViewsPerSlot = kInputViews + kMaxProjectors;
 constexpr UINT kInvalidView = ~0u;
+// Texels on a side of each face of the sky light (kSize in shaders/sky.hlsl).
+constexpr UINT kSkyLightSize = 8;
 
 // Mirrors Projector in shaders/scene.hlsli.
 struct GpuProjector {
@@ -431,7 +434,7 @@ bool Lighting::Initialize(ID3D12Device5* device, ID3D12CommandQueue* queue, Desc
         hr = m_device->CreateRootSignature(0, g_surfaceCS, sizeof(g_surfaceCS), IID_PPV_ARGS(&m_computeRoot));
     const bool micromaps = opacityMicromaps;
     const std::span<const BYTE> shaders[] = {g_surfaceCS, g_primaryCS, g_probesCS, g_aoCS, g_volumetricsCS, g_directCS, g_giTraceCS, g_giTemporalCS,
-        g_giFilterCS, g_deferredLightingCS, g_taaCS, g_taaSharpenCS, g_reflectionsCS, g_reflectionTemporalCS, g_dlssInputsCS, g_dlssResolveCS, g_directWideCS, g_swayCS, g_translucentDepthCS, g_viewRectCS, g_bakedResidualCS};
+        g_giFilterCS, g_deferredLightingCS, g_taaCS, g_taaSharpenCS, g_reflectionsCS, g_reflectionTemporalCS, g_dlssInputsCS, g_dlssResolveCS, g_directWideCS, g_swayCS, g_translucentDepthCS, g_viewRectCS, g_bakedResidualCS, g_skyCS};
     static_assert(std::size(shaders) == static_cast<size_t>(Pass::Count));
     for (size_t i = 0; i < m_pipelines.size() && SUCCEEDED(hr); ++i) {
         D3D12_COMPUTE_PIPELINE_STATE_DESC desc = {};
@@ -535,6 +538,8 @@ bool Lighting::Initialize(ID3D12Device5* device, ID3D12CommandQueue* queue, Desc
         for (auto& readback : m_volumeReadback)
             readback = CreateBuffer(m_device, D3D12_HEAP_TYPE_READBACK, bytes * m_volumeFootprints.size(), D3D12_RESOURCE_STATE_COPY_DEST);
     }
+    if (!CreateSkyLight())
+        log::Info("Lighting: creating the sky light failed; indirect light takes the map's flat sky light");
     m_fenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     m_rtvIncrement = m_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     m_skinned.Initialize(m_device, *m_descriptors);
@@ -583,6 +588,42 @@ bool Lighting::CreateTarget(Texture& texture, UINT width, UINT height, DXGI_FORM
     uav.ViewDimension = depth != 0 ? D3D12_UAV_DIMENSION_TEXTURE3D : D3D12_UAV_DIMENSION_TEXTURE2D;
     uav.Texture3D.WSize = depth != 0 ? depth : 0;
     m_device->CreateUnorderedAccessView(texture.resource.Get(), nullptr, &uav, m_descriptors->Cpu(texture.uav));
+    return true;
+}
+
+bool Lighting::CreateSkyLight()
+{
+    D3D12_HEAP_PROPERTIES heap = {D3D12_HEAP_TYPE_DEFAULT};
+    D3D12_RESOURCE_DESC desc = {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = kSkyLightSize;
+    desc.Height = kSkyLightSize;
+    desc.DepthOrArraySize = 6;
+    desc.MipLevels = 1;
+    desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    desc.SampleDesc.Count = 1;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    if (FAILED(m_device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+            IID_PPV_ARGS(&m_skyLight.resource))))
+        return false;
+    m_skyLight.state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    m_skyLight.srv = m_descriptors->Allocate();
+    m_skyLight.uav = m_descriptors->Allocate();
+    if (m_skyLight.srv == DescriptorHeap::kInvalid || m_skyLight.uav == DescriptorHeap::kInvalid) {
+        m_skyLight = {};
+        return false;
+    }
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+    srv.Format = desc.Format;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.TextureCube.MipLevels = 1;
+    m_device->CreateShaderResourceView(m_skyLight.resource.Get(), &srv, m_descriptors->Cpu(m_skyLight.srv));
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
+    uav.Format = desc.Format;
+    uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+    uav.Texture2DArray.ArraySize = 6;
+    m_device->CreateUnorderedAccessView(m_skyLight.resource.Get(), nullptr, &uav, m_descriptors->Cpu(m_skyLight.uav));
     return true;
 }
 
@@ -867,6 +908,12 @@ bool Lighting::FillConstants(FrameConstants& constants, const Scene& scene, cons
     constants.fogEnabled = fog.known && settings.fog ? 1u : 0u;
     std::memcpy(constants.fogParams, fog.params.data(), sizeof(constants.fogParams));
     std::memcpy(constants.fogColor, fog.color.data(), sizeof(constants.fogColor));
+    const gbuffer::Fog& skyboxFog = inputs.skyboxFog;
+    constants.skyboxFogEnabled = skyboxFog.known && settings.fog ? 1u : 0u;
+    std::memcpy(constants.skyboxFogParams, skyboxFog.params.data(), sizeof(constants.skyboxFogParams));
+    std::memcpy(constants.skyboxFogColor, skyboxFog.color.data(), sizeof(constants.skyboxFogColor));
+    constants.skyCubeView = inputs.skyCube != nullptr ? inputs.skyCubeView : kInvalidView;
+    constants.skyLightView = m_skyLightReady ? m_skyLight.srv : kInvalidView;
     // The 3D skybox is a scaled-down scene elsewhere in the map: the map's lights do not belong to it.
     const bool skybox = inputs.kind == gbuffer::ViewKind::Skybox;
     constants.lightCount = settings.mapLights && !skybox ? scene.LightCount() : 0u;
@@ -1193,6 +1240,8 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
             cookies.push_back(cookie);
         }
     }
+    if (inputs.skyCube != nullptr)
+        resources.push_back(inputs.skyCube);
     // The game's probe volume textures, filled by copies at the end of the irradiance volume passes.
     const std::array<ID3D12Resource*, 3>& probeTargets = inputs.probes;
     const bool copyVolume = volume && probeTargets[0] != nullptr && probeTargets[1] != nullptr && probeTargets[2] != nullptr;
@@ -1335,6 +1384,20 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     bindCompute(slotConstantsGpu);
     if (bakedIndirect && main && constants.traceMask != 0 && !scene.Baked().Ready())
         BakeStep(scene, constants, slotConstantsGpu);
+    if (main && inputs.skyCube != nullptr && m_skyLight.resource) {
+        Use(m_skyLight, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        DispatchGroups(Pass::Sky, {.input0 = inputs.skyFacesView, .output0 = m_skyLight.uav, .step = 0}, kSkyLightSize, kSkyLightSize, 6);
+        const D3D12_RESOURCE_BARRIER between = {D3D12_RESOURCE_BARRIER_TYPE_UAV, D3D12_RESOURCE_BARRIER_FLAG_NONE, {.UAV = {m_skyLight.resource.Get()}}};
+        m_list->ResourceBarrier(1, &between);
+        DispatchGroups(Pass::Sky, {.output0 = m_skyLight.uav, .step = 1}, 1, 1, 1);
+        Use(m_skyLight, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        m_skyLightReady = true;
+        constants.skyLightView = m_skyLight.srv;
+    } else if (main) {
+        // Another map's sky, until this one's is drawn.
+        m_skyLightReady = false;
+        constants.skyLightView = kInvalidView;
+    }
     m_gridWidth = m_width;
     m_gridHeight = m_height;
     // Additive draws (glows, sprites) skip the temporal resolve, which would jitter them and, with Ray Reconstruction,

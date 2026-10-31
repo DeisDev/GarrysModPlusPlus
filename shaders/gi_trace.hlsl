@@ -44,7 +44,7 @@ float3 FurtherBounces(HitSurface hit, float3 origin, inout uint seed)
         float3 direction = CosineSample(hit.normal, Random(seed), Random(seed));
         HitSurface next;
         if (!TraceClosest(origin, direction, kMaxDistance, g_frame.bounceMask, next, g_frame.indirectRayFlags))
-            return irradiance + throughput * g_frame.skyColor;
+            return irradiance + throughput * SkyLight(direction);
         origin = next.position + next.normal;
         irradiance += throughput * next.albedo * SunIrradiance(next, origin, g_frame.bounceMask);
         throughput *= next.albedo;
@@ -118,7 +118,7 @@ void main(uint3 id : SV_DispatchThreadID)
         if (baked.x < 0.0)
             baked = LeafAmbient(position, ignoreNormals ? 0.0 : normal);
         if (baked.x < 0.0)
-            baked = g_frame.skyColor;
+            baked = SkyLight(normal);
         output[pixel] = float4(baked + remainder.Load(int3(pixel, 0)).rgb, 1.0);
         return;
     }
@@ -131,7 +131,7 @@ void main(uint3 id : SV_DispatchThreadID)
         if (TraceClosest(ignoreNormals ? position + direction * bias : origin, direction, kMaxDistance, g_frame.indirectMask, hit, g_frame.indirectRayFlags))
             estimate += ClampSample(hit.albedo * HitIrradiance(hit, seed));
         else
-            estimate += g_frame.skyColor;
+            estimate += SkyLight(direction);
     }
     output[pixel] = float4(estimate / samples + remainder.Load(int3(pixel, 0)).rgb, 1.0);
 }
