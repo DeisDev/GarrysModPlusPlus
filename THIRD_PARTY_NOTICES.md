@@ -22,8 +22,15 @@ These are not in the repository. CMake downloads them, pinned by version and has
 | DirectX Shader Compiler | 1.9.2602 | LLVM Release License, MIT, Microsoft software licence terms | `dxcompiler.dll` |
 | DirectX 12 Agility SDK | 1.619.6 | Microsoft software licence terms | `D3D12Core.dll` and `d3d12SDKLayers.dll` |
 | NVIDIA DLSS SDK | 310.9.16 | NVIDIA RTX SDKs License | Linked into `gmodpp.dll`, and `nvngx_dlssd.dll`. Not to be distributed on its own. |
+| NVIDIA SHaRC | 1.8.3 (commit `4e21b585`) | NVIDIA RTX SDKs License | Compiled into `gmodpp.dll`'s lighting shaders. Not distributed as source. |
+| NVIDIA RTXDI (RTXDI-Library) | 3.1.0 (commit `f12037fa`) | NVIDIA RTX SDKs License | Compiled into `gmodpp.dll` and its lighting shaders. Not distributed as source. |
+| NVIDIA NRD | 4.18.0 | NVIDIA RTX SDKs License | Static library in `gmodpp.dll`. Not distributed as source. |
+| MathLib | 11 | MIT | Built into NRD |
+| ShaderMake | commit `3f01623a` | MIT | Its `ShaderMakeBlob` is built into NRD; the tool compiles NRD's shaders at build time and is not shipped |
 
-NVIDIA, DLSS and NVIDIA DLSS are trademarks of NVIDIA Corporation. GarrysMod++ uses NVIDIA DLSS Ray Reconstruction.
+This software contains source code provided by NVIDIA Corporation.
+
+NVIDIA, NVIDIA RTX, DLSS and NVIDIA DLSS are trademarks of NVIDIA Corporation. GarrysMod++ uses NVIDIA DLSS Ray Reconstruction, NVIDIA SHaRC, NVIDIA RTXDI and NVIDIA NRD.
 
 ## Releases
 

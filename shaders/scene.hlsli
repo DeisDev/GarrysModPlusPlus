@@ -29,7 +29,10 @@ struct InstanceRecord
     float4 previousTransform[3];
     // kInstanceIgnoreNormals, kInstanceSelfIllum, kInstanceModel, kInstanceVradSky.
     uint flags;
-    uint3 padding;
+    // For instances with emitters: each triangle's emitter index (Scene::EmittersView) plus one, 0 for none; kNoView
+    // for instances without.
+    uint emitterLights;
+    uint2 padding;
 };
 
 // kInstanceIgnoreNormals, kInstanceSelfIllum, kInstanceModel and kInstanceVradSky in src/scene.h.
@@ -445,34 +448,119 @@ struct Emitter
     float3 p1;
     uint primitive;
     float3 p2;
+    // The share of all emitters' emission times area up to and with this one.
     float cdf;
 };
 
-// A point of a glowing triangle as an area light (EmissiveLighting::Full): a triangle picked in proportion to its
-// emission times its area by `u`, and a point uniformly on it by `v`. `glow` is its emission times its cosine towards
-// `position` and its area over pi and the triangle's probability: the irradiance it gives, with the receiver's
-// Lambert term and the inverse square of the distance to `target` still to apply. False where it faces away.
-bool SampleEmitter(float3 position, float u, float2 v, out float3 target, out float3 glow)
+// One entry of a light grid tail (Scene::LightLists): entries are (index, cumulative weight up to 1), and the first whose
+// weight passes `u` in [0, 1) is picked. Its index and the probability of the pick; false for an empty tail.
+bool SampleTail(uint first, uint count, float u, out uint index, out float probability)
 {
-    target = 0.0;
-    glow = 0.0;
-    if (g_frame.emitterCount == 0)
+    index = 0;
+    probability = 0.0;
+    if (count == 0)
         return false;
-    ByteAddressBuffer emitters = ResourceDescriptorHeap[g_frame.emittersView];
+    ByteAddressBuffer tail = ResourceDescriptorHeap[g_frame.gridTailView];
     uint low = 0;
-    uint high = g_frame.emitterCount - 1;
+    uint high = count - 1;
     while (low < high) {
         uint middle = (low + high) / 2;
-        if (asfloat(emitters.Load(middle * 48 + 44)) <= u)
+        if (asfloat(tail.Load((first + middle) * 8 + 4)) <= u)
             low = middle + 1;
         else
             high = middle;
     }
-    Emitter emitter = emitters.Load<Emitter>(low * 48);
-    float probability = emitter.cdf - (low > 0 ? asfloat(emitters.Load((low - 1) * 48 + 44)) : 0.0);
+    uint2 entry = tail.Load2((first + low) * 8);
+    float before = low > 0 ? asfloat(tail.Load((first + low - 1) * 8 + 4)) : 0.0;
+    index = entry.x;
+    probability = asfloat(entry.y) - before;
+    return probability > 0.0;
+}
+
+// The light grid cell holding a point (x fastest); points outside the grid take the nearest cell.
+uint GridCell(float3 position)
+{
+    int3 cell = clamp(int3(floor((position - g_frame.gridOrigin) / g_frame.gridCellSize)), 0, int3(g_frame.gridDims) - 1);
+    return (cell.z * g_frame.gridDims.y + cell.y) * g_frame.gridDims.x + cell.x;
+}
+
+// Bytes per light grid cell: the ranges of its lights (LightsAt), then of its emitters' tail.
+static const uint kGridCellStride = 32;
+
+// An emitter's share of all emitters' emission times area.
+float EmitterShare(uint index)
+{
+    ByteAddressBuffer emitters = ResourceDescriptorHeap[g_frame.emittersView];
+    return asfloat(emitters.Load(index * 48 + 44)) - (index > 0 ? asfloat(emitters.Load((index - 1) * 48 + 44)) : 0.0);
+}
+
+// The probability with which a cell's emitter tail (entries in the order of their indices) picks an emitter, 0 for
+// one it leaves out.
+float TailProbability(uint first, uint count, uint index)
+{
+    if (count == 0)
+        return 0.0;
+    ByteAddressBuffer tail = ResourceDescriptorHeap[g_frame.gridTailView];
+    uint low = 0;
+    uint high = count - 1;
+    while (low < high) {
+        uint middle = (low + high) / 2;
+        if (tail.Load((first + middle) * 8) < index)
+            low = middle + 1;
+        else
+            high = middle;
+    }
+    uint2 entry = tail.Load2((first + low) * 8);
+    if (entry.x != index)
+        return 0.0;
+    return asfloat(entry.y) - (low > 0 ? asfloat(tail.Load((first + low - 1) * 8 + 4)) : 0.0);
+}
+
+// A point of a glowing triangle as an area light (EmissiveLighting::Full), picked by `u`: the light grid cell holding
+// `position` picks among the emitters that light it most in proportion to their emission times area over the square
+// of their distance from the cell, and leaves the rest's share of that (the cell's third word) to a pick of any emitter
+// by its emission times area. Either pick may find any emitter, so its probability sums both. A point uniformly on the
+// triangle is picked by `v`. `glow` is its emission times its cosine towards `position` and its area over pi and the
+// triangle's probability: the irradiance it gives, with the receiver's Lambert term and the inverse square of the
+// distance to `target` still to apply. False where it faces away or no emitter can light the cell.
+bool SampleEmitter(float3 position, float u, float2 v, out float3 target, out float3 glow)
+{
+    target = 0.0;
+    glow = 0.0;
+    if (g_frame.emitterCount == 0 || g_frame.gridCellsView == kNoView)
+        return false;
+    ByteAddressBuffer cells = ResourceDescriptorHeap[g_frame.gridCellsView];
+    uint3 range = cells.Load3(GridCell(position) * kGridCellStride + 16);
+    float rest = asfloat(range.z);
+    uint index;
+    float probability;
+    if (u < 1.0 - rest) {
+        if (!SampleTail(range.x, range.y, u, index, probability))
+            return false;
+        if (rest > 0.0)
+            probability += rest * EmitterShare(index);
+    } else {
+        ByteAddressBuffer emitters = ResourceDescriptorHeap[g_frame.emittersView];
+        float w = (u - (1.0 - rest)) / rest;
+        uint low = 0;
+        uint high = g_frame.emitterCount - 1;
+        while (low < high) {
+            uint middle = (low + high) / 2;
+            if (asfloat(emitters.Load(middle * 48 + 44)) <= w)
+                low = middle + 1;
+            else
+                high = middle;
+        }
+        index = low;
+        probability = rest * EmitterShare(index) + TailProbability(range.x, range.y, index);
+    }
+    if (probability <= 0.0)
+        return false;
+    ByteAddressBuffer emitters = ResourceDescriptorHeap[g_frame.emittersView];
+    Emitter emitter = emitters.Load<Emitter>(index * 48);
     float3 normal = cross(emitter.p1 - emitter.p0, emitter.p2 - emitter.p0);
     float area = 0.5 * length(normal);
-    if (probability <= 0.0 || area <= 0.0)
+    if (area <= 0.0)
         return false;
     float root = sqrt(v.x);
     float2 barycentrics = float2(root * (1.0 - v.y), root * v.y);
@@ -613,9 +701,8 @@ LightRanges LightsAt(float3 position)
     LightRanges ranges = (LightRanges)0;
     if (g_frame.lightCount == 0 || g_frame.gridCellsView == kNoView)
         return ranges;
-    int3 cell = clamp(int3(floor((position - g_frame.gridOrigin) / g_frame.gridCellSize)), 0, int3(g_frame.gridDims) - 1);
     ByteAddressBuffer cells = ResourceDescriptorHeap[g_frame.gridCellsView];
-    uint4 range = cells.Load4(((cell.z * g_frame.gridDims.y + cell.y) * g_frame.gridDims.x + cell.x) * 16);
+    uint4 range = cells.Load4(GridCell(position) * kGridCellStride);
     ranges.first = range.x;
     ranges.count = range.y;
     ranges.tailFirst = range.z;
@@ -638,26 +725,7 @@ uint LightRangeIndex(LightRanges ranges, uint i) { return LightRangeEntry(ranges
 // when the cell has no tail.
 bool SampleTailLight(LightRanges ranges, float u, out uint light, out float probability)
 {
-    light = 0;
-    probability = 0.0;
-    if (ranges.tailCount == 0)
-        return false;
-    // Entries are (light, cumulative weight up to 1); the first whose weight passes u.
-    ByteAddressBuffer tail = ResourceDescriptorHeap[g_frame.gridTailView];
-    uint low = 0;
-    uint high = ranges.tailCount - 1;
-    while (low < high) {
-        uint middle = (low + high) / 2;
-        if (asfloat(tail.Load((ranges.tailFirst + middle) * 8 + 4)) <= u)
-            low = middle + 1;
-        else
-            high = middle;
-    }
-    uint2 entry = tail.Load2((ranges.tailFirst + low) * 8);
-    float before = low > 0 ? asfloat(tail.Load((ranges.tailFirst + low - 1) * 8 + 4)) : 0.0;
-    light = entry.x;
-    probability = asfloat(entry.y) - before;
-    return probability > 0.0;
+    return SampleTail(ranges.tailFirst, ranges.tailCount, u, light, probability);
 }
 
 // Irradiance below which a light cannot change the encoded result (1/1024 after the tonemap scale), so its
@@ -994,6 +1062,22 @@ float3 LightTransmittance(LightSet set, uint i, float3 origin, float3 lightPosit
     return Transmittance(origin, path / distance, ShadowRayLength(clearance, distance), ShadowMask(attached, sealed), rayFlags);
 }
 
+// On a dynamic model, a shadow ray towards a light its triangle faces away from (where the smoothed normal still faces
+// it) starts into the model and meets the model's far side: shards along the terminator. Those rays skip the model's
+// back faces. DXR's front faces appear clockwise from the ray origin in a left-handed system, so cross(p1 - p0, p2 - p0)
+// points at the origin; Source's point out of the back, so Source's back faces are DXR's front faces.
+uint SelfShadowFlags(bool onModel, float3 faceNormal, float3 toLight)
+{
+    return onModel && dot(faceNormal, toLight) < 0.0 ? RAY_FLAG_CULL_FRONT_FACING_TRIANGLES : RAY_FLAG_NONE;
+}
+
+// Where a pixel's shadow ray towards a light starts: in front of its face, or behind it for light that comes through a
+// leaf from behind (`behind` is `origin` for other surfaces).
+float3 ShadowOrigin(float3 origin, float3 behind, float3 faceNormal, float3 toLight)
+{
+    return dot(faceNormal, toLight) < 0.0 ? behind : origin;
+}
+
 static const uint kLightCandidates = 8;
 
 // One light of a LightSet by resampled importance sampling: up to kLightCandidates lights drawn uniformly (every
@@ -1042,6 +1126,21 @@ bool SampleLight(LightSet set, float3 position, float3 normal, inout uint seed, 
         return false;
     irradiance = SetLightIrradiance(set, picked, position, normal, toLight, distance) * (total / pickedLuminance);
     return true;
+}
+
+// Direct light at a hit off screen: the sun, with its shadow ray under `sunMask`, and one local light picked by
+// SampleLight, both from `origin` off the hit's surface.
+float3 HitDirectIrradiance(HitSurface hit, float3 origin, uint sunMask, inout uint seed)
+{
+    float3 irradiance = SunIrradiance(hit, origin, sunMask);
+    float3 light;
+    float3 toLight;
+    float distance;
+    uint picked;
+    LightSet set = LightSetAt(hit.position);
+    if (SampleLight(set, hit.position, hit.normal, seed, light, toLight, distance, picked))
+        irradiance += light * LightTransmittance(set, picked, origin, hit.position + toLight * distance, float2(Random(seed), Random(seed)));
+    return irradiance;
 }
 
 #endif

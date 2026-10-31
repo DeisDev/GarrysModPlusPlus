@@ -19,6 +19,13 @@ enum class DebugView : uint32_t {
     Reflections = 9,
     MotionVectors = 10,
     AmbientOcclusion = 11,
+    // The radiance cache's voxels (shaders/deferred_lighting.hlsl).
+    RadianceCache = 12,
+    // RTXDI's sample per pixel (shaders/restir.hlsl): its light as a colour, and its reservoir's sample count.
+    LightSample = 13,
+    ReservoirM = 14,
+    // NRD's validation overlay over the image (CommonSettings::enableValidation).
+    DenoiserValidation = 15,
     Count
 };
 
@@ -43,6 +50,16 @@ enum class IndirectLighting : uint32_t { RayTraced = 0, Baked, Count };
 // them directly, as area lights with shadows.
 enum class EmissiveLighting : uint32_t { Off = 0, Bounce, Full, Count };
 
+// How the main view's local lights are sampled: the light grid's strongest lights exactly and the rest sampled
+// (Legacy); NVIDIA RTXDI's importance sampling from its ReGIR light grid (RIS); the same with samples reused across
+// frames and neighbours (ReSTIR DI); or Auto: reused samples with TAA, importance sampling with DLSS Ray Reconstruction
+// (as RTXPT pairs them).
+enum class LightSampling : uint32_t { Legacy = 0, Ris, Restir, Auto, Count };
+
+// What denoises the main view's indirect light and reflections without DLSS Ray Reconstruction: the built-in filters,
+// or NVIDIA NRD's RELAX or REBLUR.
+enum class DenoiserType : uint32_t { BuiltIn = 0, Relax, Reblur, Count };
+
 // Options shown in the in-game menu. Read on the render thread; the menu edits them on the same thread.
 struct Settings {
     bool realtimeLighting = true;
@@ -55,6 +72,8 @@ struct Settings {
     bool denoiser = true;
     bool ambientOcclusion = true;
     bool reflections = true;
+    // Reflections follow a GGX lobe where the material has a Phong exponent; mirrors everywhere without.
+    bool glossyReflections = true;
     // Translucent surfaces lit from the ray-traced irradiance volume instead of baked light.
     bool translucentLighting = true;
     // Views drawn into textures (cameras, mirrors, scopes) lit like translucent surfaces.
@@ -95,6 +114,10 @@ struct Settings {
     EmissiveLighting emissiveLighting = EmissiveLighting::Full;
     // Indirect light and ambient occlusion rays take alpha-tested surfaces from their opacity micromaps alone.
     bool fastAlphaTests = false;
+    // The world-space radiance cache (NVIDIA SHaRC) for the light of indirect, light volume and reflection hits.
+    bool radianceCache = true;
+    LightSampling lightSampling = LightSampling::Auto;
+    DenoiserType denoiserType = DenoiserType::Relax;
     bool opacityMicromaps = true;
     // The display the game window goes on, 1-based in the order Displays() lists them; 0 leaves it where the game
     // puts it (the primary display).
@@ -124,7 +147,22 @@ void SaveSettings(const std::filesystem::path& path, const Settings& settings);
 void SyncSettingsFile(const std::filesystem::path& path);
 void MarkSettingsChanged();
 
-enum class GpuPass : uint32_t { SceneUpdate, Surface, Volume, DirectLight, AmbientOcclusion, IndirectTrace, Accumulation, Denoiser, Reflections, Lighting, Resolve, Count };
+enum class GpuPass : uint32_t {
+    SceneUpdate,
+    Surface,
+    RadianceCache,
+    Volume,
+    DirectLight,
+    LightSampling,
+    AmbientOcclusion,
+    IndirectTrace,
+    Reflections,
+    Accumulation,
+    Denoiser,
+    Lighting,
+    Resolve,
+    Count
+};
 
 // Why real-time lighting is not drawing, if it is on.
 enum class RealtimeBlock : uint8_t { None, Unsupported, OtherThread };
@@ -152,6 +190,8 @@ struct Statistics {
     uint32_t gbufferShaders = 0;
     uint32_t replacedShaders = 0;
     bool opacityMicromapsAvailable = false;
+    // The device has what the radiance cache needs (RaytracingSupport::radianceCache).
+    bool radianceCacheAvailable = false;
     // Alpha-tested and translucent triangles with an opacity micromap, and the micromaps they share.
     uint32_t micromapTriangles = 0;
     uint32_t micromaps = 0;

@@ -30,6 +30,8 @@ public:
     UINT CreateRawView(ID3D12Resource* buffer, UINT64 offset, UINT64 size);
     // A RWByteAddressBuffer view of a whole buffer.
     UINT CreateRawUav(ID3D12Resource* buffer);
+    // A RWStructuredBuffer view of a whole buffer of `stride`-byte elements.
+    UINT CreateStructuredUav(ID3D12Resource* buffer, UINT stride);
 
 private:
     ID3D12Device* m_device = nullptr;

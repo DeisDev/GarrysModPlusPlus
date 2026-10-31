@@ -161,7 +161,7 @@ void main(uint3 id : SV_DispatchThreadID)
     float3 additive = g_frame.additiveAfterResolve != 0 ? 0.0 : Decode(lightTexture.Load(int3(pixel, 0)).rgb);
     if (!covered && surface.w < 0.0) {
         float3 position = WorldPositionFromDepth(pixel, DepthAt(pixel));
-        WaterResult water = ShadeWater(pixel, position, g_frame.previousLitView);
+        WaterResult water = ShadeWater(pixel, position);
         float3 shaded = ApplyFog(water.color * g_frame.tonemapScale, position) + VolumetricLight(pixel);
         output[pixel] = float4(g_frame.outputLinear != 0 ? shaded : Encode(shaded), color.a);
         if (g_pass.output1 != kNoView) {
@@ -169,7 +169,7 @@ void main(uint3 id : SV_DispatchThreadID)
             RWTexture2D<float> roughness = ResourceDescriptorHeap[g_pass.output2];
             RWTexture2D<float> hitDistance = ResourceDescriptorHeap[g_pass.output3];
             specular[pixel] = float4(water.specularAlbedo, 1.0);
-            roughness[pixel] = 0.02;
+            roughness[pixel] = g_frame.glossyReflections != 0 ? sqrt(kGlintRoughness) : 0.0;
             hitDistance[pixel] = water.hitDistance;
         }
         return;
@@ -197,6 +197,10 @@ void main(uint3 id : SV_DispatchThreadID)
     if (g_pass.input2 != kNoView) {
         Texture2D<float4> reflections = ResourceDescriptorHeap[g_pass.input2];
         added = reflections.Load(int3(pixel, 0)).rgb;
+    }
+    if (g_frame.selfIllumView != kNoView) {
+        Texture2D<float4> selfIllum = ResourceDescriptorHeap[g_frame.selfIllumView];
+        added += selfIllum.Load(int3(pixel, 0)).rgb;
     }
     float3 position = WorldPositionFromDepth(pixel, DepthAt(pixel));
     Texture2D<float4> directTexture = ResourceDescriptorHeap[g_pass.input3];
@@ -248,6 +252,18 @@ void main(uint3 id : SV_DispatchThreadID)
         break;
     }
     case 11: result = ambientOcclusion; break;
+    // The radiance cache's voxels, each its own colour (black without the cache).
+    case 12: result = RadianceCacheEnabled() ? CacheDebugColor(position, GeometricNormalAt(pixel)) : 0.0; break;
+    // RTXDI's sample per pixel: its light as a colour, or its reservoir's sample count (shaders/restir.hlsl); black without.
+    case 13:
+    case 14: {
+        result = 0.0;
+        if (g_frame.restirDebugView != kNoView) {
+            Texture2D<float4> restir = ResourceDescriptorHeap[g_frame.restirDebugView];
+            result = restir.Load(int3(pixel, 0)).rgb;
+        }
+        break;
+    }
     case 10: {
         // Red and green: motion towards last frame (a tenth of a pixel per step); blue: unlit material.
         Texture2D<float2> motion = ResourceDescriptorHeap[g_frame.motionView];
@@ -266,6 +282,12 @@ void main(uint3 id : SV_DispatchThreadID)
         }
         float3 shaded = ApplyFog((albedo * light + emissive + added + specular) * g_frame.tonemapScale, position) + additive + VolumetricLight(pixel);
         result = g_frame.outputLinear != 0 ? shaded : Encode(shaded);
+        // NRD's validation overlay (debug view 15) over the image.
+        if (g_frame.debugView == 15 && g_frame.nrdValidationView != kNoView) {
+            Texture2D<float4> validation = ResourceDescriptorHeap[g_frame.nrdValidationView];
+            float4 overlay = validation.Load(int3(pixel, 0));
+            result = lerp(result, overlay.rgb, overlay.a);
+        }
         break;
     }
     }

@@ -14,8 +14,11 @@
 #include <g_compositePS.h>
 #include <g_compositeVS.h>
 #include <g_deferredLightingCS.h>
+#include <g_deferredLightingCacheCS.h>
 #include <g_directCS.h>
 #include <g_directOmmCS.h>
+#include <g_directSunCS.h>
+#include <g_directSunOmmCS.h>
 #include <g_directWideCS.h>
 #include <g_directWideOmmCS.h>
 #include <g_dlssInputsCS.h>
@@ -23,16 +26,36 @@
 #include <g_giFilterCS.h>
 #include <g_giTemporalCS.h>
 #include <g_giTraceCS.h>
+#include <g_giTraceCacheCS.h>
+#include <g_giTraceCacheOmmCS.h>
 #include <g_giTraceOmmCS.h>
+#include <g_nrdInputsCS.h>
+#include <g_nrdResolveCS.h>
 #include <g_translucentDepthCS.h>
 #include <g_viewRectCS.h>
 #include <g_primaryCS.h>
 #include <g_primaryOmmCS.h>
 #include <g_probesCS.h>
+#include <g_probesCacheCS.h>
+#include <g_probesCacheOmmCS.h>
 #include <g_probesOmmCS.h>
 #include <g_reflectionTemporalCS.h>
 #include <g_reflectionsCS.h>
+#include <g_reflectionsCacheCS.h>
+#include <g_reflectionsCacheOmmCS.h>
 #include <g_reflectionsOmmCS.h>
+#include <g_restirInitialCS.h>
+#include <g_restirInitialOmmCS.h>
+#include <g_restirPdfCS.h>
+#include <g_restirPresampleCS.h>
+#include <g_restirRegirCS.h>
+#include <g_restirShadeCS.h>
+#include <g_restirShadeOmmCS.h>
+#include <g_restirSpatialCS.h>
+#include <g_restirTemporalCS.h>
+#include <g_sharcResolveCS.h>
+#include <g_sharcUpdateCS.h>
+#include <g_sharcUpdateOmmCS.h>
 #include <g_skyCS.h>
 #include <g_surfaceCS.h>
 #include <g_swayCS.h>
@@ -68,6 +91,26 @@ constexpr UINT kViewsPerSlot = kInputViews + kMaxProjectors;
 constexpr UINT kInvalidView = ~0u;
 // Texels on a side of each face of the sky light (kSize in shaders/sky.hlsl).
 constexpr UINT kSkyLightSize = 8;
+// Per slot: SamplingConstants, then RestirConstants from kRestirConstantsOffset.
+constexpr UINT kSamplingStride = 4096;
+constexpr UINT kRestirConstantsOffset = 256;
+static_assert(sizeof(RestirConstants) <= kSamplingStride - kRestirConstantsOffset);
+// The indirect light volume is read by the lighting passes and by the game's forward draws in their own command lists.
+constexpr D3D12_RESOURCE_STATES kVolumeRead = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+static_assert(sizeof(SamplingConstants) <= kSamplingStride);
+// The radiance cache (NVIDIA SHaRC): 2^22 entries of 8 + 16 + 16 bytes (160 MiB), SHaRC's recommended size. Voxels are
+// about their distance from the camera over kCacheSceneScale across (a ratio, so Source's units need no conversion);
+// RTXPT's advanced sample uses 35. Entries are evicted after 64 frames unseen and radiance is summed in fixed point
+// with 1000 steps per unit (SHaRC's recommended starting values). Entries accumulate over up to 5 frames: with 10, a
+// switched light's bounce light took about 1 s to settle, as the window compounds over the cached bounces; 5 halves
+// that for 0.2 points more frame-to-frame change in denoised indirect light, none measurable on de_investment.
+constexpr UINT kCacheCapacity = 1u << 22;
+constexpr float kCacheSceneScale = 35.0f;
+constexpr UINT kCacheAccumulationFrames = 5;
+constexpr UINT kCacheStaleFrames = 64;
+constexpr float kCacheRadianceScale = 1000.0f;
+// shaders/sharc_update.hlsl traces one path per block of this many pixels on a side.
+constexpr UINT kCacheBlock = 4;
 
 // Mirrors Projector in shaders/scene.hlsli.
 struct GpuProjector {
@@ -333,13 +376,14 @@ ComPtr<ID3D12Resource> CreateBuffer(ID3D12Device* device, D3D12_HEAP_TYPE heap, 
 
 }
 
-bool Lighting::Initialize(ID3D12Device5* device, ID3D12CommandQueue* queue, DescriptorHeap& descriptors, bool opacityMicromaps,
+bool Lighting::Initialize(ID3D12Device5* device, ID3D12CommandQueue* queue, DescriptorHeap& descriptors, const RaytracingSupport& support,
     const std::filesystem::path& dlssDirectory)
 {
     m_device = device;
     m_queue = queue;
     m_descriptors = &descriptors;
-    m_opacityMicromaps = opacityMicromaps;
+    m_opacityMicromaps = support.opacityMicromaps;
+    m_radianceCacheSupported = support.radianceCache;
     HRESULT hr = S_OK;
     for (auto& allocator : m_allocators) {
         if (SUCCEEDED(hr))
@@ -362,6 +406,24 @@ bool Lighting::Initialize(ID3D12Device5* device, ID3D12CommandQueue* queue, Desc
     if (SUCCEEDED(hr)) {
         m_constants = CreateBuffer(m_device, D3D12_HEAP_TYPE_UPLOAD, kConstantsStride * kConstantsPerSlot * kSlots, D3D12_RESOURCE_STATE_GENERIC_READ);
         hr = m_constants ? m_constants->Map(0, nullptr, reinterpret_cast<void**>(&m_constantsMapped)) : E_OUTOFMEMORY;
+    }
+    if (SUCCEEDED(hr)) {
+        m_sampling = CreateBuffer(m_device, D3D12_HEAP_TYPE_UPLOAD, kSamplingStride * kSlots, D3D12_RESOURCE_STATE_GENERIC_READ);
+        hr = m_sampling ? m_sampling->Map(0, nullptr, reinterpret_cast<void**>(&m_samplingMapped)) : E_OUTOFMEMORY;
+    }
+    if (SUCCEEDED(hr)) {
+        D3D12_HEAP_PROPERTIES heap = {D3D12_HEAP_TYPE_DEFAULT};
+        D3D12_RESOURCE_DESC desc = {};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        desc.Width = 256;
+        desc.Height = 1;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = 1;
+        desc.SampleDesc.Count = 1;
+        desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        hr = m_device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+            IID_PPV_ARGS(&m_unusedRootUav));
     }
     if (SUCCEEDED(hr)) {
         m_forwardConstants = CreateBuffer(m_device, D3D12_HEAP_TYPE_UPLOAD, kConstantsStride * kSlots, D3D12_RESOURCE_STATE_GENERIC_READ);
@@ -434,21 +496,37 @@ bool Lighting::Initialize(ID3D12Device5* device, ID3D12CommandQueue* queue, Desc
     }
     if (SUCCEEDED(hr))
         hr = m_device->CreateRootSignature(0, g_surfaceCS, sizeof(g_surfaceCS), IID_PPV_ARGS(&m_computeRoot));
-    const bool micromaps = opacityMicromaps;
-    const std::span<const BYTE> shaders[] = {g_surfaceCS, g_primaryCS, g_probesCS, g_aoCS, g_volumetricsCS, g_directCS, g_giTraceCS, g_giTemporalCS,
-        g_giFilterCS, g_deferredLightingCS, g_taaCS, g_taaSharpenCS, g_reflectionsCS, g_reflectionTemporalCS, g_dlssInputsCS, g_dlssResolveCS, g_directWideCS, g_swayCS, g_translucentDepthCS, g_viewRectCS, g_bakedResidualCS, g_skyCS};
+    const bool micromaps = support.opacityMicromaps;
+    // Devices with the radiance cache run the passes that read it in their variants built with SHaRC (which read it only
+    // while it is on); others run the plain passes and have no cache passes.
+    const bool cache = m_radianceCacheSupported;
+    const std::span<const BYTE> none;
+    const std::span<const BYTE> shaders[] = {g_surfaceCS, g_primaryCS, cache ? std::span<const BYTE>(g_probesCacheCS) : g_probesCS, g_aoCS,
+        g_volumetricsCS, g_directCS, cache ? std::span<const BYTE>(g_giTraceCacheCS) : g_giTraceCS, g_giTemporalCS, g_giFilterCS,
+        cache ? std::span<const BYTE>(g_deferredLightingCacheCS) : g_deferredLightingCS, g_taaCS, g_taaSharpenCS,
+        cache ? std::span<const BYTE>(g_reflectionsCacheCS) : g_reflectionsCS, g_reflectionTemporalCS, g_dlssInputsCS, g_dlssResolveCS, g_directWideCS,
+        g_swayCS, g_translucentDepthCS, g_viewRectCS, g_bakedResidualCS, g_skyCS, cache ? std::span<const BYTE>(g_sharcUpdateCS) : none,
+        cache ? std::span<const BYTE>(g_sharcResolveCS) : none, g_directSunCS, g_restirPdfCS, g_restirPresampleCS, g_restirRegirCS, g_restirInitialCS,
+        g_restirTemporalCS, g_restirSpatialCS, g_restirShadeCS, g_nrdInputsCS, g_nrdResolveCS};
     static_assert(std::size(shaders) == static_cast<size_t>(Pass::Count));
     for (size_t i = 0; i < m_pipelines.size() && SUCCEEDED(hr); ++i) {
+        if (shaders[i].empty())
+            continue;
         D3D12_COMPUTE_PIPELINE_STATE_DESC desc = {};
         desc.pRootSignature = m_computeRoot.Get();
         desc.CS = {shaders[i].data(), shaders[i].size()};
         hr = m_device->CreateComputePipelineState(&desc, IID_PPV_ARGS(&m_pipelines[i]));
     }
     // Variants of the passes that trace rays whose ray queries let opacity micromaps settle alpha tests.
-    const std::pair<Pass, std::span<const BYTE>> micromapShaders[] = {{Pass::Primary, g_primaryOmmCS}, {Pass::Probes, g_probesOmmCS}, {Pass::Ao, g_aoOmmCS},
-        {Pass::Volumetrics, g_volumetricsOmmCS}, {Pass::Direct, g_directOmmCS}, {Pass::GiTrace, g_giTraceOmmCS}, {Pass::Reflections, g_reflectionsOmmCS},
-        {Pass::DirectWide, g_directWideOmmCS}};
+    const std::pair<Pass, std::span<const BYTE>> micromapShaders[] = {{Pass::Primary, g_primaryOmmCS},
+        {Pass::Probes, cache ? std::span<const BYTE>(g_probesCacheOmmCS) : g_probesOmmCS}, {Pass::Ao, g_aoOmmCS}, {Pass::Volumetrics, g_volumetricsOmmCS},
+        {Pass::Direct, g_directOmmCS}, {Pass::GiTrace, cache ? std::span<const BYTE>(g_giTraceCacheOmmCS) : g_giTraceOmmCS},
+        {Pass::Reflections, cache ? std::span<const BYTE>(g_reflectionsCacheOmmCS) : g_reflectionsOmmCS}, {Pass::DirectWide, g_directWideOmmCS},
+        {Pass::SharcUpdate, cache ? std::span<const BYTE>(g_sharcUpdateOmmCS) : none}, {Pass::DirectSun, g_directSunOmmCS},
+        {Pass::RestirInitial, g_restirInitialOmmCS}, {Pass::RestirShade, g_restirShadeOmmCS}};
     for (size_t i = 0; i < std::size(micromapShaders) && SUCCEEDED(hr) && micromaps; ++i) {
+        if (micromapShaders[i].second.empty())
+            continue;
         D3D12_COMPUTE_PIPELINE_STATE_DESC desc = {};
         desc.pRootSignature = m_computeRoot.Get();
         desc.CS = {micromapShaders[i].second.data(), micromapShaders[i].second.size()};
@@ -550,6 +628,8 @@ bool Lighting::Initialize(ID3D12Device5* device, ID3D12CommandQueue* queue, Desc
         m_rrInputs[i].uav = m_rrInputUavs + i;
     GetStatistics().rayReconstructionAvailable = m_rayReconstruction.Initialize(m_device, dlssDirectory, ModDirectory() / L"logs");
     GetStatistics().opacityMicromapsAvailable = micromaps;
+    GetStatistics().radianceCacheAvailable = cache;
+    m_restirAvailable = m_restir.Initialize(m_device, *m_descriptors);
     log::Info("Lighting: initialized");
     return true;
 }
@@ -667,8 +747,16 @@ bool Lighting::EnsureTargets(UINT width, UINT height)
     for (Texture& texture : m_giFiltered)
         ok = ok && CreateTarget(texture, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT);
     // Linear (Ray Reconstruction) or encoded shaded colour.
-    for (Texture& texture : m_lit)
-        ok = ok && CreateTarget(texture, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT);
+    ok = ok && CreateTarget(m_lit, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT);
+    ok = ok && CreateTarget(m_restirDebug, width, height, DXGI_FORMAT_R8G8B8A8_UNORM);
+    ok = ok && CreateTarget(m_selfIllum, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT);
+    // NRD's inputs and outputs in the formats NRD.hlsli packs them for.
+    ok = ok && CreateTarget(m_nrdViewZ, width, height, DXGI_FORMAT_R32_FLOAT);
+    ok = ok && CreateTarget(m_nrdNormalRoughness, width, height, DXGI_FORMAT_R10G10B10A2_UNORM);
+    for (Texture* texture : {&m_nrdDiffuse, &m_nrdSpecular, &m_nrdDiffuseOut, &m_nrdSpecularOut})
+        ok = ok && CreateTarget(*texture, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT);
+    ok = ok && CreateTarget(m_nrdValidation, width, height, DXGI_FORMAT_R8G8B8A8_UNORM);
+    m_nrdHistoryValid = false;
     ok = ok && CreateTarget(m_reflections, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT);
     for (Texture& texture : m_aoHistory)
         ok = ok && CreateTarget(texture, width, height, DXGI_FORMAT_R16G16_FLOAT);
@@ -703,6 +791,213 @@ bool Lighting::EnsureTargets(UINT width, UINT height)
     return ok;
 }
 
+bool Lighting::EnsureRadianceCache(bool wanted)
+{
+    if (wanted == (m_cacheHash != nullptr))
+        return wanted;
+    WaitForGpu();
+    m_descriptors->Free(m_cacheAccumulationUav);
+    m_descriptors->Free(m_cacheResolvedUav);
+    m_cacheAccumulationUav = DescriptorHeap::kInvalid;
+    m_cacheResolvedUav = DescriptorHeap::kInvalid;
+    m_cacheHash.Reset();
+    m_cacheAccumulation.Reset();
+    m_cacheResolved.Reset();
+    if (!wanted) {
+        log::Info("Lighting: radiance cache freed");
+        return false;
+    }
+    D3D12_HEAP_PROPERTIES heap = {D3D12_HEAP_TYPE_DEFAULT};
+    D3D12_RESOURCE_DESC desc = {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Height = 1;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    HRESULT hr = S_OK;
+    for (auto [buffer, stride] : {std::pair(std::addressof(m_cacheHash), 8u), std::pair(std::addressof(m_cacheAccumulation), 16u),
+             std::pair(std::addressof(m_cacheResolved), 16u)}) {
+        desc.Width = static_cast<UINT64>(kCacheCapacity) * stride;
+        if (SUCCEEDED(hr))
+            hr = m_device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(buffer->ReleaseAndGetAddressOf()));
+    }
+    if (SUCCEEDED(hr)) {
+        m_cacheAccumulationUav = m_descriptors->CreateStructuredUav(m_cacheAccumulation.Get(), 16);
+        m_cacheResolvedUav = m_descriptors->CreateStructuredUav(m_cacheResolved.Get(), 16);
+        if (m_cacheAccumulationUav == DescriptorHeap::kInvalid || m_cacheResolvedUav == DescriptorHeap::kInvalid)
+            hr = E_OUTOFMEMORY;
+    }
+    if (FAILED(hr)) {
+        log::Info("Lighting: creating the radiance cache failed ({:#010x}); indirect light is traced without it", Hex(hr));
+        m_descriptors->Free(m_cacheAccumulationUav);
+        m_descriptors->Free(m_cacheResolvedUav);
+        m_cacheAccumulationUav = DescriptorHeap::kInvalid;
+        m_cacheResolvedUav = DescriptorHeap::kInvalid;
+        m_cacheHash.Reset();
+        m_cacheAccumulation.Reset();
+        m_cacheResolved.Reset();
+        return false;
+    }
+    m_cacheClear = true;
+    log::Info("Lighting: radiance cache of {} entries ({} MiB)", kCacheCapacity, static_cast<UINT64>(kCacheCapacity) * 40 / (1024 * 1024));
+    return true;
+}
+
+void Lighting::BindCompute(D3D12_GPU_VIRTUAL_ADDRESS frameConstants, D3D12_GPU_VIRTUAL_ADDRESS scene, UINT slot)
+{
+    ID3D12DescriptorHeap* heaps[] = {m_descriptors->Heap()};
+    m_list->SetDescriptorHeaps(1, heaps);
+    m_list->SetComputeRootSignature(m_computeRoot.Get());
+    m_list->SetComputeRootConstantBufferView(0, frameConstants);
+    m_list->SetComputeRootShaderResourceView(1, scene);
+    const D3D12_GPU_VIRTUAL_ADDRESS sampling = m_sampling->GetGPUVirtualAddress() + slot * kSamplingStride;
+    m_list->SetComputeRootConstantBufferView(3, sampling);
+    m_list->SetComputeRootUnorderedAccessView(4, (m_cacheHash ? m_cacheHash : m_unusedRootUav)->GetGPUVirtualAddress());
+    m_list->SetComputeRootConstantBufferView(5, sampling + kRestirConstantsOffset);
+    m_list->SetComputeRootUnorderedAccessView(6, (m_restirAvailable ? m_restir.RisBuffer() : m_unusedRootUav.Get())->GetGPUVirtualAddress());
+    m_list->SetComputeRootUnorderedAccessView(7, (m_restir.Reservoirs() ? m_restir.Reservoirs() : m_unusedRootUav.Get())->GetGPUVirtualAddress());
+    m_list->SetComputeRootShaderResourceView(8, (m_restirAvailable ? m_restir.NeighborOffsets() : m_sampling.Get())->GetGPUVirtualAddress());
+}
+
+bool Lighting::EnsureNrd(DenoiserType type)
+{
+    if (m_nrdFailed)
+        return false;
+    const NrdDenoiser::Method method = type == DenoiserType::Reblur ? NrdDenoiser::Method::Reblur : NrdDenoiser::Method::Relax;
+    if (m_nrd.Matches(method, m_width, m_height))
+        return true;
+    WaitForGpu();
+    m_nrdHistoryValid = false;
+    if (!m_nrd.Initialize(m_device, *m_descriptors, method, m_width, m_height)) {
+        m_nrdFailed = true;
+        return false;
+    }
+    return true;
+}
+
+bool Lighting::RecordNrd(const FrameConstants& constants, const ViewInputs& inputs, UINT slot, UINT current, D3D12_GPU_VIRTUAL_ADDRESS frameConstants,
+    D3D12_GPU_VIRTUAL_ADDRESS scene)
+{
+    const D3D12_RESOURCE_STATES read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    const D3D12_RESOURCE_STATES write = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    Texture* inputs_[] = {&m_nrdViewZ, &m_nrdNormalRoughness, &m_nrdDiffuse, &m_nrdSpecular};
+    for (Texture* texture : inputs_)
+        Use(*texture, write);
+    for (Texture* texture : {&m_giRaw, &m_reflections, &m_rrRoughness, &m_rrSpecularAlbedo})
+        Use(*texture, read);
+    const UINT method = m_nrd.CurrentMethod() == NrdDenoiser::Method::Reblur ? 1u : 0u;
+    Dispatch(Pass::NrdInputs, {.input0 = m_giRaw.srv, .input1 = m_reflections.srv, .input2 = m_rrRoughness.srv, .input3 = m_rrSpecularAlbedo.srv,
+        .output0 = m_nrdViewZ.uav, .output1 = m_nrdNormalRoughness.uav, .output2 = m_nrdDiffuse.uav, .output3 = m_nrdSpecular.uav, .step = method});
+    for (Texture* texture : inputs_)
+        Use(*texture, read);
+
+    // The matrices are the ones Ray Reconstruction takes: row-major for row vectors, which is NRD's column-major layout
+    // for column vectors. Motion is in pixels; NRD's is in texture coordinates.
+    nrd::CommonSettings common = {};
+    float worldToView[16];
+    float viewToClip[16];
+    SplitViewProjection(constants.viewProj, constants.eyePosition, worldToView, viewToClip);
+    const bool restart = !m_nrdHistoryValid || constants.historyValid == 0;
+    std::memcpy(common.worldToViewMatrix, worldToView, sizeof(worldToView));
+    std::memcpy(common.viewToClipMatrix, viewToClip, sizeof(viewToClip));
+    std::memcpy(common.worldToViewMatrixPrev, restart ? worldToView : m_nrdWorldToView, sizeof(worldToView));
+    std::memcpy(common.viewToClipMatrixPrev, restart ? viewToClip : m_nrdViewToClip, sizeof(viewToClip));
+    common.motionVectorScale[0] = 1.0f / static_cast<float>(m_width);
+    common.motionVectorScale[1] = 1.0f / static_cast<float>(m_height);
+    common.motionVectorScale[2] = 0.0f;
+    common.cameraJitter[0] = inputs.jitterX;
+    common.cameraJitter[1] = inputs.jitterY;
+    common.cameraJitterPrev[0] = restart ? inputs.jitterX : m_nrdJitter[0];
+    common.cameraJitterPrev[1] = restart ? inputs.jitterY : m_nrdJitter[1];
+    common.resourceSize[0] = common.resourceSizePrev[0] = common.rectSize[0] = common.rectSizePrev[0] = static_cast<uint16_t>(m_width);
+    common.resourceSize[1] = common.resourceSizePrev[1] = common.rectSize[1] = common.rectSizePrev[1] = static_cast<uint16_t>(m_height);
+    common.frameIndex = m_nrdFrame++;
+    common.accumulationMode = restart ? nrd::AccumulationMode::RESTART : nrd::AccumulationMode::CONTINUE;
+    common.enableValidation = constants.debugView == static_cast<uint32_t>(DebugView::DenoiserValidation);
+    NrdDenoiser::Resources resources = {};
+    const auto provide = [&](nrd::ResourceType type, Texture& texture) { resources[static_cast<size_t>(type)] = {texture.resource.Get(), &texture.state}; };
+    provide(nrd::ResourceType::IN_MV, m_motion);
+    provide(nrd::ResourceType::IN_NORMAL_ROUGHNESS, m_nrdNormalRoughness);
+    provide(nrd::ResourceType::IN_VIEWZ, m_nrdViewZ);
+    provide(nrd::ResourceType::IN_DIFF_RADIANCE_HITDIST, m_nrdDiffuse);
+    provide(nrd::ResourceType::IN_SPEC_RADIANCE_HITDIST, m_nrdSpecular);
+    provide(nrd::ResourceType::OUT_DIFF_RADIANCE_HITDIST, m_nrdDiffuseOut);
+    provide(nrd::ResourceType::OUT_SPEC_RADIANCE_HITDIST, m_nrdSpecularOut);
+    provide(nrd::ResourceType::OUT_VALIDATION, m_nrdValidation);
+    m_nrdHistoryValid = m_nrd.Denoise(m_list.Get(), slot, common, resources);
+    BindCompute(frameConstants, scene, slot);
+    if (!m_nrdHistoryValid) {
+        log::Info("NRD: recording its dispatches failed; the built-in denoiser is used");
+        m_nrdFailed = true;
+        return false;
+    }
+    std::memcpy(m_nrdWorldToView, worldToView, sizeof(worldToView));
+    std::memcpy(m_nrdViewToClip, viewToClip, sizeof(viewToClip));
+    m_nrdJitter[0] = inputs.jitterX;
+    m_nrdJitter[1] = inputs.jitterY;
+    Use(m_nrdDiffuseOut, read);
+    Use(m_nrdSpecularOut, read);
+    Use(m_giFiltered[0], write);
+    Use(m_reflectionHistory[current], write);
+    Dispatch(Pass::NrdResolve, {.input0 = m_nrdDiffuseOut.srv, .input1 = m_nrdSpecularOut.srv, .input2 = m_rrSpecularAlbedo.srv, .output0 = m_giFiltered[0].uav,
+        .output1 = m_reflectionHistory[current].uav, .step = method});
+    Use(m_giFiltered[0], read);
+    Use(m_reflectionHistory[current], read);
+    if (common.enableValidation)
+        Use(m_nrdValidation, read);
+    return true;
+}
+
+void Lighting::RecordRestir(RestirMode mode, bool debugImage)
+{
+    // Root descriptors are not bounds-checked: bind the buffers Prepare may have just made (BindCompute ran before).
+    m_list->SetComputeRootUnorderedAccessView(6, m_restir.RisBuffer()->GetGPUVirtualAddress());
+    m_list->SetComputeRootUnorderedAccessView(7, m_restir.Reservoirs()->GetGPUVirtualAddress());
+    ID3D12Resource* pdf = m_restir.Pdf();
+    const D3D12_RESOURCE_BARRIER pdfBarrier = {D3D12_RESOURCE_BARRIER_TYPE_UAV, D3D12_RESOURCE_BARRIER_FLAG_NONE, {.UAV = {pdf}}};
+    const D3D12_RESOURCE_BARRIER risBarrier = {D3D12_RESOURCE_BARRIER_TYPE_UAV, D3D12_RESOURCE_BARRIER_FLAG_NONE, {.UAV = {m_restir.RisBuffer()}}};
+    const D3D12_RESOURCE_BARRIER reservoirBarrier = {D3D12_RESOURCE_BARRIER_TYPE_UAV, D3D12_RESOURCE_BARRIER_FLAG_NONE, {.UAV = {m_restir.Reservoirs()}}};
+    D3D12_RESOURCE_STATES& pdfState = m_restir.PdfState();
+    if (pdfState != D3D12_RESOURCE_STATE_UNORDERED_ACCESS) {
+        const D3D12_RESOURCE_BARRIER barrier = Transition(pdf, pdfState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        m_list->ResourceBarrier(1, &barrier);
+        pdfState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    }
+    // Each light's power, then the sums of each mip.
+    for (UINT mip = 0; mip < m_restir.PdfMips(); ++mip) {
+        if (mip > 0)
+            m_list->ResourceBarrier(1, &pdfBarrier);
+        const UINT width = std::max(m_restir.PdfWidth() >> mip, 1u);
+        const UINT height = std::max(m_restir.PdfHeight() >> mip, 1u);
+        DispatchGroups(Pass::RestirPdf, {.step = mip}, (width + 7) / 8, (height + 7) / 8, 1);
+    }
+    const D3D12_RESOURCE_BARRIER readable = Transition(pdf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    m_list->ResourceBarrier(1, &readable);
+    pdfState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    m_list->ResourceBarrier(1, &risBarrier);
+    DispatchGroups(Pass::RestirPresample, {}, Restir::kTileSize * Restir::kTileCount / 256, 1, 1);
+    m_list->ResourceBarrier(1, &risBarrier);
+    DispatchGroups(Pass::RestirRegir, {}, (m_restir.RegirLightSlots() + 255) / 256, 1, 1);
+    m_list->ResourceBarrier(1, &risBarrier);
+    m_list->ResourceBarrier(1, &reservoirBarrier);
+    Dispatch(Pass::RestirInitial, {});
+    m_list->ResourceBarrier(1, &reservoirBarrier);
+    if (mode == RestirMode::Reuse) {
+        Dispatch(Pass::RestirTemporal, {});
+        m_list->ResourceBarrier(1, &reservoirBarrier);
+        Dispatch(Pass::RestirSpatial, {});
+        m_list->ResourceBarrier(1, &reservoirBarrier);
+    }
+    if (debugImage)
+        Use(m_restirDebug, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    Dispatch(Pass::RestirShade, {.output0 = m_directRemainder.uav, .output1 = m_specular.uav, .output2 = debugImage ? m_restirDebug.uav : kInvalidView});
+    m_list->ResourceBarrier(1, &reservoirBarrier);
+    if (debugImage)
+        Use(m_restirDebug, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+}
+
 void Lighting::Use(Texture& texture, D3D12_RESOURCE_STATES state)
 {
     if (texture.state == state)
@@ -712,10 +1007,16 @@ void Lighting::Use(Texture& texture, D3D12_RESOURCE_STATES state)
     texture.state = state;
 }
 
+void Lighting::SetPipeline(Pass pass)
+{
+    ID3D12PipelineState* micromapPipeline = m_micromapPipelines[static_cast<size_t>(pass)].Get();
+    m_list->SetPipelineState(m_useMicromaps && micromapPipeline != nullptr ? micromapPipeline : m_pipelines[static_cast<size_t>(pass)].Get());
+}
+
 void Lighting::Dispatch(Pass pass, const PassArgs& args)
 {
     static_assert(sizeof(PassArgs) == 12 * sizeof(UINT));
-    m_list->SetPipelineState(m_pipelines[static_cast<size_t>(pass)].Get());
+    SetPipeline(pass);
     m_list->SetComputeRoot32BitConstants(2, sizeof(PassArgs) / sizeof(UINT), &args, 0);
     if (m_rectDispatch)
         m_list->ExecuteIndirect(m_dispatchSignature.Get(), 1, m_viewRect.resource.Get(), 16, nullptr, 0);
@@ -725,8 +1026,7 @@ void Lighting::Dispatch(Pass pass, const PassArgs& args)
 
 void Lighting::DispatchGroups(Pass pass, const PassArgs& args, UINT x, UINT y, UINT z)
 {
-    ID3D12PipelineState* micromapPipeline = m_micromapPipelines[static_cast<size_t>(pass)].Get();
-    m_list->SetPipelineState(m_useMicromaps && micromapPipeline != nullptr ? micromapPipeline : m_pipelines[static_cast<size_t>(pass)].Get());
+    SetPipeline(pass);
     m_list->SetComputeRoot32BitConstants(2, sizeof(PassArgs) / sizeof(UINT), &args, 0);
     m_list->Dispatch(x, y, z);
 }
@@ -774,12 +1074,8 @@ void Lighting::UpdateSway(const Scene& scene, UINT slot, const gbuffer::SwayCloc
         log::Info("Lighting: swaying props follow the game's wind ({:.2f} {:.2f}) from time {:.2f}", clock.wind[0], clock.wind[1], time);
     }
     if (const std::optional<SwayingProps::Jobs> jobs = m_sway.BeginUpdate(m_list.Get(), scene, slot, eye, time, m_swayTime, clock.wind, m_swayWind)) {
-        ID3D12DescriptorHeap* heaps[] = {m_descriptors->Heap()};
-        m_list->SetDescriptorHeaps(1, heaps);
-        m_list->SetComputeRootSignature(m_computeRoot.Get());
-        m_list->SetComputeRootConstantBufferView(0, frameConstants);
         // The pass traces nothing, so the scene's root slot holds any valid address.
-        m_list->SetComputeRootShaderResourceView(1, frameConstants);
+        BindCompute(frameConstants, frameConstants, slot);
         DispatchGroups(Pass::Sway, {.input0 = jobs->jobsView, .input1 = jobs->materialsView, .output0 = jobs->currentUav, .output1 = jobs->previousUav},
             jobs->groupsX, jobs->count, 1);
         m_sway.FinishUpdate(m_list.Get(), scene);
@@ -895,15 +1191,20 @@ bool Lighting::FillConstants(FrameConstants& constants, const Scene& scene, cons
     constants.volumetricSteps = static_cast<uint32_t>(settings.volumetricSteps);
     constants.indirectRayFlags = m_useMicromaps && settings.fastAlphaTests ? D3D12_RAY_FLAG_FORCE_OMM_2_STATE : D3D12_RAY_FLAG_NONE;
     constants.dispatchOriginView = inputs.kind == gbuffer::ViewKind::Viewmodel ? m_viewRect.srv : kInvalidView;
+    constants.restirDebugView = kInvalidView;
+    constants.selfIllumView = kInvalidView;
+    constants.nrdValidationView = kInvalidView;
+    constants.glossyReflections = settings.glossyReflections ? 1u : 0u;
     constants.bakedTrianglesView = kInvalidView;
     constants.bakedFacesView = kInvalidView;
     constants.bakedResidualView = kInvalidView;
     constants.leafAmbientView = kInvalidView;
     constants.ambientSamplesView = kInvalidView;
-    const bool volumeLight = inputs.kind == gbuffer::ViewKind::Viewmodel && m_volumeReady;
-    constants.probeRedView = volumeLight ? m_probeVolume[0].srv : kInvalidView;
-    constants.probeGreenView = volumeLight ? m_probeVolume[1].srv : kInvalidView;
-    constants.probeBlueView = volumeLight ? m_probeVolume[2].srv : kInvalidView;
+    // The viewmodel's run reads the main view's indirect light volume (the main view's own sets it once filled).
+    const bool volumeLight = inputs.kind == gbuffer::ViewKind::Viewmodel && m_volumeReady && m_probeIndirect[0].resource;
+    constants.probeRedView = volumeLight ? m_probeIndirect[0].srv : kInvalidView;
+    constants.probeGreenView = volumeLight ? m_probeIndirect[1].srv : kInvalidView;
+    constants.probeBlueView = volumeLight ? m_probeIndirect[2].srv : kInvalidView;
     constants.depthMin = inputs.depthMin;
     constants.depthScale = inputs.depthMax - inputs.depthMin;
     const gbuffer::Fog& fog = inputs.fog;
@@ -1165,11 +1466,11 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
                     for (size_t i = 1; i <= frames; ++i)
                         frameMs += statistics.frameMs[(statistics.nextFrame + statistics.frameMs.size() - i) % statistics.frameMs.size()];
                     const auto& p = statistics.passMs;
-                    log::Info("Lighting: {:.3f} ms GPU per frame ({}x{} traced at {}x{}; scene {:.2f}, surface {:.2f}, volume {:.2f}, direct {:.2f}, "
-                              "ao {:.2f}, indirect {:.2f}, accumulation {:.2f}, denoiser {:.2f}, reflections {:.2f}, lighting {:.2f}, resolve {:.2f}; "
-                              "3D skybox and viewmodel {:.2f}); frame time {:.2f} ms, tonemap scale {:.3f}",
+                    log::Info("Lighting: {:.3f} ms GPU per frame ({}x{} traced at {}x{}; scene {:.2f}, surface {:.2f}, radiance cache {:.2f}, volume {:.2f}, "
+                              "direct {:.2f}, light sampling {:.2f}, ao {:.2f}, indirect {:.2f}, reflections {:.2f}, accumulation {:.2f}, denoiser {:.2f}, "
+                              "lighting {:.2f}, resolve {:.2f}; 3D skybox and viewmodel {:.2f}); frame time {:.2f} ms, tonemap scale {:.3f}",
                         statistics.lightingMs, m_width, m_height, statistics.renderWidth, statistics.renderHeight, p[0], p[1], p[2], p[3], p[4],
-                        p[5], p[6], p[7], p[8], p[9], p[10], statistics.otherViewsMs, frames ? frameMs / frames : 0.0, inputs.tonemapScale);
+                        p[5], p[6], p[7], p[8], p[9], p[10], p[11], p[12], statistics.otherViewsMs, frames ? frameMs / frames : 0.0, inputs.tonemapScale);
                 }
             }
         }
@@ -1236,6 +1537,28 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
         m_litFogScale = 0.0f;
     // indirect_lighting = 1: VRAD's bounce light replaces traced indirect light once the map's residual is baked.
     const bool bakedIndirect = GetSettings().indirectLighting == IndirectLighting::Baked && scene.HasBaked();
+    // The radiance cache serves traced indirect light. The main view decides whether it exists; its eye sizes the
+    // voxels for every view. The 3D skybox's scaled-down space stays out of it.
+    if (main) {
+        const Settings& settings = GetSettings();
+        const bool wanted = m_radianceCacheSupported && !m_cacheFailed && settings.radianceCache && settings.indirectLight && !bakedIndirect && scene.Ready();
+        m_cacheWanted = EnsureRadianceCache(wanted);
+        if (wanted && !m_cacheWanted)
+            m_cacheFailed = true;
+        std::copy_n(constants.eyePosition, 3, m_cacheCamera);
+    }
+    SamplingConstants& sampling = *reinterpret_cast<SamplingConstants*>(m_samplingMapped + slot * kSamplingStride);
+    sampling = {};
+    std::copy_n(m_cacheCamera, 3, sampling.cacheCamera);
+    std::copy_n(m_cacheCameraPrevious, 3, sampling.cacheCameraPrevious);
+    sampling.sceneScale = kCacheSceneScale;
+    sampling.cacheEnabled = m_cacheWanted && inputs.kind != gbuffer::ViewKind::Skybox ? 1u : 0u;
+    sampling.capacity = kCacheCapacity;
+    sampling.accumulationView = m_cacheAccumulationUav;
+    sampling.resolvedView = m_cacheResolvedUav;
+    sampling.accumulationFrames = kCacheAccumulationFrames;
+    sampling.staleFrames = kCacheStaleFrames;
+    sampling.radianceScale = kCacheRadianceScale;
     if (bakedIndirect && scene.Baked().Ready()) {
         const BakedBuffers& baked = scene.Baked();
         constants.bakedTrianglesView = baked.trianglesView;
@@ -1247,6 +1570,19 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     // Ambient occlusion darkens only the baked indirect light (shaders/deferred_lighting.hlsl): traced light holds its
     // own occlusion. The 3D skybox's scaled-down scene has no contact shadows worth tracing.
     const bool ambientOcclusion = GetSettings().ambientOcclusion && inputs.kind != gbuffer::ViewKind::Skybox && constants.bakedTrianglesView != kInvalidView;
+    // RTXDI samples the main view's local lights (the direct pass then lights with the sun alone). Its resources are made
+    // here, before any command refers to the ones they replace; the light PDF leaves room for the frame's dynamic and
+    // projected lights.
+    const LightSampling lightSampling = GetSettings().lightSampling;
+    const RestirMode restirMode = lightSampling == LightSampling::Ris || (lightSampling == LightSampling::Auto && rayReconstruction) ? RestirMode::Ris
+                                                                                                                                      : RestirMode::Reuse;
+    bool restir = false;
+    if (main && m_restirAvailable && lightSampling != LightSampling::Legacy && scene.Ready()) {
+        const RestirLights capacity{constants.lightCount, constants.emitterCount, 0, 0};
+        if (m_restir.NeedsResources(renderWidth, renderHeight, capacity))
+            WaitForGpu();
+        restir = m_restir.Prepare(renderWidth, renderHeight, capacity);
+    }
 
     ID3D12CommandQueue* queue = m_queue;
     const bool projectedLights = inputs.kind != gbuffer::ViewKind::Skybox && GetSettings().projectedLights;
@@ -1317,7 +1653,6 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     const UINT previous = 1 - current;
     constants.surfaceView = m_surface[current].srv;
     constants.prevSurfaceView = m_surface[previous].srv;
-    constants.previousLitView = main && m_historyValid ? m_lit[previous].srv : kInvalidView;
     constants.visibilityView = m_visibility.srv;
     constants.motionView = m_motion.srv;
     constants.previousDistanceView = m_previousDistance.srv;
@@ -1399,14 +1734,7 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     if (constants.bakedTrianglesView != kInvalidView)
         constants.indirectMask = constants.traceMask & (kDynamicMask | kLocalPlayerMask);
 
-    auto bindCompute = [&](D3D12_GPU_VIRTUAL_ADDRESS frameConstants) {
-        ID3D12DescriptorHeap* heaps[] = {m_descriptors->Heap()};
-        m_list->SetDescriptorHeaps(1, heaps);
-        m_list->SetComputeRootSignature(m_computeRoot.Get());
-        m_list->SetComputeRootConstantBufferView(0, frameConstants);
-        m_list->SetComputeRootShaderResourceView(1, frame.tlas);
-    };
-    bindCompute(slotConstantsGpu);
+    BindCompute(slotConstantsGpu, frame.tlas, slot);
     if (bakedIndirect && main && constants.traceMask != 0 && !scene.Baked().Ready())
         BakeStep(scene, constants, slotConstantsGpu);
     if (main && inputs.skyCube != nullptr && m_skyLight.resource) {
@@ -1486,6 +1814,28 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     for (Texture* texture : {&m_visibility, &m_motion, &m_previousDistance, &m_pixelFlags, &m_geometricNormal})
         Use(*texture, read);
     mark();
+    if (main && m_cacheWanted && constants.traceMask != 0) {
+        const D3D12_RESOURCE_BARRIER cacheBarriers[] = {
+            {D3D12_RESOURCE_BARRIER_TYPE_UAV, D3D12_RESOURCE_BARRIER_FLAG_NONE, {.UAV = {m_cacheHash.Get()}}},
+            {D3D12_RESOURCE_BARRIER_TYPE_UAV, D3D12_RESOURCE_BARRIER_FLAG_NONE, {.UAV = {m_cacheAccumulation.Get()}}},
+            {D3D12_RESOURCE_BARRIER_TYPE_UAV, D3D12_RESOURCE_BARRIER_FLAG_NONE, {.UAV = {m_cacheResolved.Get()}}},
+        };
+        constexpr UINT resolveGroups = kCacheCapacity / 256;
+        m_list->ResourceBarrier(3, cacheBarriers);
+        if (m_cacheClear) {
+            DispatchGroups(Pass::SharcResolve, {.step = 1}, resolveGroups, 1, 1);
+            m_list->ResourceBarrier(3, cacheBarriers);
+            m_cacheClear = false;
+        }
+        const UINT blocksX = (m_gridWidth + kCacheBlock - 1) / kCacheBlock;
+        const UINT blocksY = (m_gridHeight + kCacheBlock - 1) / kCacheBlock;
+        DispatchGroups(Pass::SharcUpdate, {}, (blocksX + 7) / 8, (blocksY + 7) / 8, 1);
+        m_list->ResourceBarrier(3, cacheBarriers);
+        DispatchGroups(Pass::SharcResolve, {.step = 0}, resolveGroups, 1, 1);
+        m_list->ResourceBarrier(3, cacheBarriers);
+        std::copy_n(constants.eyePosition, 3, m_cacheCameraPrevious);
+    }
+    mark();
     if (volume && constants.traceMask != 0) {
         auto& last = m_probeHistory[previous];
         auto& next = m_probeHistory[current];
@@ -1539,15 +1889,47 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
         m_probeHistoryValid = constants.bakedTrianglesView == kInvalidView;
         volumeFilled = true;
         m_volumeReady = copyVolume;
+        // Reflected hits take their indirect light from it where the radiance cache has none (shaders/reflection.hlsli).
+        if (m_probeIndirect[0].resource) {
+            for (Texture& texture : m_probeIndirect)
+                Use(texture, kVolumeRead);
+            constants.probeRedView = m_probeIndirect[0].srv;
+            constants.probeGreenView = m_probeIndirect[1].srv;
+            constants.probeBlueView = m_probeIndirect[2].srv;
+            if (rayReconstruction) {
+                FrameConstants& render = *reinterpret_cast<FrameConstants*>(slotConstants + kConstantsStride);
+                render.probeRedView = constants.probeRedView;
+                render.probeGreenView = constants.probeGreenView;
+                render.probeBlueView = constants.probeBlueView;
+            }
+        }
     }
     mark();
     Texture& direct = m_direct[current];
     Use(direct, write);
     Use(m_directRemainder, write);
     Use(m_specular, write);
+    const RestirLights restirLights{constants.lightCount, constants.emitterCount, constants.dynamicLightCount, constants.projectorCount};
+    restir = restir && constants.traceMask != 0;
+    if (restir) {
+        float previousInvViewProj[4][4] = {};
+        const bool previousCamera = Invert(m_prevViewProj, previousInvViewProj);
+        const bool restirHistory = previousCamera && constants.historyValid != 0 && m_restirLastMode == restirMode && m_restirLastSize[0] == m_gridWidth &&
+            m_restirLastSize[1] == m_gridHeight;
+        RestirConstants& restirConstants = *reinterpret_cast<RestirConstants*>(m_samplingMapped + slot * kSamplingStride + kRestirConstantsOffset);
+        const UINT previousStyles = m_restir.UploadPreviousStyles(slot, m_lastLightStyles.data(), m_lastLightStyles.size());
+        m_restir.FillConstants(restirConstants, static_cast<uint32_t>(inputs.frame), restirMode, rayReconstruction, constants.eyePosition, previousInvViewProj,
+            restirLights, scene.EmitterPower(), previousStyles, restirHistory);
+        m_restirLastMode = restirMode;
+        m_restirLastSize[0] = m_gridWidth;
+        m_restirLastSize[1] = m_gridHeight;
+        m_lastLightStyles = scene.LightStyles();
+    } else if (main) {
+        m_restirLastMode.reset();
+    }
     const bool wideLightSets = constants.exactLights > 4 || constants.sampledLightRays > 2;
-    Dispatch(wideLightSets ? Pass::DirectWide : Pass::Direct, {.output0 = direct.uav, .output1 = m_directRemainder.uav, .output2 = m_specular.uav});
-    Use(m_specular, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    Dispatch(restir ? Pass::DirectSun : wideLightSets ? Pass::DirectWide : Pass::Direct,
+        {.output0 = direct.uav, .output1 = m_directRemainder.uav, .output2 = m_specular.uav});
     if (probe) {
         D3D12_RESOURCE_BARRIER barrier = Transition(m_probeBuffer.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
         m_list->ResourceBarrier(1, &barrier);
@@ -1555,6 +1937,21 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
         barrier = Transition(m_probeBuffer.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         m_list->ResourceBarrier(1, &barrier);
     }
+    mark();
+    const bool restirDebug = restir && (constants.debugView == static_cast<uint32_t>(DebugView::LightSample) ||
+                                           constants.debugView == static_cast<uint32_t>(DebugView::ReservoirM));
+    if (restir && restirLights.Total() != 0) {
+        const D3D12_RESOURCE_BARRIER written[] = {
+            {D3D12_RESOURCE_BARRIER_TYPE_UAV, D3D12_RESOURCE_BARRIER_FLAG_NONE, {.UAV = {m_directRemainder.resource.Get()}}},
+            {D3D12_RESOURCE_BARRIER_TYPE_UAV, D3D12_RESOURCE_BARRIER_FLAG_NONE, {.UAV = {m_specular.resource.Get()}}},
+        };
+        m_list->ResourceBarrier(2, written);
+        RecordRestir(restirMode, restirDebug);
+    }
+    constants.restirDebugView = restirDebug && restirLights.Total() != 0 ? m_restirDebug.srv : kInvalidView;
+    if (rayReconstruction)
+        reinterpret_cast<FrameConstants*>(slotConstants + kConstantsStride)->restirDebugView = constants.restirDebugView;
+    Use(m_specular, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     Use(direct, read);
     Use(m_directRemainder, read);
     Use(m_direct[previous], read);
@@ -1573,79 +1970,46 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     }
     mark();
     PassArgs trace = {.input1 = m_directRemainder.srv, .input2 = m_direct[previous].srv, .output0 = m_giRaw.uav};
-    Texture* indirect = nullptr;
     // Untraced views and the distant 3D skybox (traced for reflections and sun shadows only) take the sky's
     // light as their indirect light.
-    if (constants.traceMask == 0 || inputs.kind == gbuffer::ViewKind::Skybox) {
-        mark();
-        mark();
-        mark();
-    } else if (!main) {
-        if (constants.probeRedView != kInvalidView) {
-            for (Texture& texture : m_probeVolume)
-                Use(texture, read);
+    const bool traced = constants.traceMask != 0 && inputs.kind != gbuffer::ViewKind::Skybox;
+    // Without Ray Reconstruction NVIDIA NRD denoises the main view's indirect light and reflections, unless the built-in
+    // denoiser is chosen.
+    const bool nrd = main && traced && !rayReconstruction && GetSettings().denoiser && GetSettings().denoiserType != DenoiserType::BuiltIn &&
+        EnsureNrd(GetSettings().denoiserType);
+    if (traced) {
+        if (!main) {
+            if (constants.probeRedView != kInvalidView) {
+                for (Texture& texture : m_probeIndirect)
+                    Use(texture, kVolumeRead);
+            }
+            trace.step = kViewmodelIndirectSamples;
+        } else {
+            if (m_lastDenoised != nullptr) {
+                Use(*m_lastDenoised, read);
+                trace.input0 = m_lastDenoised->srv;
+            }
+            trace.step = static_cast<UINT>(GetSettings().indirectRays);
         }
         Use(m_giRaw, write);
-        trace.step = kViewmodelIndirectSamples;
         Dispatch(Pass::GiTrace, trace);
-        mark();
-        mark();
-        Texture* source = &m_giRaw;
-        for (size_t i = 0; i < std::size(kFilterSteps) && GetSettings().denoiser; ++i) {
-            Texture* target = &m_viewmodelIndirect[i % 2];
-            Use(*source, read);
-            Use(*target, write);
-            Dispatch(Pass::GiFilter, {.input0 = source->srv, .input2 = i == 0 ? 1u : 0u, .output0 = target->uav, .step = kFilterSteps[i]});
-            source = target;
-        }
-        indirect = source;
-        mark();
-    } else {
-        if (m_lastDenoised != nullptr) {
-            Use(*m_lastDenoised, read);
-            trace.input0 = m_lastDenoised->srv;
-        }
-        trace.step = static_cast<UINT>(GetSettings().indirectRays);
-        Use(m_giRaw, write);
-        Dispatch(Pass::GiTrace, trace);
-        mark();
         Use(m_giRaw, read);
-        Use(m_giHistory[previous], read);
-        Use(m_giMoments[previous], read);
-        Use(m_giHistory[current], write);
-        Use(m_giMoments[current], write);
-        Dispatch(Pass::GiTemporal, {.input0 = m_giRaw.srv, .input1 = m_giHistory[previous].srv, .input2 = m_giMoments[previous].srv,
-            .output0 = m_giHistory[current].uav, .output1 = m_giMoments[current].uav});
-        Use(m_giMoments[current], read);
-        mark();
-        Texture* source = &m_giHistory[current];
-        // Ray Reconstruction denoises the raw estimate itself; the accumulation still serves indirect rays and
-        // reflections.
-        for (size_t i = 0; i < std::size(kFilterSteps) && GetSettings().denoiser && !rayReconstruction; ++i) {
-            Texture* target = &m_giFiltered[i % 2];
-            Use(*source, read);
-            Use(*target, write);
-            Dispatch(Pass::GiFilter, {.input0 = source->srv, .input1 = i == 0 ? m_giMoments[current].srv : kInvalidView, .input2 = i == 0 ? 1u : 0u,
-                .output0 = target->uav, .step = kFilterSteps[i]});
-            source = target;
-        }
-        indirect = source;
-        mark();
     }
-    if (main)
-        m_lastDenoised = indirect;
-    Texture* shaded = indirect != nullptr && rayReconstruction ? &m_giRaw : indirect;
+    mark();
+    // Reflections and their guides (Ray Reconstruction's and NRD's). Their fade by the pixel's light takes the main view's
+    // denoised light of last frame, as this frame's is denoised with the reflections.
     UINT reflections = kInvalidView;
+    const bool reflectionGuides = rayReconstruction || nrd;
     if (constants.traceMask != 0) {
-        Use(m_lit[previous], read);
         Use(m_reflections, write);
+        Use(m_selfIllum, write);
         Use(m_direct[current], read);
-        PassArgs args = {.input0 = m_lit[previous].srv, .input2 = m_direct[current].srv, .output0 = m_reflections.uav};
-        if (indirect != nullptr) {
-            Use(*indirect, read);
-            args.input1 = indirect->srv;
+        PassArgs args = {.input2 = m_direct[current].srv, .output0 = m_reflections.uav, .output4 = m_selfIllum.uav};
+        if (main && m_lastDenoised != nullptr) {
+            Use(*m_lastDenoised, read);
+            args.input1 = m_lastDenoised->srv;
         }
-        if (rayReconstruction) {
+        if (reflectionGuides) {
             Use(m_rrSpecularAlbedo, write);
             Use(m_rrRoughness, write);
             Use(m_rrHitDistance, write);
@@ -1655,9 +2019,11 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
         }
         Dispatch(Pass::Reflections, args);
         Use(m_reflections, read);
+        Use(m_selfIllum, read);
         reflections = m_reflections.srv;
-        // Ray Reconstruction takes the raw reflections with their guides.
-        if (main && !rayReconstruction) {
+        constants.selfIllumView = m_selfIllum.srv;
+        // Ray Reconstruction takes the raw reflections with their guides, and NRD denoises them below.
+        if (main && !rayReconstruction && !nrd) {
             Use(m_reflectionHistory[previous], read);
             Use(m_reflectionHistory[current], write);
             Dispatch(Pass::ReflectionTemporal, {.input0 = m_reflections.srv, .input1 = m_reflectionHistory[previous].srv,
@@ -1667,8 +2033,64 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
         }
     }
     if (main)
-        m_reflectionHistoryValid = reflections != kInvalidView && !rayReconstruction;
+        m_reflectionHistoryValid = reflections != kInvalidView && !rayReconstruction && !nrd;
     mark();
+    // Accumulation and denoising of the indirect light (with NRD, also of the reflections).
+    if (traced && main && !nrd) {
+        Use(m_giHistory[previous], read);
+        Use(m_giMoments[previous], read);
+        Use(m_giHistory[current], write);
+        Use(m_giMoments[current], write);
+        Dispatch(Pass::GiTemporal, {.input0 = m_giRaw.srv, .input1 = m_giHistory[previous].srv, .input2 = m_giMoments[previous].srv,
+            .output0 = m_giHistory[current].uav, .output1 = m_giMoments[current].uav});
+        Use(m_giMoments[current], read);
+    }
+    mark();
+    Texture* indirect = nullptr;
+    if (traced && !main) {
+        Texture* source = &m_giRaw;
+        for (size_t i = 0; i < std::size(kFilterSteps) && GetSettings().denoiser; ++i) {
+            Texture* target = &m_viewmodelIndirect[i % 2];
+            Use(*source, read);
+            Use(*target, write);
+            Dispatch(Pass::GiFilter, {.input0 = source->srv, .input2 = i == 0 ? 1u : 0u, .output0 = target->uav, .step = kFilterSteps[i]});
+            source = target;
+        }
+        indirect = source;
+    } else if (traced && nrd) {
+        if (RecordNrd(constants, inputs, slot, current, slotConstantsGpu, frame.tlas)) {
+            indirect = &m_giFiltered[0];
+            reflections = m_reflectionHistory[current].srv;
+            if (constants.debugView == static_cast<uint32_t>(DebugView::DenoiserValidation))
+                constants.nrdValidationView = m_nrdValidation.srv;
+        } else {
+            // This frame keeps the raw light; the next uses the built-in denoiser.
+            indirect = &m_giRaw;
+        }
+    } else if (traced) {
+        Texture* source = &m_giHistory[current];
+        // Ray Reconstruction denoises the raw estimate itself; the accumulation still serves indirect rays.
+        for (size_t i = 0; i < std::size(kFilterSteps) && GetSettings().denoiser && !rayReconstruction; ++i) {
+            Texture* target = &m_giFiltered[i % 2];
+            Use(*source, read);
+            Use(*target, write);
+            Dispatch(Pass::GiFilter, {.input0 = source->srv, .input1 = i == 0 ? m_giMoments[current].srv : kInvalidView, .input2 = i == 0 ? 1u : 0u,
+                .output0 = target->uav, .step = kFilterSteps[i]});
+            source = target;
+        }
+        indirect = source;
+    }
+    if (main && !nrd)
+        m_nrdHistoryValid = false;
+    if (rayReconstruction) {
+        FrameConstants& render = *reinterpret_cast<FrameConstants*>(slotConstants + kConstantsStride);
+        render.selfIllumView = constants.selfIllumView;
+        render.nrdValidationView = constants.nrdValidationView;
+    }
+    mark();
+    if (main)
+        m_lastDenoised = indirect;
+    Texture* shaded = indirect != nullptr && rayReconstruction ? &m_giRaw : indirect;
     if (volumetrics && constants.traceMask != 0) {
         const UINT halfWidth = (m_gridWidth + 1) / 2;
         const UINT halfHeight = (m_gridHeight + 1) / 2;
@@ -1677,7 +2099,7 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
         const bool indirectVolume = volumeFilled && m_probeIndirect[0].resource;
         if (indirectVolume) {
             for (Texture& texture : m_probeIndirect)
-                Use(texture, read);
+                Use(texture, kVolumeRead);
         }
         Use(m_volumetricMarch, write);
         // Map and dynamic lights scatter in the main view's fog; the 3D skybox is lit without them.
@@ -1712,11 +2134,9 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     if (shaded != nullptr)
         Use(*shaded, read);
     Use(m_giRaw, read);
-    if (constants.previousLitView != kInvalidView)
-        Use(m_lit[previous], read);
-    Use(m_lit[current], write);
+    Use(m_lit, write);
     PassArgs lighting = {.input0 = shaded != nullptr ? shaded->srv : kInvalidView, .input1 = m_giRaw.srv, .input2 = reflections, .input3 = direct.srv,
-        .input4 = m_directRemainder.srv, .output0 = m_lit[current].uav};
+        .input4 = m_directRemainder.srv, .output0 = m_lit.uav};
     if (rayReconstruction) {
         // Water pixels overwrite the reflection guides the reflections pass wrote.
         Use(m_rrSpecularAlbedo, write);
@@ -1736,23 +2156,23 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     Dispatch(Pass::Lighting, lighting);
     mark();
     // The 3D skybox is drawn before the main view, which covers it again, so only the main view is resolved.
-    Texture* output = &m_lit[current];
+    Texture* output = &m_lit;
     bool rayReconstructed = false;
     if (rayReconstruction) {
-        Use(m_lit[current], read);
+        Use(m_lit, read);
         Use(m_surface[current], read);
         Use(m_rrSpecularAlbedo, read);
         Use(m_rrRoughness, read);
         Use(m_rrHitDistance, read);
         Use(m_rrOutput, write);
         SplitViewProjection(constants.viewProj, constants.eyePosition, m_worldToView, m_viewToClip);
-        const RayReconstruction::Inputs rr{m_lit[current].resource.Get(), m_rrInputs[RrDepth].resource.Get(), m_motion.resource.Get(),
+        const RayReconstruction::Inputs rr{m_lit.resource.Get(), m_rrInputs[RrDepth].resource.Get(), m_motion.resource.Get(),
             m_surface[current].resource.Get(), m_rrInputs[RrAlbedo].resource.Get(), m_rrSpecularAlbedo.resource.Get(), m_rrRoughness.resource.Get(),
             m_rrHitDistance.resource.Get(), m_rrOutput.resource.Get(), m_worldToView, m_viewToClip, renderWidth, renderHeight, inputs.jitterX,
             inputs.jitterY, !m_historyValid};
         rayReconstructed = m_rayReconstruction.Evaluate(m_list.Get(), GetSettings().upscaling, m_width, m_height, rr);
         // NGX leaves its own descriptor heap and root signature bound.
-        bindCompute(slotConstantsGpu);
+        BindCompute(slotConstantsGpu, frame.tlas, slot);
         m_gridWidth = m_width;
         m_gridHeight = m_height;
         if (rayReconstructed) {
@@ -1762,10 +2182,10 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
             output = &m_resolved;
         }
     } else if (main && GetSettings().antiAliasing == AntiAliasing::Temporal) {
-        Use(m_lit[current], read);
+        Use(m_lit, read);
         Use(m_taaHistory[previous], read);
         Use(m_taaHistory[current], write);
-        Dispatch(Pass::TemporalAntiAliasing, {.input0 = m_lit[current].srv, .input1 = m_taaHistory[previous].srv, .output0 = m_taaHistory[current].uav,
+        Dispatch(Pass::TemporalAntiAliasing, {.input0 = m_lit.srv, .input1 = m_taaHistory[previous].srv, .output0 = m_taaHistory[current].uav,
             .step = m_taaHistoryValid ? 1u : 0u});
         Use(m_taaHistory[current], read);
         Use(m_resolved, write);
@@ -1848,7 +2268,7 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     if (main && m_volumeReady && m_probeIndirect[0].resource) {
         // Forward draws read the indirect volume in their own command lists.
         for (Texture& texture : m_probeIndirect)
-            Use(texture, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            Use(texture, kVolumeRead);
         FrameConstants& forward = *reinterpret_cast<FrameConstants*>(m_forwardConstantsMapped + slot * kConstantsStride);
         forward = constants;
         forward.probeRedView = m_probeIndirect[0].srv;

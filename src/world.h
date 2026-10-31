@@ -14,7 +14,7 @@
 namespace gmodpp::world {
 
 // Creates the lighting on the device the game's frames go to; false (logged) when it cannot.
-bool Initialize(ID3D12Device5* device, ID3D12CommandQueue* queue, DescriptorHeap& descriptors, bool opacityMicromaps,
+bool Initialize(ID3D12Device5* device, ID3D12CommandQueue* queue, DescriptorHeap& descriptors, const RaytracingSupport& support,
     const std::filesystem::path& dlssDirectory);
 // Waits for the lighting's commands and destroys it, with the scene.
 void Shutdown();

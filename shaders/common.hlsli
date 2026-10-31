@@ -2,8 +2,11 @@
 #define GMODPP_COMMON_HLSLI
 
 // Every compute pass shares this layout. Textures and buffers are reached through descriptor heap indices
-// in g_frame and g_pass.
+// in g_frame and g_pass. The radiance cache's constants (b2) and hash entries (u0, space2: a root descriptor, on which
+// Shader Model 6.6 guarantees 64-bit atomics), and RTXDI's constants (b3), RIS buffer (u1), reservoirs (u2) and neighbour
+// offsets (t1), are bound for every pass and read by those built with them (shaders/nvidia).
 #define ROOT_SIGNATURE "RootFlags(CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED), CBV(b0), SRV(t0), RootConstants(num32BitConstants = 12, b1), " \
+    "CBV(b2), UAV(u0, space = 2), CBV(b3), UAV(u1, space = 2), UAV(u2, space = 2), SRV(t1, space = 2), " \
     "StaticSampler(s0, filter = FILTER_MIN_MAG_MIP_LINEAR, addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP), "     "StaticSampler(s2, filter = FILTER_MIN_MAG_MIP_LINEAR, addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP)"
 
 // Mirrors gmodpp::FrameConstants in src/lighting.h.
@@ -111,8 +114,8 @@ struct FrameConstants
     // 1 when the game's additive passes (lightView) are added after the temporal resolve (AdditiveAfterResolve), so
     // glows are neither jittered nor denoised.
     uint additiveAfterResolve;
-    // The main view's shaded colour of last frame, for reflections of what was on screen (shaders/water.hlsli), or kNoView.
-    uint previousLitView;
+    // 1 when reflections follow the GGX lobe of their roughness (shaders/reflection.hlsli), 0 for mirrors everywhere.
+    uint glossyReflections;
     // indirect_lighting = 1 once the map's baked light is ready (shaders/baked.hlsli): the world's BakedTriangles, the
     // faces' lightmaps, the filtered residual, and the leaf ambient ranges and samples; kNoView otherwise.
     uint bakedTrianglesView;
@@ -148,11 +151,17 @@ struct FrameConstants
     uint emissiveLighting;
     // 1 when volumetricView holds the map's fog, lit (shaders/volumetrics.hlsl), in place of Source's flat fog.
     uint volumetricFog;
-    uint padding;
+    // RTXDI's debug image (shaders/restir.hlsl), or kNoView.
+    uint restirDebugView;
     // The 3D skybox's fog, for reflected rays that continue into it (shaders/reflection.hlsli).
     float4 skyboxFogParams;
     float3 skyboxFogColor;
     uint skyboxFogEnabled;
+    // Self-illumination from the material table for surfaces whose G-buffer shader wrote none (shaders/reflections.hlsl),
+    // and NRD's validation overlay (debug view 15), or kNoView.
+    uint selfIllumView;
+    uint nrdValidationView;
+    uint2 padding;
     uint4 lightWarpViews[16];
 };
 
@@ -353,6 +362,20 @@ float3 AdditiveAfterResolve(int2 pixel, float2 shift)
         return 0.0;
     Texture2D<float4> light = ResourceDescriptorHeap[g_frame.lightView];
     return Decode(light.SampleLevel(g_linearClamp, (float2(pixel) + 0.5 + shift) * g_frame.invSize, 0.0).rgb);
+}
+
+// Roughness (GGX alpha) below which a reflection is a mirror.
+static const float kMirrorRoughness = 0.02;
+
+// The GGX roughness (alpha) of a pixel's reflection: from the Phong exponent its twin wrote to the self-illumination
+// target's alpha (negative for models, positive for GMod's brush Phong, 0 for none), by the Blinn-Phong to Beckmann
+// relation alpha = sqrt(2 / (n + 2)) (Walter et al. 2007) carried over to GGX. Source gives no roughness; without an
+// exponent, or without glossy reflections, its env_cubemap reflections are mirrors (0).
+float PhongRoughness(int2 pixel)
+{
+    Texture2D<float4> emissive = ResourceDescriptorHeap[g_frame.emissiveView];
+    float exponent = abs(emissive.Load(int3(pixel, 0)).a);
+    return exponent > 0.0 && g_frame.glossyReflections != 0 ? clamp(sqrt(2.0 / (exponent + 2.0)), kMirrorRoughness, 1.0) : 0.0;
 }
 
 uint Hash(uint x)

@@ -1044,10 +1044,12 @@ void AddVradOccluders(const bsp::WorldGeometry& world, std::vector<SceneInstance
         meshProps, world.brushOccluders.size() / 3, world.skyOccluders.size() / 3);
 }
 
-// The scene's emitters (Scene::SetEmitters): the self-illuminated triangles of the world and of static props outside
-// the 3D skybox, in world space, picked in proportion to their emission times their area. Instances with some get
-// kInstanceEmitter; the world is instance 0 and static instance i is i + 1 (Scene::RecordFrame).
-void SetEmitters(const std::vector<ModelEmitter>& worldEmitters, std::vector<SceneInstance>& instances)
+// The scene's emitters (Scene::LoadMap): the self-illuminated triangles of the world and of static props outside the
+// 3D skybox, in world space, with the cumulative share of their emission times their area. Instances with some get
+// kInstanceEmitter, and `worldEmits` says whether the world has some; the world is instance 0 and static instance i is
+// i + 1 (Scene::RecordFrame).
+std::vector<GpuEmitter> CollectEmitters(const std::vector<ModelEmitter>& worldEmitters, std::vector<SceneInstance>& instances, bool& worldEmits,
+    float& totalPower)
 {
     std::vector<GpuEmitter> emitters;
     std::vector<double> power;
@@ -1069,7 +1071,7 @@ void SetEmitters(const std::vector<ModelEmitter>& worldEmitters, std::vector<Sce
         }
     };
     add(worldEmitters, 0, nullptr);
-    const bool worldEmits = !emitters.empty();
+    worldEmits = !emitters.empty();
     for (size_t i = 0; i < instances.size(); ++i) {
         if (instances[i].mask == kSkyboxMask)
             continue;
@@ -1091,10 +1093,8 @@ void SetEmitters(const std::vector<ModelEmitter>& worldEmitters, std::vector<Sce
     }
     if (!emitters.empty())
         emitters.back().cdf = 1.0f;
-    if (!g_state.scene.SetEmitters(emitters, worldEmits))
-        log::Info("Scene: the {} self-illuminated triangles could not be uploaded; glowing surfaces light only what indirect rays meet", emitters.size());
-    else
-        log::Info("Scene: {} self-illuminated triangles light the scene", emitters.size());
+    totalPower = static_cast<float>(total);
+    return emitters;
 }
 
 bool IsFirstPersonModel(const std::string& path)
@@ -1191,49 +1191,52 @@ void UpdateScene()
         const ModelGeometry worldGeometry = PrepareMesh(world.mesh, worldTriangles);
         std::vector<bool> shells;
         const std::vector<MapLightShape> lightShapes = SealedLights(world, worldGeometry, shells);
-        if (g_state.scene.LoadMap(level, world, lightShapes, worldGeometry)) {
+        std::vector<SceneInstance> instances;
+        std::vector<SwayingProp> swayingProps;
+        // `propShells` marks the props that are lamp shells.
+        const auto addProps = [&](const std::vector<bsp::StaticProp>& props, UINT mask, const std::vector<bool>& propShells) {
+            for (size_t p = 0; p < props.size(); ++p) {
+                const bsp::StaticProp& prop = props[p];
+                const ModelEntry& model = ModelFor(world.propModels[prop.model], prop.skin);
+                SceneInstance instance;
+                instance.model = model.sceneModel;
+                if (mask == 0 && p < propShells.size() && propShells[p])
+                    instance.mask = kLampShellMask;
+                else
+                    instance.mask = mask == 0 && prop.noShadow ? kShadowlessPropMask : mask;
+                instance.flags = prop.ignoreNormals ? kInstanceIgnoreNormals : 0;
+                std::memcpy(instance.transform, prop.transform, sizeof(instance.transform));
+                // The 3D skybox's scaled-down props sway too little to matter.
+                if (model.swaying && mask != kSkyboxMask)
+                    swayingProps.push_back({model.swaying, instance});
+                else
+                    instances.push_back(instance);
+            }
+        };
+        addProps(world.props, 0, shells);
+        const size_t worldProps = swayingProps.size() +
+            std::count_if(instances.begin(), instances.end(), [](const SceneInstance& instance) { return instance.model >= 0; });
+        if (!world.skybox.indices.empty()) {
+            TriangleData skyboxTriangles;
+            SceneInstance& skybox = instances.emplace_back();
+            skybox.model = g_state.scene.AddModel(PrepareMesh(world.skybox, skyboxTriangles));
+            skybox.mask = kSkyboxMask;
+            const float identity[3][4] = {{1.0f, 0.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 1.0f, 0.0f}};
+            std::memcpy(skybox.transform, identity, sizeof(skybox.transform));
+        }
+        addProps(world.skyboxProps, kSkyboxMask, {});
+        std::erase_if(instances, [](const SceneInstance& instance) { return instance.model < 0; });
+        bool worldEmits = false;
+        float emitterPower = 0.0f;
+        const std::vector<GpuEmitter> emitters = CollectEmitters(
+            ModelEmitters(world.mesh.positions, world.mesh.indices, world.mesh.triangleAlbedo, worldTriangles.materials), instances, worldEmits, emitterPower);
+        if (g_state.scene.LoadMap(level, world, lightShapes, worldGeometry, emitters, worldEmits, emitterPower)) {
             g_state.brushModels = std::move(world.brushModels);
             g_state.skyboxTest.visibility.nodes = std::move(world.visibility.nodes);
             g_state.skyboxTest.visibility.leaves = std::move(world.visibility.leaves);
             g_state.skyboxTest.skyArea = world.skyArea;
             g_state.skyboxTest.skyMins = world.skyMins;
             g_state.skyboxTest.skyMaxs = world.skyMaxs;
-            std::vector<SceneInstance> instances;
-            std::vector<SwayingProp> swayingProps;
-            // `propShells` marks the props that are lamp shells.
-            const auto addProps = [&](const std::vector<bsp::StaticProp>& props, UINT mask, const std::vector<bool>& propShells) {
-                for (size_t p = 0; p < props.size(); ++p) {
-                    const bsp::StaticProp& prop = props[p];
-                    const ModelEntry& model = ModelFor(world.propModels[prop.model], prop.skin);
-                    SceneInstance instance;
-                    instance.model = model.sceneModel;
-                    if (mask == 0 && p < propShells.size() && propShells[p])
-                        instance.mask = kLampShellMask;
-                    else
-                        instance.mask = mask == 0 && prop.noShadow ? kShadowlessPropMask : mask;
-                    instance.flags = prop.ignoreNormals ? kInstanceIgnoreNormals : 0;
-                    std::memcpy(instance.transform, prop.transform, sizeof(instance.transform));
-                    // The 3D skybox's scaled-down props sway too little to matter.
-                    if (model.swaying && mask != kSkyboxMask)
-                        swayingProps.push_back({model.swaying, instance});
-                    else
-                        instances.push_back(instance);
-                }
-            };
-            addProps(world.props, 0, shells);
-            const size_t worldProps = swayingProps.size() +
-                std::count_if(instances.begin(), instances.end(), [](const SceneInstance& instance) { return instance.model >= 0; });
-            if (!world.skybox.indices.empty()) {
-                TriangleData skyboxTriangles;
-                SceneInstance& skybox = instances.emplace_back();
-                skybox.model = g_state.scene.AddModel(PrepareMesh(world.skybox, skyboxTriangles));
-                skybox.mask = kSkyboxMask;
-                const float identity[3][4] = {{1.0f, 0.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 1.0f, 0.0f}};
-                std::memcpy(skybox.transform, identity, sizeof(skybox.transform));
-            }
-            addProps(world.skyboxProps, kSkyboxMask, {});
-            std::erase_if(instances, [](const SceneInstance& instance) { return instance.model < 0; });
-            SetEmitters(ModelEmitters(world.mesh.positions, world.mesh.indices, world.mesh.triangleAlbedo, worldTriangles.materials), instances);
             log::Info("Scene: {} of {} textures are VRAD light textures; {} of those glow ($selfillum) and light nothing again",
                 std::count(g_state.lightMaterials.begin(), g_state.lightMaterials.end(), true), g_state.lightMaterials.size(),
                 g_state.lightTextureMaterials.size());
@@ -1447,18 +1450,18 @@ std::optional<std::array<float, 3>> EyePosition(const gbuffer::Matrix4& m)
 
 }
 
-bool Initialize(ID3D12Device5* device, ID3D12CommandQueue* queue, DescriptorHeap& descriptors, bool opacityMicromaps,
+bool Initialize(ID3D12Device5* device, ID3D12CommandQueue* queue, DescriptorHeap& descriptors, const RaytracingSupport& support,
     const std::filesystem::path& dlssDirectory)
 {
     if (g_state.lighting)
         return true;
     auto lighting = std::make_unique<Lighting>();
-    if (!lighting->Initialize(device, queue, descriptors, opacityMicromaps, dlssDirectory))
+    if (!lighting->Initialize(device, queue, descriptors, support, dlssDirectory))
         return false;
     g_state.device = device;
     g_state.queue = queue;
     g_state.descriptors = &descriptors;
-    g_state.opacityMicromaps = opacityMicromaps;
+    g_state.opacityMicromaps = support.opacityMicromaps;
     g_state.lighting = std::move(lighting);
     return true;
 }

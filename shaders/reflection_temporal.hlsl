@@ -2,7 +2,9 @@
 
 // Accumulates reflections over frames. A mirror image moves with the reflected point, not with the mirror, so
 // the history is reprojected from the virtual point behind the mirror (the eye ray continued by the hit
-// distance) and clipped to the spread of the current 3x3 neighbourhood in YCoCg, which rejects stale history.
+// distance) and clipped to the spread of the current 3x3 neighbourhood in YCoCg, which rejects stale history. A rough
+// reflection's image blurs towards the surface, so its virtual point moves towards it with the roughness (a
+// heuristic: the hit distance times 1 - alpha).
 // input0: this frame's reflections (rgb, hit distance; 0 for pixels without a reflection); input1: last
 // frame's accumulated reflections (rgb, sample count); output0: new accumulation; step: 1 when the history may
 // be used.
@@ -37,7 +39,7 @@ void main(uint3 id : SV_DispatchThreadID)
     }
     float3 position = WorldPositionFromDepth(pixel, DepthAt(pixel));
     float3 view = normalize(position - g_frame.eyePosition);
-    float3 reprojected = center.a > 0.0 ? g_frame.eyePosition + view * (surface.w + center.a) : position;
+    float3 reprojected = center.a > 0.0 ? g_frame.eyePosition + view * (surface.w + center.a * (1.0 - PhongRoughness(pixel))) : position;
     float4 clip = mul(g_frame.prevViewProj, float4(reprojected, 1.0));
     float2 uv = float2(clip.x / clip.w * 0.5 + 0.5, 0.5 - clip.y / clip.w * 0.5);
     // The mirror itself must have been on screen at a matching distance.

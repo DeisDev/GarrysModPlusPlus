@@ -1,10 +1,11 @@
-#include "scene.hlsli"
+#include "phong.hlsli"
 
 // Direct light of each G-buffer pixel. The sun and the g_frame.exactLights strongest local lights get a shadow ray
 // each; the other lights share g_frame.sampledLightRays shadow rays, picked in proportion to their light in one pass
 // (weighted reservoir sampling) and weighted to keep the sum unbiased. The exact part stays sharp; the noisy
-// remainder is added to the indirect estimate (gi_trace.hlsl) and denoised with it.
-// output0: exact direct irradiance (rgb) and sun visibility (a); output1: sampled remainder.
+// remainder is added to the indirect estimate (gi_trace.hlsl) and denoised with it. The SUN_ONLY variant lights with
+// the sun alone, for local lights sampled by RTXDI (shaders/restir.hlsl), which writes the remainder.
+// output0: exact direct irradiance (rgb) and sun visibility (a); output1: sampled remainder; output2: highlights.
 
 // The most g_frame.exactLights and g_frame.sampledLightRays can be. Larger sets take registers that slow the light
 // loop, so only settings above the High preset's 4 and 2 use the wide variant (WIDE_LIGHT_SETS).
@@ -85,90 +86,6 @@ void ConsiderLight(uint i, float3 irradiance, bool exact, inout uint top[kExactL
         AddToRemainder(candidate, candidateWeight, candidateWeight, picked, pickedWeight, remainder, seed);
 }
 
-// A pixel's Phong highlight from its twin (shaders/twins): the exponent in the emissive target's alpha (negative for
-// Source's model specular, positive for GMod's brush Phong, 0 for none) and the strength in the flags' blue.
-struct Phong
-{
-    float exponent;
-    float strength;
-    float3 normal;
-    float3 toEye;
-    // Rim light (Source's SpecularAndRimTerms), or exponent 0.
-    float rimExponent;
-    float rimScale;
-};
-
-Phong PhongAt(int2 pixel, bool lit, float3 position, float3 normal)
-{
-    Phong phong = (Phong)0;
-    if (!lit)
-        return phong;
-    Texture2D<float4> emissive = ResourceDescriptorHeap[g_frame.emissiveView];
-    phong.exponent = emissive.Load(int3(pixel, 0)).a;
-    if (phong.exponent == 0.0)
-        return phong;
-    Texture2D<float4> flags = ResourceDescriptorHeap[g_frame.flagsView];
-    float4 marks = flags.Load(int3(pixel, 0));
-    phong.strength = marks.b;
-    phong.normal = normal;
-    phong.toEye = normalize(g_frame.eyePosition - position);
-    if (phong.exponent < 0.0 && (MaterialBits(marks) & kMaterialRimLight) != 0) {
-        Texture2D<float4> normals = ResourceDescriptorHeap[g_frame.gbufferNormalView];
-        phong.rimExponent = normals.Load(int3(pixel, 0)).a;
-        phong.rimScale = RimScale(marks);
-    }
-    return phong;
-}
-
-// Rim light from one light: pow(R.L, rim exponent) times the light reaching the surface, scaled by the rim's mask,
-// Fresnel and tint. The skin shader takes the larger of the summed highlights and the summed rim.
-float3 ModelRim(Phong phong, float3 light, float3 toLight)
-{
-    if (phong.rimExponent <= 0.0)
-        return 0.0;
-    float3 reflected = 2.0 * phong.normal * dot(phong.normal, phong.toEye) - phong.toEye;
-    return light * (phong.rimScale * pow(saturate(dot(reflected, toLight)), phong.rimExponent));
-}
-
-// Models: Source's SpecularAndRimTerms (common_vertexlitgeneric_dx9.h), pow(R.L, exponent) times the light reaching
-// the surface (with its N.L), as the skin shader sums it over its lights.
-float3 ModelHighlight(Phong phong, float3 light, float3 toLight)
-{
-    if (phong.exponent >= 0.0)
-        return 0.0;
-    float3 reflected = 2.0 * phong.normal * dot(phong.normal, phong.toEye) - phong.toEye;
-    return light * (phong.strength * pow(saturate(dot(reflected, toLight)), -phong.exponent));
-}
-
-// The sun's highlight. Brushes: GMod's lightmappedgeneric_ps30 PHONG combos compute pow(|N.H|, exponent) * sqrt(N.L) *
-// strength * L * saturate(L) toward the sun (g_LightDir), with L the lightmap; here L is the traced direct sunlight.
-float3 SunHighlight(Phong phong, float3 sunlight)
-{
-    if (phong.exponent < 0.0)
-        return ModelHighlight(phong, sunlight, g_frame.sunDirection);
-    if (phong.exponent == 0.0)
-        return 0.0;
-    float lambert = saturate(dot(phong.normal, g_frame.sunDirection));
-    float3 halfway = normalize(phong.toEye + g_frame.sunDirection);
-    return sunlight * saturate(sunlight) * (phong.strength * sqrt(lambert) * pow(saturate(abs(dot(phong.normal, halfway))), phong.exponent));
-}
-
-// On a dynamic model, a shadow ray towards a light its triangle faces away from (where the smoothed normal still faces
-// it) starts into the model and meets the model's far side: shards along the terminator. Those rays skip the model's
-// back faces. DXR's front faces appear clockwise from the ray origin in a left-handed system, so cross(p1 - p0, p2 - p0)
-// points at the origin; Source's point out of the back, so Source's back faces are DXR's front faces.
-uint SelfShadowFlags(bool onModel, float3 faceNormal, float3 toLight)
-{
-    return onModel && dot(faceNormal, toLight) < 0.0 ? RAY_FLAG_CULL_FRONT_FACING_TRIANGLES : RAY_FLAG_NONE;
-}
-
-// Where a pixel's shadow ray towards a light starts: in front of its face, or behind it for light that comes through a
-// leaf from behind (`behind` is `origin` for other surfaces).
-float3 ShadowOrigin(float3 origin, float3 behind, float3 faceNormal, float3 toLight)
-{
-    return dot(faceNormal, toLight) < 0.0 ? behind : origin;
-}
-
 [RootSignature(ROOT_SIGNATURE)]
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID)
@@ -216,6 +133,8 @@ void main(uint3 id : SV_DispatchThreadID)
         rim += ModelRim(phong, g_frame.sunColor * (lambert * sunVisibility), g_frame.sunDirection);
     }
 
+    float3 sampled = 0.0;
+#if !SUN_ONLY
     LightSet set = (LightSet)0;
     if (lit)
         set = LightSetAt(position);
@@ -300,7 +219,6 @@ void main(uint3 id : SV_DispatchThreadID)
         specular += ModelHighlight(phong, shadowed, toLight);
         rim += ModelRim(phong, shadowed, toLight);
     }
-    float3 sampled = 0.0;
     if (remainder > 0.0) {
         [unroll]
         for (uint s = 0; s < kRemainderSamples; ++s) {
@@ -317,8 +235,7 @@ void main(uint3 id : SV_DispatchThreadID)
     // Glowing triangles as area lights (EmissiveLighting::Full): one point of one of them, with the sampled remainder.
     float3 target;
     float3 glow;
-    if (lit && SampleEmitter(position, Random(seed), float2(Random(seed), Random(seed)), target, glow)) {
-        float3 toEmitter = target - position;
+    if (lit && SampleEmitter(position, Random(seed), float2(Random(seed), Random(seed)), target, glow)) {        float3 toEmitter = target - position;
         float distanceSquared = max(dot(toEmitter, toEmitter), 1.0);
         float3 toLight = toEmitter * rsqrt(max(dot(toEmitter, toEmitter), 1e-8));
         float lambert = Lambert(lightNormal, toLight);
@@ -330,6 +247,7 @@ void main(uint3 id : SV_DispatchThreadID)
                 Transmittance(from, path / distance, ShadowRayLength(kLightClearance, distance), ShadowMask(false), SelfShadowFlags(onModel, faceNormal, toLight)));
         }
     }
+#endif
     if (!inside)
         return;
     RWTexture2D<float4> exactOutput = ResourceDescriptorHeap[g_pass.output0];

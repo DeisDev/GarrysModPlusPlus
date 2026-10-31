@@ -247,8 +247,9 @@ void DrawPerformance(const Statistics& statistics)
 
     ImGui::SeparatorText(Text(TextId::SectionGpuPasses));
     TextLine(TextId::StatLightingTime, statistics.lightingMs);
-    const TextId passes[] = {TextId::PassSceneUpdate, TextId::PassSurface, TextId::PassVolume, TextId::PassDirectLight, TextId::PassAmbientOcclusion,
-        TextId::PassIndirectTrace, TextId::PassAccumulation, TextId::PassDenoiser, TextId::PassReflections, TextId::PassLighting, TextId::PassResolve};
+    const TextId passes[] = {TextId::PassSceneUpdate, TextId::PassSurface, TextId::PassRadianceCache, TextId::PassVolume, TextId::PassDirectLight,
+        TextId::PassLightSampling, TextId::PassAmbientOcclusion, TextId::PassIndirectTrace, TextId::PassReflections, TextId::PassAccumulation,
+        TextId::PassDenoiser, TextId::PassLighting, TextId::PassResolve};
     static_assert(std::size(passes) == static_cast<size_t>(GpuPass::Count));
     for (size_t i = 0; i < std::size(passes); ++i)
         TextLine(passes[i], statistics.passMs[i]);
@@ -264,7 +265,8 @@ void DrawGeneralTab(Settings& settings)
         ImGui::TextWrapped("%s", Text(kBlocks[static_cast<size_t>(block)]));
     const TextId views[] = {TextId::ViewFinal, TextId::ViewAlbedo, TextId::ViewNormals, TextId::ViewCoverage, TextId::ViewDirectLight,
         TextId::ViewIndirectLight, TextId::ViewIndirectRaw, TextId::ViewSunVisibility, TextId::ViewAdditiveLight,
-        TextId::ViewReflections, TextId::ViewMotionVectors, TextId::ViewAmbientOcclusion};
+        TextId::ViewReflections, TextId::ViewMotionVectors, TextId::ViewAmbientOcclusion, TextId::ViewRadianceCache, TextId::ViewLightSample,
+        TextId::ViewReservoirM, TextId::ViewDenoiserValidation};
     static_assert(std::size(views) == static_cast<size_t>(DebugView::Count));
     int view = static_cast<int>(settings.debugView);
     if (ImGui::BeginCombo(Text(TextId::DebugView), Text(views[view]))) {
@@ -296,10 +298,31 @@ void DrawLightingTab(Settings& settings)
     if (BeginOptionTable("indirect")) {
         ToggleRow(TextId::IndirectLight, settings.indirectLight, settings, &Settings::indirectIntensity);
         ToggleRow(TextId::Denoiser, settings.denoiser, settings, nullptr);
+        // DLSS Ray Reconstruction denoises by itself.
+        ImGui::BeginDisabled(!settings.denoiser || settings.antiAliasing == AntiAliasing::RayReconstruction);
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn();
+        ImGui::TextUnformatted(Text(TextId::DenoiserMethod));
+        ImGui::TableNextColumn();
+        const TextId denoisers[] = {TextId::DenoiserBuiltIn, TextId::DenoiserRelax, TextId::DenoiserReblur};
+        static_assert(std::size(denoisers) == static_cast<size_t>(DenoiserType::Count));
+        const int denoiser = static_cast<int>(settings.denoiserType);
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        if (ImGui::BeginCombo("##denoiserType", Text(denoisers[denoiser]))) {
+            for (int i = 0; i < static_cast<int>(std::size(denoisers)); ++i) {
+                if (ImGui::Selectable(Text(denoisers[i]), i == denoiser))
+                    settings.denoiserType = static_cast<DenoiserType>(i);
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::EndDisabled();
         ImGui::BeginDisabled(settings.indirectLighting != IndirectLighting::Baked);
         ToggleRow(TextId::AmbientOcclusion, settings.ambientOcclusion, settings, &Settings::aoIntensity);
         ImGui::EndDisabled();
         ToggleRow(TextId::Reflections, settings.reflections, settings, &Settings::reflectionIntensity);
+        ImGui::BeginDisabled(!settings.reflections);
+        ToggleRow(TextId::GlossyReflections, settings.glossyReflections, settings, nullptr);
+        ImGui::EndDisabled();
         ToggleRow(TextId::TranslucentLighting, settings.translucentLighting, settings, nullptr);
         ToggleRow(TextId::RenderTargetLighting, settings.renderTargetLighting, settings, nullptr);
         ToggleRow(TextId::VolumetricLight, settings.volumetricLight, settings, &Settings::volumetricIntensity);
@@ -336,8 +359,27 @@ void DrawRayTracingTab(Settings& settings)
     }
     ImGui::SeparatorText(Text(TextId::SectionShadows));
     if (BeginOptionTable("shadows")) {
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn();
+        ImGui::TextUnformatted(Text(TextId::LightSampling));
+        ImGui::TableNextColumn();
+        const TextId sampling[] = {TextId::LightSamplingLegacy, TextId::LightSamplingRis, TextId::LightSamplingRestir, TextId::LightSamplingAuto};
+        static_assert(std::size(sampling) == static_cast<size_t>(LightSampling::Count));
+        const int samplingMode = static_cast<int>(settings.lightSampling);
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        if (ImGui::BeginCombo("##lightSampling", Text(sampling[samplingMode]))) {
+            for (int i = 0; i < static_cast<int>(std::size(sampling)); ++i) {
+                if (ImGui::Selectable(Text(sampling[i]), i == samplingMode) && i != samplingMode) {
+                    settings.lightSampling = static_cast<LightSampling>(i);
+                    settings.qualityPreset = QualityPreset::Custom;
+                }
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::BeginDisabled(settings.lightSampling != LightSampling::Legacy);
         IntSliderRow(TextId::ExactLights, settings, &Settings::exactLights);
         IntSliderRow(TextId::SampledLightRays, settings, &Settings::sampledLightRays);
+        ImGui::EndDisabled();
         ImGui::TableNextRow();
         ImGui::TableNextColumn();
         ImGui::TextUnformatted(Text(TextId::FoliageShadows));
@@ -395,6 +437,17 @@ void DrawRayTracingTab(Settings& settings)
         }
         IntSliderRow(TextId::IndirectRays, settings, &Settings::indirectRays);
         IntSliderRow(TextId::IndirectBounces, settings, &Settings::indirectBounces);
+        const bool cacheAvailable = GetStatistics().radianceCacheAvailable;
+        ImGui::BeginDisabled(!cacheAvailable || settings.indirectLighting == IndirectLighting::Baked);
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn();
+        if (ImGui::Checkbox(Text(TextId::RadianceCache), &settings.radianceCache))
+            settings.qualityPreset = QualityPreset::Custom;
+        ImGui::EndDisabled();
+        if (!cacheAvailable) {
+            ImGui::TableNextColumn();
+            ImGui::TextDisabled("%s", Text(TextId::RadianceCacheUnavailable));
+        }
         ImGui::BeginDisabled(settings.indirectLighting != IndirectLighting::Baked);
         IntSliderRow(TextId::AoRays, settings, &Settings::aoRays);
         ImGui::EndDisabled();

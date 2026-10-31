@@ -1,6 +1,9 @@
 #pragma once
 
+#include "d3d12_device.h"
 #include "dlss.h"
+#include "nrd_denoiser.h"
+#include "restir.h"
 #include "scene.h"
 #include "settings.h"
 #include "skinned_casters.h"
@@ -103,7 +106,7 @@ struct FrameConstants {
     uint32_t probeBlueView;
     uint32_t lightStylesView;
     uint32_t additiveAfterResolve;
-    uint32_t previousLitView;
+    uint32_t glossyReflections;
     uint32_t bakedTrianglesView;
     uint32_t bakedFacesView;
     uint32_t bakedResidualView;
@@ -136,12 +139,34 @@ struct FrameConstants {
     uint32_t emissiveLighting;
     // 1 when volumetricView holds the map's fog, lit (shaders/volumetrics.hlsl), in place of Source's flat fog.
     uint32_t volumetricFog;
-    uint32_t padding;
+    // RTXDI's debug image (DebugView::LightSample and ReservoirM, shaders/restir.hlsl), or kInvalidView.
+    uint32_t restirDebugView;
     // The 3D skybox's fog (ViewInputs::skyboxFog), for reflected rays that continue into it.
     float skyboxFogParams[4];
     float skyboxFogColor[3];
     uint32_t skyboxFogEnabled;
+    // Self-illumination from the material table (shaders/reflections.hlsl) and NRD's validation overlay, or kInvalidView.
+    uint32_t selfIllumView;
+    uint32_t nrdValidationView;
+    uint32_t padding[2];
     uint32_t lightWarpViews[64];
+};
+
+// Mirrors SamplingConstants in shaders/nvidia/sharc_common.hlsli: the radiance cache's parameters, bound to every pass
+// (root parameter 3) beside FrameConstants.
+struct SamplingConstants {
+    float cacheCamera[3];
+    float sceneScale;
+    float cacheCameraPrevious[3];
+    float levelBias;
+    uint32_t cacheEnabled;
+    uint32_t capacity;
+    uint32_t accumulationView;
+    uint32_t resolvedView;
+    uint32_t accumulationFrames;
+    uint32_t staleFrames;
+    float radianceScale;
+    uint32_t padding;
 };
 
 // What blocks the sun at a pixel of the main view (Lighting::RequestProbe).
@@ -209,7 +234,7 @@ struct ViewInputs {
 class Lighting {
 public:
     // `dlssDirectory` holds nvngx_dlssd.dll.
-    bool Initialize(ID3D12Device5* device, ID3D12CommandQueue* queue, DescriptorHeap& descriptors, bool opacityMicromaps,
+    bool Initialize(ID3D12Device5* device, ID3D12CommandQueue* queue, DescriptorHeap& descriptors, const RaytracingSupport& support,
         const std::filesystem::path& dlssDirectory);
     // Submits the view's commands to the queue. The game's commands that wrote the inputs must be submitted first.
     void Run(const ViewInputs& inputs, Scene& scene, std::span<const SceneInstance> dynamic, const std::vector<SkinnedEntity>& skinned);
@@ -222,10 +247,12 @@ public:
     // view is lit at the output resolution instead.
     bool RayReconstructionSize(UINT outputWidth, UINT outputHeight, UINT& width, UINT& height);
     void WaitForGpu();
+    // Forgets everything learnt about the scene: frame histories and the radiance cache (a new map).
     void InvalidateHistory()
     {
         m_historyValid = false;
         m_probeHistoryValid = false;
+        m_cacheClear = true;
     }
     // Whether the last main view filled the irradiance volume for translucent surfaces, and the volume's first cell.
     bool VolumeReady() const { return m_volumeReady; }
@@ -252,7 +279,43 @@ private:
         D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     };
     // DirectWide is Direct for more exact lights or shared shadow rays than the High preset's.
-    enum class Pass { Surface, Primary, Probes, Ao, Volumetrics, Direct, GiTrace, GiTemporal, GiFilter, Lighting, TemporalAntiAliasing, Sharpen, Reflections, ReflectionTemporal, DlssInputs, DlssResolve, DirectWide, Sway, TranslucentDepth, ViewRect, Baked, Sky, Count };
+    enum class Pass {
+        Surface,
+        Primary,
+        Probes,
+        Ao,
+        Volumetrics,
+        Direct,
+        GiTrace,
+        GiTemporal,
+        GiFilter,
+        Lighting,
+        TemporalAntiAliasing,
+        Sharpen,
+        Reflections,
+        ReflectionTemporal,
+        DlssInputs,
+        DlssResolve,
+        DirectWide,
+        Sway,
+        TranslucentDepth,
+        ViewRect,
+        Baked,
+        Sky,
+        SharcUpdate,
+        SharcResolve,
+        DirectSun,
+        RestirPdf,
+        RestirPresample,
+        RestirRegir,
+        RestirInitial,
+        RestirTemporal,
+        RestirSpatial,
+        RestirShade,
+        NrdInputs,
+        NrdResolve,
+        Count
+    };
     // Mirrors PassConstants in shaders/common.hlsli: descriptor indices (none by default) and a parameter.
     struct PassArgs {
         UINT input0 = DescriptorHeap::kInvalid;
@@ -272,8 +335,24 @@ private:
     enum RayReconstructionInput { RrColor, RrDepth, RrNormal, RrFlags, RrLight, RrAlbedo, RrEmissive, RrInputCount };
 
     bool EnsureTargets(UINT width, UINT height);
+    // Creates the radiance cache's buffers, or frees them when `wanted` is false (waiting for the GPU).
+    bool EnsureRadianceCache(bool wanted);
+    // Binds the compute root signature with the view's frame constants, the scene and the slot's sampling constants.
+    void BindCompute(D3D12_GPU_VIRTUAL_ADDRESS frameConstants, D3D12_GPU_VIRTUAL_ADDRESS scene, UINT slot);
+    // Records RTXDI's passes for the main view (shaders/restir.hlsl): the light PDF, presampling, ReGIR, initial sampling,
+    // reuse in `mode`, and shading into the sampled remainder and highlights.
+    void RecordRestir(RestirMode mode, bool debugImage);
+    // NRD for the main view at the output size with the chosen denoiser (re)made; false when it cannot be (logged once).
+    bool EnsureNrd(DenoiserType type);
+    // Records NRD's denoising of the main view's raw indirect light and reflections into m_giFiltered[0] and
+    // m_reflectionHistory[current] (shaders/nrd.hlsl), then binds the compute root signature again; false when NRD failed,
+    // leaving them unwritten.
+    bool RecordNrd(const FrameConstants& constants, const ViewInputs& inputs, UINT slot, UINT current, D3D12_GPU_VIRTUAL_ADDRESS frameConstants,
+        D3D12_GPU_VIRTUAL_ADDRESS scene);
     bool CreateTarget(Texture& texture, UINT width, UINT height, DXGI_FORMAT format, UINT depth = 0);
     bool CreateSkyLight();
+    // Binds the pass's pipeline: its opacity micromap variant while they are in use, when it has one.
+    void SetPipeline(Pass pass);
     void DispatchGroups(Pass pass, const PassArgs& args, UINT x, UINT y, UINT z);
     // Moves the swaying props near the eye to this frame's sway (SwayingProps).
     void UpdateSway(const Scene& scene, UINT slot, const gbuffer::SwayClock& clock, const float (&eye)[3], D3D12_GPU_VIRTUAL_ADDRESS frameConstants);
@@ -293,6 +372,34 @@ private:
     ID3D12CommandQueue* m_queue = nullptr;
     DescriptorHeap* m_descriptors = nullptr;
     bool m_opacityMicromaps = false;
+    bool m_radianceCacheSupported = false;
+    // NVIDIA RTXDI for the main view's local lights (LightSampling other than Legacy).
+    Restir m_restir;
+    bool m_restirAvailable = false;
+    // The mode and size the main view last sampled with RTXDI, whose reservoirs the next may reuse.
+    std::optional<RestirMode> m_restirLastMode;
+    UINT m_restirLastSize[2] = {};
+    // The light style values of the last main view, for RTXDI's temporal reuse.
+    std::array<float, engine::kLightStyles> m_lastLightStyles = {};
+    Texture m_restirDebug;
+    // NVIDIA NRD, the main view's denoiser without Ray Reconstruction (DenoiserType other than BuiltIn), its inputs and
+    // outputs, and the camera of its last frame.
+    NrdDenoiser m_nrd;
+    bool m_nrdFailed = false;
+    bool m_nrdHistoryValid = false;
+    uint32_t m_nrdFrame = 0;
+    Texture m_nrdViewZ;
+    Texture m_nrdNormalRoughness;
+    Texture m_nrdDiffuse;
+    Texture m_nrdSpecular;
+    Texture m_nrdDiffuseOut;
+    Texture m_nrdSpecularOut;
+    Texture m_nrdValidation;
+    float m_nrdWorldToView[16] = {};
+    float m_nrdViewToClip[16] = {};
+    float m_nrdJitter[2] = {};
+    // The material table's self-illumination (shaders/reflections.hlsl), added by the lighting pass.
+    Texture m_selfIllum;
     static constexpr UINT kSlots = Scene::kFrameSlots;
     std::array<Microsoft::WRL::ComPtr<ID3D12CommandAllocator>, kSlots> m_allocators;
     std::array<uint64_t, kSlots> m_slotFenceValues = {};
@@ -305,6 +412,25 @@ private:
     UINT m_slotViews = DescriptorHeap::kInvalid;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_constants;
     std::byte* m_constantsMapped = nullptr;
+    // SamplingConstants per slot.
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_sampling;
+    std::byte* m_samplingMapped = nullptr;
+    // Bound as the radiance cache's hash entries while there is no cache: root descriptors must point somewhere.
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_unusedRootUav;
+    // The radiance cache (NVIDIA SHaRC): hash entries (a root UAV), accumulation and resolved buffers, all with
+    // kCacheCapacity entries; `m_cacheClear` zeroes them before the next update.
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_cacheHash;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_cacheAccumulation;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_cacheResolved;
+    UINT m_cacheAccumulationUav = DescriptorHeap::kInvalid;
+    UINT m_cacheResolvedUav = DescriptorHeap::kInvalid;
+    bool m_cacheClear = true;
+    bool m_cacheWanted = false;
+    // Creating the cache failed once; it is not tried again.
+    bool m_cacheFailed = false;
+    // The main view's eye this frame, which sizes the cache's voxels for every view, and when the cache was last updated.
+    float m_cacheCamera[3] = {};
+    float m_cacheCameraPrevious[3] = {};
     // The last main view's constants with its irradiance volume, per slot, for game draws that light themselves
     // (forward twins), and the scene they trace.
     Microsoft::WRL::ComPtr<ID3D12Resource> m_forwardConstants;
@@ -362,8 +488,8 @@ private:
     std::array<Texture, 2> m_giFiltered;
     // The denoised light the main view used last frame, which indirect rays reuse; kInvalid when there is none.
     Texture* m_lastDenoised = nullptr;
-    // Shaded colour; the main view alternates between the two so the reflections pass can read last frame's.
-    std::array<Texture, 2> m_lit;
+    // Shaded colour.
+    Texture m_lit;
     Texture m_reflections;
     // Ambient occlusion accumulated over frames (occlusion, sample count) and blurred.
     std::array<Texture, 2> m_aoHistory;

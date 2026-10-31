@@ -59,6 +59,12 @@ RaytracingSupport QueryRaytracing(ID3D12Device* device)
     }
     support.inlineRaytracing = support.tier >= D3D12_RAYTRACING_TIER_1_1 && support.shaderModel >= D3D_SHADER_MODEL_6_6;
     support.opacityMicromaps = support.tier >= D3D12_RAYTRACING_TIER_1_2 && support.shaderModel >= D3D_SHADER_MODEL_6_9;
+    D3D12_FEATURE_DATA_D3D12_OPTIONS1 options1 = {};
+    D3D12_FEATURE_DATA_D3D12_OPTIONS4 options4 = {};
+    const bool int64 = SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &options1, sizeof(options1))) && options1.Int64ShaderOps;
+    const bool native16 =
+        SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS4, &options4, sizeof(options4))) && options4.Native16BitShaderOpsSupported;
+    support.radianceCache = support.inlineRaytracing && int64 && native16;
     return support;
 }
 

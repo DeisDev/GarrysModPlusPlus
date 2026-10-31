@@ -1,14 +1,20 @@
 #include "water.hlsli"
 
 // Light the deferred pass adds on top of diffuse lighting, found from the material of the triangle each pixel
-// shows (shaders/primary.hlsl): mirror reflections of env_cubemap materials (envmap mask times $envmaptint, as
-// LightmappedGeneric applies them) and self-illumination of surfaces whose G-buffer shader wrote none.
-// Reflected surfaces visible last frame reuse last frame's shaded colour. Others get the sun, one local light
-// picked by SampleLight and, as their indirect light, the denoised light of the reflecting pixel.
-// input0: last frame's shaded colour of the main view (linear when outputLinear); input1: this frame's denoised
-// light, or none; input2: the exact direct light (shaders/direct.hlsl); output0: added radiance, before the tonemap scale, and the reflection's hit distance (0 without
-// one) for shaders/reflection_temporal.hlsl; output1, output2, output3 (or none):
-// specular albedo, roughness and specular hit distance guides for Ray Reconstruction.
+// shows (shaders/primary.hlsl): reflections of env_cubemap materials (envmap mask times $envmaptint, as
+// LightmappedGeneric applies them) and self-illumination of surfaces whose G-buffer shader wrote none. Reflections
+// are glossy where the twin wrote a Phong exponent (PhongRoughness), mirrors elsewhere; reflected surfaces are lit where
+// they are (ReflectedRadiance in shaders/reflection.hlsli).
+// input1: the main view's denoised light of last frame, or none; input2: the exact direct light (shaders/direct.hlsl);
+// output0: the reflection, before the tonemap scale, and its hit distance (0 without one) for
+// shaders/reflection_temporal.hlsl and NRD; output1, output2, output3 (or none): specular albedo, linear roughness and
+// specular hit distance guides for Ray Reconstruction and NRD; output4: the material table's self-illumination.
+
+// The roughness a reflection was traced with, linear (the square root of alpha) as Ray Reconstruction takes it.
+float GuideRoughness(float alpha)
+{
+    return g_frame.glossyReflections != 0 && alpha >= kMirrorRoughness ? sqrt(alpha) : 0.0;
+}
 
 void WriteGuides(int2 pixel, float3 specularAlbedo, float roughness, float hitDistance)
 {
@@ -31,7 +37,9 @@ void main(uint3 id : SV_DispatchThreadID)
         return;
     int2 pixel = int2(id.xy);
     RWTexture2D<float4> output = ResourceDescriptorHeap[g_pass.output0];
+    RWTexture2D<float4> selfIllumOutput = ResourceDescriptorHeap[g_pass.output4];
     output[pixel] = 0.0;
+    selfIllumOutput[pixel] = 0.0;
     WriteGuides(pixel, 0.0, 0.0, kSkyHitDistance);
     float4 surface = SurfaceAt(g_frame.surfaceView, pixel);
     if (surface.w <= 0.0 || g_frame.traceMask == 0)
@@ -45,15 +53,18 @@ void main(uint3 id : SV_DispatchThreadID)
         // alpha, from just above the plane (shaders/water.hlsli).
         Texture2D<float4> normals = ResourceDescriptorHeap[g_frame.gbufferNormalView];
         float4 water = normals.Load(int3(pixel, 0));
-        float3 direction = reflect(view, WaterNormal(water.xy, water.w, -view, kWaveSlope));
+        uint seed = PixelSeed(pixel, 0x8Fu);
+        float weight;
+        float3 direction = ReflectionDirection(view, WaterNormal(water.xy, water.w, -view, kWaveSlope), float3(0.0, 0.0, 1.0), kGlintRoughness,
+            float2(Random(seed), Random(seed)), weight);
         direction.z = max(direction.z, 0.02);
         float strength = Schlick(dot(surface.xyz, -view)) * water.z * g_frame.reflectionScale;
         float hitDistance;
-        uint seed = PixelSeed(pixel, 0x8Fu);
-        float3 reflection = ReflectedRadiance(g_pass.input0, position + float3(0.0, 0.0, 2.0), normalize(direction), g_frame.skyColor * g_frame.indirectScale,
-            seed, hitDistance);
-        output[pixel] = float4(reflection * strength, hitDistance);
-        WriteGuides(pixel, saturate(strength), 0.0, hitDistance);
+        float lobe = g_frame.glossyReflections != 0 ? LobeSpread(kGlintRoughness) : 0.0;
+        float3 reflection = ReflectedRadiance(position + float3(0.0, 0.0, 2.0), normalize(direction), PixelAngle() * surface.w, PixelAngle() + lobe, seed,
+            hitDistance);
+        output[pixel] = float4(reflection * strength * weight, hitDistance);
+        WriteGuides(pixel, saturate(strength), GuideRoughness(kGlintRoughness), hitDistance);
         return;
     }
     HitInfo hit;
@@ -69,7 +80,8 @@ void main(uint3 id : SV_DispatchThreadID)
     float3 left = position - WorldPositionFromDepth(pixel - int2(1, 0), DepthAt(pixel - int2(1, 0)));
     float3 down = WorldPositionFromDepth(pixel + int2(0, 1), DepthAt(pixel + int2(0, 1))) - position;
     float3 up = position - WorldPositionFromDepth(pixel - int2(0, 1), DepthAt(pixel - int2(0, 1)));
-    float footprint = max(min(length(right), length(left)), min(length(down), length(up))) * uvPerUnit;
+    float pixelWidth = max(min(length(right), length(left)), min(length(down), length(up)));
+    float footprint = pixelWidth * uvPerUnit;
 
     float3 result = 0.0;
     float reflectionDistance = 0.0;
@@ -79,20 +91,23 @@ void main(uint3 id : SV_DispatchThreadID)
         float3 normal = surface.xyz;
         float3 geometricNormal = GeometricNormalAt(pixel);
         float3 origin = SurfaceRayOrigin(position, geometricNormal, surface.w);
-        float3 ambient = g_frame.skyColor;
-        if (g_pass.input1 != kNoView) {
-            Texture2D<float4> denoised = ResourceDescriptorHeap[g_pass.input1];
-            ambient = denoised.Load(int3(pixel, 0)).rgb;
-        }
         uint seed = PixelSeed(pixel, 0x8Fu);
         float hitDistance;
+        float alpha = PhongRoughness(pixel);
+        float weight;
+        float3 direction = ReflectionDirection(view, normal, geometricNormal, alpha, float2(Random(seed), Random(seed)), weight);
+        float lobe = g_frame.glossyReflections != 0 && alpha >= kMirrorRoughness ? LobeSpread(alpha) : 0.0;
         // As LightmappedGeneric and VertexLitGeneric shape their cubemap term.
-        float3 specular = ReflectedRadiance(g_pass.input0, origin, AboveSurface(reflect(view, normal), geometricNormal), ambient * g_frame.indirectScale, seed, hitDistance) *
-            material.envmapTint * reflectivity;
+        float3 specular = ReflectedRadiance(origin, direction, pixelWidth, PixelAngle() + lobe, seed, hitDistance) * material.envmapTint * (reflectivity * weight);
         specular = lerp(specular, specular * specular, material.envmapContrast);
         specular = lerp(dot(specular, float3(0.299, 0.587, 0.114)), specular, material.envmapSaturation);
         if (material.envmapLightScale > 0.0) {
             // GMod's CUBEMAP 2 combos fade the reflection where the lightmap is dark; the pixel's light stands in for it.
+            float3 ambient = g_frame.skyColor;
+            if (g_pass.input1 != kNoView) {
+                Texture2D<float4> denoised = ResourceDescriptorHeap[g_pass.input1];
+                ambient = denoised.Load(int3(pixel, 0)).rgb;
+            }
             Texture2D<float4> direct = ResourceDescriptorHeap[g_pass.input2];
             float3 light = direct.Load(int3(pixel, 0)).rgb + ambient * g_frame.indirectScale;
             float3 fade = saturate((light - material.envmapLightMin) * material.envmapLightRange);
@@ -100,15 +115,15 @@ void main(uint3 id : SV_DispatchThreadID)
         }
         result += specular;
         reflectionDistance = hitDistance;
-        // Source's env_cubemap reflections are mirrors.
-        WriteGuides(pixel, saturate(material.envmapTint * reflectivity), 0.0, hitDistance);
+        float roughness = GuideRoughness(alpha);
+        WriteGuides(pixel, SpecularAlbedo(saturate(material.envmapTint * reflectivity), roughness * roughness, dot(normal, -view)), roughness, hitDistance);
     }
     float selfIllum = MaskValue(material.selfIllumMask, uv, footprint);
     if (selfIllum > 0.0) {
         Texture2D<float4> emissive = ResourceDescriptorHeap[g_frame.emissiveView];
         Texture2D<float4> albedo = ResourceDescriptorHeap[g_frame.albedoView];
         if (all(emissive.Load(int3(pixel, 0)).rgb == 0.0))
-            result += material.selfIllumTint * albedo.Load(int3(pixel, 0)).rgb * selfIllum;
+            selfIllumOutput[pixel] = float4(material.selfIllumTint * albedo.Load(int3(pixel, 0)).rgb * selfIllum, 0.0);
     }
     output[pixel] = float4(result, reflectionDistance);
 }

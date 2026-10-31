@@ -22,6 +22,26 @@ FetchContent_Declare(imgui
 )
 FetchContent_MakeAvailable(minhook imgui)
 
+# NVIDIA NRD 4.18.0 (the denoiser without DLSS Ray Reconstruction), built as a static library whose DXIL shaders it embeds,
+# compiled by its ShaderMake with the DXC below. Its dependencies are declared first, pinned by hash, so NRD's own
+# declarations of them (by the same URLs) are not used. MathLib (MIT) is compiled into NRD and its ShaderMakeBlob (MIT)
+# linked into it.
+FetchContent_Declare(shadermake
+    URL https://github.com/NVIDIA-RTX/ShaderMake/archive/3f01623a76b092ac127d2debd79a672f55d77665.zip
+    URL_HASH SHA256=becdd4593f09f42b191c3a9579569d6497869ad624fdb0275f7708508bfcadd7
+    DOWNLOAD_EXTRACT_TIMESTAMP 1
+)
+FetchContent_Declare(mathlib
+    URL https://github.com/NVIDIA-RTX/MathLib/archive/refs/tags/v11.zip
+    URL_HASH SHA256=4a0772103fd7ef832f8c2fb3ec7fb6bf5b3bebbd41ecafc476671d11eca28a06
+    DOWNLOAD_EXTRACT_TIMESTAMP 1
+)
+FetchContent_Declare(nrd
+    URL https://github.com/NVIDIA-RTX/NRD/archive/refs/tags/v4.18.0.zip
+    URL_HASH SHA256=d9cb9476c11a8773bfe32d99d26e7038bac0ef3e09957f63e35c3b0fe9f29790
+    DOWNLOAD_EXTRACT_TIMESTAMP 1
+)
+
 add_library(imgui STATIC
     ${imgui_SOURCE_DIR}/imgui.cpp
     ${imgui_SOURCE_DIR}/imgui_draw.cpp
@@ -42,6 +62,18 @@ if(NOT EXISTS "${DXC_DIR}/bin/x64/dxc.exe")
     file(ARCHIVE_EXTRACT INPUT "${DXC_DIR}.zip" DESTINATION "${DXC_DIR}")
 endif()
 set(DXC_EXECUTABLE "${DXC_DIR}/bin/x64/dxc.exe")
+
+set(NRD_STATIC_LIBRARY ON CACHE BOOL "" FORCE)
+set(NRD_NRI OFF CACHE BOOL "" FORCE)
+set(NRD_EMBEDS_DXIL_SHADERS ON CACHE BOOL "" FORCE)
+set(NRD_EMBEDS_SPIRV_SHADERS OFF CACHE BOOL "" FORCE)
+set(NRD_EMBEDS_DXBC_SHADERS OFF CACHE BOOL "" FORCE)
+set(SHADERMAKE_FIND_COMPILERS OFF CACHE BOOL "" FORCE)
+set(SHADERMAKE_DXC_PATH "${DXC_EXECUTABLE}" CACHE INTERNAL "")
+FetchContent_MakeAvailable(nrd)
+# NRD made its dependencies available in its own scope; their source directories are needed here for their licences.
+FetchContent_GetProperties(mathlib SOURCE_DIR MATHLIB_SOURCE_DIR)
+FetchContent_GetProperties(shadermake SOURCE_DIR SHADERMAKE_SOURCE_DIR)
 find_program(FXC_EXECUTABLE fxc HINTS "$ENV{WindowsSdkVerBinPath}/x64" REQUIRED)
 
 # DirectX 12 Agility SDK: headers for opacity micromaps and the D3D12Core.dll runtime the device is created
@@ -58,15 +90,94 @@ set(SHADER_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/shaders")
 file(MAKE_DIRECTORY "${SHADER_OUTPUT_DIR}")
 set(SHADER_HEADERS)
 
+# NVIDIA SHaRC 1.8.3 (spatially hashed radiance cache), pinned by commit and each file by hash. Its headers are compiled
+# into the lighting passes that use the radiance cache (shaders/nvidia) and never shipped as source.
+set(SHARC_COMMIT 4e21b585c33c83d723ca9a1e11bbb1090d145793)
+set(SHARC_DIR "${CMAKE_CURRENT_BINARY_DIR}/_deps/sharc-${SHARC_COMMIT}")
+set(SHARC_FILES
+    "include/HashGridCommon.h|74585a8af1eee32c90c9f56ef0db5d50ca8929ac4d1fbc093ea8664957b02334"
+    "include/HashGridTypes.h|f5a04ff7f7a511cb8ccd7150fdf39e689f10afa4c0c355982ef52f6859e9340f"
+    "include/SharcCommon.h|097e5238a3c3a3360d1e8685b56189a75b5c663dbdcc74383d5384c61b936a76"
+    "include/SharcTypes.h|cde3f200e4e84f029968dffd9eede5228f2ae0b0bbc166d2babb1aa88dc044b3"
+    "License.md|5575ad921bfe6027dc830887ff51ceb4097e31c2d538b6932cd4bbdf5c1899a9"
+)
+set(SHARC_PATHS "")
+foreach(entry IN LISTS SHARC_FILES)
+    string(REPLACE "|" ";" parts "${entry}")
+    list(GET parts 0 file)
+    list(GET parts 1 hash)
+    file(DOWNLOAD "https://raw.githubusercontent.com/NVIDIA-RTX/SHARC/${SHARC_COMMIT}/${file}" "${SHARC_DIR}/${file}"
+        EXPECTED_HASH SHA256=${hash} TLS_VERIFY ON)
+    list(APPEND SHARC_PATHS "${SHARC_DIR}/${file}")
+endforeach()
+# NVIDIA RTXDI-Library (RTXDI 3.1.0) for many-light direct lighting (ReSTIR DI with a ReGIR light grid), pinned by commit
+# and each file by hash: the DI, ReGIR, light sampling and utility headers the lighting passes include (shaders/nvidia), and
+# the host sources of the ReSTIR DI and ReGIR contexts compiled into gmodpp.dll. Never shipped as source.
+set(RTXDI_COMMIT f12037fa8e97ebc08e9e3edfd2de528ed1772a4b)
+set(RTXDI_DIR "${CMAKE_CURRENT_BINARY_DIR}/_deps/rtxdi-${RTXDI_COMMIT}")
+set(RTXDI_FILES
+    "Include/Rtxdi/RtxdiParameters.h|70947be081ce6456bc724f18f3c06a6b88cad90d336bda470c4794416d6cfe30"
+    "Include/Rtxdi/RtxdiTypes.h|3e0b0593cf23503f3d7c5fdc449a5ecb0f686e334b394ca328130b4fd1af6336"
+    "Include/Rtxdi/RtxdiUtils.h|9e77e4aecc7f575fe166ffa068aedfe4c5a3d8788b11bc09bd3305c061584fd5"
+    "Include/Rtxdi/DI/ReSTIRDI.h|ff8572e7852e7e3a271641721be101adbcdec50539282481b7f8561487038256"
+    "Include/Rtxdi/DI/ReSTIRDIParameters.h|39fc383642be6b3c0f90c376b8be261b1d5eccf361efc002e684bfc28c6e4e39"
+    "Include/Rtxdi/DI/BoilingFilter.hlsli|28530097ce3ea47156d345152e14e4c1f9661d210f0e719af7694dee3fdb6806"
+    "Include/Rtxdi/DI/InitialSampling.hlsli|53f27901d296bac2a1d5fb9c4f73b643a4c39c632c970407ab595e6ddaf098ec"
+    "Include/Rtxdi/DI/PairwiseStreaming.hlsli|fd15e9051036a211a3f516a186edef0f36cf99f9392bd840121b0dbe449fac8c"
+    "Include/Rtxdi/DI/Reservoir.hlsli|be474731482b1edb0669f19a1c07f4abe23d8ceee895948e933f685566a0111d"
+    "Include/Rtxdi/DI/ReservoirStorage.hlsli|564bdaf5e82dc214f9f90a055e388eae33280347d5aed531cecdc3ab47afa139"
+    "Include/Rtxdi/DI/SpatialResampling.hlsli|7ece19806068de3e12a088544af90a2597bf3444b50b7d1331b5e2a61cda55f5"
+    "Include/Rtxdi/DI/SpatioTemporalResampling.hlsli|f1d6c303aa9500db46426d93b80dd0ea5868e190671727649de2ce9c357adb6e"
+    "Include/Rtxdi/DI/TemporalResampling.hlsli|ef2394f6959b24fb2098a41aae2c14284708c410f17ea071eb3216ea4ec90d59"
+    "Include/Rtxdi/LightSampling/LocalLightSelection.hlsli|7376cf1cea74ea9710c7da350db193d8edfcdd0b49d16f80020e0fa06c9da92c"
+    "Include/Rtxdi/LightSampling/PresamplingFunctions.hlsli|cec1bc2f34f39563d4fe04e88ecf89afaf2dfb49f80e91dc2ac6fb716b27a6c5"
+    "Include/Rtxdi/LightSampling/RISBuffer.hlsli|23b7dd3d870ce210fc51925fdc3a66f6fca2960962256287631a65da28f15f1c"
+    "Include/Rtxdi/LightSampling/RISBufferSegmentAllocator.h|83e2520d782efd0afc06fc87fe74c22cb17d6a5060cf141e85958dfd6a61b046"
+    "Include/Rtxdi/LightSampling/RISBufferSegmentParameters.h|7c3028089f236e2dd8d37f8c9f91f65de10b2940b028aa43d448aecc82af96d2"
+    "Include/Rtxdi/LightSampling/UniformSampling.hlsli|3d3779cf58a4b2e68658d56d4acc3240be5ca92f387c8a70ab553793a466675c"
+    "Include/Rtxdi/ReGIR/ReGIR.h|0bed923e912f56470595bbc9d4120b91c470691b2e7fdac0314101b19dff3323"
+    "Include/Rtxdi/ReGIR/ReGIRParameters.h|efa12becd55831bb8e079fd9ed2201616bcda6ada8c03c07fd0cd781be1d344e"
+    "Include/Rtxdi/ReGIR/ReGIRSampling.hlsli|fba9b81a34d63d8d5b3b6fda7a5792557e3ab309ae6d98c0ab95fb8bfc153720"
+    "Include/Rtxdi/Utils/BoilingFilter.hlsli|80c42405fc0b22ac8383baaf0737394b892257e7c812effce0fbd78ce10ea418"
+    "Include/Rtxdi/Utils/BrdfRaySample.hlsli|4c49daad4f9549daf55bd397db89882f8eab0a089f2d60626103d001a795d516"
+    "Include/Rtxdi/Utils/Checkerboard.hlsli|9d787231c7c4d32a9e7b575166fd77eeecc74759e540ca44f98149e5901865b5"
+    "Include/Rtxdi/Utils/Color.hlsli|4dbc197d6b38c19becb80adf6e361d16c99684b9689a1cc4678a842d21179114"
+    "Include/Rtxdi/Utils/Math.hlsli|ec4bb38fac6d922e75799449bc311b9fa2c91f79bdfa50e197e4d2c95f381954"
+    "Include/Rtxdi/Utils/RandomSamplerPerPassSeeds.hlsli|c83a644b6cbd6256a523ed0a719af4d49a9ef1a7133db320339114c3645cfbd9"
+    "Include/Rtxdi/Utils/RandomSamplerState.hlsli|ea29055daa730794146adb25612889b9d7fe2adb1ff940b462ae13c731e0274d"
+    "Include/Rtxdi/Utils/ReservoirAddressing.hlsli|df44bf8fbc1d5bbcda24e40d4f4acc71bedab5ffa24d7f2db8c3e515cf4a86da"
+    "Include/Rtxdi/Utils/SampledLightData.hlsli|8224d0ba265d5daca0df8629c91a8dd4576f848d2b9f461acaab91b7ff64cf88"
+    "Include/Rtxdi/Utils/TypePacking.hlsli|e9bda8d1c534329ba19ee5d46819adac829da17869f3864c5749236f434873f0"
+    "Source/ReSTIRDI.cpp|ae6e5157ee9cf752ff3200a455203753cb484bfcf93f62f0e4a6cd81f2ee7f16"
+    "Source/ReGIR.cpp|1c542e1085e1b6c1a22de309eff9c4b8b7f08f337c77c4f85ac08610d4d301d6"
+    "Source/RtxdiUtils.cpp|3b8613b9e2b191d031103c5be307eef2249b211788d0c1b02e0397210732a261"
+    "Source/RISBufferSegmentAllocator.cpp|d17bf9c94e1e69a3810132a7983f3c6c79f770d4c28fac6aa2e1657b8bcbc1a6"
+    "LICENSE.txt|120a5af845068454e8498718e230689660abd96b15f48a19858c56f0e3ecfb4c"
+)
+set(RTXDI_PATHS "")
+foreach(entry IN LISTS RTXDI_FILES)
+    string(REPLACE "|" ";" parts "${entry}")
+    list(GET parts 0 file)
+    list(GET parts 1 hash)
+    file(DOWNLOAD "https://raw.githubusercontent.com/NVIDIA-RTX/RTXDI-Library/${RTXDI_COMMIT}/${file}" "${RTXDI_DIR}/${file}"
+        EXPECTED_HASH SHA256=${hash} TLS_VERIFY ON)
+    list(APPEND RTXDI_PATHS "${RTXDI_DIR}/${file}")
+endforeach()
+set(RTXDI_SHADER_OPTIONS -D GMODPP_RTXDI=1 -I "${RTXDI_DIR}/Include")
+
+# Lighting passes built with the radiance cache: DXC options and the files they read.
+set(SHARC_SHADER_OPTIONS -D GMODPP_SHARC=1 -I "${SHARC_DIR}/include" -enable-16bit-types)
+file(GLOB NVIDIA_SHADER_HEADERS CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/nvidia/*.hlsli")
+file(GLOB SHADER_INCLUDES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/*.hlsli")
+
 # Extra arguments are dxc options.
 function(add_shader source entry profile variable)
     set(output "${SHADER_OUTPUT_DIR}/${variable}.h")
     add_custom_command(
         OUTPUT "${output}"
         COMMAND "${DXC_EXECUTABLE}" -nologo -T ${profile} -E ${entry} -O3 -HV 2021 ${ARGN} -Fh "${output}" -Vn ${variable} "${CMAKE_CURRENT_SOURCE_DIR}/${source}"
-        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/${source}" "${CMAKE_CURRENT_SOURCE_DIR}/shaders/common.hlsli" "${CMAKE_CURRENT_SOURCE_DIR}/shaders/scene.hlsli"
-            "${CMAKE_CURRENT_SOURCE_DIR}/shaders/reflection.hlsli" "${CMAKE_CURRENT_SOURCE_DIR}/shaders/water.hlsli"
-            "${CMAKE_CURRENT_SOURCE_DIR}/shaders/baked.hlsli"
+        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/${source}" ${SHADER_INCLUDES} ${NVIDIA_SHADER_HEADERS} ${SHARC_PATHS} ${RTXDI_PATHS}
+            "${nrd_SOURCE_DIR}/Shaders/NRD.hlsli" "${nrd_SOURCE_DIR}/Shaders/NRDConfig.hlsli"
         COMMENT "Compiling ${source} (${entry})"
         VERBATIM
     )
@@ -98,6 +209,30 @@ foreach(pass primary probes ao volumetrics direct reflections gi_trace)
     add_shader(shaders/${pass}.hlsl main cs_6_6 g_${variable}CS)
     add_shader(shaders/${pass}.hlsl main cs_6_9 g_${variable}OmmCS -D OPACITY_MICROMAPS=1)
 endforeach()
+# The passes that read the radiance cache, built with it for devices that support it (16-bit types and 64-bit atomics),
+# and the cache's own passes.
+foreach(pass probes reflections gi_trace)
+    string(REPLACE "_t" "T" variable ${pass})
+    add_shader(shaders/${pass}.hlsl main cs_6_6 g_${variable}CacheCS ${SHARC_SHADER_OPTIONS})
+    add_shader(shaders/${pass}.hlsl main cs_6_9 g_${variable}CacheOmmCS -D OPACITY_MICROMAPS=1 ${SHARC_SHADER_OPTIONS})
+endforeach()
+add_shader(shaders/deferred_lighting.hlsl main cs_6_6 g_deferredLightingCacheCS ${SHARC_SHADER_OPTIONS})
+add_shader(shaders/sharc_update.hlsl main cs_6_6 g_sharcUpdateCS ${SHARC_SHADER_OPTIONS})
+add_shader(shaders/sharc_update.hlsl main cs_6_9 g_sharcUpdateOmmCS -D OPACITY_MICROMAPS=1 ${SHARC_SHADER_OPTIONS})
+add_shader(shaders/sharc_resolve.hlsl main cs_6_6 g_sharcResolveCS ${SHARC_SHADER_OPTIONS})
+# Many-light direct lighting (NVIDIA RTXDI): the sun alone in the direct pass, the light PDF, presampling, ReGIR, and ReSTIR
+# DI's initial sampling, reuse and shading.
+add_shader(shaders/direct.hlsl main cs_6_6 g_directSunCS -D SUN_ONLY=1)
+add_shader(shaders/direct.hlsl main cs_6_9 g_directSunOmmCS -D SUN_ONLY=1 -D OPACITY_MICROMAPS=1)
+foreach(entry Pdf Presample Regir Initial Temporal Spatial Shade)
+    add_shader(shaders/restir.hlsl ${entry}Main cs_6_6 g_restir${entry}CS ${RTXDI_SHADER_OPTIONS})
+endforeach()
+foreach(entry Initial Shade)
+    add_shader(shaders/restir.hlsl ${entry}Main cs_6_9 g_restir${entry}OmmCS -D OPACITY_MICROMAPS=1 ${RTXDI_SHADER_OPTIONS})
+endforeach()
+# NVIDIA NRD's inputs and outputs (its own shaders are embedded in the NRD library).
+add_shader(shaders/nrd.hlsl InputsMain cs_6_6 g_nrdInputsCS -I "${nrd_SOURCE_DIR}/Shaders")
+add_shader(shaders/nrd.hlsl ResolveMain cs_6_6 g_nrdResolveCS -I "${nrd_SOURCE_DIR}/Shaders")
 add_shader(shaders/direct.hlsl main cs_6_6 g_directWideCS -D WIDE_LIGHT_SETS=1)
 add_shader(shaders/direct.hlsl main cs_6_9 g_directWideOmmCS -D WIDE_LIGHT_SETS=1 -D OPACITY_MICROMAPS=1)
 add_shader(shaders/reflection_temporal.hlsl main cs_6_6 g_reflectionTemporalCS)
@@ -298,13 +433,21 @@ add_library(gmodpp SHARED
     src/client_hooks.cpp
     src/light_queries.cpp
     src/overlay.cpp
+    src/restir.cpp
+    src/nrd_denoiser.cpp
+    "${RTXDI_DIR}/Source/ReSTIRDI.cpp"
+    "${RTXDI_DIR}/Source/ReGIR.cpp"
+    "${RTXDI_DIR}/Source/RtxdiUtils.cpp"
+    "${RTXDI_DIR}/Source/RISBufferSegmentAllocator.cpp"
     ${SHADER_HEADERS}
 )
 target_compile_definitions(gmodpp PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
 target_compile_options(gmodpp PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4 /permissive- /utf-8>)
 target_include_directories(gmodpp BEFORE PRIVATE "${AGILITY_SDK_DIR}/build/native/include")
-target_include_directories(gmodpp PRIVATE "${DXC_DIR}/inc" "${SHADER_OUTPUT_DIR}" "${DLSS_SDK_DIR}/include")
-target_link_libraries(gmodpp PRIVATE d3d12 dxgi dxguid lzma_dec dbghelp comctl32 minhook imgui "${DLSS_SDK_DIR}/lib/Windows_x86_64/x64/nvsdk_ngx_s.lib")
+target_include_directories(gmodpp PRIVATE "${DXC_DIR}/inc" "${SHADER_OUTPUT_DIR}" "${DLSS_SDK_DIR}/include" "${RTXDI_DIR}/Include")
+# ReSTIRDI.cpp leaves a parameter unused in release builds (its check is an assert).
+set_source_files_properties("${RTXDI_DIR}/Source/ReSTIRDI.cpp" PROPERTIES COMPILE_OPTIONS /wd4100)
+target_link_libraries(gmodpp PRIVATE d3d12 dxgi dxguid lzma_dec dbghelp comctl32 minhook imgui NRD "${DLSS_SDK_DIR}/lib/Windows_x86_64/x64/nvsdk_ngx_s.lib")
 
 # The mod laid out as the game folder: the loader in the root and everything else in gmodplusplus, with the licences
 # every bundled component requires. deploy copies it into the game and release zips it.
@@ -329,6 +472,11 @@ add_custom_target(stage
     COMMAND ${CMAKE_COMMAND} -E copy "${DXC_DIR}/LICENSE-MS.txt" "${STAGE_LICENSES}/DXC-Microsoft.txt"
     COMMAND ${CMAKE_COMMAND} -E copy "${AGILITY_SDK_DIR}/LICENSE.txt" "${STAGE_LICENSES}/DirectX-Agility-SDK.txt"
     COMMAND ${CMAKE_COMMAND} -E copy "${DLSS_SDK_DIR}/LICENSE.txt" "${STAGE_LICENSES}/NVIDIA-DLSS-SDK.txt"
+    COMMAND ${CMAKE_COMMAND} -E copy "${SHARC_DIR}/License.md" "${STAGE_LICENSES}/NVIDIA-SHaRC.txt"
+    COMMAND ${CMAKE_COMMAND} -E copy "${RTXDI_DIR}/LICENSE.txt" "${STAGE_LICENSES}/NVIDIA-RTXDI.txt"
+    COMMAND ${CMAKE_COMMAND} -E copy "${nrd_SOURCE_DIR}/LICENSE.txt" "${STAGE_LICENSES}/NVIDIA-NRD.txt"
+    COMMAND ${CMAKE_COMMAND} -E copy "${MATHLIB_SOURCE_DIR}/LICENSE.txt" "${STAGE_LICENSES}/MathLib.txt"
+    COMMAND ${CMAKE_COMMAND} -E copy "${SHADERMAKE_SOURCE_DIR}/LICENSE.txt" "${STAGE_LICENSES}/ShaderMake.txt"
     DEPENDS gmodpp_loader gmodpp
     COMMENT "Staging the mod in ${STAGE_DIR}"
 )

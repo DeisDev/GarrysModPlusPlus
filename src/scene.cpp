@@ -28,7 +28,8 @@ struct Scene::InstanceRecord {
     uint32_t previousPositions;
     float previousTransform[3][4];
     uint32_t flags;
-    uint32_t padding[3];
+    uint32_t emitterLights;
+    uint32_t padding[2];
 };
 static_assert(sizeof(GpuMaterial) == 64);
 
@@ -87,6 +88,8 @@ constexpr double kGridCells = 4096.0;
 constexpr double kGridTailEntries = 4.0 * 1024.0 * 1024.0;
 // Lights a cell lists for the light loop (shaders/direct.hlsl); its other lights are sampled from its tail.
 constexpr size_t kGridListLights = 64;
+// Emitters a cell samples by their bound there; the others are sampled by their power over the whole map.
+constexpr size_t kGridEmitters = 256;
 // The weight, relative to its bound, of a light the PVS of a cell's clusters leaves out: such light rarely arrives, but
 // nothing proves it cannot.
 constexpr float kHiddenWeight = 1.0f / 16.0f;
@@ -127,6 +130,30 @@ float LightBound(const Scene::GpuLight& light, const bsp::Float3& low, const bsp
         }
     }
     return intensity * light.referenceScale / std::max(nearest, light.size * light.size);
+}
+
+// The most an emitter of `power` (its emission times its area, in any unit) gives a point of a box before shadows, with
+// a Lambert term of 1: its power over the square of the distance between its bounds and the box (at least 1); 0 where
+// the box lies wholly behind it.
+float EmitterBound(const GpuEmitter& emitter, float power, const bsp::Float3& low, const bsp::Float3& high)
+{
+    const float* p[3] = {emitter.p0, emitter.p1, emitter.p2};
+    const float lo[3] = {low.x, low.y, low.z};
+    const float hi[3] = {high.x, high.y, high.z};
+    const float e1[3] = {p[1][0] - p[0][0], p[1][1] - p[0][1], p[1][2] - p[0][2]};
+    const float e2[3] = {p[2][0] - p[0][0], p[2][1] - p[0][1], p[2][2] - p[0][2]};
+    // Source's front faces: cross(p1 - p0, p2 - p0) points out of the back.
+    const float front[3] = {e2[1] * e1[2] - e2[2] * e1[1], e2[2] * e1[0] - e2[0] * e1[2], e2[0] * e1[1] - e2[1] * e1[0]};
+    float reach = 0.0f;
+    float nearest = 0.0f;
+    for (int a = 0; a < 3; ++a) {
+        reach += std::max((lo[a] - p[0][a]) * front[a], (hi[a] - p[0][a]) * front[a]);
+        const float triangleLow = std::min({p[0][a], p[1][a], p[2][a]});
+        const float triangleHigh = std::max({p[0][a], p[1][a], p[2][a]});
+        const float d = std::max({lo[a] - triangleHigh, 0.0f, triangleLow - hi[a]});
+        nearest += d * d;
+    }
+    return reach > 0.0f ? power / std::max(nearest, 1.0f) : 0.0f;
 }
 
 // GpuLight::referenceScale: the inverse square matched to VRAD's attenuation at the reference distance, where VRAD's
@@ -700,6 +727,11 @@ void Scene::Clear()
     m_emittersView = DescriptorHeap::kInvalid;
     m_emitters.Reset();
     m_emitterCount = 0;
+    m_emitterPower = 0.0f;
+    for (UINT view : m_emitterLightViews)
+        m_descriptors->Free(view);
+    m_emitterLightViews.clear();
+    m_emitterLights.clear();
     m_worldFlags = 0;
     m_hasSkybox = false;
     m_worldModel = -1;
@@ -728,8 +760,10 @@ void Scene::Clear()
     m_sunClusters.Reset();
 }
 
-bool Scene::LoadMap(const std::string& name, const bsp::WorldGeometry& world, std::span<const MapLightShape> lightShapes, const ModelGeometry& worldGeometry)
+bool Scene::LoadMap(const std::string& name, const bsp::WorldGeometry& world, std::span<const MapLightShape> lightShapes, const ModelGeometry& worldGeometry,
+    std::span<const GpuEmitter> emitters, bool worldEmits, float emitterPower)
 {
+    m_emitterPower = emitterPower;
     m_worldModel = AddModel(worldGeometry);
     if (m_worldModel < 0)
         return false;
@@ -745,9 +779,15 @@ bool Scene::LoadMap(const std::string& name, const bsp::WorldGeometry& world, st
             0.0f, {light.normal.x, light.normal.y, light.normal.z}, light.stopdot, light.stopdot2, light.exponent, light.constantAttn,
             light.linearAttn, light.quadraticAttn, shape.flags, shape.radius, static_cast<uint32_t>(light.style), ReferenceScale(light), {}};
     }
+    if (!lights.empty() && !BuildLightLists(world.lights, world.visibility))
+        return false;
+    if ((!lights.empty() || !emitters.empty()) && !BuildLightGrid(lights, world.lights, emitters, world.visibility, worldGeometry.positions))
+        return false;
+    if (!UploadEmitters(emitters, worldEmits))
+        log::Info("Scene: the {} self-illuminated triangles could not be uploaded; glowing surfaces light only what indirect rays meet", emitters.size());
+    else if (!emitters.empty())
+        log::Info("Scene: {} self-illuminated triangles light the scene", emitters.size());
     if (!lights.empty()) {
-        if (!BuildLightLists(world.lights, world.visibility) || !BuildLightGrid(lights, world.lights, world.visibility, worldGeometry.positions))
-            return false;
         m_allocator->Reset();
         m_list->Reset(m_allocator.Get(), nullptr);
         std::vector<ComPtr<ID3D12Resource>> staging;
@@ -846,8 +886,8 @@ bool Scene::BuildLightLists(std::span<const bsp::Light> lights, const bsp::Visib
     return true;
 }
 
-bool Scene::BuildLightGrid(std::span<const GpuLight> lights, std::span<const bsp::Light> mapLights, const bsp::Visibility& visibility,
-    std::span<const bsp::Float3> worldPositions)
+bool Scene::BuildLightGrid(std::span<const GpuLight> lights, std::span<const bsp::Light> mapLights, std::span<const GpuEmitter> emitters,
+    const bsp::Visibility& visibility, std::span<const bsp::Float3> worldPositions)
 {
     bsp::Float3 low = {0.0f, 0.0f, 0.0f};
     bsp::Float3 high = {0.0f, 0.0f, 0.0f};
@@ -901,6 +941,25 @@ bool Scene::BuildLightGrid(std::span<const GpuLight> lights, std::span<const bsp
     struct CellLights {
         std::vector<uint32_t> list;
         std::vector<std::pair<uint32_t, float>> tail;
+        std::vector<std::pair<uint32_t, float>> emitterTail;
+        float emitterRest = 0.0f;
+    };
+    // Each emitter's share of all emitters' power (GpuEmitter::cdf).
+    std::vector<float> emitterPower(emitters.size());
+    for (size_t e = 0; e < emitters.size(); ++e)
+        emitterPower[e] = emitters[e].cdf - (e > 0 ? emitters[e - 1].cdf : 0.0f);
+    // (index, cumulative weight up to 1) of each weighted entry from `first` on.
+    const auto cumulativeTail = [](const std::vector<std::pair<float, uint32_t>>& weighted, size_t first, std::vector<std::pair<uint32_t, float>>& tail) {
+        double total = 0.0;
+        for (size_t k = first; k < weighted.size(); ++k)
+            total += weighted[k].first;
+        double cumulative = 0.0;
+        for (size_t k = first; k < weighted.size(); ++k) {
+            cumulative += weighted[k].first;
+            tail.emplace_back(weighted[k].second, static_cast<float>(cumulative / total));
+        }
+        if (!tail.empty())
+            tail.back().second = 1.0f;
     };
     std::vector<CellLights> cellLights(cellCount);
     std::vector<size_t> order(cellCount);
@@ -926,33 +985,58 @@ bool Scene::BuildLightGrid(std::span<const GpuLight> lights, std::span<const bsp
         CellLights& result = cellLights[c];
         for (size_t k = 0; k < listed; ++k)
             result.list.push_back(ranked[k].second);
-        double total = 0.0;
         for (size_t k = listed; k < ranked.size(); ++k)
-            total += ranked[k].first;
-        double cumulative = 0.0;
-        for (size_t k = listed; k < ranked.size(); ++k) {
-            cumulative += ranked[k].first;
-            result.tail.emplace_back(ranked[k].second & ~kHiddenLight, static_cast<float>(cumulative / total));
+            ranked[k].second &= ~kHiddenLight;
+        cumulativeTail(ranked, listed, result.tail);
+        // The emitters with the largest bound, in the order of their indices, with cumulative weights that leave the
+        // others' share of the summed bound (`emitterRest`) to the global distribution (SampleEmitter).
+        std::vector<std::pair<float, uint32_t>> glowing;
+        double glowTotal = 0.0;
+        for (uint32_t e = 0; e < emitters.size(); ++e) {
+            const float bound = EmitterBound(emitters[e], emitterPower[e], cellLow, cellHigh);
+            if (bound > 0.0f) {
+                glowing.emplace_back(bound, e);
+                glowTotal += bound;
+            }
         }
-        if (!result.tail.empty())
-            result.tail.back().second = 1.0f;
+        const size_t kept = std::min(glowing.size(), kGridEmitters);
+        std::partial_sort(glowing.begin(), glowing.begin() + kept, glowing.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+        glowing.resize(kept);
+        std::sort(glowing.begin(), glowing.end(), [](const auto& a, const auto& b) { return a.second < b.second; });
+        double cumulative = 0.0;
+        for (const auto& [bound, e] : glowing) {
+            cumulative += bound;
+            result.emitterTail.emplace_back(e, static_cast<float>(cumulative / glowTotal));
+        }
+        result.emitterRest = glowTotal > 0.0 ? static_cast<float>(1.0 - cumulative / glowTotal) : 0.0f;
+        if (result.emitterRest < 1e-6f && !result.emitterTail.empty()) {
+            result.emitterRest = 0.0f;
+            result.emitterTail.back().second = 1.0f;
+        }
     });
 
     std::vector<uint32_t> cellRanges;
     std::vector<uint32_t> indices;
     std::vector<uint32_t> tail;
-    cellRanges.reserve(cellCount * 4);
+    cellRanges.reserve(cellCount * 8);
     size_t maxListed = 0;
+    size_t emitterTotal = 0;
     for (const CellLights& cell : cellLights) {
-        cellRanges.insert(cellRanges.end(), {static_cast<uint32_t>(indices.size()), static_cast<uint32_t>(cell.list.size()),
-                                                static_cast<uint32_t>(tail.size() / 2), static_cast<uint32_t>(cell.tail.size())});
-        indices.insert(indices.end(), cell.list.begin(), cell.list.end());
+        const auto tailFirst = static_cast<uint32_t>(tail.size() / 2);
         for (const auto& [light, cdf] : cell.tail)
             tail.insert(tail.end(), {light, std::bit_cast<uint32_t>(cdf)});
+        const auto emitterFirst = static_cast<uint32_t>(tail.size() / 2);
+        for (const auto& [emitter, cdf] : cell.emitterTail)
+            tail.insert(tail.end(), {emitter, std::bit_cast<uint32_t>(cdf)});
+        cellRanges.insert(cellRanges.end(), {static_cast<uint32_t>(indices.size()), static_cast<uint32_t>(cell.list.size()), tailFirst,
+                                                static_cast<uint32_t>(cell.tail.size()), emitterFirst, static_cast<uint32_t>(cell.emitterTail.size()),
+                                                std::bit_cast<uint32_t>(cell.emitterRest), 0u});
+        indices.insert(indices.end(), cell.list.begin(), cell.list.end());
         maxListed = std::max(maxListed, cell.list.size());
+        emitterTotal += cell.emitterTail.size();
     }
     const size_t listedTotal = indices.size();
-    const size_t tailTotal = tail.size() / 2;
+    const size_t tailTotal = tail.size() / 2 - emitterTotal;
     // Buffers may not be empty.
     if (indices.empty())
         indices.push_back(0);
@@ -976,8 +1060,10 @@ bool Scene::BuildLightGrid(std::span<const GpuLight> lights, std::span<const bsp
     if (m_lightLists.gridCellsView == DescriptorHeap::kInvalid || m_lightLists.gridIndicesView == DescriptorHeap::kInvalid ||
         m_lightLists.gridTailView == DescriptorHeap::kInvalid)
         return false;
-    log::Info("Scene: light grid of {}x{}x{} cells of {:.0f} units; cells list {:.1f} lights on average, {} at most, and sample {:.1f} more", dims[0],
-        dims[1], dims[2], size, static_cast<double>(listedTotal) / cellCount, maxListed, static_cast<double>(tailTotal) / cellCount);
+    log::Info("Scene: light grid of {}x{}x{} cells of {:.0f} units; cells list {:.1f} lights on average, {} at most, and sample {:.1f} more lights and "
+              "{:.1f} glowing triangles",
+        dims[0], dims[1], dims[2], size, static_cast<double>(listedTotal) / cellCount, maxListed, static_cast<double>(tailTotal) / cellCount,
+        static_cast<double>(emitterTotal) / cellCount);
     return true;
 }
 
@@ -1064,7 +1150,7 @@ void Scene::SetStaticInstances(std::vector<SceneInstance> instances)
     m_hasSkybox = std::any_of(m_staticInstances.begin(), m_staticInstances.end(), [](const SceneInstance& instance) { return instance.mask == kSkyboxMask; });
 }
 
-bool Scene::SetEmitters(std::span<const GpuEmitter> emitters, bool worldEmits)
+bool Scene::UploadEmitters(std::span<const GpuEmitter> emitters, bool worldEmits)
 {
     m_worldFlags = worldEmits ? kInstanceEmitter : 0u;
     if (emitters.empty())
@@ -1077,7 +1163,35 @@ bool Scene::SetEmitters(std::span<const GpuEmitter> emitters, bool worldEmits)
         return false;
     m_emittersView = m_descriptors->CreateRawView(m_emitters.Get());
     m_emitterCount = m_emittersView != DescriptorHeap::kInvalid ? static_cast<UINT>(emitters.size()) : 0u;
-    return m_emitterCount != 0;
+    if (m_emitterCount == 0)
+        return false;
+    // Rays that meet a glowing triangle find its emitter (RTXDI's BRDF samples, shaders/nvidia/rtxdi_bridge.hlsli).
+    std::vector<std::vector<uint32_t>> tables;
+    for (uint32_t e = 0; e < emitters.size(); ++e) {
+        const GpuEmitter& emitter = emitters[e];
+        if (emitter.instance >= tables.size())
+            tables.resize(emitter.instance + 1);
+        std::vector<uint32_t>& table = tables[emitter.instance];
+        if (emitter.primitive >= table.size())
+            table.resize(emitter.primitive + 1, 0u);
+        table[emitter.primitive] = e + 1;
+    }
+    m_allocator->Reset();
+    m_list->Reset(m_allocator.Get(), nullptr);
+    std::vector<ComPtr<ID3D12Resource>> tableStaging;
+    m_emitterLights.assign(tables.size(), nullptr);
+    m_emitterLightViews.assign(tables.size(), DescriptorHeap::kInvalid);
+    for (size_t i = 0; i < tables.size(); ++i) {
+        if (!tables[i].empty())
+            m_emitterLights[i] = UploadToDefault(tables[i].data(), tables[i].size() * sizeof(uint32_t), tableStaging);
+    }
+    if (!Submit())
+        return false;
+    for (size_t i = 0; i < tables.size(); ++i) {
+        if (m_emitterLights[i])
+            m_emitterLightViews[i] = m_descriptors->CreateRawView(m_emitterLights[i].Get());
+    }
+    return true;
 }
 
 SceneFrame Scene::RecordFrame(ID3D12GraphicsCommandList4* list, UINT slot, std::span<const SceneInstance> dynamic, bool micromaps)
@@ -1090,7 +1204,8 @@ SceneFrame Scene::RecordFrame(ID3D12GraphicsCommandList4* list, UINT slot, std::
 
     UINT written = 0;
     m_recorded.clear();
-    auto write = [&](const SceneInstance& source, const float (*transform)[4], UINT mask) {
+    // `staticIndex`: 0 for the world, i + 1 for static instance i, none for dynamic ones.
+    auto write = [&](const SceneInstance& source, const float (*transform)[4], UINT mask, std::optional<size_t> staticIndex) {
         if (source.model < 0 || static_cast<size_t>(source.model) >= m_models.size())
             return;
         const Model& model = m_models[source.model];
@@ -1111,7 +1226,8 @@ SceneFrame Scene::RecordFrame(ID3D12GraphicsCommandList4* list, UINT slot, std::
         InstanceRecord& record = frame.mappedRecords[written];
         record = {source.positionsView != DescriptorHeap::kInvalid ? source.positionsView : model.positionsView, model.indicesView, model.albedoView,
             model.uvsView, model.alphaView, model.opaqueTriangles, model.materialsView, source.previousPositionsView, {},
-            source.flags | (model.selfIllum ? kInstanceSelfIllum : 0u) | (dynamicModel ? kInstanceModel : 0u) | (model.character ? kInstanceCharacter : 0u), {}};
+            source.flags | (model.selfIllum ? kInstanceSelfIllum : 0u) | (dynamicModel ? kInstanceModel : 0u) | (model.character ? kInstanceCharacter : 0u),
+            staticIndex && *staticIndex < m_emitterLightViews.size() ? m_emitterLightViews[*staticIndex] : DescriptorHeap::kInvalid, {}};
         std::memcpy(record.previousTransform, source.previousKnown ? source.previousTransform : instance.Transform, sizeof(record.previousTransform));
         m_recorded.emplace_back(source.model, mask);
         ++written;
@@ -1119,11 +1235,11 @@ SceneFrame Scene::RecordFrame(ID3D12GraphicsCommandList4* list, UINT slot, std::
     SceneInstance world;
     world.model = m_worldModel;
     world.flags = m_worldFlags;
-    write(world, nullptr, kWorldMask);
-    for (const SceneInstance& instance : m_staticInstances)
-        write(instance, instance.transform, instance.mask != 0 ? instance.mask : kStaticPropMask);
+    write(world, nullptr, kWorldMask, 0);
+    for (size_t i = 0; i < m_staticInstances.size(); ++i)
+        write(m_staticInstances[i], m_staticInstances[i].transform, m_staticInstances[i].mask != 0 ? m_staticInstances[i].mask : kStaticPropMask, i + 1);
     for (const SceneInstance& instance : dynamic)
-        write(instance, instance.transform, instance.mask != 0 ? instance.mask : kDynamicMask);
+        write(instance, instance.transform, instance.mask != 0 ? instance.mask : kDynamicMask, std::nullopt);
 
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC desc = {};
     desc.Inputs = TlasInputs(written, frame.instances->GetGPUVirtualAddress());

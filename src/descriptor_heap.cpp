@@ -97,4 +97,18 @@ UINT DescriptorHeap::CreateRawUav(ID3D12Resource* buffer)
     return index;
 }
 
+UINT DescriptorHeap::CreateStructuredUav(ID3D12Resource* buffer, UINT stride)
+{
+    UINT index = Allocate();
+    if (index == kInvalid)
+        return kInvalid;
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
+    uav.Format = DXGI_FORMAT_UNKNOWN;
+    uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    uav.Buffer.NumElements = static_cast<UINT>(buffer->GetDesc().Width / stride);
+    uav.Buffer.StructureByteStride = stride;
+    m_device->CreateUnorderedAccessView(buffer, nullptr, &uav, Cpu(index));
+    return index;
+}
+
 }

@@ -1,4 +1,5 @@
 #include "baked.hlsli"
+#include "radiance_cache.hlsli"
 
 // Irradiance volume for surfaces lit outside the G-buffer (the translucent surfaces the game draws after the
 // capture, shaders/forward_light.hlsli). A grid of kProbeGrid probes around the camera holds irradiance as
@@ -7,9 +8,9 @@
 // whose cell changed starts over.
 //
 // Trace (step 0, input4: 1 when last frame's volume may be used; a thread group per probe, its threads sharing the
-// rays): every frame a share of the probes traces g_frame.volumeRays rays. A hit returns its albedo times the
-// light reaching it (sun, one light picked by SampleLight, and last frame's volume as indirect light), a miss
-// the sky. Probes that mostly see back faces are inside geometry and marked invalid.
+// rays): every frame a share of the probes traces g_frame.volumeRays rays. A hit returns the light the radiance cache
+// holds for it (CachedRadiance), or else its albedo times the light reaching it (sun, one light picked by SampleLight,
+// and last frame's volume as indirect light); a miss the sky. Probes that mostly see back faces are inside geometry and marked invalid.
 // input0-2: last frame's red, green and blue coefficients; input3: last frame's cells (xyz) and validity (w);
 // output0-2, output3: this frame's.
 //
@@ -22,7 +23,9 @@
 // ambient light at it (L1 of its ambient cube) and adds the direct light as the fill does. output0-2: the volume.
 
 static const uint3 kProbeGrid = uint3(32, 32, 16);
-// Probes away from the camera are traced every this many frames.
+// Probes within this many cells of the camera's (Chebyshev distance) are traced every frame, so the light on
+// translucent surfaces near the player follows changes at once; probes further away every kUpdatePeriod frames.
+static const uint kNearCells = 4;
 static const uint kUpdatePeriod = 4;
 static const float kHistoryWeight = 0.85;
 static const float kInsideFraction = 0.3;
@@ -90,7 +93,9 @@ void Trace(uint3 id, uint thread)
     float4 previous[3] = {red[texel], green[texel], blue[texel]};
     int4 previousCell = cells[texel];
     bool fresh = any(previousCell.xyz != cell) || previousCell.w < 0 || g_pass.input4 == 0;
-    if (!fresh && (texel.x + texel.y * 3 + texel.z * 7 + g_frame.frameIndex) % kUpdatePeriod != 0) {
+    int3 cameraOffset = abs(int3(id) - int3(kProbeGrid / 2));
+    bool near = uint(max(cameraOffset.x, max(cameraOffset.y, cameraOffset.z))) <= kNearCells;
+    if (!fresh && !near && (texel.x + texel.y * 3 + texel.z * 7 + g_frame.frameIndex) % kUpdatePeriod != 0) {
         if (thread == 0) {
             redOut[texel] = previous[0];
             greenOut[texel] = previous[1];
@@ -115,16 +120,14 @@ void Trace(uint3 id, uint thread)
                 radiance = 0.0;
             } else {
                 HitSurface surface = SurfaceOf(hit, position, direction);
-                float3 origin = surface.position + surface.normal;
-                float3 irradiance = SunIrradiance(surface, origin, g_frame.bounceMask) + LastVolumeIrradiance(surface.position, surface.normal) * g_frame.indirectScale;
-                float3 light;
-                float3 toLight;
-                float distance;
-                uint picked;
-                LightSet set = LightSetAt(surface.position);
-                if (SampleLight(set, surface.position, surface.normal, seed, light, toLight, distance, picked))
-                    irradiance += light * LightTransmittance(set, picked, origin, surface.position + toLight * distance, float2(Random(seed), Random(seed)));
-                radiance = ClampSample(surface.albedo * irradiance + BounceEmission(surface, hit, false));
+                float3 emission = BounceEmission(surface, hit, false);
+                if (!CachedRadiance(surface, emission, hit.t, hit.t, radiance)) {
+                    float3 origin = surface.position + surface.normal;
+                    float3 irradiance = HitDirectIrradiance(surface, origin, g_frame.bounceMask, seed) +
+                        LastVolumeIrradiance(surface.position, surface.normal) * g_frame.indirectScale;
+                    radiance = surface.albedo * irradiance + emission;
+                }
+                radiance = ClampSample(radiance);
             }
         }
         a += radiance;

@@ -68,8 +68,9 @@ struct WaterResult
     float hitDistance;
 };
 
-// The shaded water at a pixel, before the tonemap scale. `previousView` is last frame's shaded colour of the main view.
-WaterResult ShadeWater(int2 pixel, float3 position, uint previousView)
+// The shaded water at a pixel, before the tonemap scale. Its reflection samples the glint's GGX lobe around the rippled
+// normal (a mirror without glossy reflections).
+WaterResult ShadeWater(int2 pixel, float3 position)
 {
     Texture2D<float4> albedos = ResourceDescriptorHeap[g_frame.albedoView];
     Texture2D<float4> normals = ResourceDescriptorHeap[g_frame.gbufferNormalView];
@@ -99,17 +100,17 @@ WaterResult ShadeWater(int2 pixel, float3 position, uint previousView)
     float3 reflection = 0.0;
     if (g_frame.traceMask != 0 && g_frame.reflectionScale > 0.0) {
         uint seed = PixelSeed(pixel, 0x5Au);
-        float3 direction = reflect(-toEye, normal);
-        // Ripples can tilt the mirror direction into the water; reflect it back off the plane.
         float side = below ? -1.0 : 1.0;
+        float weight;
+        float3 direction = ReflectionDirection(-toEye, normal, float3(0.0, 0.0, side), kGlintRoughness, float2(Random(seed), Random(seed)), weight);
+        // Ripples can tilt the direction into the water; reflect it back off the plane.
         if (direction.z * side < 0.02)
             direction.z = side * max(abs(direction.z), 0.02);
         direction = normalize(direction);
-        // The 3D skybox's view has no last-frame image of its own.
-        uint previous = (g_frame.traceMask & kSkyboxMask) != 0 ? kNoView : previousView;
-        reflection = ReflectedRadiance(previous, position + float3(0.0, 0.0, side * 2.0), direction, g_frame.skyColor * g_frame.indirectScale, seed,
+        float lobe = g_frame.glossyReflections != 0 ? LobeSpread(kGlintRoughness) : 0.0;
+        reflection = ReflectedRadiance(position + float3(0.0, 0.0, side * 2.0), direction, PixelAngle() * distance, PixelAngle() + lobe, seed,
             result.hitDistance);
-        reflection *= tint * g_frame.reflectionScale;
+        reflection *= tint * g_frame.reflectionScale * weight;
         // Seen from below, the reflected underwater scene lies behind more water.
         if (below && g_frame.fogEnabled != 0) {
             float fog = saturate(min(g_frame.fogParams.z, result.hitDistance * g_frame.fogParams.w - g_frame.fogParams.x));

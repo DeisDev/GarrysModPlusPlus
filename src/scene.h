@@ -46,14 +46,15 @@ constexpr uint32_t kInstanceSelfIllum = 0x02;
 constexpr uint32_t kInstanceModel = 0x04;
 // The sky faces among VRAD's occluders (kVradOccluderMask).
 constexpr uint32_t kInstanceVradSky = 0x08;
-// Instances whose self-illuminated triangles are emitters (Scene::SetEmitters): with EmissiveLighting::Full their
+// Instances whose self-illuminated triangles are emitters (Scene::LoadMap): with EmissiveLighting::Full their
 // glow reaches surfaces directly, so indirect rays from the G-buffer take none at them.
 constexpr uint32_t kInstanceEmitter = 0x10;
 // Set by Scene for instances of character models (Scene::MarkCharacter), whose $halflambert materials are skin.
 constexpr uint32_t kInstanceCharacter = 0x20;
 
 // A static self-illuminated triangle sampled as an area light (Emitter in shaders/scene.hlsli): its corners in world
-// space, its scene instance and triangle, and the share of all emitters' emission times area up to and with it.
+// space, its scene instance and triangle, and the share of all emitters' emission times area up to and with it. The
+// light grid's cells sample the emitters that light them most by their bound there, the rest by this share.
 struct GpuEmitter {
     float p0[3];
     uint32_t instance;
@@ -202,8 +203,11 @@ public:
     // With `opacityMicromaps`, models get opacity micromaps for their alpha-tested and translucent triangles.
     bool Initialize(ID3D12Device5* device, ID3D12CommandQueue* queue, DescriptorHeap& descriptors, bool opacityMicromaps);
     // The map's lights and sun come from `world`, with each light's shape in `lightShapes`; its triangles from
-    // `worldGeometry`.
-    bool LoadMap(const std::string& name, const bsp::WorldGeometry& world, std::span<const MapLightShape> lightShapes, const ModelGeometry& worldGeometry);
+    // `worldGeometry`. `emitters` are its self-illuminated triangles (Emitter in shaders/scene.hlsli), sampled from the
+    // light grid's cells; `worldEmits` gives the world kInstanceEmitter.
+    // `emitterPower` is their emission times area in all.
+    bool LoadMap(const std::string& name, const bsp::WorldGeometry& world, std::span<const MapLightShape> lightShapes, const ModelGeometry& worldGeometry,
+        std::span<const GpuEmitter> emitters, bool worldEmits, float emitterPower);
     // Uploads the map's baked light for indirect_lighting = 1, with the world model's triangles in their BLAS order;
     // false (logged) when the map has none or the upload fails. A filtered residual from an earlier bake of the same
     // map (`cachedResidual`, empty for none) makes the bake unnecessary.
@@ -276,15 +280,15 @@ public:
         if (model >= 0 && static_cast<size_t>(model) < m_models.size())
             m_models[model].character = true;
     }
-    // The map's emitters, in the order of their cumulative weights; `worldEmits` gives the world kInstanceEmitter.
-    bool SetEmitters(std::span<const GpuEmitter> emitters, bool worldEmits);
     UINT EmittersView() const { return m_emittersView; }
     UINT EmitterCount() const { return m_emitterCount; }
+    float EmitterPower() const { return m_emitterPower; }
     bool HasSkybox() const { return m_hasSkybox; }
     // The engine's dynamic lights for the next RecordFrame.
     void SetDynamicLights(std::span<const engine::DynamicLight> lights) { m_dynamicLights.assign(lights.begin(), lights.end()); }
     // The engine's light style values for the next RecordFrame; every style stays at 1 until they are set.
     void SetLightStyles(const std::array<float, engine::kLightStyles>& values) { m_lightStyles = values; }
+    const std::array<float, engine::kLightStyles>& LightStyles() const { return m_lightStyles; }
     // The current value of a light style (bsp::Light::style).
     float LightStyle(int32_t style) const { return style >= 0 && static_cast<size_t>(style) < m_lightStyles.size() ? m_lightStyles[style] : 1.0f; }
     void Clear();
@@ -298,9 +302,10 @@ public:
     // The map lights each visibility cluster can see and be reached by, found per point by walking the BSP tree
     // (ClusterLights in shaders/scene.hlsli, for the bake: VRAD's PVSCheck). `rangesView` holds an (offset, count) range
     // of light indices per cluster and one more, after them, with every light for points outside any cluster.
-    // The light grid (LightsAt) serves everything else: per cell (x fastest), `gridCellsView` holds the range of its
-    // listed lights in `gridIndicesView`, the strongest that can reach it, and of its tail in `gridTailView`: every other
-    // light that can reach it, with cumulative weights for importance sampling.
+    // The light grid (LightsAt) serves everything else: per cell (x fastest), `gridCellsView` holds two uint4: the range
+    // of its listed lights in `gridIndicesView`, the strongest that can reach it, and of its tail in `gridTailView`: every
+    // other light that can reach it, with cumulative weights for importance sampling; then the range in `gridTailView` of
+    // the emitters that can light it, by the same weights (EmittersAt).
     struct LightLists {
         UINT rangesView = DescriptorHeap::kInvalid;
         UINT indicesView = DescriptorHeap::kInvalid;
@@ -389,9 +394,13 @@ private:
     bool EnsureLightStyles(FrameTlas& frame);
     bool BuildLightLists(std::span<const bsp::Light> lights, const bsp::Visibility& visibility);
     // The light grid of LightLists over the world's triangles. A cell lists the lights with the largest bound there
-    // (LightBound), lights its clusters' PVS leaves out weighed down but kept, and samples the rest.
-    bool BuildLightGrid(std::span<const GpuLight> lights, std::span<const bsp::Light> mapLights, const bsp::Visibility& visibility,
-        std::span<const bsp::Float3> worldPositions);
+    // (LightBound), lights its clusters' PVS leaves out weighed down but kept, and samples the rest; it samples the
+    // emitters by their bound (EmitterBound).
+    bool BuildLightGrid(std::span<const GpuLight> lights, std::span<const bsp::Light> mapLights, std::span<const GpuEmitter> emitters,
+        const bsp::Visibility& visibility, std::span<const bsp::Float3> worldPositions);
+    // Uploads the emitters and, for each instance with some, its triangles' emitter indices plus one (0 for none;
+    // InstanceRecord::emitterLights).
+    bool UploadEmitters(std::span<const GpuEmitter> emitters, bool worldEmits);
     // Bakes and records the build of a model's opacity micromap array and points its alpha geometry at it.
     bool AddMicromaps(Model& model, const ModelGeometry& geometry, D3D12_RAYTRACING_GEOMETRY_DESC& alphaGeometry,
         D3D12_RAYTRACING_GEOMETRY_TRIANGLES_DESC& triangles, D3D12_RAYTRACING_GEOMETRY_OMM_LINKAGE_DESC& linkage,
@@ -425,6 +434,11 @@ private:
     Microsoft::WRL::ComPtr<ID3D12Resource> m_emitters;
     UINT m_emittersView = DescriptorHeap::kInvalid;
     UINT m_emitterCount = 0;
+    float m_emitterPower = 0.0f;
+    // Per instance of the world and static instances (0 is the world, static instance i is i + 1): the view of its
+    // triangles' emitter indices, or kInvalid.
+    std::vector<UINT> m_emitterLightViews;
+    std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> m_emitterLights;
     // kInstanceEmitter when the world has emitters.
     uint32_t m_worldFlags = 0;
     std::vector<std::pair<int, UINT>> m_recorded;

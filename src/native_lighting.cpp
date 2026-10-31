@@ -122,13 +122,14 @@ void OnDeviceReady()
         return;
     }
     const RaytracingSupport support = QueryRaytracing(device.Get());
-    log::Info("Real-time lighting: raytracing tier {:#x}, shader model {:#x}, inline raytracing {}, opacity micromaps {}", static_cast<int>(support.tier),
-        static_cast<int>(support.shaderModel), support.inlineRaytracing ? "available" : "unavailable", support.opacityMicromaps ? "available" : "unavailable");
+    log::Info("Real-time lighting: raytracing tier {:#x}, shader model {:#x}, inline raytracing {}, opacity micromaps {}, radiance cache {}",
+        static_cast<int>(support.tier), static_cast<int>(support.shaderModel), support.inlineRaytracing ? "available" : "unavailable",
+        support.opacityMicromaps ? "available" : "unavailable", support.radianceCache ? "available" : "unavailable");
     if (!support.inlineRaytracing) {
         g_state.block = RealtimeBlock::Unsupported;
         return;
     }
-    g_state.available = world::Initialize(device.Get(), backend.Queue(), backend.Descriptors(), support.opacityMicromaps, ModDirectory());
+    g_state.available = world::Initialize(device.Get(), backend.Queue(), backend.Descriptors(), support, ModDirectory());
     overlay::Initialize(backend.Window(), backend.Device(), backend.Queue(), backend.Descriptors(), Backend::kBackBufferFormat, Backend::kFrames);
 }
 

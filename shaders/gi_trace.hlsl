@@ -1,13 +1,17 @@
 #include "baked.hlsli"
+#include "radiance_cache.hlsli"
 
-// Cosine-weighted diffuse bounces per pixel. The result is an irradiance estimate: a sky miss returns
-// the sky irradiance, a hit returns its albedo times the light reaching it. Where the hit was on screen last
-// frame that is last frame's whole irradiance there (exact direct plus denoised light); elsewhere it is the sun,
-// one local light picked by SampleLight and g_frame.indirectBounces - 1 more traced bounces, or, for the viewmodel's
-// many rays, the main view's irradiance volume and the projected lights.
+// Cosine-weighted diffuse bounces per pixel. The result is an irradiance estimate: a sky miss returns the sky
+// irradiance, a hit the light leaving it towards the pixel, its albedo times the light reaching it plus its glow. With
+// the radiance cache that light comes from the cache where the hit is far enough away (CachedRadiance). Without it,
+// where the hit was on screen last frame, it is last frame's whole irradiance there (exact direct plus denoised light).
+// Elsewhere it is the sun, one local light picked by SampleLight and g_frame.indirectBounces - 1 more traced bounces lit
+// the same way, which end in the cache where it has their light, or, for the viewmodel's many rays, the sun and one local
+// light with the main view's indirect light volume.
 // The sampled remainder of the direct light (direct.hlsl) is added, so the denoiser handles both.
 // input0: last frame's denoised light, or none; input1: sampled direct remainder; input2: last frame's exact direct
-// light; output0: raw estimate; step: samples per pixel.
+// light; output0: raw estimate (rgb) and the rays' mean hit distance (a; NRD's, shaders/nrd.hlsl); step: samples per
+// pixel.
 // With indirect_lighting = 1 (g_frame.bakedTrianglesView) nothing is traced: the world takes VRAD's baked bounce
 // light (shaders/baked.hlsli), other surfaces the leaf ambient light, and the denoiser still gets the remainder.
 
@@ -33,9 +37,10 @@ float3 PreviousIrradiance(float3 position, float3 normal)
     return denoised.Load(int3(pixel, 0)).rgb + direct.Load(int3(pixel, 0)).rgb;
 }
 
-// Indirect light at an off-screen hit: more diffuse bounces, each seeing the sky or a sunlit surface. Below
-// foliage_shadows' "All light", rays after the first pass through shadowless props (g_frame.bounceMask): in grass they
-// cross many alpha-tested blades for light the denoiser blurs anyway.
+// Indirect light at an off-screen hit: more diffuse bounces, each seeing the sky, the light the radiance cache holds for
+// the surface it meets, or that surface lit by the sun and one local light. Below foliage_shadows' "All light", rays
+// after the first pass through shadowless props (g_frame.bounceMask): in grass they cross many alpha-tested blades for
+// light the denoiser blurs anyway.
 float3 FurtherBounces(HitSurface hit, float3 origin, inout uint seed)
 {
     float3 irradiance = 0.0;
@@ -46,47 +51,36 @@ float3 FurtherBounces(HitSurface hit, float3 origin, inout uint seed)
         HitInfo nextHit;
         if (!TraceClosest(origin, direction, kMaxDistance, g_frame.bounceMask, next, nextHit, g_frame.indirectRayFlags))
             return irradiance + throughput * SkyLight(direction);
+        float3 emission = BounceEmission(next, nextHit, false);
+        float3 cached;
+        if (CachedRadiance(next, emission, nextHit.t, nextHit.t, cached))
+            return irradiance + throughput * cached;
         origin = next.position + next.normal;
-        irradiance += throughput * (next.albedo * SunIrradiance(next, origin, g_frame.bounceMask) + BounceEmission(next, nextHit, false));
+        irradiance += throughput * (next.albedo * HitDirectIrradiance(next, origin, g_frame.bounceMask, seed) + emission);
         throughput *= next.albedo;
         hit = next;
     }
     return irradiance;
 }
 
-// The projected lights (flashlights) at a hit, which the irradiance volume leaves out.
-float3 ProjectorLight(HitSurface hit, float3 origin)
-{
-    float3 irradiance = 0.0;
-    for (uint p = 0; p < g_frame.projectorCount; ++p) {
-        Projector projector = LoadProjector(p);
-        float3 toLight;
-        float distance;
-        float3 light = ProjectorIrradiance(projector, hit.position, hit.normal, toLight, distance);
-        if (Luminance(light) > 0.0)
-            irradiance += light * ProjectorTransmittance(projector, origin);
-    }
-    return irradiance;
-}
 
-float3 HitIrradiance(HitSurface hit, inout uint seed)
+// The light leaving the first hit of a pixel's indirect ray towards it.
+float3 HitRadiance(HitSurface hit, HitInfo hitInfo, inout uint seed)
 {
-    float3 previous = PreviousIrradiance(hit.position, hit.normal);
-    if (previous.x >= 0.0)
-        return previous;
+    float3 emission = BounceEmission(hit, hitInfo, true);
+    float3 cached;
+    if (CachedRadiance(hit, emission, hitInfo.t, hitInfo.t, cached))
+        return cached;
+    if (!RadianceCacheEnabled()) {
+        float3 previous = PreviousIrradiance(hit.position, hit.normal);
+        if (previous.x >= 0.0)
+            return hit.albedo * previous + emission;
+    }
     float3 origin = hit.position + hit.normal * 1.0;
-    float3 volume = VolumeIrradiance(hit.position, hit.normal);
-    if (volume.x >= 0.0)
-        return volume + ProjectorLight(hit, origin);
-    float3 irradiance = SunIrradiance(hit, origin, g_frame.bounceMask);
-    float3 light;
-    float3 toLight;
-    float distance;
-    uint picked;
-    LightSet set = LightSetAt(hit.position);
-    if (SampleLight(set, hit.position, hit.normal, seed, light, toLight, distance, picked))
-        irradiance += light * LightTransmittance(set, picked, origin, hit.position + toLight * distance, float2(Random(seed), Random(seed)));
-    return irradiance + FurtherBounces(hit, origin, seed);
+    // The viewmodel's many rays take the main view's indirect light volume in place of further bounces.
+    float3 volume = g_frame.viewmodel != 0 ? VolumeIrradiance(hit.position, hit.normal) : -1.0;
+    float3 further = volume.x >= 0.0 ? volume : FurtherBounces(hit, origin, seed);
+    return hit.albedo * (HitDirectIrradiance(hit, origin, g_frame.bounceMask, seed) + further) + emission;
 }
 
 [RootSignature(ROOT_SIGNATURE)]
@@ -115,11 +109,13 @@ void main(uint3 id : SV_DispatchThreadID)
     normal = LitNormal(pixel, normal, leaf);
     Texture2D<float4> remainder = ResourceDescriptorHeap[g_pass.input1];
     if (g_frame.bakedTrianglesView != kNoView) {
-        output[pixel] = float4(BakedIndirect(pixel, position, normal, leaf) + remainder.Load(int3(pixel, 0)).rgb, 1.0);
+        // No ray was traced: NRD takes the hit distance as unoccluded.
+        output[pixel] = float4(BakedIndirect(pixel, position, normal, leaf) + remainder.Load(int3(pixel, 0)).rgb, kMaxDistance);
         return;
     }
     uint samples = max(g_pass.step, 1u);
     float3 estimate = 0.0;
+    float hitDistance = 0.0;
     for (uint s = 0; s < samples; ++s) {
         // A leaf's side is picked in proportion to the light it takes from it, which leaves each sample weighing 1.
         bool through = false;
@@ -129,10 +125,13 @@ void main(uint3 id : SV_DispatchThreadID)
         float3 direction = AboveSurface(CosineSample(through ? -normal : normal, Random(seed), Random(seed)), side);
         HitSurface hit;
         HitInfo hitInfo;
-        if (TraceClosest(through ? position - geometricNormal * bias : origin, direction, kMaxDistance, g_frame.indirectMask, hit, hitInfo, g_frame.indirectRayFlags))
-            estimate += ClampSample(hit.albedo * HitIrradiance(hit, seed) + BounceEmission(hit, hitInfo, true));
-        else
+        if (TraceClosest(through ? position - geometricNormal * bias : origin, direction, kMaxDistance, g_frame.indirectMask, hit, hitInfo, g_frame.indirectRayFlags)) {
+            estimate += ClampSample(HitRadiance(hit, hitInfo, seed));
+            hitDistance += hitInfo.t;
+        } else {
             estimate += SkyLight(direction);
+            hitDistance += kMaxDistance;
+        }
     }
-    output[pixel] = float4(estimate / samples + remainder.Load(int3(pixel, 0)).rgb, 1.0);
+    output[pixel] = float4(estimate / samples + remainder.Load(int3(pixel, 0)).rgb, hitDistance / samples);
 }
