@@ -12,13 +12,13 @@
 
 namespace gmodpp {
 
-// NVIDIA NRD's diffuse and specular denoiser (RELAX or REBLUR), driven through its C API with our own D3D12 pipelines:
+// NVIDIA NRD's diffuse and specular denoiser (RELAX or REBLUR) or its sun shadow denoiser (SIGMA), driven through its C API with our own D3D12 pipelines:
 // one root signature for all its pipelines (a descriptor table of its SRVs then UAVs, a root constant buffer and its
 // static samplers, at the registers and spaces InstanceDesc names, as NRDIntegration.hpp lays them out), its texture pools,
 // and descriptors and constants from rings per frame slot.
 class NrdDenoiser {
 public:
-    enum class Method { Relax, Reblur };
+    enum class Method { Relax, Reblur, Sigma };
 
     // A texture the application provides for one of NRD's resource types, with its state, which Denoise updates.
     struct Resource {
@@ -35,8 +35,9 @@ public:
     Method CurrentMethod() const { return m_method; }
 
     // Records NRD's dispatches for a frame into `list`, which then needs its descriptor heap and root signature again.
-    // `slot` picks the rings the GPU is done with.
-    bool Denoise(ID3D12GraphicsCommandList* list, UINT slot, const nrd::CommonSettings& common, const Resources& resources);
+    // `slot` picks the rings the GPU is done with; `lightDirection` (towards the sun, world space) is SIGMA's.
+    bool Denoise(ID3D12GraphicsCommandList* list, UINT slot, const nrd::CommonSettings& common, const Resources& resources,
+        const float (&lightDirection)[3] = {});
 
 private:
     // The frame rate, low-pass filtered, measured between calls to Denoise (once per frame).

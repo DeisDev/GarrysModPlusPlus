@@ -625,6 +625,68 @@ float3 SunVisibility(float3 origin, uint mask, uint rayFlags = RAY_FLAG_NONE)
     return visibility;
 }
 
+// The real sun's angular radius (its disc is about 0.53 degrees across), and 1 - its cosine.
+static const float kSunAngularRadius = 0.00465;
+static const float kSunConeSpan = 1.081e-5;
+
+// A direction to a uniformly random point of the sun's disc.
+float3 SunDiscDirection(inout uint seed)
+{
+    float cosine = 1.0 - Random(seed) * kSunConeSpan;
+    float sine = sqrt(saturate(1.0 - cosine * cosine));
+    float phi = 6.28318530718 * Random(seed);
+    float3 t, b;
+    BuildBasis(g_frame.sunDirection, t, b);
+    return normalize(t * (sine * cos(phi)) + b * (sine * sin(phi)) + g_frame.sunDirection * cosine);
+}
+
+// Transmittance that also finds the nearest surface taking any light (`occluder`, tMax when none), as NRD's shadow
+// denoiser needs for the penumbra's size: no early end at the first hit.
+float3 TransmittanceToNearest(float3 origin, float3 direction, float tMax, uint mask, uint rayFlags, out float occluder)
+{
+    occluder = tMax;
+    if (mask == 0)
+        return 1.0;
+    SCENE_RAY_QUERY(RAY_FLAG_SKIP_CLOSEST_HIT_SHADER) query;
+    RayDesc ray;
+    ray.Origin = origin;
+    ray.Direction = direction;
+    ray.TMin = 0.01;
+    ray.TMax = tMax;
+    query.TraceRayInline(g_scene, rayFlags, mask, ray);
+    float3 transmittance = 1.0;
+    while (query.Proceed()) {
+        bool translucent;
+        float3 through = CandidateTransmission(query.CandidateInstanceID(), query.CandidatePrimitiveIndex(), query.CandidateTriangleBarycentrics(), translucent);
+        if (translucent) {
+            transmittance *= through;
+            occluder = min(occluder, query.CandidateTriangleRayT());
+        } else if (through.x < 1.0) {
+            query.CommitNonOpaqueTriangleHit();
+        }
+    }
+    if (query.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
+        occluder = min(occluder, query.CommittedRayT());
+        return 0.0;
+    }
+    return transmittance;
+}
+
+// SunVisibility along `direction` (a point of the sun's disc), with the distance to the nearest occluder; occluders in
+// the 3D skybox are as far as their scaled distance.
+float3 SunVisibilityToNearest(float3 origin, float3 direction, uint mask, uint rayFlags, out float occluder)
+{
+    float3 visibility = TransmittanceToNearest(origin, direction, 65536.0, mask, rayFlags, occluder);
+    if (any(visibility > 0.0) && g_frame.worldToSky > 0.0 && (mask & kSkyboxMask) == 0) {
+        float3 camera = float3(g_frame.skyCameraX, g_frame.skyCameraY, g_frame.skyCameraZ);
+        float skyOccluder;
+        visibility *= TransmittanceToNearest(camera + origin * g_frame.worldToSky, direction, 65536.0, kSkyboxMask, RAY_FLAG_NONE, skyOccluder);
+        if (skyOccluder < 65536.0)
+            occluder = min(occluder, skyOccluder / g_frame.worldToSky);
+    }
+    return visibility;
+}
+
 // Sunlight reaching a hit surface, with its shadow ray starting at `origin`, off the side the ray came from. Leaves
 // (kInstanceIgnoreNormals) also take the sunlight that comes through from their other side, evenly scattered.
 float3 SunIrradiance(HitSurface hit, float3 origin, uint mask)

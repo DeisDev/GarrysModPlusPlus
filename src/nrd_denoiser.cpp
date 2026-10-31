@@ -76,6 +76,16 @@ D3D12_RESOURCE_BARRIER Transition(ID3D12Resource* resource, D3D12_RESOURCE_STATE
     return barrier;
 }
 
+const char* MethodName(NrdDenoiser::Method method)
+{
+    switch (method) {
+    case NrdDenoiser::Method::Relax: return "RELAX";
+    case NrdDenoiser::Method::Reblur: return "REBLUR";
+    case NrdDenoiser::Method::Sigma: return "SIGMA";
+    }
+    return "?";
+}
+
 }
 
 bool NrdDenoiser::Initialize(ID3D12Device* device, DescriptorHeap& descriptors, Method method, UINT width, UINT height)
@@ -89,16 +99,17 @@ bool NrdDenoiser::Initialize(ID3D12Device* device, DescriptorHeap& descriptors, 
     const nrd::LibraryDesc& library = *nrd::GetLibraryDesc();
     // shaders/nvidia/nrd_common.hlsli packs normals and roughness in NRD's default encodings.
     if (library.normalEncoding != nrd::NormalEncoding::R10_G10_B10_A2_UNORM || library.roughnessEncoding != nrd::RoughnessEncoding::LINEAR) {
-        log::Info("NRD: the library was built with other normal or roughness encodings; the built-in denoiser is used");
+        log::Info("NRD: the library was built with other normal or roughness encodings");
         return false;
     }
-    const nrd::DenoiserDesc denoiser = {0, method == Method::Relax ? nrd::Denoiser::RELAX_DIFFUSE_SPECULAR : nrd::Denoiser::REBLUR_DIFFUSE_SPECULAR};
+    const nrd::Denoiser denoisers[] = {nrd::Denoiser::RELAX_DIFFUSE_SPECULAR, nrd::Denoiser::REBLUR_DIFFUSE_SPECULAR, nrd::Denoiser::SIGMA_SHADOW_TRANSLUCENCY};
+    const nrd::DenoiserDesc denoiser = {0, denoisers[static_cast<size_t>(method)]};
     nrd::InstanceCreationDesc creation = {};
     creation.denoisers = &denoiser;
     creation.denoisersNum = 1;
     if (nrd::CreateInstance(creation, m_instance) != nrd::Result::SUCCESS) {
         m_instance = nullptr;
-        log::Info("NRD: creating the denoiser failed; the built-in denoiser is used");
+        log::Info("NRD: creating the denoiser failed");
         return false;
     }
     const nrd::InstanceDesc& instance = *nrd::GetInstanceDesc(*m_instance);
@@ -106,7 +117,7 @@ bool NrdDenoiser::Initialize(ID3D12Device* device, DescriptorHeap& descriptors, 
     m_tableStorages = instance.descriptorPoolDesc.perSetStorageTexturesMaxNum;
     m_tableSize = m_tableTextures + m_tableStorages;
     if (m_tableSize > kMaxTable) {
-        log::Info("NRD: its pipelines need {} descriptors, more than {}; the built-in denoiser is used", m_tableSize, kMaxTable);
+        log::Info("NRD: its pipelines need {} descriptors, more than {}", m_tableSize, kMaxTable);
         Release();
         return false;
     }
@@ -198,12 +209,12 @@ bool NrdDenoiser::Initialize(ID3D12Device* device, DescriptorHeap& descriptors, 
     if (FAILED(hr)) {
         if (errors)
             log::Info("NRD: {}", static_cast<const char*>(errors->GetBufferPointer()));
-        log::Info("NRD: creating its pipelines or textures failed ({:#010x}); the built-in denoiser is used", static_cast<unsigned>(hr));
+        log::Info("NRD: creating its pipelines or textures failed ({:#010x})", static_cast<unsigned>(hr));
         Release();
         return false;
     }
     log::Info("NRD {}.{}.{}: {} for {}x{}, {} pipelines, {} pool textures", library.versionMajor, library.versionMinor, library.versionBuild,
-        method == Method::Relax ? "RELAX" : "REBLUR", width, height, m_pipelines.size(), m_pool.size());
+        MethodName(method), width, height, m_pipelines.size(), m_pool.size());
     return true;
 }
 
@@ -258,7 +269,8 @@ float NrdDenoiser::SmoothedFps()
     return 1000.0f / m_smoothedFrameMs;
 }
 
-bool NrdDenoiser::Denoise(ID3D12GraphicsCommandList* list, UINT slot, const nrd::CommonSettings& common, const Resources& resources)
+bool NrdDenoiser::Denoise(ID3D12GraphicsCommandList* list, UINT slot, const nrd::CommonSettings& common, const Resources& resources,
+    const float (&lightDirection)[3])
 {
     if (m_instance == nullptr)
         return false;
@@ -270,6 +282,11 @@ bool NrdDenoiser::Denoise(ID3D12GraphicsCommandList* list, UINT slot, const nrd:
         settings.diffuseMaxAccumulatedFrameNum = settings.specularMaxAccumulatedFrameNum = lengths.frames;
         settings.diffuseMaxFastAccumulatedFrameNum = settings.specularMaxFastAccumulatedFrameNum = lengths.fast;
         settings.historyFixFrameNum = lengths.fix;
+        nrd::SetDenoiserSettings(*m_instance, 0, &settings);
+    } else if (m_method == Method::Sigma) {
+        nrd::SigmaSettings settings = {};
+        std::copy_n(lightDirection, 3, settings.lightDirection);
+        settings.maxStabilizedFrameNum = std::min(nrd::GetMaxAccumulatedFrameNum(nrd::SIGMA_DEFAULT_ACCUMULATION_TIME, fps), nrd::SIGMA_MAX_HISTORY_FRAME_NUM);
         nrd::SetDenoiserSettings(*m_instance, 0, &settings);
     } else {
         nrd::ReblurSettings settings = {};

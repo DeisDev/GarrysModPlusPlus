@@ -233,6 +233,9 @@ endforeach()
 # NVIDIA NRD's inputs and outputs (its own shaders are embedded in the NRD library).
 add_shader(shaders/nrd.hlsl InputsMain cs_6_6 g_nrdInputsCS -I "${nrd_SOURCE_DIR}/Shaders")
 add_shader(shaders/nrd.hlsl ResolveMain cs_6_6 g_nrdResolveCS -I "${nrd_SOURCE_DIR}/Shaders")
+# The main view's sun shadows, traced to the sun's disc for NRD's SIGMA.
+add_shader(shaders/sun_shadow.hlsl main cs_6_6 g_sunShadowCS -I "${nrd_SOURCE_DIR}/Shaders")
+add_shader(shaders/sun_shadow.hlsl main cs_6_9 g_sunShadowOmmCS -D OPACITY_MICROMAPS=1 -I "${nrd_SOURCE_DIR}/Shaders")
 add_shader(shaders/direct.hlsl main cs_6_6 g_directWideCS -D WIDE_LIGHT_SETS=1)
 add_shader(shaders/direct.hlsl main cs_6_9 g_directWideOmmCS -D WIDE_LIGHT_SETS=1 -D OPACITY_MICROMAPS=1)
 add_shader(shaders/reflection_temporal.hlsl main cs_6_6 g_reflectionTemporalCS)

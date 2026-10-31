@@ -44,6 +44,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Sun shadows are soft, sharp near the object and blurring with distance, as the real sun's size makes them.
 - Reflected surfaces are lit with the sun, a lamp and the radiance cache where they are, instead of borrowing the reflecting surface's light or reusing last frame's image.
 - The "Shadow rays" settings apply only to the Legacy light sampling mode.
 - The credits name NVIDIA RTXDI, SHaRC and NRD, and their licences are in `gmodplusplus\licenses`.

@@ -5,6 +5,7 @@
 // (weighted reservoir sampling) and weighted to keep the sum unbiased. The exact part stays sharp; the noisy
 // remainder is added to the indirect estimate (gi_trace.hlsl) and denoised with it. The SUN_ONLY variant lights with
 // the sun alone, for local lights sampled by RTXDI (shaders/restir.hlsl), which writes the remainder.
+// input0: the sun's visibility when traced softly beforehand (SunShadowAt), else it is traced here, to the sun's centre.
 // output0: exact direct irradiance (rgb) and sun visibility (a); output1: sampled remainder; output2: highlights.
 
 // The most g_frame.exactLights and g_frame.sampledLightRays can be. Larger sets take registers that slow the light
@@ -86,6 +87,15 @@ void ConsiderLight(uint i, float3 irradiance, bool exact, inout uint top[kExactL
         AddToRemainder(candidate, candidateWeight, candidateWeight, picked, pickedWeight, remainder, seed);
 }
 
+// The main view's soft sun shadows (shaders/sun_shadow.hlsl) in input0, NRD's translucency encoding: denoised by SIGMA
+// when input1 is 1, which stores the square root (NRD.hlsli, SIGMA_BackEnd_UnpackShadow).
+float3 SunShadowAt(int2 pixel)
+{
+    Texture2D<float4> shadow = ResourceDescriptorHeap[g_pass.input0];
+    float3 visibility = shadow.Load(int3(pixel, 0)).yzw;
+    return g_pass.input1 == 1 ? visibility * visibility : visibility;
+}
+
 [RootSignature(ROOT_SIGNATURE)]
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID)
@@ -126,8 +136,8 @@ void main(uint3 id : SV_DispatchThreadID)
     float3 sunVisibility = 0.0;
     float lambert = Lambert(lightNormal, g_frame.sunDirection);
     if (lit && g_frame.sunEnabled != 0.0 && lambert > 0.0) {
-        sunVisibility = SunVisibility(ShadowOrigin(origin, behind, faceNormal, g_frame.sunDirection), g_frame.sunShadowMask,
-            SelfShadowFlags(onModel, faceNormal, g_frame.sunDirection));
+        sunVisibility = g_pass.input0 != kNoView ? SunShadowAt(pixel) : SunVisibility(ShadowOrigin(origin, behind, faceNormal, g_frame.sunDirection),
+            g_frame.sunShadowMask, SelfShadowFlags(onModel, faceNormal, g_frame.sunDirection));
         exact += g_frame.sunColor * lambert * sunVisibility * LightWarp(lightNormal, g_frame.sunDirection);
         specular += SunHighlight(phong, g_frame.sunColor * (lambert * sunVisibility));
         rim += ModelRim(phong, g_frame.sunColor * (lambert * sunVisibility), g_frame.sunDirection);

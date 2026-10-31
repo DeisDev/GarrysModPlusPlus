@@ -314,6 +314,7 @@ private:
         RestirShade,
         NrdInputs,
         NrdResolve,
+        SunShadow,
         Count
     };
     // Mirrors PassConstants in shaders/common.hlsli: descriptor indices (none by default) and a parameter.
@@ -349,6 +350,23 @@ private:
     // leaving them unwritten.
     bool RecordNrd(const FrameConstants& constants, const ViewInputs& inputs, UINT slot, UINT current, D3D12_GPU_VIRTUAL_ADDRESS frameConstants,
         D3D12_GPU_VIRTUAL_ADDRESS scene);
+    // The camera an NRD denoiser saw in its last frame.
+    struct NrdHistory {
+        bool valid = false;
+        uint32_t frame = 0;
+        float worldToView[16] = {};
+        float viewToClip[16] = {};
+        float jitter[2] = {};
+    };
+    // NRD's settings for the main view, restarting without `history` (or the view's), which this frame's camera becomes.
+    nrd::CommonSettings NrdCommonSettings(const FrameConstants& constants, const ViewInputs& inputs, NrdHistory& history);
+    // NRD's SIGMA for the main view's sun shadows at the output size; false when it cannot be made (logged once).
+    bool EnsureSigma();
+    // Traces the main view's sun shadows to the sun's disc (shaders/sun_shadow.hlsl) and, when `denoise`, has SIGMA
+    // denoise them, then binds the compute root signature again. Returns the direct pass's input0 and input1
+    // (shaders/direct.hlsl, SunShadowAt); without SIGMA when it failed, none: the sun's shadows stay hard.
+    std::pair<UINT, UINT> RecordSunShadow(const FrameConstants& constants, const ViewInputs& inputs, bool denoise, UINT slot,
+        D3D12_GPU_VIRTUAL_ADDRESS frameConstants, D3D12_GPU_VIRTUAL_ADDRESS scene);
     bool CreateTarget(Texture& texture, UINT width, UINT height, DXGI_FORMAT format, UINT depth = 0);
     bool CreateSkyLight();
     // Binds the pass's pipeline: its opacity micromap variant while they are in use, when it has one.
@@ -386,8 +404,7 @@ private:
     // outputs, and the camera of its last frame.
     NrdDenoiser m_nrd;
     bool m_nrdFailed = false;
-    bool m_nrdHistoryValid = false;
-    uint32_t m_nrdFrame = 0;
+    NrdHistory m_nrdHistory;
     Texture m_nrdViewZ;
     Texture m_nrdNormalRoughness;
     Texture m_nrdDiffuse;
@@ -395,9 +412,14 @@ private:
     Texture m_nrdDiffuseOut;
     Texture m_nrdSpecularOut;
     Texture m_nrdValidation;
-    float m_nrdWorldToView[16] = {};
-    float m_nrdViewToClip[16] = {};
-    float m_nrdJitter[2] = {};
+    // The main view's soft sun shadows: SIGMA's noisy penumbra and translucency (or Ray Reconstruction's input), and its
+    // output. SIGMA shares NRD's view depth and normal inputs.
+    NrdDenoiser m_sigma;
+    bool m_sigmaFailed = false;
+    NrdHistory m_sigmaHistory;
+    Texture m_sunPenumbra;
+    Texture m_sunTranslucency;
+    Texture m_sunShadow;
     // The material table's self-illumination (shaders/reflections.hlsl), added by the lighting pass.
     Texture m_selfIllum;
     static constexpr UINT kSlots = Scene::kFrameSlots;

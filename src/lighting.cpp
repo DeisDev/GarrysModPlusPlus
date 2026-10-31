@@ -30,6 +30,8 @@
 #include <g_giTraceCacheOmmCS.h>
 #include <g_giTraceOmmCS.h>
 #include <g_nrdInputsCS.h>
+#include <g_sunShadowCS.h>
+#include <g_sunShadowOmmCS.h>
 #include <g_nrdResolveCS.h>
 #include <g_translucentDepthCS.h>
 #include <g_viewRectCS.h>
@@ -507,7 +509,7 @@ bool Lighting::Initialize(ID3D12Device5* device, ID3D12CommandQueue* queue, Desc
         cache ? std::span<const BYTE>(g_reflectionsCacheCS) : g_reflectionsCS, g_reflectionTemporalCS, g_dlssInputsCS, g_dlssResolveCS, g_directWideCS,
         g_swayCS, g_translucentDepthCS, g_viewRectCS, g_bakedResidualCS, g_skyCS, cache ? std::span<const BYTE>(g_sharcUpdateCS) : none,
         cache ? std::span<const BYTE>(g_sharcResolveCS) : none, g_directSunCS, g_restirPdfCS, g_restirPresampleCS, g_restirRegirCS, g_restirInitialCS,
-        g_restirTemporalCS, g_restirSpatialCS, g_restirShadeCS, g_nrdInputsCS, g_nrdResolveCS};
+        g_restirTemporalCS, g_restirSpatialCS, g_restirShadeCS, g_nrdInputsCS, g_nrdResolveCS, g_sunShadowCS};
     static_assert(std::size(shaders) == static_cast<size_t>(Pass::Count));
     for (size_t i = 0; i < m_pipelines.size() && SUCCEEDED(hr); ++i) {
         if (shaders[i].empty())
@@ -523,7 +525,7 @@ bool Lighting::Initialize(ID3D12Device5* device, ID3D12CommandQueue* queue, Desc
         {Pass::Direct, g_directOmmCS}, {Pass::GiTrace, cache ? std::span<const BYTE>(g_giTraceCacheOmmCS) : g_giTraceOmmCS},
         {Pass::Reflections, cache ? std::span<const BYTE>(g_reflectionsCacheOmmCS) : g_reflectionsOmmCS}, {Pass::DirectWide, g_directWideOmmCS},
         {Pass::SharcUpdate, cache ? std::span<const BYTE>(g_sharcUpdateOmmCS) : none}, {Pass::DirectSun, g_directSunOmmCS},
-        {Pass::RestirInitial, g_restirInitialOmmCS}, {Pass::RestirShade, g_restirShadeOmmCS}};
+        {Pass::RestirInitial, g_restirInitialOmmCS}, {Pass::RestirShade, g_restirShadeOmmCS}, {Pass::SunShadow, g_sunShadowOmmCS}};
     for (size_t i = 0; i < std::size(micromapShaders) && SUCCEEDED(hr) && micromaps; ++i) {
         if (micromapShaders[i].second.empty())
             continue;
@@ -756,7 +758,11 @@ bool Lighting::EnsureTargets(UINT width, UINT height)
     for (Texture* texture : {&m_nrdDiffuse, &m_nrdSpecular, &m_nrdDiffuseOut, &m_nrdSpecularOut})
         ok = ok && CreateTarget(*texture, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT);
     ok = ok && CreateTarget(m_nrdValidation, width, height, DXGI_FORMAT_R8G8B8A8_UNORM);
-    m_nrdHistoryValid = false;
+    ok = ok && CreateTarget(m_sunPenumbra, width, height, DXGI_FORMAT_R16_FLOAT);
+    ok = ok && CreateTarget(m_sunTranslucency, width, height, DXGI_FORMAT_R8G8B8A8_UNORM);
+    ok = ok && CreateTarget(m_sunShadow, width, height, DXGI_FORMAT_R8G8B8A8_UNORM);
+    m_nrdHistory.valid = false;
+    m_sigmaHistory.valid = false;
     ok = ok && CreateTarget(m_reflections, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT);
     for (Texture& texture : m_aoHistory)
         ok = ok && CreateTarget(texture, width, height, DXGI_FORMAT_R16G16_FLOAT);
@@ -869,12 +875,97 @@ bool Lighting::EnsureNrd(DenoiserType type)
     if (m_nrd.Matches(method, m_width, m_height))
         return true;
     WaitForGpu();
-    m_nrdHistoryValid = false;
+    m_nrdHistory.valid = false;
     if (!m_nrd.Initialize(m_device, *m_descriptors, method, m_width, m_height)) {
+        log::Info("NRD: the built-in denoiser is used");
         m_nrdFailed = true;
         return false;
     }
     return true;
+}
+
+bool Lighting::EnsureSigma()
+{
+    if (m_sigmaFailed)
+        return false;
+    if (m_sigma.Matches(NrdDenoiser::Method::Sigma, m_width, m_height))
+        return true;
+    WaitForGpu();
+    m_sigmaHistory.valid = false;
+    if (!m_sigma.Initialize(m_device, *m_descriptors, NrdDenoiser::Method::Sigma, m_width, m_height)) {
+        log::Info("NRD: the sun's shadows stay hard");
+        m_sigmaFailed = true;
+        return false;
+    }
+    return true;
+}
+
+nrd::CommonSettings Lighting::NrdCommonSettings(const FrameConstants& constants, const ViewInputs& inputs, NrdHistory& history)
+{
+    // The matrices are the ones Ray Reconstruction takes: row-major for row vectors, which is NRD's column-major layout
+    // for column vectors. Motion is in pixels; NRD's is in texture coordinates.
+    nrd::CommonSettings common = {};
+    float worldToView[16];
+    float viewToClip[16];
+    SplitViewProjection(constants.viewProj, constants.eyePosition, worldToView, viewToClip);
+    const bool restart = !history.valid || constants.historyValid == 0;
+    std::memcpy(common.worldToViewMatrix, worldToView, sizeof(worldToView));
+    std::memcpy(common.viewToClipMatrix, viewToClip, sizeof(viewToClip));
+    std::memcpy(common.worldToViewMatrixPrev, restart ? worldToView : history.worldToView, sizeof(worldToView));
+    std::memcpy(common.viewToClipMatrixPrev, restart ? viewToClip : history.viewToClip, sizeof(viewToClip));
+    common.motionVectorScale[0] = 1.0f / static_cast<float>(m_width);
+    common.motionVectorScale[1] = 1.0f / static_cast<float>(m_height);
+    common.motionVectorScale[2] = 0.0f;
+    common.cameraJitter[0] = inputs.jitterX;
+    common.cameraJitter[1] = inputs.jitterY;
+    common.cameraJitterPrev[0] = restart ? inputs.jitterX : history.jitter[0];
+    common.cameraJitterPrev[1] = restart ? inputs.jitterY : history.jitter[1];
+    common.resourceSize[0] = common.resourceSizePrev[0] = common.rectSize[0] = common.rectSizePrev[0] = static_cast<uint16_t>(m_width);
+    common.resourceSize[1] = common.resourceSizePrev[1] = common.rectSize[1] = common.rectSizePrev[1] = static_cast<uint16_t>(m_height);
+    common.frameIndex = history.frame++;
+    common.accumulationMode = restart ? nrd::AccumulationMode::RESTART : nrd::AccumulationMode::CONTINUE;
+    history.valid = true;
+    std::memcpy(history.worldToView, worldToView, sizeof(worldToView));
+    std::memcpy(history.viewToClip, viewToClip, sizeof(viewToClip));
+    history.jitter[0] = inputs.jitterX;
+    history.jitter[1] = inputs.jitterY;
+    return common;
+}
+
+std::pair<UINT, UINT> Lighting::RecordSunShadow(const FrameConstants& constants, const ViewInputs& inputs, bool denoise, UINT slot,
+    D3D12_GPU_VIRTUAL_ADDRESS frameConstants, D3D12_GPU_VIRTUAL_ADDRESS scene)
+{
+    Texture* written[] = {&m_sunPenumbra, &m_sunTranslucency, &m_nrdViewZ, &m_nrdNormalRoughness};
+    for (Texture* texture : written)
+        Use(*texture, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    Dispatch(Pass::SunShadow, {.output0 = m_sunPenumbra.uav, .output1 = m_sunTranslucency.uav, .output2 = m_nrdViewZ.uav, .output3 = m_nrdNormalRoughness.uav});
+    for (Texture* texture : written)
+        Use(*texture, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    if (!denoise) {
+        m_sigmaHistory.valid = false;
+        return {m_sunTranslucency.srv, 0};
+    }
+    if (!EnsureSigma())
+        return {kInvalidView, 0};
+    const nrd::CommonSettings common = NrdCommonSettings(constants, inputs, m_sigmaHistory);
+    NrdDenoiser::Resources resources = {};
+    const auto provide = [&](nrd::ResourceType type, Texture& texture) { resources[static_cast<size_t>(type)] = {texture.resource.Get(), &texture.state}; };
+    provide(nrd::ResourceType::IN_MV, m_motion);
+    provide(nrd::ResourceType::IN_NORMAL_ROUGHNESS, m_nrdNormalRoughness);
+    provide(nrd::ResourceType::IN_VIEWZ, m_nrdViewZ);
+    provide(nrd::ResourceType::IN_PENUMBRA, m_sunPenumbra);
+    provide(nrd::ResourceType::IN_TRANSLUCENCY, m_sunTranslucency);
+    provide(nrd::ResourceType::OUT_SHADOW_TRANSLUCENCY, m_sunShadow);
+    const bool recorded = m_sigma.Denoise(m_list.Get(), slot, common, resources, constants.sunDirection);
+    BindCompute(frameConstants, scene, slot);
+    if (!recorded) {
+        log::Info("NRD: recording SIGMA's dispatches failed; the sun's shadows stay hard");
+        m_sigmaHistory.valid = false;
+        m_sigmaFailed = true;
+        return {kInvalidView, 0};
+    }
+    Use(m_sunShadow, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    return {m_sunShadow.srv, 1};
 }
 
 bool Lighting::RecordNrd(const FrameConstants& constants, const ViewInputs& inputs, UINT slot, UINT current, D3D12_GPU_VIRTUAL_ADDRESS frameConstants,
@@ -893,28 +984,7 @@ bool Lighting::RecordNrd(const FrameConstants& constants, const ViewInputs& inpu
     for (Texture* texture : inputs_)
         Use(*texture, read);
 
-    // The matrices are the ones Ray Reconstruction takes: row-major for row vectors, which is NRD's column-major layout
-    // for column vectors. Motion is in pixels; NRD's is in texture coordinates.
-    nrd::CommonSettings common = {};
-    float worldToView[16];
-    float viewToClip[16];
-    SplitViewProjection(constants.viewProj, constants.eyePosition, worldToView, viewToClip);
-    const bool restart = !m_nrdHistoryValid || constants.historyValid == 0;
-    std::memcpy(common.worldToViewMatrix, worldToView, sizeof(worldToView));
-    std::memcpy(common.viewToClipMatrix, viewToClip, sizeof(viewToClip));
-    std::memcpy(common.worldToViewMatrixPrev, restart ? worldToView : m_nrdWorldToView, sizeof(worldToView));
-    std::memcpy(common.viewToClipMatrixPrev, restart ? viewToClip : m_nrdViewToClip, sizeof(viewToClip));
-    common.motionVectorScale[0] = 1.0f / static_cast<float>(m_width);
-    common.motionVectorScale[1] = 1.0f / static_cast<float>(m_height);
-    common.motionVectorScale[2] = 0.0f;
-    common.cameraJitter[0] = inputs.jitterX;
-    common.cameraJitter[1] = inputs.jitterY;
-    common.cameraJitterPrev[0] = restart ? inputs.jitterX : m_nrdJitter[0];
-    common.cameraJitterPrev[1] = restart ? inputs.jitterY : m_nrdJitter[1];
-    common.resourceSize[0] = common.resourceSizePrev[0] = common.rectSize[0] = common.rectSizePrev[0] = static_cast<uint16_t>(m_width);
-    common.resourceSize[1] = common.resourceSizePrev[1] = common.rectSize[1] = common.rectSizePrev[1] = static_cast<uint16_t>(m_height);
-    common.frameIndex = m_nrdFrame++;
-    common.accumulationMode = restart ? nrd::AccumulationMode::RESTART : nrd::AccumulationMode::CONTINUE;
+    nrd::CommonSettings common = NrdCommonSettings(constants, inputs, m_nrdHistory);
     common.enableValidation = constants.debugView == static_cast<uint32_t>(DebugView::DenoiserValidation);
     NrdDenoiser::Resources resources = {};
     const auto provide = [&](nrd::ResourceType type, Texture& texture) { resources[static_cast<size_t>(type)] = {texture.resource.Get(), &texture.state}; };
@@ -926,17 +996,14 @@ bool Lighting::RecordNrd(const FrameConstants& constants, const ViewInputs& inpu
     provide(nrd::ResourceType::OUT_DIFF_RADIANCE_HITDIST, m_nrdDiffuseOut);
     provide(nrd::ResourceType::OUT_SPEC_RADIANCE_HITDIST, m_nrdSpecularOut);
     provide(nrd::ResourceType::OUT_VALIDATION, m_nrdValidation);
-    m_nrdHistoryValid = m_nrd.Denoise(m_list.Get(), slot, common, resources);
+    const bool recorded = m_nrd.Denoise(m_list.Get(), slot, common, resources);
     BindCompute(frameConstants, scene, slot);
-    if (!m_nrdHistoryValid) {
+    if (!recorded) {
         log::Info("NRD: recording its dispatches failed; the built-in denoiser is used");
+        m_nrdHistory.valid = false;
         m_nrdFailed = true;
         return false;
     }
-    std::memcpy(m_nrdWorldToView, worldToView, sizeof(worldToView));
-    std::memcpy(m_nrdViewToClip, viewToClip, sizeof(viewToClip));
-    m_nrdJitter[0] = inputs.jitterX;
-    m_nrdJitter[1] = inputs.jitterY;
     Use(m_nrdDiffuseOut, read);
     Use(m_nrdSpecularOut, read);
     Use(m_giFiltered[0], write);
@@ -1927,9 +1994,16 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     } else if (main) {
         m_restirLastMode.reset();
     }
+    // The main view's sun shadows are soft, denoised by Ray Reconstruction or else by SIGMA; other views trace the sun's
+    // centre in the direct pass.
+    std::pair<UINT, UINT> sunShadow = {kInvalidView, 0};
+    if (main && constants.traceMask != 0 && constants.sunEnabled != 0.0f)
+        sunShadow = RecordSunShadow(constants, inputs, !rayReconstruction, slot, slotConstantsGpu, frame.tlas);
+    else if (main)
+        m_sigmaHistory.valid = false;
     const bool wideLightSets = constants.exactLights > 4 || constants.sampledLightRays > 2;
     Dispatch(restir ? Pass::DirectSun : wideLightSets ? Pass::DirectWide : Pass::Direct,
-        {.output0 = direct.uav, .output1 = m_directRemainder.uav, .output2 = m_specular.uav});
+        {.input0 = sunShadow.first, .input1 = sunShadow.second, .output0 = direct.uav, .output1 = m_directRemainder.uav, .output2 = m_specular.uav});
     if (probe) {
         D3D12_RESOURCE_BARRIER barrier = Transition(m_probeBuffer.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
         m_list->ResourceBarrier(1, &barrier);
@@ -2081,7 +2155,7 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
         indirect = source;
     }
     if (main && !nrd)
-        m_nrdHistoryValid = false;
+        m_nrdHistory.valid = false;
     if (rayReconstruction) {
         FrameConstants& render = *reinterpret_cast<FrameConstants*>(slotConstants + kConstantsStride);
         render.selfIllumView = constants.selfIllumView;
