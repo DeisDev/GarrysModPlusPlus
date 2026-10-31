@@ -28,7 +28,6 @@ static const uint3 kProbeGrid = uint3(32, 32, 16);
 static const uint kNearCells = 4;
 static const uint kUpdatePeriod = 4;
 static const float kHistoryWeight = 0.85;
-static const float kInsideFraction = 0.3;
 static const float kMaxDistance = 16384.0;
 static const uint kProbeLights = 4;
 static const uint kProbeThreads = 32;
@@ -63,19 +62,6 @@ float3 LastVolumeIrradiance(float3 position, float3 normal)
     float4 g = green.SampleLevel(g_linearWrap, uvw, 0.0);
     float4 b = blue.SampleLevel(g_linearWrap, uvw, 0.0);
     return max(float3(r.x + dot(r.yzw, normal), g.x + dot(g.yzw, normal), b.x + dot(b.yzw, normal)), 0.0);
-}
-
-// Whether the ray met the back of the triangle it hit. Source's triangles are clockwise seen from the front, so the
-// cross product of their edges points out of the back.
-bool HitBackFace(HitInfo hit, float3 direction)
-{
-    InstanceRecord record = LoadInstance(hit.instance);
-    ByteAddressBuffer positions = ResourceDescriptorHeap[NonUniformResourceIndex(record.positions)];
-    ByteAddressBuffer indices = ResourceDescriptorHeap[NonUniformResourceIndex(record.indices)];
-    uint3 index = indices.Load3(hit.primitive * 12);
-    float3 p0 = positions.Load<float3>(index.x * 12);
-    float3 normal = mul((float3x3)hit.objectToWorld, cross(positions.Load<float3>(index.y * 12) - p0, positions.Load<float3>(index.z * 12) - p0));
-    return dot(normal, direction) < 0.0;
 }
 
 void Trace(uint3 id, uint thread)

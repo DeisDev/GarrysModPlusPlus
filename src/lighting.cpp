@@ -7,7 +7,7 @@
 #include "settings.h"
 
 #include <g_aoCS.h>
-#include <g_bakedResidualCS.h>
+#include <g_bakedBounceCS.h>
 #include <g_aoOmmCS.h>
 #include <g_compositeCoveredPS.h>
 #include <g_compositeDepthPS.h>
@@ -202,10 +202,9 @@ constexpr UINT kPassCount = static_cast<UINT>(GpuPass::Count);
 constexpr UINT kMarkers = kPassCount + 1;
 constexpr uint32_t kTimingSamples = 120;
 constexpr UINT kProbeBytes = 32;
-// Luxels the residual bake handles per main view, which keeps each part well below the GPU timeout.
-constexpr UINT kBakeLuxelsPerView = 1 << 17;
-// VRAD's extrapasses: rounds of supersampling at light gradients.
-constexpr UINT kSupersamplePasses = 4;
+// Luxels the bounce light bake traces per main view or loading screen update, which keeps each part well below the
+// GPU timeout.
+constexpr UINT kBakeLuxelsPerView = 1 << 14;
 constexpr UINT kMaxGroups = 65535;
 
 unsigned Hex(HRESULT hr) { return static_cast<unsigned>(hr); }
@@ -436,8 +435,15 @@ bool Lighting::Initialize(ID3D12Device5* device, ID3D12CommandQueue* queue, Desc
         hr = m_bakeConstants ? m_bakeConstants->Map(0, nullptr, reinterpret_cast<void**>(&m_bakeConstantsMapped)) : E_OUTOFMEMORY;
     }
     if (SUCCEEDED(hr)) {
-        m_bakeReadback = CreateBuffer(m_device, D3D12_HEAP_TYPE_READBACK, 16, D3D12_RESOURCE_STATE_COPY_DEST);
-        hr = m_bakeReadback ? S_OK : E_OUTOFMEMORY;
+        m_bakeStyles = CreateBuffer(m_device, D3D12_HEAP_TYPE_UPLOAD, engine::kLightStyles * sizeof(float), D3D12_RESOURCE_STATE_GENERIC_READ);
+        float* styles = nullptr;
+        hr = m_bakeStyles ? m_bakeStyles->Map(0, nullptr, reinterpret_cast<void**>(&styles)) : E_OUTOFMEMORY;
+        if (SUCCEEDED(hr)) {
+            std::fill_n(styles, engine::kLightStyles, 0.0f);
+            styles[0] = 1.0f;
+            m_bakeStyles->Unmap(0, nullptr);
+            m_bakeStylesView = m_descriptors->CreateRawView(m_bakeStyles.Get());
+        }
     }
     if (SUCCEEDED(hr)) {
         m_projectors = CreateBuffer(m_device, D3D12_HEAP_TYPE_UPLOAD, sizeof(GpuProjector) * kMaxProjectors * kSlots, D3D12_RESOURCE_STATE_GENERIC_READ);
@@ -507,7 +513,7 @@ bool Lighting::Initialize(ID3D12Device5* device, ID3D12CommandQueue* queue, Desc
         g_volumetricsCS, g_directCS, cache ? std::span<const BYTE>(g_giTraceCacheCS) : g_giTraceCS, g_giTemporalCS, g_giFilterCS,
         cache ? std::span<const BYTE>(g_deferredLightingCacheCS) : g_deferredLightingCS, g_taaCS, g_taaSharpenCS,
         cache ? std::span<const BYTE>(g_reflectionsCacheCS) : g_reflectionsCS, g_reflectionTemporalCS, g_dlssInputsCS, g_dlssResolveCS, g_directWideCS,
-        g_swayCS, g_translucentDepthCS, g_viewRectCS, g_bakedResidualCS, g_skyCS, cache ? std::span<const BYTE>(g_sharcUpdateCS) : none,
+        g_swayCS, g_translucentDepthCS, g_viewRectCS, g_bakedBounceCS, g_skyCS, cache ? std::span<const BYTE>(g_sharcUpdateCS) : none,
         cache ? std::span<const BYTE>(g_sharcResolveCS) : none, g_directSunCS, g_restirPdfCS, g_restirPresampleCS, g_restirRegirCS, g_restirInitialCS,
         g_restirTemporalCS, g_restirSpatialCS, g_restirShadeCS, g_nrdInputsCS, g_nrdResolveCS, g_sunShadowCS};
     static_assert(std::size(shaders) == static_cast<size_t>(Pass::Count));
@@ -1190,6 +1196,43 @@ void Lighting::WaitForGpu()
     }
 }
 
+void Lighting::FillSceneConstants(FrameConstants& constants, const Scene& scene)
+{
+    const bsp::SunLight& sun = scene.Sun();
+    constants.sunEnabled = sun.present ? 1.0f : 0.0f;
+    float length = std::sqrt(sun.direction.x * sun.direction.x + sun.direction.y * sun.direction.y + sun.direction.z * sun.direction.z);
+    if (length > 0.0f) {
+        constants.sunDirection[0] = sun.direction.x / length;
+        constants.sunDirection[1] = sun.direction.y / length;
+        constants.sunDirection[2] = sun.direction.z / length;
+    }
+    constants.sunColor[0] = sun.color.x;
+    constants.sunColor[1] = sun.color.y;
+    constants.sunColor[2] = sun.color.z;
+    constants.skyColor[0] = sun.ambient.x;
+    constants.skyColor[1] = sun.ambient.y;
+    constants.skyColor[2] = sun.ambient.z;
+    constants.skyCameraX = sun.skyCameraOrigin.x;
+    constants.skyCameraY = sun.skyCameraOrigin.y;
+    constants.skyCameraZ = sun.skyCameraOrigin.z;
+    constants.worldToSky = sun.skyCameraScale > 0.0f ? 1.0f / sun.skyCameraScale : 0.0f;
+    constants.materialsView = scene.MaterialsView();
+    constants.lightsView = scene.LightsView();
+    const Scene::LightLists& lists = scene.Lights();
+    constants.lightRangesView = lists.rangesView;
+    constants.lightIndicesView = lists.indicesView;
+    constants.bspNodesView = lists.nodesView;
+    constants.leafClustersView = lists.leafClustersView;
+    constants.clusterCount = lists.clusterCount;
+    std::memcpy(constants.gridOrigin, &lists.gridOrigin, sizeof(constants.gridOrigin));
+    constants.gridCellSize = lists.gridCellSize;
+    std::copy_n(lists.gridDims, 3, constants.gridDims);
+    constants.gridCellsView = lists.gridCellsView;
+    constants.gridIndicesView = lists.gridIndicesView;
+    constants.gridTailView = lists.gridTailView;
+    constants.emittersView = scene.EmittersView();
+}
+
 bool Lighting::FillConstants(FrameConstants& constants, const Scene& scene, const ViewInputs& inputs)
 {
     constants = {};
@@ -1211,24 +1254,8 @@ bool Lighting::FillConstants(FrameConstants& constants, const Scene& scene, cons
         return false;
     for (int i = 0; i < 3; ++i)
         constants.eyePosition[i] = inv[i][2] / inv[3][2];
+    FillSceneConstants(constants, scene);
     const bsp::SunLight& sun = scene.Sun();
-    constants.sunEnabled = sun.present ? 1.0f : 0.0f;
-    float length = std::sqrt(sun.direction.x * sun.direction.x + sun.direction.y * sun.direction.y + sun.direction.z * sun.direction.z);
-    if (length > 0.0f) {
-        constants.sunDirection[0] = sun.direction.x / length;
-        constants.sunDirection[1] = sun.direction.y / length;
-        constants.sunDirection[2] = sun.direction.z / length;
-    }
-    constants.sunColor[0] = sun.color.x;
-    constants.sunColor[1] = sun.color.y;
-    constants.sunColor[2] = sun.color.z;
-    constants.skyColor[0] = sun.ambient.x;
-    constants.skyColor[1] = sun.ambient.y;
-    constants.skyColor[2] = sun.ambient.z;
-    constants.skyCameraX = sun.skyCameraOrigin.x;
-    constants.skyCameraY = sun.skyCameraOrigin.y;
-    constants.skyCameraZ = sun.skyCameraOrigin.z;
-    constants.worldToSky = sun.skyCameraScale > 0.0f ? 1.0f / sun.skyCameraScale : 0.0f;
     const Settings& settings = GetSettings();
     const float sunStyle = scene.LightStyle(sun.style);
     const float skyStyle = scene.LightStyle(sun.ambientStyle);
@@ -1249,7 +1276,6 @@ bool Lighting::FillConstants(FrameConstants& constants, const Scene& scene, cons
     constants.normalBias = 2.0f;
     constants.frameIndex = static_cast<uint32_t>(inputs.frame);
     constants.debugView = static_cast<uint32_t>(settings.debugView);
-    constants.materialsView = scene.MaterialsView();
     constants.reflectionScale = settings.reflections ? settings.reflectionIntensity : 0.0f;
     constants.exactLights = static_cast<uint32_t>(settings.exactLights);
     constants.sampledLightRays = static_cast<uint32_t>(settings.sampledLightRays);
@@ -1266,7 +1292,7 @@ bool Lighting::FillConstants(FrameConstants& constants, const Scene& scene, cons
     constants.glossyReflections = settings.glossyReflections ? 1u : 0u;
     constants.bakedTrianglesView = kInvalidView;
     constants.bakedFacesView = kInvalidView;
-    constants.bakedResidualView = kInvalidView;
+    constants.bakedLightView = kInvalidView;
     constants.leafAmbientView = kInvalidView;
     constants.ambientSamplesView = kInvalidView;
     // The viewmodel's run reads the main view's indirect light volume (the main view's own sets it once filled).
@@ -1289,24 +1315,9 @@ bool Lighting::FillConstants(FrameConstants& constants, const Scene& scene, cons
     // The 3D skybox is a scaled-down scene elsewhere in the map: the map's lights do not belong to it.
     const bool skybox = inputs.kind == gbuffer::ViewKind::Skybox;
     constants.lightCount = settings.mapLights && !skybox ? scene.LightCount() : 0u;
-    constants.lightsView = scene.LightsView();
-    const Scene::LightLists& lists = scene.Lights();
-    constants.lightRangesView = lists.rangesView;
-    constants.lightIndicesView = lists.indicesView;
-    constants.bspNodesView = lists.nodesView;
-    constants.leafClustersView = lists.leafClustersView;
-    constants.sunClustersView = lists.sunClustersView;
     constants.lightWarpCount = static_cast<uint32_t>(std::min(inputs.lightWarps.size(), std::size(constants.lightWarpViews)));
     std::copy_n(inputs.lightWarps.begin(), constants.lightWarpCount, constants.lightWarpViews);
-    constants.clusterCount = lists.clusterCount;
-    std::memcpy(constants.gridOrigin, &lists.gridOrigin, sizeof(constants.gridOrigin));
-    constants.gridCellSize = lists.gridCellSize;
-    std::copy_n(lists.gridDims, 3, constants.gridDims);
-    constants.gridCellsView = lists.gridCellsView;
-    constants.gridIndicesView = lists.gridIndicesView;
-    constants.gridTailView = lists.gridTailView;
     constants.emissiveLighting = static_cast<uint32_t>(settings.emissiveLighting);
-    constants.emittersView = scene.EmittersView();
     constants.emitterCount = settings.emissiveLighting == EmissiveLighting::Full && !skybox ? scene.EmitterCount() : 0u;
     constants.viewmodel = inputs.kind == gbuffer::ViewKind::Viewmodel ? 1u : 0u;
     // The skybox view shares the main view's orientation, so it finds last frame's sky (reflections.hlsl).
@@ -1366,95 +1377,64 @@ UINT Lighting::WriteProjectors(UINT slot, std::span<const gbuffer::ProjectedLigh
     return count;
 }
 
-void Lighting::BakeStep(Scene& scene, const FrameConstants& constants, D3D12_GPU_VIRTUAL_ADDRESS frameConstants)
+void Lighting::BakeStep(Scene& scene, const SceneFrame& frame, D3D12_GPU_VIRTUAL_ADDRESS frameConstants)
 {
     BakedBuffers& baked = scene.Baked();
-    // The lights at the strength VRAD baked them: style-0 lights alone (the shader skips the others), no settings.
+    // The map's static scene with its lights at their baked strength, whatever the settings: style-0 lights and sun,
+    // and glowing surfaces in full. Every static instance blocks, as foliage_shadows' "All light" has it.
     FrameConstants& bake = *reinterpret_cast<FrameConstants*>(m_bakeConstantsMapped);
-    bake = constants;
-    bake.lightScale = 1.0f;
-    bake.lightStylesView = kInvalidView;
-    bake.lightCount = scene.LightCount();
+    bake = {};
+    FillSceneConstants(bake, scene);
     const bsp::SunLight& sun = scene.Sun();
     bake.sunEnabled = sun.present && sun.style == 0 ? 1.0f : 0.0f;
-    bake.sunColor[0] = sun.color.x;
-    bake.sunColor[1] = sun.color.y;
-    bake.sunColor[2] = sun.color.z;
+    bake.lightScale = 1.0f;
+    bake.indirectScale = 1.0f;
+    bake.lightCount = scene.LightCount();
+    bake.lightStylesView = m_bakeStylesView;
+    bake.emissiveLighting = static_cast<uint32_t>(EmissiveLighting::Full);
+    bake.emitterCount = scene.EmitterCount();
+    bake.instancesView = frame.instancesView;
+    bake.dynamicLightsView = frame.dynamicLightsView;
+    constexpr UINT kStaticMask = kTraceMask & ~(kDynamicMask | kLocalPlayerMask);
+    bake.traceMask = bake.sunShadowMask = bake.indirectMask = bake.bounceMask = bake.lightShadowMask = kStaticMask;
+    for (uint32_t* view : {&bake.skyCubeView, &bake.skyLightView, &bake.projectorsView, &bake.probeRedView, &bake.probeGreenView, &bake.probeBlueView,
+             &bake.aoView, &bake.volumetricView, &bake.dispatchOriginView, &bake.restirDebugView, &bake.selfIllumView, &bake.nrdValidationView,
+             &bake.probeView, &bake.bakedTrianglesView, &bake.bakedFacesView, &bake.bakedLightView, &bake.leafAmbientView, &bake.ambientSamplesView})
+        *view = kInvalidView;
     m_list->SetComputeRootConstantBufferView(0, m_bakeConstants->GetGPUVirtualAddress());
-    const D3D12_RESOURCE_BARRIER countersBarrier = {D3D12_RESOURCE_BARRIER_TYPE_UAV, D3D12_RESOURCE_BARRIER_FLAG_NONE, {.UAV = {scene.BakedCounters()}}};
-    // Until the gather, the filtered buffer holds each sample's direct light and the residual buffer the supersampling
-    // state.
-    const D3D12_RESOURCE_BARRIER bakeBarriers[] = {
-        {D3D12_RESOURCE_BARRIER_TYPE_UAV, D3D12_RESOURCE_BARRIER_FLAG_NONE, {.UAV = {scene.BakedFiltered()}}},
-        {D3D12_RESOURCE_BARRIER_TYPE_UAV, D3D12_RESOURCE_BARRIER_FLAG_NONE, {.UAV = {scene.BakedResidual()}}},
-    };
-    const D3D12_RESOURCE_BARRIER& directBarrier = bakeBarriers[0];
-    if (baked.stage == BakedBuffers::Stage::Direct || baked.stage == BakedBuffers::Stage::Supersample) {
-        const bool direct = baked.stage == BakedBuffers::Stage::Direct;
-        if (baked.bakedLuxels == 0)
-            m_list->ResourceBarrier(2, bakeBarriers);
-        const UINT count = std::min(kBakeLuxelsPerView, baked.luxelCount - baked.bakedLuxels);
-        DispatchGroups(Pass::Baked, {.input0 = baked.luxelsView, .input2 = baked.facesView, .input3 = baked.bakedLuxels, .input4 = count,
-            .output0 = baked.filteredUav, .output1 = baked.residualUav, .output2 = baked.countersUav, .step = direct ? 0u : 5u}, (count + 63) / 64, 1, 1);
-        baked.bakedLuxels += count;
-        if (baked.bakedLuxels == baked.luxelCount) {
-            baked.bakedLuxels = 0;
-            baked.stage = direct || ++baked.supersamplePass < kSupersamplePasses ? BakedBuffers::Stage::Mark : BakedBuffers::Stage::Gather;
-        }
-    } else if (baked.stage == BakedBuffers::Stage::Mark) {
-        m_list->ResourceBarrier(2, bakeBarriers);
-        for (UINT first = 0; first < baked.luxelCount; first += kMaxGroups * 64) {
-            const UINT count = std::min(kMaxGroups * 64, baked.luxelCount - first);
-            DispatchGroups(Pass::Baked, {.input0 = baked.luxelsView, .input2 = baked.facesView, .input3 = first, .input4 = count,
-                .output0 = baked.filteredUav, .output1 = baked.residualUav, .step = 4}, (count + 63) / 64, 1, 1);
-        }
-        baked.stage = BakedBuffers::Stage::Supersample;
+    if (baked.tracedLuxels < baked.luxelCount) {
+        const UINT count = std::min(kBakeLuxelsPerView, baked.luxelCount - baked.tracedLuxels);
+        DispatchGroups(Pass::Baked, {.input0 = baked.luxelsView, .input2 = baked.facesView, .input3 = baked.tracedLuxels, .input4 = count, .output0 = baked.rawUav,
+            .step = 0}, (count + 63) / 64, 1, 1);
+        baked.tracedLuxels += count;
     } else {
-        m_list->ResourceBarrier(2, bakeBarriers);
-        m_list->ResourceBarrier(1, &countersBarrier);
+        const D3D12_RESOURCE_BARRIER traced = Transition(scene.BakedRaw(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        m_list->ResourceBarrier(1, &traced);
         for (UINT first = 0; first < baked.luxelCount; first += kMaxGroups * 64) {
             const UINT count = std::min(kMaxGroups * 64, baked.luxelCount - first);
-            DispatchGroups(Pass::Baked, {.input0 = baked.luxelsView, .input1 = baked.samplesView, .input2 = baked.facesView, .input3 = first, .input4 = count,
-                .output0 = baked.residualUav, .output1 = baked.countersUav, .output2 = baked.filteredUav, .output3 = baked.neighboursView, .step = 3},
-                (count + 63) / 64, 1, 1);
-        }
-        const D3D12_RESOURCE_BARRIER gathered[] = {
-            Transition(scene.BakedResidual(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
-            directBarrier,
-            countersBarrier,
-        };
-        m_list->ResourceBarrier(3, gathered);
-        for (UINT first = 0; first < baked.luxelCount; first += kMaxGroups * 64) {
-            const UINT count = std::min(kMaxGroups * 64, baked.luxelCount - first);
-            DispatchGroups(Pass::Baked, {.input0 = baked.luxelsView, .input1 = baked.residualView, .input2 = baked.facesView, .input3 = first, .input4 = count,
-                .output0 = baked.filteredUav, .output1 = baked.countersUav, .step = 1}, (count + 63) / 64, 1, 1);
+            DispatchGroups(Pass::Baked, {.input0 = baked.luxelsView, .input1 = baked.rawView, .input2 = baked.facesView, .input3 = first, .input4 = count,
+                .output0 = baked.filteredUav, .step = 1}, (count + 63) / 64, 1, 1);
         }
         ID3D12Resource* ambient = scene.BakedAmbient();
         if (ambient != nullptr) {
             for (UINT first = 0; first < baked.ambientSampleCount; first += kMaxGroups * 64) {
                 const UINT count = std::min(kMaxGroups * 64, baked.ambientSampleCount - first);
-                DispatchGroups(Pass::Baked, {.input0 = baked.ambientLightsView, .input1 = baked.ambientLightCount, .input3 = first, .input4 = count,
-                    .output0 = baked.ambientSamplesUav, .output1 = baked.countersUav, .step = 2}, (count + 63) / 64, 1, 1);
+                DispatchGroups(Pass::Baked, {.input3 = first, .input4 = count, .output0 = baked.ambientSamplesUav, .step = 2}, (count + 63) / 64, 1, 1);
             }
         }
         D3D12_RESOURCE_BARRIER barriers[] = {
             Transition(scene.BakedFiltered(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
-            Transition(scene.BakedCounters(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
             Transition(ambient, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
         };
-        m_list->ResourceBarrier(ambient != nullptr ? 3 : 2, barriers);
-        const UINT64 counterBytes = scene.BakedCounters()->GetDesc().Width;
-        if (!m_bakeReadback || m_bakeReadback->GetDesc().Width < counterBytes)
-            m_bakeReadback = CreateBuffer(m_device, D3D12_HEAP_TYPE_READBACK, counterBytes, D3D12_RESOURCE_STATE_COPY_DEST);
-        m_list->CopyBufferRegion(m_bakeReadback.Get(), 0, scene.BakedCounters(), 0, counterBytes);
+        m_list->ResourceBarrier(ambient != nullptr ? 2 : 1, barriers);
         if (!baked.cachePath.empty()) {
-            const UINT64 residualBytes = scene.BakedFiltered()->GetDesc().Width;
+            const UINT64 lightBytes = scene.BakedFiltered()->GetDesc().Width;
             const UINT64 ambientBytes = ambient != nullptr ? ambient->GetDesc().Width : 0;
-            m_bakeCacheReadback = CreateBuffer(m_device, D3D12_HEAP_TYPE_READBACK, residualBytes + ambientBytes, D3D12_RESOURCE_STATE_COPY_DEST);
+            m_bakeCacheReadback = CreateBuffer(m_device, D3D12_HEAP_TYPE_READBACK, lightBytes + ambientBytes, D3D12_RESOURCE_STATE_COPY_DEST);
             if (m_bakeCacheReadback) {
-                m_list->CopyBufferRegion(m_bakeCacheReadback.Get(), 0, scene.BakedFiltered(), 0, residualBytes);
+                m_list->CopyBufferRegion(m_bakeCacheReadback.Get(), 0, scene.BakedFiltered(), 0, lightBytes);
                 if (ambient != nullptr)
-                    m_list->CopyBufferRegion(m_bakeCacheReadback.Get(), residualBytes, ambient, 0, ambientBytes);
+                    m_list->CopyBufferRegion(m_bakeCacheReadback.Get(), lightBytes, ambient, 0, ambientBytes);
             }
         }
         D3D12_RESOURCE_BARRIER readable[] = {
@@ -1466,6 +1446,67 @@ void Lighting::BakeStep(Scene& scene, const FrameConstants& constants, D3D12_GPU
         m_bakeLogPending = true;
     }
     m_list->SetComputeRootConstantBufferView(0, frameConstants);
+}
+
+float Lighting::BakeProgress(Scene& scene) const
+{
+    const BakedBuffers& baked = scene.Baked();
+    if (baked.Ready())
+        return 1.0f;
+    return static_cast<float>(baked.tracedLuxels) / static_cast<float>(std::max(baked.luxelCount, 1u));
+}
+
+void Lighting::Bake(Scene& scene, const std::function<void(float)>& progress)
+{
+    if (m_failed || !scene.Ready() || !scene.HasBaked() || scene.Baked().Ready())
+        return;
+    m_useMicromaps = m_opacityMicromaps && GetSettings().opacityMicromaps && scene.HasMicromaps();
+    WaitForGpu();
+    const UINT slot = static_cast<UINT>(m_run % kSlots);
+    const D3D12_GPU_VIRTUAL_ADDRESS bakeConstants = m_bakeConstants->GetGPUVirtualAddress();
+    while (!scene.Baked().Ready()) {
+        m_allocators[slot]->Reset();
+        m_list->Reset(m_allocators[slot].Get(), nullptr);
+        const SceneFrame frame = scene.RecordFrame(m_list.Get(), slot, {}, m_useMicromaps);
+        BindCompute(bakeConstants, frame.tlas, slot);
+        BakeStep(scene, frame, bakeConstants);
+        const HRESULT hr = m_list->Close();
+        if (FAILED(hr)) {
+            log::Info("Lighting: closing the bake's command list failed ({:#010x})", Hex(hr));
+            m_failed = true;
+            return;
+        }
+        ID3D12CommandList* lists[] = {m_list.Get()};
+        m_queue->ExecuteCommandLists(1, lists);
+        WaitForGpu();
+        if (std::exchange(m_bakeLogPending, false))
+            FinishBake(scene);
+        progress(BakeProgress(scene));
+    }
+}
+
+void Lighting::FinishBake(Scene& scene)
+{
+    log::Info("Baked light: {} luxels and {} leaf ambient samples baked", scene.Baked().luxelCount, scene.Baked().ambientSampleCount);
+    if (!m_bakeCacheReadback)
+        return;
+    WaitForGpu();
+    const std::filesystem::path& path = scene.Baked().cachePath;
+    const UINT64 bytes = m_bakeCacheReadback->GetDesc().Width;
+    const D3D12_RANGE whole = {0, static_cast<SIZE_T>(bytes)};
+    std::error_code error;
+    std::filesystem::create_directories(path.parent_path(), error);
+    std::ofstream file(path, std::ios::binary);
+    void* mapped = nullptr;
+    if (file && SUCCEEDED(m_bakeCacheReadback->Map(0, &whole, &mapped))) {
+        file.write(reinterpret_cast<const char*>(&kBakeVersion), sizeof(kBakeVersion));
+        file.write(static_cast<const char*>(mapped), static_cast<std::streamsize>(bytes));
+        const D3D12_RANGE written = {0, 0};
+        m_bakeCacheReadback->Unmap(0, &written);
+    }
+    if (!file)
+        log::Info("Baked light: writing {} failed", path.string());
+    m_bakeCacheReadback.Reset();
 }
 
 bool Lighting::RayReconstructionSize(UINT outputWidth, UINT outputHeight, UINT& width, UINT& height)
@@ -1604,7 +1645,7 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     const bool volumetrics = (main && volumetricSetting) || (inputs.kind == gbuffer::ViewKind::Skybox && litFog);
     if (main)
         m_litFogScale = 0.0f;
-    // indirect_lighting = 1: VRAD's bounce light replaces traced indirect light once the map's residual is baked.
+    // indirect_lighting = 1: the baked bounce light replaces traced indirect light once the map's is baked.
     const bool bakedIndirect = GetSettings().indirectLighting == IndirectLighting::Baked && scene.HasBaked();
     // The radiance cache serves traced indirect light. The main view decides whether it exists; its eye sizes the
     // voxels for every view. The 3D skybox's scaled-down space stays out of it.
@@ -1632,7 +1673,7 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
         const BakedBuffers& baked = scene.Baked();
         constants.bakedTrianglesView = baked.trianglesView;
         constants.bakedFacesView = baked.facesView;
-        constants.bakedResidualView = baked.filteredView;
+        constants.bakedLightView = baked.filteredView;
         constants.leafAmbientView = baked.leafAmbientView;
         constants.ambientSamplesView = baked.ambientSamplesView;
     }
@@ -1808,7 +1849,7 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
 
     BindCompute(slotConstantsGpu, frame.tlas, slot);
     if (bakedIndirect && main && constants.traceMask != 0 && !scene.Baked().Ready())
-        BakeStep(scene, constants, slotConstantsGpu);
+        BakeStep(scene, frame, slotConstantsGpu);
     if (main && inputs.skyCube != nullptr && m_skyLight.resource) {
         Use(m_skyLight, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         DispatchGroups(Pass::Sky, {.input0 = inputs.skyFacesView, .output0 = m_skyLight.uav, .step = 0}, kSkyLightSize, kSkyLightSize, 6);
@@ -2377,55 +2418,8 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     }
     queue->Signal(m_fence.Get(), ++m_fenceValue);
     m_slotFenceValues[slot] = m_fenceValue;
-    if (m_bakeLogPending) {
-        m_bakeLogPending = false;
-        WaitForGpu();
-        uint32_t counters[8] = {};
-        const std::vector<Scene::BakedFaceInfo>& faces = scene.BakedFaces();
-        std::vector<uint32_t> faceClamps(faces.size());
-        void* mapped = nullptr;
-        const D3D12_RANGE range = {0, static_cast<SIZE_T>(m_bakeReadback->GetDesc().Width)};
-        if (SUCCEEDED(m_bakeReadback->Map(0, &range, &mapped))) {
-            std::memcpy(counters, mapped, sizeof(counters));
-            if (32 + faceClamps.size() * 4 <= range.End)
-                std::memcpy(faceClamps.data(), static_cast<const std::byte*>(mapped) + 32, faceClamps.size() * 4);
-            const D3D12_RANGE written = {0, 0};
-            m_bakeReadback->Unmap(0, &written);
-        }
-        const UINT luxels = std::max(scene.Baked().luxelCount, 1u);
-        const UINT sampled = std::max(scene.Baked().luxelCount - std::min(counters[2], scene.Baked().luxelCount), 1u);
-        log::Info("Baked light: {} of {} sampled luxels clamped where the recomputed direct light exceeded the baked light ({:.1f}%), {} without a VRAD "
-                  "sample, {} samples supersampled; the filter changed {} ({:.1f}%) by more than a tenth; {} of {} leaf ambient samples clamped after "
-                  "taking out {} surface lights",
-            counters[0], sampled, 100.0 * counters[0] / sampled, counters[2], counters[4], counters[1], 100.0 * counters[1] / luxels, counters[3],
-            scene.Baked().ambientSampleCount, scene.Baked().ambientLightCount);
-        std::vector<uint32_t> order(faceClamps.size());
-        std::iota(order.begin(), order.end(), 0u);
-        const size_t shown = std::min<size_t>(order.size(), 8);
-        std::partial_sort(order.begin(), order.begin() + shown, order.end(), [&](uint32_t a, uint32_t b) { return faceClamps[a] > faceClamps[b]; });
-        for (size_t i = 0; i < shown && faceClamps[order[i]] > 0; ++i) {
-            const Scene::BakedFaceInfo& face = faces[order[i]];
-            log::Info("Baked light: lightmap {} has {} clamped luxels, first luxel at ({:.0f} {:.0f} {:.0f}), normal ({:.2f} {:.2f} {:.2f})", order[i],
-                faceClamps[order[i]], face.position.x, face.position.y, face.position.z, face.normal.x, face.normal.y, face.normal.z);
-        }
-        if (m_bakeCacheReadback) {
-            const std::filesystem::path& path = scene.Baked().cachePath;
-            const UINT64 bytes = m_bakeCacheReadback->GetDesc().Width;
-            const D3D12_RANGE whole = {0, static_cast<SIZE_T>(bytes)};
-            std::error_code error;
-            std::filesystem::create_directories(path.parent_path(), error);
-            std::ofstream file(path, std::ios::binary);
-            if (file && SUCCEEDED(m_bakeCacheReadback->Map(0, &whole, &mapped))) {
-                file.write(reinterpret_cast<const char*>(&kBakeVersion), sizeof(kBakeVersion));
-                file.write(static_cast<const char*>(mapped), static_cast<std::streamsize>(bytes));
-                const D3D12_RANGE written = {0, 0};
-                m_bakeCacheReadback->Unmap(0, &written);
-            }
-            if (!file)
-                log::Info("Baked light: writing {} failed", path.string());
-            m_bakeCacheReadback.Reset();
-        }
-    }
+    if (std::exchange(m_bakeLogPending, false))
+        FinishBake(scene);
     if (probe) {
         m_probeRequested = false;
         WaitForGpu();

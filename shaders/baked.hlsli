@@ -3,8 +3,8 @@
 
 #include "scene.hlsli"
 
-// VRAD's baked light for indirect_lighting = 1 (src/bsp.h BakedLighting, src/scene.h BakedBuffers): style-0
-// lightmaps, whose direct light shaders/baked_residual.hlsl takes out, and leaf ambient samples.
+// The baked bounce light of indirect_lighting = 1 (src/bsp.h BakedLighting, src/scene.h BakedBuffers), which
+// shaders/baked_bounce.hlsl traces into the map's style-0 lightmap layout and leaf ambient samples.
 
 // Mirrors bsp::FaceLightmap in src/bsp.h.
 struct FaceLightmap
@@ -32,19 +32,6 @@ struct BakeLuxel
     uint face;
     float3 normal;
     uint luxel;
-    // bsp::BakeLuxel::weights, unorm16.
-    uint2 weights;
-    uint subsamples;
-    uint neighbourEnd;
-};
-
-// Mirrors bsp::BakeNeighbour in src/bsp.h.
-struct BakeNeighbour
-{
-    uint lightmap;
-    uint cell;
-    float weight;
-    uint unused;
 };
 
 // Mirrors gmodpp::BakedTriangle in src/scene.h.
@@ -87,21 +74,21 @@ float3 DecodeSample(uint packed)
     return float3(packed & 0xFF, (packed >> 8) & 0xFF, (packed >> 16) & 0xFF) * (exp2(float(exponent)) / 255.0);
 }
 
-float3 LoadResidual(ByteAddressBuffer residual, uint sample)
+float3 LoadLuxelLight(ByteAddressBuffer light, uint sample)
 {
-    uint2 halves = residual.Load2(sample * 8);
+    uint2 halves = light.Load2(sample * 8);
     return float3(f16tof32(halves.x), f16tof32(halves.x >> 16), f16tof32(halves.y));
 }
 
-float3 LoadResidual(RWByteAddressBuffer residual, uint sample)
+float3 LoadLuxelLight(RWByteAddressBuffer light, uint sample)
 {
-    uint2 halves = residual.Load2(sample * 8);
+    uint2 halves = light.Load2(sample * 8);
     return float3(f16tof32(halves.x), f16tof32(halves.x >> 16), f16tof32(halves.y));
 }
 
-void StoreResidual(RWByteAddressBuffer residual, uint sample, float3 value)
+void StoreLuxelLight(RWByteAddressBuffer light, uint sample, float3 value)
 {
-    residual.Store2(sample * 8, uint2(f32tof16(value.x) | (f32tof16(value.y) << 16), f32tof16(value.z)));
+    light.Store2(sample * 8, uint2(f32tof16(value.x) | (f32tof16(value.y) << 16), f32tof16(value.z)));
 }
 
 // How Source mixes a bumped face's three lightmaps for a normal (lightmappedgeneric_ps2_3_x.h): the squared
@@ -114,17 +101,17 @@ float3 BumpWeights(FaceLightmap face, float3 normal)
     return weights / max(dot(weights, 1.0), 1e-4);
 }
 
-// One luxel's residual for a normal: the flat lightmap's, or the bump lightmaps' mixed by `weights`.
-float3 LuxelResidual(ByteAddressBuffer residual, FaceLightmap face, uint luxel, float3 weights)
+// One luxel's baked light for a normal: the flat lightmap's, or the bump lightmaps' mixed by `weights`.
+float3 LuxelLight(ByteAddressBuffer light, FaceLightmap face, uint luxel, float3 weights)
 {
     if (face.bumped == 0)
-        return LoadResidual(residual, face.sample + luxel);
+        return LoadLuxelLight(light, face.sample + luxel);
     uint luxels = face.width * face.height;
-    return weights.x * LoadResidual(residual, face.sample + luxels + luxel) + weights.y * LoadResidual(residual, face.sample + 2 * luxels + luxel) +
-        weights.z * LoadResidual(residual, face.sample + 3 * luxels + luxel);
+    return weights.x * LoadLuxelLight(light, face.sample + luxels + luxel) + weights.y * LoadLuxelLight(light, face.sample + 2 * luxels + luxel) +
+        weights.z * LoadLuxelLight(light, face.sample + 3 * luxels + luxel);
 }
 
-// The baked indirect light at a G-buffer pixel that shows the world, read bilinearly from its face's residual as
+// The baked indirect light at a G-buffer pixel that shows the world, read bilinearly from its face's luxels as
 // the engine reads lightmaps; -1 for other surfaces.
 float3 BakedIrradiance(int2 pixel, float3 normal)
 {
@@ -142,12 +129,12 @@ float3 BakedIrradiance(int2 pixel, float3 normal)
     uint2 low = uint2(min(floor(coord), max(last - 1.0, 0.0)));
     uint2 high = min(low + 1, uint2(last));
     float2 f = saturate(coord - float2(low));
-    ByteAddressBuffer residual = ResourceDescriptorHeap[g_frame.bakedResidualView];
+    ByteAddressBuffer light = ResourceDescriptorHeap[g_frame.bakedLightView];
     float3 weights = face.bumped != 0 ? BumpWeights(face, normal) : 0.0;
-    float3 a = LuxelResidual(residual, face, low.y * face.width + low.x, weights);
-    float3 b = LuxelResidual(residual, face, low.y * face.width + high.x, weights);
-    float3 c = LuxelResidual(residual, face, high.y * face.width + low.x, weights);
-    float3 d = LuxelResidual(residual, face, high.y * face.width + high.x, weights);
+    float3 a = LuxelLight(light, face, low.y * face.width + low.x, weights);
+    float3 b = LuxelLight(light, face, low.y * face.width + high.x, weights);
+    float3 c = LuxelLight(light, face, high.y * face.width + low.x, weights);
+    float3 d = LuxelLight(light, face, high.y * face.width + high.x, weights);
     return lerp(lerp(a, b, f.x), lerp(c, d, f.x), f.y);
 }
 
@@ -205,7 +192,7 @@ float3 LeafAmbient(float3 position, float3 normal)
     return squared.x * cube[normal.x < 0.0 ? 1 : 0] + squared.y * cube[normal.y < 0.0 ? 3 : 2] + squared.z * cube[normal.z < 0.0 ? 5 : 4];
 }
 
-// A pixel's untraced indirect light with indirect_lighting = 1: VRAD's bounce light on the world, the leaf ambient light
+// A pixel's untraced indirect light with indirect_lighting = 1: the baked bounce light on the world, the leaf ambient light
 // elsewhere, or the sky's light. Leaves (`leaf`, `normal` towards the eye) take kLeafTransmission of it from behind.
 float3 BakedIndirect(int2 pixel, float3 position, float3 normal, bool leaf)
 {

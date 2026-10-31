@@ -15,6 +15,7 @@
 
 #include <array>
 #include <filesystem>
+#include <functional>
 #include <optional>
 #include <span>
 #include <utility>
@@ -109,7 +110,7 @@ struct FrameConstants {
     uint32_t glossyReflections;
     uint32_t bakedTrianglesView;
     uint32_t bakedFacesView;
-    uint32_t bakedResidualView;
+    uint32_t bakedLightView;
     uint32_t leafAmbientView;
     uint32_t ambientSamplesView;
     float skyCameraX;
@@ -118,8 +119,7 @@ struct FrameConstants {
     float worldToSky;
     // Phong highlights (shaders/direct.hlsl), added unlit by shaders/deferred_lighting.hlsl.
     uint32_t specularView;
-    // Scene::LightLists::sunClustersView: where VRAD's sun reached (the bake), or kInvalidView.
-    uint32_t sunClustersView;
+    uint32_t padding2;
     // The light warp textures of the view's G-buffer twins (shaderapi_capture.h, LightWarpSlot).
     uint32_t lightWarpCount;
     // The 2D sky as the game draws it (ViewInputs::skyCube) and its blurred light for indirect rays (shaders/sky.hlsl),
@@ -240,6 +240,9 @@ public:
         const std::filesystem::path& dlssDirectory);
     // Submits the view's commands to the queue. The game's commands that wrote the inputs must be submitted first.
     void Run(const ViewInputs& inputs, Scene& scene, std::span<const SceneInstance> dynamic, const std::vector<SkinnedEntity>& skinned);
+    // Runs the rest of the map's bounce light bake without a view, waiting for each part, and reports the share done after
+    // each one. Does nothing once it is baked.
+    void Bake(Scene& scene, const std::function<void(float)>& progress);
     // The fence and value the commands submitted so far signal.
     ID3D12Fence* Fence() const { return m_fence.Get(); }
     uint64_t FenceValue() const { return m_fenceValue; }
@@ -381,9 +384,16 @@ private:
     void Use(Texture& texture, D3D12_RESOURCE_STATES state);
     void Dispatch(Pass pass, const PassArgs& args);
     bool FillConstants(FrameConstants& constants, const Scene& scene, const ViewInputs& inputs);
-    // Records the next part of the map's residual bake (shaders/baked_residual.hlsl) with the view's constants changed
-    // to the lights' baked strength, then puts `frameConstants` back.
-    void BakeStep(Scene& scene, const FrameConstants& constants, D3D12_GPU_VIRTUAL_ADDRESS frameConstants);
+    // The constants that depend on the map alone: the sun and sky as the map sets them, the 3D skybox's camera, the
+    // lights, their lists and grid, the emitters and the materials.
+    void FillSceneConstants(FrameConstants& constants, const Scene& scene);
+    // The share of the bounce light bake done.
+    float BakeProgress(Scene& scene) const;
+    // After the bake's last part has run: saves the baked light to the map's cache.
+    void FinishBake(Scene& scene);
+    // Records the next part of the map's bounce light bake (shaders/baked_bounce.hlsl) in `frame`'s scene, with the map's
+    // lights at their baked strength, then puts `frameConstants` back.
+    void BakeStep(Scene& scene, const SceneFrame& frame, D3D12_GPU_VIRTUAL_ADDRESS frameConstants);
     bool EnsureDepthPipeline(DXGI_FORMAT format);
     UINT WriteProjectors(UINT slot, std::span<const gbuffer::ProjectedLight> projected, std::span<ID3D12Resource* const> cookies, UINT cookieViews,
         const FrameConstants& constants, const std::optional<std::array<float, 3>>& localPlayer);
@@ -463,10 +473,11 @@ private:
     D3D12_GPU_VIRTUAL_ADDRESS m_forwardScene = 0;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_bakeConstants;
     std::byte* m_bakeConstantsMapped = nullptr;
-    // The bake's counters, read once it is done to log how much the direct light exceeded the baked light.
-    Microsoft::WRL::ComPtr<ID3D12Resource> m_bakeReadback;
+    // The light style values the bake lights with: style 0 on, the others off, as VRAD baked bounce light.
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_bakeStyles;
+    UINT m_bakeStylesView = DescriptorHeap::kInvalid;
     bool m_bakeLogPending = false;
-    // The filtered residual on its way to the cache (BakedBuffers::cachePath).
+    // The baked light on its way to the cache (BakedBuffers::cachePath).
     Microsoft::WRL::ComPtr<ID3D12Resource> m_bakeCacheReadback;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_projectors;
     std::byte* m_projectorsMapped = nullptr;

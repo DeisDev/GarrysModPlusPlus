@@ -42,8 +42,8 @@ enum class QualityPreset : uint32_t { Low = 0, Medium, High, Ultra, Custom, Coun
 // lighting; the sun; the sun and the first bounce of indirect light; or all light. The lower levels are faster in grass.
 enum class FoliageShadows : uint32_t { Off = 0, Sun, SunAndIndirect, All, Count };
 
-// Where indirect light comes from: traced bounces, or VRAD's baked bounce light with the direct light it held taken
-// out (cheaper; the sun and local lights are still traced).
+// Where indirect light comes from: traced bounces, or bounce light baked into the map's lightmaps with the same light
+// model while the map loads (cheaper; the sun and local lights are still traced).
 enum class IndirectLighting : uint32_t { RayTraced = 0, Baked, Count };
 
 // What self-illuminated surfaces light: nothing; what indirect rays meet (bounce light); or also the surfaces around

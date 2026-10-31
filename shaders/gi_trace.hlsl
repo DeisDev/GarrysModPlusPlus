@@ -12,8 +12,8 @@
 // input0: last frame's denoised light, or none; input1: sampled direct remainder; input2: last frame's exact direct
 // light; output0: raw estimate (rgb) and the rays' mean hit distance (a; NRD's, shaders/nrd.hlsl); step: samples per
 // pixel.
-// With indirect_lighting = 1 (g_frame.bakedTrianglesView) nothing is traced: the world takes VRAD's baked bounce
-// light (shaders/baked.hlsli), other surfaces the leaf ambient light, and the denoiser still gets the remainder.
+// With indirect_lighting = 1 (g_frame.bakedTrianglesView) nothing is traced: the world takes the baked bounce light
+// (shaders/baked.hlsli, shaders/baked_bounce.hlsl), other surfaces the leaf ambient light, and the denoiser still gets the remainder.
 
 static const float kMaxDistance = 16384.0;
 

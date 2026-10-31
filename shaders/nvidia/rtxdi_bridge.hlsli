@@ -444,7 +444,7 @@ float LightPower(uint index)
 static uint g_volumeCluster = 0;
 
 // Whether the map's visibility data lets a map light reach a cluster: whether the light is in the cluster's list (sorted
-// by index; ClusterLights).
+// by index; Scene::BuildLightLists).
 bool PvsReaches(uint light, uint cluster)
 {
     if (g_frame.clusterCount == 0)

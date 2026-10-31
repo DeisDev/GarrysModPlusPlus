@@ -239,7 +239,7 @@ add_shader(shaders/sun_shadow.hlsl main cs_6_9 g_sunShadowOmmCS -D OPACITY_MICRO
 add_shader(shaders/direct.hlsl main cs_6_6 g_directWideCS -D WIDE_LIGHT_SETS=1)
 add_shader(shaders/direct.hlsl main cs_6_9 g_directWideOmmCS -D WIDE_LIGHT_SETS=1 -D OPACITY_MICROMAPS=1)
 add_shader(shaders/reflection_temporal.hlsl main cs_6_6 g_reflectionTemporalCS)
-add_shader(shaders/baked_residual.hlsl main cs_6_6 g_bakedResidualCS)
+add_shader(shaders/baked_bounce.hlsl main cs_6_6 g_bakedBounceCS)
 add_shader(shaders/sway.hlsl main cs_6_6 g_swayCS)
 add_shader(shaders/dlss_inputs.hlsl main cs_6_6 g_dlssInputsCS)
 add_shader(shaders/dlss_resolve.hlsl main cs_6_6 g_dlssResolveCS)
@@ -424,7 +424,6 @@ add_library(gmodpp SHARED
     src/scene.cpp
     src/bsp.cpp
     src/studio_model.cpp
-    src/convex_hull.cpp
     src/opacity_micromaps.cpp
     src/skinned_casters.cpp
     src/swaying_props.cpp
@@ -435,6 +434,7 @@ add_library(gmodpp SHARED
     src/engine_interfaces.cpp
     src/client_hooks.cpp
     src/light_queries.cpp
+    src/loading_screen.cpp
     src/overlay.cpp
     src/overlay_widgets.cpp
     src/restir.cpp

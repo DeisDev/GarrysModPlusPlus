@@ -165,6 +165,9 @@ constexpr std::array<const char*, static_cast<size_t>(TextId::Count)> kEnglish =
     // Frames per second.
     "{:.0f}",
     "{:.2f} ms",
+    // Status lines of the game's loading screen.
+    "Preparing ray-traced lighting...",
+    "Baking indirect light...",
 };
 
 }

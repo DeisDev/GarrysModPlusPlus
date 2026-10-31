@@ -117,10 +117,10 @@ struct FrameConstants
     // 1 when reflections follow the GGX lobe of their roughness (shaders/reflection.hlsli), 0 for mirrors everywhere.
     uint glossyReflections;
     // indirect_lighting = 1 once the map's baked light is ready (shaders/baked.hlsli): the world's BakedTriangles, the
-    // faces' lightmaps, the filtered residual, and the leaf ambient ranges and samples; kNoView otherwise.
+    // faces' lightmaps, the baked bounce light, and the leaf ambient ranges and samples; kNoView otherwise.
     uint bakedTrianglesView;
     uint bakedFacesView;
-    uint bakedResidualView;
+    uint bakedLightView;
     uint leafAmbientView;
     uint ambientSamplesView;
     // The 3D skybox's camera and 1 / its scale, through which sun rays that reach the sky continue (SunVisibility);
@@ -131,8 +131,7 @@ struct FrameConstants
     float worldToSky;
     // Phong highlights (shaders/direct.hlsl), added unlit by shaders/deferred_lighting.hlsl.
     uint specularView;
-    // Where VRAD's sun reached (shaders/baked_residual.hlsl), or kNoView.
-    uint sunClustersView;
+    uint padding2;
     // The light warp textures the G-buffer's flags refer to (LightWarpView).
     uint lightWarpCount;
     // The 2D sky as the game draws it and its blurred light for indirect rays (SkyRadiance, SkyLight), or kNoView.

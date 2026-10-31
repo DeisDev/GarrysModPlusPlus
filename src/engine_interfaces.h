@@ -15,6 +15,8 @@ bool Ready();
 
 // Current map path as reported by the engine, e.g. "maps/gm_construct.bsp"; empty when no map is loaded.
 std::string LevelName();
+// Whether the client has fully joined the map (signon state FULL).
+bool IsInGame();
 
 // Entity index of the local player, or 0 when the engine is unavailable.
 int LocalPlayerIndex();

@@ -15,6 +15,9 @@ float3 ForwardSunLight(float3 position, float3 normal)
     return g_frame.sunColor * lambert * SunVisibility(position + g_frame.sunDirection * 0.5, g_frame.sunShadowMask);
 }
 
+// Points of the cell's tail distribution its lights are taken at.
+static const uint kForwardTailSamples = 4;
+
 float3 ForwardLocalLight(float3 position, float3 normal)
 {
     LightSet set = LightSetAt(position);
@@ -27,13 +30,13 @@ float3 ForwardLocalLight(float3 position, float3 normal)
     }
     float3 toLight;
     float distance;
-    // The lights left out of the strongest, and the cell's tail, share one shadow ray picked in proportion to their light
-    // (weighted reservoir sampling, as shaders/direct.hlsl's remainder): with only the strongest, surfaces lit by many
-    // lamps, such as a room's far end in a mirror, came out darker than the room.
-    uint seed = Hash(asuint(position.x) * 73856093u ^ asuint(position.y) * 19349663u ^ asuint(position.z) * 83492791u ^ g_frame.frameIndex * 0x9E3779B9u);
-    float remainder = 0.0;
-    uint picked = 0;
-    float pickedLuminance = 0.0;
+    // The lights left out of the strongest, and the cell's tail at fixed points of its distribution, share the shadow
+    // ray of the strongest of them: with only the strongest, surfaces lit by many lamps, such as a room's far end in a
+    // mirror, came out darker than the room, and a light picked at random per pixel sparkled on glass, which is drawn
+    // after anti-aliasing and never denoised.
+    float3 remainder = 0.0;
+    uint strongest = 0;
+    float strongestWeight = 0.0;
     for (uint i = 0; i < set.pointLights; ++i) {
         uint candidate = i;
         float candidateWeight = Luminance(SetLightIrradiance(set, i, position, normal, toLight, distance));
@@ -49,23 +52,23 @@ float3 ForwardLocalLight(float3 position, float3 normal)
             }
         }
         if (candidateWeight > 0.0) {
-            remainder += candidateWeight;
-            if (Random(seed) * remainder < candidateWeight) {
-                picked = candidate;
-                pickedLuminance = candidateWeight;
+            remainder += SetLightIrradiance(set, candidate, position, normal, toLight, distance);
+            if (candidateWeight > strongestWeight) {
+                strongest = candidate;
+                strongestWeight = candidateWeight;
             }
         }
     }
-    uint tailLight;
-    float probability;
-    if (SampleTailLight(set.ranges, Random(seed), tailLight, probability)) {
-        float luminance = Luminance(SetLightIrradiance(set, set.count + tailLight, position, normal, toLight, distance));
-        if (luminance > 0.0) {
-            remainder += luminance / probability;
-            if (Random(seed) * remainder < luminance / probability) {
-                picked = set.count + tailLight;
-                pickedLuminance = luminance;
-            }
+    for (uint t = 0; t < kForwardTailSamples; ++t) {
+        uint tailLight;
+        float probability;
+        if (!SampleTailLight(set.ranges, (t + 0.5) / kForwardTailSamples, tailLight, probability))
+            break;
+        float3 irradiance = SetLightIrradiance(set, set.count + tailLight, position, normal, toLight, distance);
+        remainder += irradiance / (probability * kForwardTailSamples);
+        if (Luminance(irradiance) > strongestWeight) {
+            strongest = set.count + tailLight;
+            strongestWeight = Luminance(irradiance);
         }
     }
     float3 light = 0.0;
@@ -76,10 +79,9 @@ float3 ForwardLocalLight(float3 position, float3 normal)
         float3 irradiance = SetLightIrradiance(set, top[k], position, normal, toLight, distance);
         light += irradiance * LightTransmittance(set, top[k], position + toLight * 0.5, position + toLight * distance, kLightCentre);
     }
-    if (remainder > 0.0) {
-        float3 irradiance = SetLightIrradiance(set, picked, position, normal, toLight, distance);
-        light += irradiance * LightTransmittance(set, picked, position + toLight * 0.5, position + toLight * distance, kLightCentre) *
-            (remainder / pickedLuminance);
+    if (strongestWeight > 0.0) {
+        SetLightIrradiance(set, strongest, position, normal, toLight, distance);
+        light += remainder * LightTransmittance(set, strongest, position + toLight * 0.5, position + toLight * distance, kLightCentre);
     }
     for (uint p = set.pointLights; p < set.count; ++p) {
         float3 irradiance = SetLightIrradiance(set, p, position, normal, toLight, distance);

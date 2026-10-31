@@ -3,10 +3,10 @@
 #include "bsp.h"
 #include "client_hooks.h"
 #include "command_line.h"
-#include "convex_hull.h"
 #include "engine_interfaces.h"
 #include "entities.h"
 #include "light_queries.h"
+#include "loading_screen.h"
 #include "log.h"
 #include "options.h"
 #include "ropes.h"
@@ -17,14 +17,18 @@
 #include "swaying_props.h"
 
 #include <algorithm>
+#include <atomic>
 #include <charconv>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <execution>
 #include <format>
 #include <fstream>
+#include <functional>
 #include <memory>
+#include <thread>
 #include <numeric>
 #include <optional>
 #include <span>
@@ -140,6 +144,15 @@ struct State {
     std::unique_ptr<Lighting> lighting;
     Scene scene;
     bool sceneInitialized = false;
+    // PrepareLevel is running; the frames it presents must not load the scene again.
+    bool preparing = false;
+    // Loads the scene of the map being joined while the game loads it (BeginLevelLoad); only it touches the scene
+    // until it is joined.
+    std::jthread loader;
+    std::atomic<float> loaderDone = 0.0f;
+    std::atomic<bool> loaderFinished = false;
+    std::chrono::steady_clock::time_point loaderStart;
+    std::chrono::steady_clock::time_point loaderEnd;
     std::string failedMap;
     std::unordered_map<std::string, ModelEntry> models;
     std::unordered_map<std::string, std::optional<MaterialInfo>> materials;
@@ -744,39 +757,6 @@ const ModelEntry& ModelFor(const std::string& mdlPath, int skin = 0)
     return entry;
 }
 
-// The convex hulls VRAD shadowed a static prop's model with, as model-space points (CreateCollisionModel in
-// src/utils/vrad/vradstaticprops.cpp): the pieces of its collision model's first solid, or for a model without one a
-// hull around each of its meshes (ComputeConvexHull).
-std::vector<std::vector<bsp::Float3>> VradPropHulls(const std::string& path, bool& fromCollision)
-{
-    std::vector<std::vector<bsp::Float3>> hulls;
-    const std::string base = path.size() > 4 ? path.substr(0, path.size() - 4) : path;
-    const std::vector<std::byte> phy = ReadOptional(base + ".phy");
-    studio::Geometry geometry;
-    std::string error;
-    fromCollision = !phy.empty();
-    if (!phy.empty()) {
-        if (!studio::ReadCollisionPieces(phy, hulls, error) && ++g_state.modelErrors <= 10)
-            log::Info("Scene: collision model of '{}' skipped: {}", path, error);
-    } else if (studio::BuildGeometry(ReadOptional(path), ReadOptional(base + ".vvd"), ReadOptional(base + ".dx90.vtx"), {}, geometry, error)) {
-        std::vector<std::vector<uint32_t>> vertices;
-        for (size_t t = 0; t < geometry.triangleTextures.size(); ++t) {
-            const size_t mesh = geometry.triangleTextures[t];
-            if (vertices.size() <= mesh)
-                vertices.resize(mesh + 1);
-            vertices[mesh].insert(vertices[mesh].end(), geometry.indices.begin() + t * 3, geometry.indices.begin() + t * 3 + 3);
-        }
-        for (std::vector<uint32_t>& mesh : vertices) {
-            std::sort(mesh.begin(), mesh.end());
-            mesh.erase(std::unique(mesh.begin(), mesh.end()), mesh.end());
-            std::vector<bsp::Float3>& points = hulls.emplace_back();
-            for (uint32_t v : mesh)
-                points.push_back(geometry.positions[v]);
-        }
-    }
-    return hulls;
-}
-
 // Ray tests of SealedLights: rays from a light stop at triangles within kShellReach, and when all but kSealedEscape of
 // kSealRays directions stop, the light is sealed. A light inside a hollow building prop reaches walls further away.
 constexpr int kSealRays = 128;
@@ -987,63 +967,6 @@ std::vector<MapLightShape> SealedLights(const bsp::WorldGeometry& world, const M
     return shapes;
 }
 
-// Static props as VRAD shadowed them when the map was compiled without -StaticPropPolys (AddPolysForRayTrace in
-// src/utils/vrad/vradstaticprops.cpp): the convex hulls of VradPropHulls. Props marked "disable shadows" are left out.
-void AddVradOccluders(const bsp::WorldGeometry& world, std::vector<SceneInstance>& instances)
-{
-    constexpr int kUnread = -2;
-    std::vector<int> collisionModels(world.propModels.size(), kUnread);
-    std::vector<bool> fromCollision(world.propModels.size(), false);
-    const auto addModel = [](const std::vector<bsp::Float3>& triangles) {
-        std::vector<uint32_t> indices(triangles.size());
-        std::iota(indices.begin(), indices.end(), 0u);
-        const std::vector<uint32_t> albedo(triangles.size() / 3, PackAlbedo({0.5f, 0.5f, 0.5f}));
-        return g_state.scene.AddModel({triangles, indices, albedo, static_cast<UINT>(albedo.size()), {}, {}, {}, {}});
-    };
-    size_t collisionProps = 0;
-    size_t meshProps = 0;
-    for (const bsp::StaticProp& prop : world.props) {
-        if (prop.noShadow)
-            continue;
-        const std::string& path = world.propModels[prop.model];
-        int& collision = collisionModels[prop.model];
-        if (collision == kUnread) {
-            collision = -1;
-            bool collides = false;
-            std::vector<bsp::Float3> triangles;
-            for (const std::vector<bsp::Float3>& piece : VradPropHulls(path, collides)) {
-                const std::vector<bsp::Float3> hull = hull::Triangles(piece);
-                triangles.insert(triangles.end(), hull.begin(), hull.end());
-            }
-            fromCollision[prop.model] = collides;
-            if (!triangles.empty())
-                collision = addModel(triangles);
-        }
-        if (collision < 0)
-            continue;
-        SceneInstance instance;
-        instance.mask = kVradOccluderMask;
-        instance.model = collision;
-        std::memcpy(instance.transform, prop.transform, sizeof(instance.transform));
-        instances.push_back(instance);
-        ++(fromCollision[prop.model] ? collisionProps : meshProps);
-    }
-    const float identity[3][4] = {{1.0f, 0.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 1.0f, 0.0f}};
-    for (const auto& [triangles, flags] : {std::pair(&world.brushOccluders, 0u), std::pair(&world.skyOccluders, kInstanceVradSky)}) {
-        if (triangles->empty())
-            continue;
-        SceneInstance instance;
-        instance.model = addModel(*triangles);
-        instance.mask = kVradOccluderMask;
-        instance.flags = flags;
-        std::memcpy(instance.transform, identity, sizeof(instance.transform));
-        if (instance.model >= 0)
-            instances.push_back(instance);
-    }
-    log::Info("Scene: VRAD's shadows for the bake: {} props by collision model, {} by mesh hulls; {} brush triangles, {} sky triangles", collisionProps,
-        meshProps, world.brushOccluders.size() / 3, world.skyOccluders.size() / 3);
-}
-
 // The scene's emitters (Scene::LoadMap): the self-illuminated triangles of the world and of static props outside the
 // 3D skybox, in world space, with the cumulative share of their emission times their area. Instances with some get
 // kInstanceEmitter, and `worldEmits` says whether the world has some; the world is instance 0 and static instance i is
@@ -1111,7 +1034,7 @@ bool InSkybox(const entities::ModelEntity& entity, const bsp::Float3& center)
         m[1][0] * center.x + m[1][1] * center.y + m[1][2] * center.z + m[1][3], m[2][0] * center.x + m[2][1] * center.y + m[2][2] * center.z + m[2][3]});
 }
 
-// Identifies a map by its contents, for the baked residual cache.
+// Identifies a map by its contents, for the baked light cache.
 uint64_t FileHash(std::span<const std::byte> data)
 {
     uint64_t hash = 14695981039346656037ull ^ data.size();
@@ -1150,14 +1073,16 @@ void ClearScene()
     g_state.loggedRopes = false;
 }
 
-void UpdateScene()
+// The map whose scene must be loaded, or nothing when the scene is up to date. Clears the scene when no map is loaded
+// or real-time lighting is off.
+std::optional<std::string> PendingLevel()
 {
     if (!engine::Ready())
-        return;
+        return std::nullopt;
     if (!g_state.sceneInitialized) {
         g_state.sceneInitialized = g_state.scene.Initialize(g_state.device, g_state.queue, *g_state.descriptors, g_state.opacityMicromaps);
         if (!g_state.sceneInitialized)
-            return;
+            return std::nullopt;
     }
     std::string level = engine::LevelName();
     if (level.empty()) {
@@ -1165,25 +1090,32 @@ void UpdateScene()
             ClearScene();
             log::Info("Scene cleared");
         }
-        return;
+        return std::nullopt;
     }
     if (level == g_state.scene.Name() || level == g_state.failedMap)
-        return;
+        return std::nullopt;
     // With real-time lighting off the game lights itself; the map's scene loads once it is turned on.
     if (!GetSettings().realtimeLighting) {
         if (g_state.scene.Ready()) {
             ClearScene();
             log::Info("Scene cleared");
         }
-        return;
+        return std::nullopt;
     }
+    return level;
+}
 
+// Replaces the scene with `level`'s, reporting the share done to `report`. Runs on the main thread, or on the loader
+// thread while the game loads the map and draws nothing else.
+void LoadScene(const std::string& level, const std::function<void(float)>& report)
+{
     std::vector<std::byte> file;
     bsp::WorldGeometry world;
     std::string error;
     if (!engine::ReadGameFile(level, file)) {
         error = "the game filesystem could not read it";
     } else if (bsp::LoadWorld(file, world, error)) {
+        report(0.05f);
         ClearScene();
         g_state.mapMaterials = std::move(world.materials);
         g_state.lightMaterials = world.lightMaterials;
@@ -1191,6 +1123,7 @@ void UpdateScene()
         const ModelGeometry worldGeometry = PrepareMesh(world.mesh, worldTriangles);
         std::vector<bool> shells;
         const std::vector<MapLightShape> lightShapes = SealedLights(world, worldGeometry, shells);
+        report(0.2f);
         std::vector<SceneInstance> instances;
         std::vector<SwayingProp> swayingProps;
         // `propShells` marks the props that are lamp shells.
@@ -1225,12 +1158,14 @@ void UpdateScene()
             std::memcpy(skybox.transform, identity, sizeof(skybox.transform));
         }
         addProps(world.skyboxProps, kSkyboxMask, {});
+        report(0.4f);
         std::erase_if(instances, [](const SceneInstance& instance) { return instance.model < 0; });
         bool worldEmits = false;
         float emitterPower = 0.0f;
         const std::vector<GpuEmitter> emitters = CollectEmitters(
             ModelEmitters(world.mesh.positions, world.mesh.indices, world.mesh.triangleAlbedo, worldTriangles.materials), instances, worldEmits, emitterPower);
         if (g_state.scene.LoadMap(level, world, lightShapes, worldGeometry, emitters, worldEmits, emitterPower)) {
+            report(0.75f);
             g_state.brushModels = std::move(world.brushModels);
             g_state.skyboxTest.visibility.nodes = std::move(world.visibility.nodes);
             g_state.skyboxTest.visibility.leaves = std::move(world.visibility.leaves);
@@ -1240,7 +1175,7 @@ void UpdateScene()
             log::Info("Scene: {} of {} textures are VRAD light textures; {} of those glow ($selfillum) and light nothing again",
                 std::count(g_state.lightMaterials.begin(), g_state.lightMaterials.end(), true), g_state.lightMaterials.size(),
                 g_state.lightTextureMaterials.size());
-            // A residual baked before for this map, by the map's contents (gmodplusplus\cache\baked).
+            // Light baked before for this map, by the map's contents (gmodplusplus\cache\baked).
             const std::filesystem::path cachePath = ModDirectory() / L"cache" / L"baked" / std::format(L"{:016x}.bin", FileHash(file));
             std::vector<std::byte> cached;
             std::error_code sizeError;
@@ -1253,8 +1188,7 @@ void UpdateScene()
                 if (!cache || version != kBakeVersion)
                     cached.clear();
             }
-            if (cached.empty() && !world.baked.samples.empty())
-                AddVradOccluders(world, instances);
+            report(0.9f);
             log::Info("Scene '{}': {} faces, {} displacements, {} skybox faces and {} skybox props, {} world triangles ({} alpha-tested), {} of {} static props, {} lights; "
                       "sun {} dir ({:.2f} {:.2f} {:.2f}) color ({:.2f} {:.2f} {:.2f}), sky ({:.2f} {:.2f} {:.2f})",
                 level, world.faceCount, world.displacementCount, world.skyboxFaceCount, world.skyboxProps.size(), world.mesh.indices.size() / 3, worldTriangles.alphaTriangles.size(),
@@ -1289,6 +1223,25 @@ void UpdateScene()
     }
     log::Info("Scene: cannot load '{}': {}", level, error);
     g_state.failedMap = level;
+}
+
+bool LoaderBusy() { return g_state.loader.joinable() && !g_state.loaderFinished; }
+
+void JoinLoader()
+{
+    if (g_state.loader.joinable())
+        g_state.loader.join();
+}
+
+// Loads the scene of a map the client is in; maps being joined are loaded during their loading screen
+// (BeginLevelLoad, PrepareLevel).
+void UpdateScene()
+{
+    if (LoaderBusy())
+        return;
+    JoinLoader();
+    if (const std::optional<std::string> level = PendingLevel(); level && engine::IsInGame())
+        LoadScene(*level, [](float) {});
 }
 
 // The rope prism with a rope material's albedo, or -1 for clear materials (additive beams and lasers), which cast no
@@ -1470,6 +1423,7 @@ void Shutdown()
 {
     if (!g_state.lighting)
         return;
+    JoinLoader();
     ClearScene();
     g_state.lighting.reset();
 }
@@ -1488,15 +1442,63 @@ void OnPresent(UINT width, UINT height, bool consoleRequests)
     g_state.width = width;
     g_state.height = height;
     client::TryInstall();
+    loading::TryInstall();
     engine::TryInitialize();
     light_queries::TryInstall();
     entities::TryInitialize();
     if (g_state.frame % kMapPollInterval == 0)
         SyncSettingsFile(ModDirectory() / L"settings.ini");
-    if (g_state.lighting && g_state.frame % kMapPollInterval == 0) {
+    if (g_state.lighting && g_state.frame % kMapPollInterval == 0 && !g_state.preparing && !loading::Active()) {
         UpdateScene();
         RunConsoleRequests(consoleRequests);
     }
+}
+
+void BeginLevelLoad()
+{
+    if (!g_state.lighting || g_state.preparing || g_state.loader.joinable())
+        return;
+    engine::TryInitialize();
+    const std::optional<std::string> level = PendingLevel();
+    if (!level)
+        return;
+    g_state.loaderDone = 0.0f;
+    g_state.loaderFinished = false;
+    g_state.loaderStart = std::chrono::steady_clock::now();
+    g_state.loader = std::jthread([level = *level] {
+        LoadScene(level, [](float done) { g_state.loaderDone = done; });
+        g_state.loaderEnd = std::chrono::steady_clock::now();
+        g_state.loaderFinished = true;
+    });
+}
+
+void PrepareLevel(const LoadProgress& progress)
+{
+    if (!g_state.lighting || g_state.preparing)
+        return;
+    engine::TryInitialize();
+    g_state.preparing = true;
+    SyncSettingsFile(ModDirectory() / L"settings.ini");
+    // The scene's share of the bar; with baked indirect light, the bake of a map not cached yet fills the rest.
+    const bool bake = GetSettings().indirectLighting == IndirectLighting::Baked;
+    const float sceneShare = bake ? 0.7f : 1.0f;
+    const auto start = std::chrono::steady_clock::now();
+    const bool background = g_state.loader.joinable();
+    while (LoaderBusy()) {
+        progress(g_state.loaderDone * sceneShare, LoadStage::Scene);
+        std::this_thread::sleep_for(std::chrono::milliseconds(15));
+    }
+    JoinLoader();
+    if (const std::optional<std::string> level = PendingLevel())
+        LoadScene(*level, [&](float done) { progress(done * sceneShare, LoadStage::Scene); });
+    const auto loaded = std::chrono::steady_clock::now();
+    if (bake && g_state.scene.Ready())
+        g_state.lighting->Bake(g_state.scene, [&](float done) { progress(sceneShare + done * (1.0f - sceneShare), LoadStage::Bake); });
+    const auto ms = [](auto from, auto to) { return std::chrono::duration<double, std::milli>(to - from).count(); };
+    log::Info("Loading screen: '{}' ready when the loading screen closes (scene loaded {}, {:.0f} ms waited for it; bake {:.0f} ms)", g_state.scene.Name(),
+        background ? std::format("in the background in {:.0f} ms", ms(g_state.loaderStart, g_state.loaderEnd)) : std::string("then"), ms(start, loaded),
+        ms(loaded, std::chrono::steady_clock::now()));
+    g_state.preparing = false;
 }
 
 std::array<float, 2> ViewJitter(UINT width, UINT height)

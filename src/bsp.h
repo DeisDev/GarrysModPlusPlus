@@ -49,8 +49,6 @@ struct Light {
     int32_t cluster;
     // Light style: 0 for plain lights, 1-31 for animated patterns, 32 and up for switchable (named) lights.
     int32_t style;
-    // VRAD added the light's direct light to the leaf ambient samples (DWL_FLAGS_INAMBIENTCUBE: dim surface lights).
-    bool inAmbientCube;
     // Where the mapper's brightness holds: 100 units, where VRAD scales point and spot lights' intensity to it, or a
     // light entity's _fifty_percent_distance, whose falloff VRAD solves for instead (SetLightFalloffParams in
     // src/utils/vrad/lightmap.cpp).
@@ -79,10 +77,6 @@ struct Visibility {
     std::vector<uint8_t> pvs;
     std::vector<BspNode> nodes;
     std::vector<BspLeaf> leaves;
-    // The clusters VRAD let the sun and sky light reach (one PVS row): those the light_environment's cluster or a
-    // cluster holding a sky face sees (BuildVisForLightEnvironment and PVSCheck in src/utils/vrad/lightmap.cpp).
-    // Empty for every cluster.
-    std::vector<uint8_t> sunClusters;
 
     bool Sees(int32_t from, int32_t to) const
     {
@@ -144,33 +138,15 @@ struct FaceLightmap {
 };
 static_assert(sizeof(FaceLightmap) == 96);
 
-// A style-0 luxel of a world face, `luxel` = s + t * width in the face's lightmap, with the point and normal where
-// VRAD sampled the cell from it to the next luxel (its luxel point when VRAD had none there). `weights` (unorm16) mix
-// the samples of the cells at (s - 1, t - 1), (s, t - 1), (s - 1, t) and (s, t) into the luxel, and
-// BakedLighting::neighbours up to `neighbourEnd` (from the previous luxel's) add those of neighbouring faces; all
-// zero when no sample reaches the luxel. `subsamples`: bit 31 when the cell has a sample, bits 0-15 the points VRAD
-// would supersample it at (see LuxelCell in src/bsp.cpp). Mirrors BakeLuxel in shaders/baked.hlsli.
+// A style-0 luxel of a world face, `luxel` = s + t * width in the face's lightmap, with the point on the face and the
+// normal its bounce light is baked for. Mirrors BakeLuxel in shaders/baked.hlsli.
 struct BakeLuxel {
     Float3 position;
     uint32_t face;
     Float3 normal;
     uint32_t luxel;
-    std::array<uint16_t, 4> weights = {0, 0, 0, 0xFFFF};
-    uint32_t subsamples = 0;
-    uint32_t neighbourEnd = 0;
 };
-static_assert(sizeof(BakeLuxel) == 48);
-
-// A sample of a neighbouring face that VRAD's radial filter added to a luxel (BuildLuxelRadial in
-// src/utils/vrad/radial.cpp): cell `cell` of the FaceLightmap `lightmap`, with its share of the luxel. Mirrors
-// BakeNeighbour in shaders/baked.hlsli.
-struct BakeNeighbour {
-    uint32_t lightmap;
-    uint32_t cell;
-    float weight;
-    uint32_t unused;
-};
-static_assert(sizeof(BakeNeighbour) == 16);
+static_assert(sizeof(BakeLuxel) == 32);
 
 // A leaf ambient sample (dleafambientlighting_t): the light arriving from each axis direction (+x, -x, +y, -y,
 // +z, -z) at a point of a leaf. Mirrors AmbientSample in shaders/baked.hlsli.
@@ -180,28 +156,17 @@ struct AmbientSample {
 };
 static_assert(sizeof(AmbientSample) == 112);
 
-// VRAD's baked light: the lightmaps of style 0 (direct light from style-0 lights, sky ambient and bounced light,
-// summed) and the leaf ambient samples, HDR when the map has them.
-// A light whose direct light VRAD added to the leaf ambient samples (Light::inAmbientCube), as
-// shaders/baked_residual.hlsl reads it: origin and radius, intensity, the surface's normal.
-struct AmbientLight {
-    float origin[4];
-    float intensity[4];
-    float normal[4];
-};
-static_assert(sizeof(AmbientLight) == 48);
-
+// The map's style-0 lightmaps and leaf ambient samples, HDR when the map has them: their layout and sample points are
+// where shaders/baked_bounce.hlsl bakes bounce light.
 struct BakedLighting {
     // ColorRGBExp32 samples (r, g, b, exponent): c * 2^exponent / 255.
     std::vector<uint32_t> samples;
     bool hdr = false;
     std::vector<FaceLightmap> faces;
     std::vector<BakeLuxel> luxels;
-    std::vector<BakeNeighbour> neighbours;
     // Per BSP leaf (Visibility::leaves): its first sample in `ambientSamples` and their number.
     std::vector<std::array<uint32_t, 2>> leafAmbient;
     std::vector<AmbientSample> ambientSamples;
-    std::vector<AmbientLight> ambientLights;
 };
 
 struct WorldGeometry {
@@ -226,11 +191,6 @@ struct WorldGeometry {
     // only rays of the skybox view meet it.
     Mesh skybox;
     std::vector<StaticProp> skyboxProps;
-    // VRAD's brush occluders as triangle lists, for the baked light only: every side of every opaque brush of the
-    // world model but sky and displacement sides, whatever its texture, 3D skybox included; and the world model's sky
-    // faces, where VRAD's sun rays end unblocked (AddBrushesForRayTrace in src/utils/vrad/trace.cpp).
-    std::vector<Float3> brushOccluders;
-    std::vector<Float3> skyOccluders;
     BakedLighting baked;
     // The sky camera's area (BspLeaf::area), or -1, and the bounds of its leaves.
     int32_t skyArea = -1;

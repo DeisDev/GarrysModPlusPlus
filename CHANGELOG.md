@@ -8,7 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
-- A "Baked" indirect light option that reuses the map's own bounce light instead of tracing it, for faster frames; the Low preset uses it.
+- The loading screen stays up until ray-traced lighting is ready, and its progress bar shows that work, so maps no longer open with a few frames of the game's own lighting.
+- A "Baked" indirect light option for faster frames: bounce light is baked into the map's lightmaps while it loads, with the same light as ray-traced indirect light. The Low preset uses it.
 - Glass and other translucent surfaces are lit by real-time light instead of baked light.
 - Ray-traced ambient occlusion for the "Baked" indirect light option, with an on/off switch and strength in the menu. Ray-traced indirect light already holds its own occlusion, so the setting is greyed out with it.
 - Volumetric light from the sun and flashlights, with an on/off switch and strength in the menu.
@@ -44,6 +45,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- The Low preset picks how map lights are sampled automatically, like the other presets.
 - The settings menu has a new look: the game's own fonts, a page list on the left, switches and grouped sections.
 - Sun shadows are soft, sharp near the object and blurring with distance, as the real sun's size makes them.
 - Reflected surfaces are lit with the sun, a lamp and the radiance cache where they are, instead of borrowing the reflecting surface's light or reusing last frame's image.
@@ -98,6 +100,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Fixed
 
 - With DLSS Ray Reconstruction, map lights and the flashlight are no longer blotchy and noisy.
+- Map lights no longer show square blotches with "Importance sampled" or "Reused samples" light sampling.
+- Glass and other see-through surfaces no longer sparkle with noise.
 - With DLSS Ray Reconstruction, the sky and the 3D skybox keep their texture detail instead of looking smeared.
 - The 3D skybox no longer smears when TAA or DLSS is on and you move.
 - Shadows on the weapon in your hands are soft and smooth instead of grainy and jagged. "Shadow rays on held weapons" in the menu sets their quality (Low keeps hard shadows).
@@ -135,8 +139,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fixed rain, snow and other unlit particles disappearing with real-time lighting.
 - Fixed the physics gun's glow on held objects flickering.
 - Fixed thin bright lines along the edges of white window frames, as on gm_skywatching.
-- Fixed baked indirect light counting dim light-emitting surfaces twice.
-- Fixed dark patches in the "Baked" indirect light option where the map's baked shadows differ from the ray-traced ones.
 - Fixed ray-traced lighting possibly reading the wrong textures or materials on some GPUs.
 - Fixed ray-traced shadows ignoring the transparent parts of textures stored in less common formats.
 - Fixed props and other models with a non-default skin being lit as their first skin, which could make static props glow at full brightness.

@@ -30,9 +30,6 @@ constexpr UINT kSkyboxMask = 0x10;
 // Static props the map marks as casting no shadows (often foliage). VRAD let all light through them; they block
 // light by FoliageShadows (src/settings.h).
 constexpr UINT kShadowlessPropMask = 0x20;
-// Static props and brushes as VRAD's shadows saw them (collision models or mesh hulls, every side of opaque brushes),
-// traced only by the residual bake, with the sky faces that end VRAD's sun rays (kInstanceVradSky).
-constexpr UINT kVradOccluderMask = 0x40;
 // Static props that enclose a map light (SealedLights in src/world.cpp). The lights they seal shine through them, as
 // through a diffuser; to every other ray they are static props.
 constexpr UINT kLampShellMask = 0x80;
@@ -44,8 +41,6 @@ constexpr uint32_t kInstanceSelfIllum = 0x02;
 // Set by Scene for dynamic models (kDynamicMask, kLocalPlayerMask), whose back faces shadow rays may skip (their
 // instances allow culling; shaders/direct.hlsl).
 constexpr uint32_t kInstanceModel = 0x04;
-// The sky faces among VRAD's occluders (kVradOccluderMask).
-constexpr uint32_t kInstanceVradSky = 0x08;
 // Instances whose self-illuminated triangles are emitters (Scene::LoadMap): with EmissiveLighting::Full their
 // glow reaches surfaces directly, so indirect rays from the G-buffer take none at them.
 constexpr uint32_t kInstanceEmitter = 0x10;
@@ -121,7 +116,7 @@ struct SceneInstance {
     D3D12_GPU_VIRTUAL_ADDRESS blas = 0;
     UINT positionsView = DescriptorHeap::kInvalid;
     UINT mask = 0;
-    // kInstanceIgnoreNormals, kInstanceVradSky.
+    // kInstanceIgnoreNormals.
     uint32_t flags = 0;
     float transform[3][4];
     // Where the instance was last frame, for motion vectors: its transform when `previousKnown`, and a skinned
@@ -140,44 +135,32 @@ struct BakedTriangle {
 };
 static_assert(sizeof(BakedTriangle) == 32);
 
-// The format of the baked residual cache (gmodplusplus\cache\baked): bump when shaders/baked_residual.hlsl or the data it
+// The format of the baked light cache (gmodplusplus\cacheaked): bump when shaders/baked_bounce.hlsl or the data it
 // reads changes.
-inline constexpr uint32_t kBakeVersion = 13;
+inline constexpr uint32_t kBakeVersion = 16;
 
-// VRAD's baked light on the GPU (indirect_lighting = 1): raw views of bsp::BakedLighting and of the world's
-// BakedTriangles, and the residual shaders/baked_residual.hlsl writes: the baked light less the direct light VRAD
-// summed into it, per lightmap sample, as half4, then filtered within each face. The leaf ambient samples lose the
-// direct light of the lights VRAD added to them in the same bake. The cache holds the filtered residual, then the
-// ambient samples.
+// The map's baked bounce light on the GPU (indirect_lighting = 1): raw views of the lightmap layout of
+// bsp::BakedLighting and of the world's BakedTriangles; the bounce light shaders/baked_bounce.hlsl traces per lightmap
+// sample as half4, then filters within each face; and the leaf ambient samples, whose cubes it traces in place. The
+// cache holds the filtered light, then the ambient samples.
 struct BakedBuffers {
-    UINT samplesView = DescriptorHeap::kInvalid;
     UINT facesView = DescriptorHeap::kInvalid;
     UINT trianglesView = DescriptorHeap::kInvalid;
     UINT luxelsView = DescriptorHeap::kInvalid;
-    UINT neighboursView = DescriptorHeap::kInvalid;
     UINT leafAmbientView = DescriptorHeap::kInvalid;
     UINT ambientSamplesView = DescriptorHeap::kInvalid;
     UINT ambientSamplesUav = DescriptorHeap::kInvalid;
-    UINT ambientLightsView = DescriptorHeap::kInvalid;
     UINT ambientSampleCount = 0;
-    UINT ambientLightCount = 0;
-    UINT residualView = DescriptorHeap::kInvalid;
-    UINT residualUav = DescriptorHeap::kInvalid;
+    UINT rawView = DescriptorHeap::kInvalid;
+    UINT rawUav = DescriptorHeap::kInvalid;
     UINT filteredView = DescriptorHeap::kInvalid;
     UINT filteredUav = DescriptorHeap::kInvalid;
-    // Clamped luxels, luxels the filter changed by more than a tenth, luxels without a VRAD sample, ambient samples
-    // clamped and samples supersampled, then clamped luxels per lightmap from byte 32 (shaders/baked_residual.hlsl).
-    UINT countersUav = DescriptorHeap::kInvalid;
     UINT luxelCount = 0;
-    UINT leafCount = 0;
-    // Progress of the bake, which Lighting runs a part of each main view: the samples' direct light, rounds of marking
-    // and supersampling samples, then the gather and filter. `bakedLuxels` counts the luxels done in a stage.
-    enum class Stage { Direct, Mark, Supersample, Gather };
-    Stage stage = Stage::Direct;
-    UINT supersamplePass = 0;
-    UINT bakedLuxels = 0;
+    // Progress of the bake, which Lighting runs a part of each main view, or whole while the map loads: the luxels
+    // traced so far, then the filter and the leaf ambient samples.
+    UINT tracedLuxels = 0;
     bool filtered = false;
-    // Where the filtered residual is saved once baked; empty when it was loaded from there.
+    // Where the baked light is saved once baked; empty when it was loaded from there.
     std::filesystem::path cachePath;
     bool Ready() const { return filtered; }
 };
@@ -208,22 +191,15 @@ public:
     // `emitterPower` is their emission times area in all.
     bool LoadMap(const std::string& name, const bsp::WorldGeometry& world, std::span<const MapLightShape> lightShapes, const ModelGeometry& worldGeometry,
         std::span<const GpuEmitter> emitters, bool worldEmits, float emitterPower);
-    // Uploads the map's baked light for indirect_lighting = 1, with the world model's triangles in their BLAS order;
-    // false (logged) when the map has none or the upload fails. A filtered residual from an earlier bake of the same
-    // map (`cachedResidual`, empty for none) makes the bake unnecessary.
-    bool LoadBaked(const bsp::BakedLighting& baked, std::span<const BakedTriangle> triangles, std::span<const std::byte> cachedResidual);
+    // Uploads the map's lightmap layout and leaf ambient samples for indirect_lighting = 1, with the world model's
+    // triangles in their BLAS order; false (logged) when the map has none or the upload fails. The light of an earlier
+    // bake of the same map (`cached`, empty for none) makes the bake unnecessary.
+    bool LoadBaked(const bsp::BakedLighting& baked, std::span<const BakedTriangle> triangles, std::span<const std::byte> cached);
     bool HasBaked() const { return m_baked.trianglesView != DescriptorHeap::kInvalid; }
     BakedBuffers& Baked() { return m_baked; }
-    ID3D12Resource* BakedResidual() const { return m_bakedResidual.Get(); }
+    ID3D12Resource* BakedRaw() const { return m_bakedRaw.Get(); }
     ID3D12Resource* BakedFiltered() const { return m_bakedFiltered.Get(); }
-    ID3D12Resource* BakedCounters() const { return m_bakedCounters.Get(); }
     ID3D12Resource* BakedAmbient() const { return m_bakedAmbient.Get(); }
-    // A baked face's first luxel and its normal, for the log of the most clamped faces.
-    struct BakedFaceInfo {
-        bsp::Float3 position;
-        bsp::Float3 normal;
-    };
-    const std::vector<BakedFaceInfo>& BakedFaces() const { return m_bakedFaces; }
     // Builds a BLAS for the geometry and returns its model id, or -1 when the geometry is empty or fails.
     int AddModel(const ModelGeometry& geometry);
     // A texture for alpha tests and material masks: VTF mips in their stored layout, largest first. Returns its
@@ -311,8 +287,6 @@ public:
         UINT indicesView = DescriptorHeap::kInvalid;
         UINT nodesView = DescriptorHeap::kInvalid;
         UINT leafClustersView = DescriptorHeap::kInvalid;
-        // bsp::Visibility::sunClusters as bits, or kInvalid for every cluster.
-        UINT sunClustersView = DescriptorHeap::kInvalid;
         UINT clusterCount = 0;
         UINT gridCellsView = DescriptorHeap::kInvalid;
         UINT gridIndicesView = DescriptorHeap::kInvalid;
@@ -464,14 +438,11 @@ private:
     Microsoft::WRL::ComPtr<ID3D12Resource> m_gridTail;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_bspNodes;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_leafClusters;
-    Microsoft::WRL::ComPtr<ID3D12Resource> m_sunClusters;
     BakedBuffers m_baked;
     std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> m_bakedInputs;
-    Microsoft::WRL::ComPtr<ID3D12Resource> m_bakedResidual;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_bakedRaw;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_bakedFiltered;
-    Microsoft::WRL::ComPtr<ID3D12Resource> m_bakedCounters;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_bakedAmbient;
-    std::vector<BakedFaceInfo> m_bakedFaces;
 };
 
 }

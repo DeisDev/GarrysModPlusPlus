@@ -8,6 +8,7 @@
 
 #include <array>
 #include <filesystem>
+#include <functional>
 #include <optional>
 
 // The ray-traced scene of the loaded map and its entities, and the lighting that uses it.
@@ -26,6 +27,16 @@ void WaitForGpu();
 // loads the map's scene and, every few frames, the developer requests (probe.request and, with
 // `consoleRequests`, console.txt).
 void OnPresent(UINT width, UINT height, bool consoleRequests);
+
+// What PrepareLevel is doing when it reports progress.
+enum class LoadStage { Scene, Bake };
+// The share of PrepareLevel's work done, from 0 to 1, and its current stage.
+using LoadProgress = std::function<void(float done, LoadStage stage)>;
+// While a map is being joined: starts loading its scene on another thread, once its name is known.
+void BeginLevelLoad();
+// Finishes loading the current map's scene (waiting for BeginLevelLoad's thread) and, with baked indirect light,
+// bakes its bounce light when it is not cached, reporting progress between parts. Frames presented meanwhile (the loading screen's) leave the scene alone.
+void PrepareLevel(const LoadProgress& progress);
 
 // The clip-space jitter (NDC units) for the next captured view of an output this size, for temporal anti-aliasing
 // or Ray Reconstruction; zero without either.

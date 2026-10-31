@@ -153,6 +153,8 @@ enum class TextId {
     SectionFrameRate,
     StatFpsValue,
     ValueMilliseconds,
+    LoadingScene,
+    LoadingBake,
     Count
 };
 

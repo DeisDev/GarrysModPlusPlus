@@ -25,6 +25,7 @@
 static const uint kPresampleSeed = 7;
 static const uint kRegirSeed = 8;
 static const uint kRegirCellSeed = 9;
+static const uint kCellSelectionSeed = 10;
 
 [RootSignature(ROOT_SIGNATURE)]
 [numthreads(8, 8, 1)]
@@ -99,8 +100,10 @@ void InitialMain(uint3 id : SV_DispatchThreadID)
     RTXDI_DIReservoir reservoir = RTXDI_EmptyDIReservoir();
     if (RAB_IsSurfaceValid(surface)) {
         RTXDI_RandomSamplerState rng = RTXDI_InitRandomSampler(id.xy, g_restir.runtime.frameIndex, RTXDI_DI_GENERATE_INITIAL_SAMPLES_RANDOM_SEED);
-        RTXDI_RandomSamplerState coherentRng =
-            RTXDI_InitRandomSampler(id.xy / RTXDI_TILE_SIZE_IN_PIXELS, g_restir.runtime.frameIndex, RTXDI_DI_GENERATE_INITIAL_SAMPLES_RANDOM_SEED);
+        // RTXDI shares this stream across a 16x16-pixel tile, which then jitters to one ReGIR cell and one presampled
+        // tile: each block took the same few candidates and came out as a square blotch. Per pixel, the jitter also
+        // blurs the cells' edges.
+        RTXDI_RandomSamplerState coherentRng = RTXDI_InitRandomSampler(id.xy, g_restir.runtime.frameIndex, kCellSelectionSeed);
         RAB_LightSample sample;
         reservoir = RTXDI_SampleLightsForSurface(rng, coherentRng, surface, g_restir.restir.initialSamplingParams, g_restir.lightBuffer, g_restir.localLightRis,
             g_restir.environmentRis, g_restir.regir, sample);

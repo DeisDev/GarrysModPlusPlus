@@ -25,6 +25,8 @@ using CreateInterfaceFn = void*(__cdecl*)(const char* name, int* returnCode);
 // confirmed in GMod's engine.dll (GetLevelName, ClientCmd_Unrestricted) and filesystem_stdio.dll
 // (Read/Open/Close/Seek/Tell) with Ghidra.
 constexpr int kGetLocalPlayerSlot = 12;
+// IsInGame (engine.dll+0x7f550 in Ghidra) compares the client's signon state with SIGNONSTATE_FULL (6).
+constexpr int kIsInGameSlot = 26;
 constexpr int kGetLevelNameSlot = 51;
 constexpr int kClientCmdUnrestrictedSlot = 106;
 // GetLightForPoint (slot 1, engine.dll+0x7ee20) calls this slot (engine.dll+0x7d210), which forwards its
@@ -181,6 +183,11 @@ std::string LevelName()
         return {};
     const char* name = Slot<const char*(__fastcall*)(void*)>(g_engineClient, kGetLevelNameSlot)(g_engineClient);
     return name != nullptr ? std::string(name) : std::string();
+}
+
+bool IsInGame()
+{
+    return Ready() && Slot<bool(__fastcall*)(void*)>(g_engineClient, kIsInGameSlot)(g_engineClient);
 }
 
 int LocalPlayerIndex()

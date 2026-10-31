@@ -53,10 +53,6 @@ bool ReadMaterialPaths(std::span<const std::byte> mdl, std::vector<std::vector<s
 bool BuildGeometry(std::span<const std::byte> mdl, std::span<const std::byte> vvd, std::span<const std::byte> vtx,
     const std::vector<bool>& skipTexture, Geometry& geometry, std::string& error, int skin = 0);
 
-// The convex pieces of a .phy collision model's first solid, each as its points in model space (inches, Source
-// axes); the pieces are convex hulls of these points.
-bool ReadCollisionPieces(std::span<const std::byte> phy, std::vector<std::vector<bsp::Float3>>& pieces, std::string& error);
-
 // The value of a VMT key, matched without regard to case, or nothing when the key is absent.
 std::optional<std::string> MaterialValue(std::string_view vmt, std::string_view key);
 

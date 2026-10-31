@@ -27,7 +27,7 @@ struct InstanceRecord
     uint previousPositions;
     // Last frame's object-to-world transform.
     float4 previousTransform[3];
-    // kInstanceIgnoreNormals, kInstanceSelfIllum, kInstanceModel, kInstanceVradSky.
+    // kInstanceIgnoreNormals, kInstanceSelfIllum, kInstanceModel.
     uint flags;
     // For instances with emitters: each triangle's emitter index (Scene::EmittersView) plus one, 0 for none; kNoView
     // for instances without.
@@ -35,11 +35,10 @@ struct InstanceRecord
     uint2 padding;
 };
 
-// kInstanceIgnoreNormals, kInstanceSelfIllum, kInstanceModel and kInstanceVradSky in src/scene.h.
+// kInstanceIgnoreNormals, kInstanceSelfIllum and kInstanceModel in src/scene.h.
 static const uint kInstanceIgnoreNormals = 0x01;
 static const uint kInstanceSelfIllum = 0x02;
 static const uint kInstanceModel = 0x04;
-static const uint kInstanceVradSky = 0x08;
 static const uint kInstanceEmitter = 0x10;
 static const uint kInstanceCharacter = 0x20;
 
@@ -296,6 +295,22 @@ HitSurface SurfaceOf(HitInfo hit, float3 origin, float3 direction)
     surface.flags = record.flags;
     return surface;
 }
+
+// Whether the ray met the back of the triangle it hit. Source's triangles are clockwise seen from the front, so the
+// cross product of their edges points out of the back.
+bool HitBackFace(HitInfo hit, float3 direction)
+{
+    InstanceRecord record = LoadInstance(hit.instance);
+    ByteAddressBuffer positions = ResourceDescriptorHeap[NonUniformResourceIndex(record.positions)];
+    ByteAddressBuffer indices = ResourceDescriptorHeap[NonUniformResourceIndex(record.indices)];
+    uint3 index = indices.Load3(hit.primitive * 12);
+    float3 p0 = positions.Load<float3>(index.x * 12);
+    float3 normal = mul((float3x3)hit.objectToWorld, cross(positions.Load<float3>(index.y * 12) - p0, positions.Load<float3>(index.z * 12) - p0));
+    return dot(normal, direction) < 0.0;
+}
+
+// A point whose rays meet back faces this often is inside geometry.
+static const float kInsideFraction = 0.3;
 
 // The closest surface along a ray, and the triangle it is on, or false when it reaches tMax.
 bool TraceClosest(float3 origin, float3 direction, float tMax, uint mask, out HitSurface surface, out HitInfo hit, uint rayFlags = RAY_FLAG_NONE)
@@ -748,26 +763,6 @@ uint ClusterAt(float3 position)
     ByteAddressBuffer leafClusters = ResourceDescriptorHeap[g_frame.leafClustersView];
     int cluster = asint(leafClusters.Load((-node - 1) * 4));
     return cluster >= 0 ? uint(cluster) : g_frame.clusterCount;
-}
-
-// The lights VRAD let reach a point (its PVSCheck), for the bake: those of its visibility cluster. Surface points lie on
-// leaf boundaries, so the lookup is made just off the surface. Without a tail; ClusterLightIndex reads them.
-LightRanges ClusterLights(float3 position, float3 normal)
-{
-    LightRanges ranges = (LightRanges)0;
-    if (g_frame.lightCount == 0)
-        return ranges;
-    ByteAddressBuffer lists = ResourceDescriptorHeap[g_frame.lightRangesView];
-    uint2 range = lists.Load2(ClusterAt(position + normal * 2.0) * 8);
-    ranges.first = range.x;
-    ranges.count = range.y;
-    return ranges;
-}
-
-uint ClusterLightIndex(LightRanges ranges, uint i)
-{
-    ByteAddressBuffer indices = ResourceDescriptorHeap[g_frame.lightIndicesView];
-    return indices.Load((ranges.first + i) * 4);
 }
 
 // The lights of the light grid cell holding a point; points outside the grid take the nearest cell.
