@@ -34,6 +34,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - In the native renderer, models and world surfaces with a light warp texture take real-time light through it as in the game.
 - Glowing surfaces such as screens and light panels light their surroundings, with a "Glowing surfaces" setting (Off, Bounce light, Full). Light textures the map already turned into lights keep the map's lights instead.
 - In the native renderer, reflections show the sky as the game draws it, including painted skies, and the 3D skybox, instead of a flat colour.
+- The project is licensed under the Mozilla Public License 2.0. `THIRD_PARTY_NOTICES.md` lists the parts under other licences.
 
 ### Changed
 
