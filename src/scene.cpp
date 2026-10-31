@@ -3,10 +3,13 @@
 #include "log.h"
 
 #include <algorithm>
+#include <bit>
 #include <cfloat>
 #include <cmath>
 #include <cstring>
+#include <execution>
 #include <limits>
+#include <numeric>
 #include <optional>
 
 using Microsoft::WRL::ComPtr;
@@ -34,7 +37,8 @@ static_assert(sizeof(GpuMaterial) == 64);
 struct AlphaTriangle {
     uint32_t packed;
     bsp::Float2 uvs[3];
-    uint32_t padding;
+    // ModelGeometry::alphaTints.
+    uint32_t tint;
 };
 static_assert(sizeof(AlphaTriangle) == 32);
 
@@ -51,16 +55,18 @@ struct Scene::GpuLight {
     float constantAttn;
     float linearAttn;
     float quadraticAttn;
-    // Byte offset in the lights buffer of the light's hull records, and their number.
-    uint32_t hullOffset;
-    uint32_t hullCount;
+    // kLightSealed.
+    uint32_t flags;
+    // MapLightShape::radius; 0 for the engine's dynamic lights.
+    float size;
     // bsp::Light::style, or kNoLightStyle.
     uint32_t style;
+    // VRAD's falloff at the light's reference distance (bsp::Light::referenceDistance) times its square: point and spot
+    // lights fall off with the inverse square scaled by it, which gives the mapper's brightness there.
+    float referenceScale;
+    uint32_t padding[3];
 };
-static_assert(sizeof(Scene::GpuLight) == 80);
-// A hull record in the lights buffer: its plane count, then each plane as (normal, distance).
-constexpr size_t kHullHeaderBytes = 16;
-static_assert(sizeof(hull::Plane) == 16);
+static_assert(sizeof(Scene::GpuLight) == 96);
 // Read by ClusterAt in shaders/scene.hlsli.
 static_assert(sizeof(bsp::BspNode) == 24);
 
@@ -74,24 +80,70 @@ constexpr float kDegreesToRadians = 3.14159265358979f / 180.0f;
 // tonemap scale.
 constexpr float kLightThreshold = 1.0f / 16384.0f;
 
+// The light grid (Scene::BuildLightGrid): at most kGridCells cubic cells of at least kGridCellMin units over the world,
+// and few enough that their tails hold about kGridTailEntries lights in all.
+constexpr float kGridCellMin = 256.0f;
+constexpr double kGridCells = 4096.0;
+constexpr double kGridTailEntries = 4.0 * 1024.0 * 1024.0;
+// Lights a cell lists for the light loop (shaders/direct.hlsl); its other lights are sampled from its tail.
+constexpr size_t kGridListLights = 64;
+// The weight, relative to its bound, of a light the PVS of a cell's clusters leaves out: such light rarely arrives, but
+// nothing proves it cannot.
+constexpr float kHiddenWeight = 1.0f / 16.0f;
+// Marks a listed light the PVS leaves out (kHiddenLight in shaders/scene.hlsli).
+constexpr uint32_t kHiddenLight = 0x80000000u;
+
+// The most a light gives a point of a box before shadows, with a Lambert term of 1: the inverse square from its sphere
+// at the box's nearest point (LightIrradiance in shaders/scene.hlsli); 0 where no point of the box is in front of a
+// surface light or near a spot light's cone.
+float LightBound(const Scene::GpuLight& light, const bsp::Float3& low, const bsp::Float3& high)
+{
+    const float intensity = std::max({light.intensity[0], light.intensity[1], light.intensity[2], 0.0f});
+    const float lo[3] = {low.x, low.y, low.z};
+    const float hi[3] = {high.x, high.y, high.z};
+    float nearest = 0.0f;
+    float centre[3];
+    float halfDiagonal = 0.0f;
+    float reach = 0.0f;
+    for (int a = 0; a < 3; ++a) {
+        const float d = std::max({lo[a] - light.origin[a], 0.0f, light.origin[a] - hi[a]});
+        nearest += d * d;
+        centre[a] = 0.5f * (lo[a] + hi[a]) - light.origin[a];
+        halfDiagonal += 0.25f * (hi[a] - lo[a]) * (hi[a] - lo[a]);
+        reach += std::max((lo[a] - light.origin[a]) * light.normal[a], (hi[a] - light.origin[a]) * light.normal[a]);
+    }
+    halfDiagonal = std::sqrt(halfDiagonal);
+    if (light.type == static_cast<uint32_t>(bsp::LightType::Surface))
+        return reach > 0.0f ? intensity / std::max(nearest, 1.0f) : 0.0f;
+    if (light.type == static_cast<uint32_t>(bsp::LightType::Spot)) {
+        const float distance = std::sqrt(centre[0] * centre[0] + centre[1] * centre[1] + centre[2] * centre[2]);
+        if (distance > halfDiagonal) {
+            const float cosine = (centre[0] * light.normal[0] + centre[1] * light.normal[1] + centre[2] * light.normal[2]) / distance;
+            const float spread = std::asin(halfDiagonal / distance);
+            // SpotFactor's fringe widens the cone by up to kSpotEdgeBlur (8) units either side; twice that is left.
+            const float margin = std::asin(16.0f / std::max(distance - halfDiagonal, 16.0f));
+            if (std::acos(std::clamp(cosine, -1.0f, 1.0f)) - spread > std::acos(std::clamp(light.stopdot2, -1.0f, 1.0f)) + margin)
+                return 0.0f;
+        }
+    }
+    return intensity * light.referenceScale / std::max(nearest, light.size * light.size);
+}
+
+// GpuLight::referenceScale: the inverse square matched to VRAD's attenuation at the reference distance, where VRAD's
+// falloff is 1 / (constant + linear d + quadratic d^2) (GatherSampleStandardLightSSE in src/utils/vrad/lightmap.cpp).
+float ReferenceScale(const bsp::Light& light)
+{
+    if (light.type == bsp::LightType::Surface)
+        return 1.0f;
+    const float d = light.referenceDistance;
+    return d * d / std::max(light.constantAttn + light.linearAttn * d + light.quadraticAttn * d * d, 1e-4f);
+}
+
 // How far a light can reach visibly, following the falloff in LightIrradiance (shaders/scene.hlsli).
 float LightRange(const bsp::Light& light)
 {
     const float intensity = std::max({light.intensity.x, light.intensity.y, light.intensity.z, 0.0f});
-    float range = std::numeric_limits<float>::infinity();
-    const float limit = intensity / kLightThreshold;
-    if (light.type == bsp::LightType::Surface) {
-        range = std::sqrt(limit);
-    } else if (light.quadraticAttn > 0.0f) {
-        const float c = light.constantAttn - limit;
-        range = (-light.linearAttn + std::sqrt(std::max(light.linearAttn * light.linearAttn - 4.0f * light.quadraticAttn * c, 0.0f))) /
-            (2.0f * light.quadraticAttn);
-    } else if (light.linearAttn > 0.0f) {
-        range = (limit - light.constantAttn) / light.linearAttn;
-    }
-    if (light.radius > 0.0f)
-        range = std::min(range, light.radius);
-    return std::max(range, 0.0f);
+    return std::sqrt(intensity * ReferenceScale(light) / kLightThreshold);
 }
 
 unsigned Hex(HRESULT hr) { return static_cast<unsigned>(hr); }
@@ -257,6 +309,12 @@ uint32_t Scene::PackTranslucent(UINT textureView, float opacity)
     return (textureView & 0xFFFFFFu) | static_cast<uint32_t>(std::lround(std::clamp(opacity, 0.0f, 1.0f) * 127.0f)) << 24 | 1u << 31;
 }
 
+uint32_t Scene::PackTint(const bsp::Float3& tint, uint32_t mode)
+{
+    const auto channel = [](float c) { return static_cast<uint32_t>(std::lround(std::clamp(c, 0.0f, 1.0f) * 255.0f)); };
+    return channel(tint.x) | channel(tint.y) << 8 | channel(tint.z) << 16 | mode << 24;
+}
+
 UINT Scene::AddTexture(DXGI_FORMAT format, UINT width, UINT height, std::span<const std::span<const std::byte>> mips)
 {
     constexpr UINT kMaxMips = 16;
@@ -350,7 +408,8 @@ int Scene::AddModel(const ModelGeometry& geometry)
         std::vector<AlphaTriangle> records(alphaTriangles);
         for (UINT t = 0; t < alphaTriangles; ++t) {
             const uint32_t* triangle = geometry.indices.data() + static_cast<size_t>(model.opaqueTriangles + t) * 3;
-            records[t] = {geometry.alphaTriangles[t], {geometry.uvs[triangle[0]], geometry.uvs[triangle[1]], geometry.uvs[triangle[2]]}, 0};
+            records[t] = {geometry.alphaTriangles[t], {geometry.uvs[triangle[0]], geometry.uvs[triangle[1]], geometry.uvs[triangle[2]]},
+                t < geometry.alphaTints.size() ? geometry.alphaTints[t] : 0u};
         }
         model.alpha = UploadToDefault(records.data(), records.size() * sizeof(AlphaTriangle), staging);
     }
@@ -425,7 +484,10 @@ bool Scene::AddMicromaps(Model& model, const ModelGeometry& geometry, D3D12_RAYT
     std::vector<omm::AlphaTriangle> alpha(geometry.alphaTriangles.size());
     for (size_t t = 0; t < alpha.size(); ++t) {
         const uint32_t* triangle = geometry.indices.data() + (model.opaqueTriangles + t) * 3;
-        alpha[t] = {geometry.alphaTriangles[t], {geometry.uvs[triangle[0]], geometry.uvs[triangle[1]], geometry.uvs[triangle[2]]}};
+        // A Refract tint texture's alpha is no opacity: the shader decides everywhere, and fast alpha tests let rays pass.
+        const bool refract = t < geometry.alphaTints.size() && geometry.alphaTints[t] >> 24 == kTintRefract;
+        alpha[t] = {refract ? PackTranslucent(DescriptorHeap::kInvalid, 0.25f) : geometry.alphaTriangles[t],
+            {geometry.uvs[triangle[0]], geometry.uvs[triangle[1]], geometry.uvs[triangle[2]]}};
     }
     const omm::Micromaps baked = omm::Bake(alpha, m_alphaImages);
     model.micromapIndices = UploadToDefault(baked.indices.data(), baked.indices.size() * sizeof(int32_t), staging);
@@ -634,6 +696,11 @@ void Scene::Clear()
     m_materialCount = 0;
     m_selfIllumMaterials.clear();
     m_staticInstances.clear();
+    m_descriptors->Free(m_emittersView);
+    m_emittersView = DescriptorHeap::kInvalid;
+    m_emitters.Reset();
+    m_emitterCount = 0;
+    m_worldFlags = 0;
     m_hasSkybox = false;
     m_worldModel = -1;
     m_name.clear();
@@ -647,52 +714,44 @@ void Scene::Clear()
     m_descriptors->Free(m_lightLists.nodesView);
     m_descriptors->Free(m_lightLists.leafClustersView);
     m_descriptors->Free(m_lightLists.sunClustersView);
+    m_descriptors->Free(m_lightLists.gridCellsView);
+    m_descriptors->Free(m_lightLists.gridIndicesView);
+    m_descriptors->Free(m_lightLists.gridTailView);
     m_lightLists = {};
     m_lightRanges.Reset();
     m_lightIndices.Reset();
+    m_gridCells.Reset();
+    m_gridIndices.Reset();
+    m_gridTail.Reset();
     m_bspNodes.Reset();
     m_leafClusters.Reset();
     m_sunClusters.Reset();
 }
 
-bool Scene::LoadMap(const std::string& name, const bsp::WorldGeometry& world, std::span<const LightHull> lightHulls, const ModelGeometry& worldGeometry)
+bool Scene::LoadMap(const std::string& name, const bsp::WorldGeometry& world, std::span<const MapLightShape> lightShapes, const ModelGeometry& worldGeometry)
 {
     m_worldModel = AddModel(worldGeometry);
     if (m_worldModel < 0)
         return false;
 
     std::vector<GpuLight> lights;
-    for (const bsp::Light& light : world.lights) {
+    for (size_t i = 0; i < world.lights.size(); ++i) {
+        const bsp::Light& light = world.lights[i];
+        const MapLightShape shape = i < lightShapes.size() ? lightShapes[i] : MapLightShape{};
         GpuLight& gpu = lights.emplace_back();
+        // VRAD's lightmaps never applied a light's _distance (radius): GatherSampleStandardLightSSE in
+        // src/utils/vrad/lightmap.cpp ignores it, and only leaf_ambient_lighting.cpp reads it. It is left out.
         gpu = {{light.origin.x, light.origin.y, light.origin.z}, static_cast<uint32_t>(light.type), {light.intensity.x, light.intensity.y, light.intensity.z},
-            light.radius, {light.normal.x, light.normal.y, light.normal.z}, light.stopdot, light.stopdot2, light.exponent, light.constantAttn,
-            light.linearAttn, light.quadraticAttn, 0, 0, static_cast<uint32_t>(light.style)};
-    }
-    std::vector<std::byte> hulls;
-    for (size_t i = 0; i < lights.size(); ++i) {
-        lights[i].hullOffset = static_cast<uint32_t>(lights.size() * sizeof(GpuLight) + hulls.size());
-        for (const LightHull& entry : lightHulls) {
-            if (entry.light != i || entry.planes.empty())
-                continue;
-            ++lights[i].hullCount;
-            const size_t at = hulls.size();
-            hulls.resize(at + kHullHeaderBytes + entry.planes.size() * sizeof(hull::Plane));
-            const auto planeCount = static_cast<uint32_t>(entry.planes.size());
-            std::memcpy(hulls.data() + at, &planeCount, sizeof(planeCount));
-            std::memcpy(hulls.data() + at + kHullHeaderBytes, entry.planes.data(), entry.planes.size() * sizeof(hull::Plane));
-        }
+            0.0f, {light.normal.x, light.normal.y, light.normal.z}, light.stopdot, light.stopdot2, light.exponent, light.constantAttn,
+            light.linearAttn, light.quadraticAttn, shape.flags, shape.radius, static_cast<uint32_t>(light.style), ReferenceScale(light), {}};
     }
     if (!lights.empty()) {
-        if (!BuildLightLists(world.lights, world.visibility))
+        if (!BuildLightLists(world.lights, world.visibility) || !BuildLightGrid(lights, world.lights, world.visibility, worldGeometry.positions))
             return false;
         m_allocator->Reset();
         m_list->Reset(m_allocator.Get(), nullptr);
         std::vector<ComPtr<ID3D12Resource>> staging;
-        std::vector<std::byte> buffer(lights.size() * sizeof(GpuLight) + hulls.size());
-        std::memcpy(buffer.data(), lights.data(), lights.size() * sizeof(GpuLight));
-        if (!hulls.empty())
-            std::memcpy(buffer.data() + lights.size() * sizeof(GpuLight), hulls.data(), hulls.size());
-        m_lights = UploadToDefault(buffer.data(), buffer.size(), staging);
+        m_lights = UploadToDefault(lights.data(), lights.size() * sizeof(GpuLight), staging);
         if (!m_lights || !Submit())
             return false;
         m_lightsView = m_descriptors->CreateRawView(m_lights.Get());
@@ -787,6 +846,141 @@ bool Scene::BuildLightLists(std::span<const bsp::Light> lights, const bsp::Visib
     return true;
 }
 
+bool Scene::BuildLightGrid(std::span<const GpuLight> lights, std::span<const bsp::Light> mapLights, const bsp::Visibility& visibility,
+    std::span<const bsp::Float3> worldPositions)
+{
+    bsp::Float3 low = {0.0f, 0.0f, 0.0f};
+    bsp::Float3 high = {0.0f, 0.0f, 0.0f};
+    if (!worldPositions.empty()) {
+        low = high = worldPositions[0];
+        for (const bsp::Float3& p : worldPositions) {
+            low = {std::min(low.x, p.x), std::min(low.y, p.y), std::min(low.z, p.z)};
+            high = {std::max(high.x, p.x), std::max(high.y, p.y), std::max(high.z, p.z)};
+        }
+    }
+    const float extent[3] = {std::max(high.x - low.x, 1.0f), std::max(high.y - low.y, 1.0f), std::max(high.z - low.z, 1.0f)};
+    const double cells = std::clamp(kGridTailEntries / static_cast<double>(std::max<size_t>(lights.size(), 1)), 1.0, kGridCells);
+    const float size = std::max(kGridCellMin, static_cast<float>(std::cbrt(static_cast<double>(extent[0]) * extent[1] * extent[2] / cells)));
+    const uint32_t dims[3] = {static_cast<uint32_t>(std::ceil(extent[0] / size)), static_cast<uint32_t>(std::ceil(extent[1] / size)),
+        static_cast<uint32_t>(std::ceil(extent[2] / size))};
+    const size_t cellCount = static_cast<size_t>(dims[0]) * dims[1] * dims[2];
+    const auto cellRange = [&](float minimum, float maximum, float origin, uint32_t count) {
+        const auto first = static_cast<int64_t>(std::floor((minimum - origin) / size));
+        const auto last = static_cast<int64_t>(std::floor((maximum - origin) / size));
+        return std::pair<uint32_t, uint32_t>{static_cast<uint32_t>(std::clamp<int64_t>(first, 0, count - 1)),
+            static_cast<uint32_t>(std::clamp<int64_t>(last, 0, count - 1))};
+    };
+
+    // The clusters of the leaves each cell overlaps, and the clusters each light's cluster sees, for the PVS weight.
+    std::vector<std::vector<int32_t>> cellClusters(cellCount);
+    for (const bsp::BspLeaf& leaf : visibility.leaves) {
+        if (leaf.cluster < 0)
+            continue;
+        const auto [x0, x1] = cellRange(leaf.mins.x, leaf.maxs.x, low.x, dims[0]);
+        const auto [y0, y1] = cellRange(leaf.mins.y, leaf.maxs.y, low.y, dims[1]);
+        const auto [z0, z1] = cellRange(leaf.mins.z, leaf.maxs.z, low.z, dims[2]);
+        for (uint32_t z = z0; z <= z1; ++z)
+            for (uint32_t y = y0; y <= y1; ++y)
+                for (uint32_t x = x0; x <= x1; ++x)
+                    cellClusters[(static_cast<size_t>(z) * dims[1] + y) * dims[0] + x].push_back(leaf.cluster);
+    }
+    for (std::vector<int32_t>& clusters : cellClusters) {
+        std::sort(clusters.begin(), clusters.end());
+        clusters.erase(std::unique(clusters.begin(), clusters.end()), clusters.end());
+    }
+    std::vector<std::vector<bool>> sees;
+    if (!visibility.pvs.empty()) {
+        sees.resize(lights.size());
+        for (size_t i = 0; i < lights.size(); ++i) {
+            sees[i].resize(visibility.clusterCount);
+            for (uint32_t c = 0; c < visibility.clusterCount; ++c)
+                sees[i][c] = visibility.Sees(mapLights[i].cluster, static_cast<int32_t>(c));
+        }
+    }
+
+    struct CellLights {
+        std::vector<uint32_t> list;
+        std::vector<std::pair<uint32_t, float>> tail;
+    };
+    std::vector<CellLights> cellLights(cellCount);
+    std::vector<size_t> order(cellCount);
+    std::iota(order.begin(), order.end(), size_t{0});
+    std::for_each(std::execution::par, order.begin(), order.end(), [&](size_t c) {
+        const uint32_t x = static_cast<uint32_t>(c % dims[0]);
+        const uint32_t y = static_cast<uint32_t>(c / dims[0] % dims[1]);
+        const uint32_t z = static_cast<uint32_t>(c / (static_cast<size_t>(dims[0]) * dims[1]));
+        const bsp::Float3 cellLow = {low.x + x * size, low.y + y * size, low.z + z * size};
+        const bsp::Float3 cellHigh = {cellLow.x + size, cellLow.y + size, cellLow.z + size};
+        std::vector<std::pair<float, uint32_t>> ranked;
+        for (uint32_t i = 0; i < lights.size(); ++i) {
+            const float bound = LightBound(lights[i], cellLow, cellHigh);
+            if (bound <= 0.0f)
+                continue;
+            const int32_t from = mapLights[i].cluster;
+            const bool visible = sees.empty() || from < 0 || cellClusters[c].empty() ||
+                std::any_of(cellClusters[c].begin(), cellClusters[c].end(), [&](int32_t to) { return sees[i][to]; });
+            ranked.emplace_back(visible ? bound : bound * kHiddenWeight, visible ? i : i | kHiddenLight);
+        }
+        const size_t listed = std::min(ranked.size(), kGridListLights);
+        std::partial_sort(ranked.begin(), ranked.begin() + listed, ranked.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+        CellLights& result = cellLights[c];
+        for (size_t k = 0; k < listed; ++k)
+            result.list.push_back(ranked[k].second);
+        double total = 0.0;
+        for (size_t k = listed; k < ranked.size(); ++k)
+            total += ranked[k].first;
+        double cumulative = 0.0;
+        for (size_t k = listed; k < ranked.size(); ++k) {
+            cumulative += ranked[k].first;
+            result.tail.emplace_back(ranked[k].second & ~kHiddenLight, static_cast<float>(cumulative / total));
+        }
+        if (!result.tail.empty())
+            result.tail.back().second = 1.0f;
+    });
+
+    std::vector<uint32_t> cellRanges;
+    std::vector<uint32_t> indices;
+    std::vector<uint32_t> tail;
+    cellRanges.reserve(cellCount * 4);
+    size_t maxListed = 0;
+    for (const CellLights& cell : cellLights) {
+        cellRanges.insert(cellRanges.end(), {static_cast<uint32_t>(indices.size()), static_cast<uint32_t>(cell.list.size()),
+                                                static_cast<uint32_t>(tail.size() / 2), static_cast<uint32_t>(cell.tail.size())});
+        indices.insert(indices.end(), cell.list.begin(), cell.list.end());
+        for (const auto& [light, cdf] : cell.tail)
+            tail.insert(tail.end(), {light, std::bit_cast<uint32_t>(cdf)});
+        maxListed = std::max(maxListed, cell.list.size());
+    }
+    const size_t listedTotal = indices.size();
+    const size_t tailTotal = tail.size() / 2;
+    // Buffers may not be empty.
+    if (indices.empty())
+        indices.push_back(0);
+    if (tail.empty())
+        tail.insert(tail.end(), {0u, 0u});
+
+    m_allocator->Reset();
+    m_list->Reset(m_allocator.Get(), nullptr);
+    std::vector<ComPtr<ID3D12Resource>> staging;
+    m_gridCells = UploadToDefault(cellRanges.data(), cellRanges.size() * sizeof(uint32_t), staging);
+    m_gridIndices = UploadToDefault(indices.data(), indices.size() * sizeof(uint32_t), staging);
+    m_gridTail = UploadToDefault(tail.data(), tail.size() * sizeof(uint32_t), staging);
+    if (!m_gridCells || !m_gridIndices || !m_gridTail || !Submit())
+        return false;
+    m_lightLists.gridCellsView = m_descriptors->CreateRawView(m_gridCells.Get());
+    m_lightLists.gridIndicesView = m_descriptors->CreateRawView(m_gridIndices.Get());
+    m_lightLists.gridTailView = m_descriptors->CreateRawView(m_gridTail.Get());
+    m_lightLists.gridOrigin = low;
+    m_lightLists.gridCellSize = size;
+    std::copy_n(dims, 3, m_lightLists.gridDims);
+    if (m_lightLists.gridCellsView == DescriptorHeap::kInvalid || m_lightLists.gridIndicesView == DescriptorHeap::kInvalid ||
+        m_lightLists.gridTailView == DescriptorHeap::kInvalid)
+        return false;
+    log::Info("Scene: light grid of {}x{}x{} cells of {:.0f} units; cells list {:.1f} lights on average, {} at most, and sample {:.1f} more", dims[0],
+        dims[1], dims[2], size, static_cast<double>(listedTotal) / cellCount, maxListed, static_cast<double>(tailTotal) / cellCount);
+    return true;
+}
+
 bool Scene::EnsureDynamicLights(FrameTlas& frame)
 {
     if (frame.dynamicLights)
@@ -870,6 +1064,22 @@ void Scene::SetStaticInstances(std::vector<SceneInstance> instances)
     m_hasSkybox = std::any_of(m_staticInstances.begin(), m_staticInstances.end(), [](const SceneInstance& instance) { return instance.mask == kSkyboxMask; });
 }
 
+bool Scene::SetEmitters(std::span<const GpuEmitter> emitters, bool worldEmits)
+{
+    m_worldFlags = worldEmits ? kInstanceEmitter : 0u;
+    if (emitters.empty())
+        return true;
+    m_allocator->Reset();
+    m_list->Reset(m_allocator.Get(), nullptr);
+    std::vector<ComPtr<ID3D12Resource>> staging;
+    m_emitters = UploadToDefault(emitters.data(), emitters.size_bytes(), staging);
+    if (!m_emitters || !Submit())
+        return false;
+    m_emittersView = m_descriptors->CreateRawView(m_emitters.Get());
+    m_emitterCount = m_emittersView != DescriptorHeap::kInvalid ? static_cast<UINT>(emitters.size()) : 0u;
+    return m_emitterCount != 0;
+}
+
 SceneFrame Scene::RecordFrame(ID3D12GraphicsCommandList4* list, UINT slot, std::span<const SceneInstance> dynamic, bool micromaps)
 {
     static_assert(sizeof(InstanceRecord) == 96);
@@ -901,13 +1111,14 @@ SceneFrame Scene::RecordFrame(ID3D12GraphicsCommandList4* list, UINT slot, std::
         InstanceRecord& record = frame.mappedRecords[written];
         record = {source.positionsView != DescriptorHeap::kInvalid ? source.positionsView : model.positionsView, model.indicesView, model.albedoView,
             model.uvsView, model.alphaView, model.opaqueTriangles, model.materialsView, source.previousPositionsView, {},
-            source.flags | (model.selfIllum ? kInstanceSelfIllum : 0u) | (dynamicModel ? kInstanceModel : 0u), {}};
+            source.flags | (model.selfIllum ? kInstanceSelfIllum : 0u) | (dynamicModel ? kInstanceModel : 0u) | (model.character ? kInstanceCharacter : 0u), {}};
         std::memcpy(record.previousTransform, source.previousKnown ? source.previousTransform : instance.Transform, sizeof(record.previousTransform));
         m_recorded.emplace_back(source.model, mask);
         ++written;
     };
     SceneInstance world;
     world.model = m_worldModel;
+    world.flags = m_worldFlags;
     write(world, nullptr, kWorldMask);
     for (const SceneInstance& instance : m_staticInstances)
         write(instance, instance.transform, instance.mask != 0 ? instance.mask : kStaticPropMask);
@@ -931,7 +1142,7 @@ SceneFrame Scene::RecordFrame(ID3D12GraphicsCommandList4* list, UINT slot, std::
             const bool spot = light.outerAngle > 0.0f;
             gpu = {{light.origin[0], light.origin[1], light.origin[2]}, kDynamicLightType, {light.color[0], light.color[1], light.color[2]},
                 light.radius, {light.direction[0], light.direction[1], light.direction[2]}, spot ? std::cos(light.innerAngle * kDegreesToRadians) : 0.0f,
-                spot ? std::cos(light.outerAngle * kDegreesToRadians) : -1.0f, spot ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f, 0, 0, kNoLightStyle};
+                spot ? std::cos(light.outerAngle * kDegreesToRadians) : -1.0f, spot ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f, 0u, 0.0f, kNoLightStyle, 0.0f, {}};
         }
         result.dynamicLightsView = frame.dynamicLightsView;
     }

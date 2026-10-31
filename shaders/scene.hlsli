@@ -27,15 +27,30 @@ struct InstanceRecord
     uint previousPositions;
     // Last frame's object-to-world transform.
     float4 previousTransform[3];
-    // kInstanceIgnoreNormals, kInstanceSelfIllum, kInstanceModel.
+    // kInstanceIgnoreNormals, kInstanceSelfIllum, kInstanceModel, kInstanceVradSky.
     uint flags;
     uint3 padding;
 };
 
-// kInstanceIgnoreNormals, kInstanceSelfIllum and kInstanceModel in src/scene.h.
+// kInstanceIgnoreNormals, kInstanceSelfIllum, kInstanceModel and kInstanceVradSky in src/scene.h.
 static const uint kInstanceIgnoreNormals = 0x01;
 static const uint kInstanceSelfIllum = 0x02;
 static const uint kInstanceModel = 0x04;
+static const uint kInstanceVradSky = 0x08;
+static const uint kInstanceEmitter = 0x10;
+static const uint kInstanceCharacter = 0x20;
+
+// EmissiveLighting in src/settings.h.
+static const uint kEmissiveOff = 0;
+static const uint kEmissiveFull = 2;
+
+// Props that ignore normals (kInstanceIgnoreNormals, mostly foliage) are lit as thin two-sided leaves: this share of
+// the light reaching one side passes through to the other.
+static const float kLeafTransmission = 0.3;
+// Light through a leaf scatters under its surface: this share of it scatters forward, in a lobe of this power around
+// the light's own direction, and the rest evenly. Leaves glow most where the eye looks through them towards the light.
+static const float kLeafForwardScatter = 0.5;
+static const float kLeafScatterPower = 4.0;
 
 // Mirrors GpuLight in src/scene.cpp (bsp::Light, VRAD units and falloff).
 struct Light
@@ -43,6 +58,7 @@ struct Light
     float3 origin;
     uint type;
     float3 intensity;
+    // Where an engine dynamic light's light ends; 0 for map lights.
     float radius;
     float3 normal;
     float stopdot;
@@ -51,14 +67,25 @@ struct Light
     float constantAttn;
     float linearAttn;
     float quadraticAttn;
-    // Byte offset in the lights buffer of the convex hulls that block the light (HullBlocks), and their number.
-    uint hullOffset;
-    uint hullCount;
+    // kLightSealed.
+    uint flags;
+    // The radius of the sphere a map light is lit as: kBulbRadius in src/scene.h, or its lamp shell's.
+    float size;
     // Light style (switchable and animated lights), or kNoLightStyle.
     uint style;
+    // A map light's inverse-square intensity relative to `intensity` (Scene::GpuLight::referenceScale).
+    float referenceScale;
+    uint3 padding;
 };
 
+// Bytes per Light in the light buffers.
+static const uint kLightStride = 96;
+// For LightTransmittance: aim at the light's centre.
+static const float2 kLightCentre = -1.0;
+
 static const uint kNoLightStyle = 0xFFFFFFFFu;
+// kLightSealed in src/scene.h: the light sits inside lamp shells (kLampShellMask), which its shadow rays pass.
+static const uint kLightSealed = 0x01;
 // engine::kLightStyles; lights of higher styles always shine fully, as in the engine.
 static const uint kLightStyles = 128;
 
@@ -119,39 +146,50 @@ struct AlphaTriangle
     float2 uv0;
     float2 uv1;
     float2 uv2;
-    uint padding;
+    // Scene::PackTint: how a translucent triangle colours the light through it (linear RGB8, mode in the top byte).
+    uint tint;
 };
 
-// Opacity where a ray crosses a candidate in a model's non-opaque geometry: 0 or 1 for alpha-tested triangles,
-// texture alpha times $alpha for translucent ones (`translucent`). The alpha is filtered as the game's alpha tests
-// filter it; unfiltered, the low-resolution alpha's texels showed as square blocks in leaf shadows.
-float CandidateOpacity(uint instance, uint alphaPrimitive, float2 barycentrics, out bool translucent)
+// Scene::kTintFilter and Scene::kTintRefract.
+static const uint kTintFilter = 1;
+static const uint kTintRefract = 2;
+
+// The light that gets through where a ray crosses a candidate in a model's non-opaque geometry: 0 or 1 for alpha-tested
+// triangles; for translucent ones (`translucent`), with opacity the texture's alpha times $alpha, (1 - opacity) as it
+// is and the covered part filtered by the texture's colour; for Refract glass its tint times its tint texture's colour.
+// The alpha is filtered as the game's alpha tests filter it; unfiltered, the low-resolution alpha's texels showed as
+// square blocks in leaf shadows. Textures are read as sRGB, as the game reads base and tint textures.
+float3 CandidateTransmission(uint instance, uint alphaPrimitive, float2 barycentrics, out bool translucent)
 {
     ByteAddressBuffer alpha = ResourceDescriptorHeap[NonUniformResourceIndex(LoadInstance(instance).alpha)];
     AlphaTriangle entry = alpha.Load<AlphaTriangle>(alphaPrimitive * 32);
     uint packed = entry.packed;
     translucent = (packed & kTranslucentFlag) != 0;
     float value = ((packed >> 24) & 0x7F) * (1.0 / 127.0);
-    float textureAlpha = 1.0;
+    float4 texel = 1.0;
     if ((packed & 0xFFFFFF) != kNoAlphaTexture) {
         float2 uv = entry.uv0 + barycentrics.x * (entry.uv1 - entry.uv0) + barycentrics.y * (entry.uv2 - entry.uv0);
         Texture2D<float4> texture = ResourceDescriptorHeap[NonUniformResourceIndex(packed & 0xFFFFFF)];
-        textureAlpha = texture.SampleLevel(g_linearWrap, uv, 0.0).a;
+        texel = texture.SampleLevel(g_linearWrap, uv, 0.0);
     }
-    if (translucent)
-        return saturate(textureAlpha * value);
-    return textureAlpha >= value ? 1.0 : 0.0;
+    if (!translucent)
+        return texel.a >= value ? 0.0 : 1.0;
+    float3 colour = UnpackAlbedo(entry.tint) * SrgbToLinear(saturate(texel.rgb));
+    if ((entry.tint >> 24) == kTintRefract)
+        return colour;
+    float opacity = saturate(texel.a * value);
+    return (1.0 - opacity) + opacity * colour;
 }
 
-// Rays other than shadow rays stop at candidates at least this opaque.
+// Rays other than shadow rays stop at candidates at least this opaque (1 - the luminance of what gets through).
 static const float kSolidOpacity = 0.5;
 
 // With `gbufferSurface`, translucent candidates never stop the ray: the game draws them after the G-buffer.
 bool CandidateIsSolid(uint instance, uint alphaPrimitive, float2 barycentrics, bool gbufferSurface = false)
 {
     bool translucent;
-    float opacity = CandidateOpacity(instance, alphaPrimitive, barycentrics, translucent);
-    return opacity >= kSolidOpacity && !(gbufferSurface && translucent);
+    float3 through = CandidateTransmission(instance, alphaPrimitive, barycentrics, translucent);
+    return 1.0 - Luminance(through) >= kSolidOpacity && !(gbufferSurface && translucent);
 }
 
 // A committed triangle hit: the instance, the triangle's index in its model, and where on it.
@@ -289,8 +327,10 @@ struct Material
 };
 
 static const uint kNoMaterial = 0xFFFFFFFFu;
-// Material flags (Scene::kMaterialUnlit): the surface shows its albedo as it is.
+// Material flags (Scene::kMaterialUnlit): the surface shows its albedo as it is. Scene::kMaterialLightTexture: a face
+// whose texture VRAD made emit_surface lights of, so its glow lights nothing again.
 static const uint kMaterialUnlit = 1;
+static const uint kMaterialLightTexture = 2;
 
 // The material flags of a hit triangle, 0 without a material.
 uint MaterialFlags(HitInfo hit)
@@ -374,25 +414,94 @@ static const float kHitMaskFootprint = 0.01;
 
 // The light a hit surface gives off itself: Source's self-illumination, its albedo times the material's tint and mask
 // (the G-buffer twins write the same as emissive). `distance` is the ray's length. Only models with such a material
-// (kInstanceSelfIllum) look the material up.
-float3 HitEmission(HitSurface surface, HitInfo hit, float distance)
+// (kInstanceSelfIllum) look the material up. For `lighting` (light it gives other surfaces), light textures give none:
+// VRAD's emit_surface lights already hold their light.
+float3 HitEmission(HitSurface surface, HitInfo hit, float distance, bool lighting = false)
 {
     if ((surface.flags & kInstanceSelfIllum) == 0)
         return 0.0;
     Material material;
     float2 uv;
     float uvPerUnit;
-    if (!HitMaterial(hit, material, uv, uvPerUnit) || material.selfIllumMask == kMaskOff)
+    if (!HitMaterial(hit, material, uv, uvPerUnit) || material.selfIllumMask == kMaskOff || (lighting && (material.flags & kMaterialLightTexture) != 0))
         return 0.0;
     return material.selfIllumTint * surface.albedo * MaskValue(material.selfIllumMask, uv, uvPerUnit * max(distance, 1.0) * kHitMaskFootprint);
+}
+
+// The glow an indirect ray meets at a hit, which lights the surface the ray left (EmissiveLighting): none when off,
+// and at the ray's first hit from the G-buffer none from emitters when they are sampled directly (SampleEmitter).
+float3 BounceEmission(HitSurface surface, HitInfo hit, bool firstHit)
+{
+    if (g_frame.emissiveLighting == kEmissiveOff || (firstHit && g_frame.emitterCount != 0 && (surface.flags & kInstanceEmitter) != 0))
+        return 0.0;
+    return HitEmission(surface, hit, hit.t, true);
+}
+
+// Mirrors GpuEmitter in src/scene.h.
+struct Emitter
+{
+    float3 p0;
+    uint instance;
+    float3 p1;
+    uint primitive;
+    float3 p2;
+    float cdf;
+};
+
+// A point of a glowing triangle as an area light (EmissiveLighting::Full): a triangle picked in proportion to its
+// emission times its area by `u`, and a point uniformly on it by `v`. `glow` is its emission times its cosine towards
+// `position` and its area over pi and the triangle's probability: the irradiance it gives, with the receiver's
+// Lambert term and the inverse square of the distance to `target` still to apply. False where it faces away.
+bool SampleEmitter(float3 position, float u, float2 v, out float3 target, out float3 glow)
+{
+    target = 0.0;
+    glow = 0.0;
+    if (g_frame.emitterCount == 0)
+        return false;
+    ByteAddressBuffer emitters = ResourceDescriptorHeap[g_frame.emittersView];
+    uint low = 0;
+    uint high = g_frame.emitterCount - 1;
+    while (low < high) {
+        uint middle = (low + high) / 2;
+        if (asfloat(emitters.Load(middle * 48 + 44)) <= u)
+            low = middle + 1;
+        else
+            high = middle;
+    }
+    Emitter emitter = emitters.Load<Emitter>(low * 48);
+    float probability = emitter.cdf - (low > 0 ? asfloat(emitters.Load((low - 1) * 48 + 44)) : 0.0);
+    float3 normal = cross(emitter.p1 - emitter.p0, emitter.p2 - emitter.p0);
+    float area = 0.5 * length(normal);
+    if (probability <= 0.0 || area <= 0.0)
+        return false;
+    float root = sqrt(v.x);
+    float2 barycentrics = float2(root * (1.0 - v.y), root * v.y);
+    target = emitter.p0 + barycentrics.x * (emitter.p1 - emitter.p0) + barycentrics.y * (emitter.p2 - emitter.p0);
+    float3 toPosition = position - target;
+    float distance = length(toPosition);
+    // Source's front faces: cross(p1 - p0, p2 - p0) points out of the back.
+    float cosine = dot(-normal / (2.0 * area), toPosition / max(distance, 1e-4));
+    if (cosine <= 0.0)
+        return false;
+    InstanceRecord record = LoadInstance(emitter.instance);
+    ByteAddressBuffer albedo = ResourceDescriptorHeap[NonUniformResourceIndex(record.albedo)];
+    HitSurface surface = (HitSurface)0;
+    surface.albedo = UnpackAlbedo(albedo.Load(emitter.primitive * 4));
+    surface.flags = record.flags;
+    HitInfo hit = (HitInfo)0;
+    hit.instance = emitter.instance;
+    hit.primitive = emitter.primitive;
+    hit.barycentrics = barycentrics;
+    glow = HitEmission(surface, hit, distance, true) * (cosine * area / (3.14159265 * probability));
+    return any(glow > 0.0);
 }
 
 // kSkyboxMask in src/scene.h.
 static const uint kSkyboxMask = 0x10;
 
-// The share of light that gets from `origin` to tMax along a ray: 0 past anything solid, otherwise the product of
-// what each translucent surface crossed lets through.
-float Transmittance(float3 origin, float3 direction, float tMax, uint mask, uint rayFlags = RAY_FLAG_NONE)
+// The share of light that gets from `origin` to tMax along a ray, per colour: 0 past anything solid, otherwise the
+// product of what each translucent surface crossed lets through.
+float3 Transmittance(float3 origin, float3 direction, float tMax, uint mask, uint rayFlags = RAY_FLAG_NONE)
 {
     if (mask == 0)
         return 1.0;
@@ -403,13 +512,13 @@ float Transmittance(float3 origin, float3 direction, float tMax, uint mask, uint
     ray.TMin = 0.01;
     ray.TMax = tMax;
     query.TraceRayInline(g_scene, rayFlags, mask, ray);
-    float transmittance = 1.0;
+    float3 transmittance = 1.0;
     while (query.Proceed()) {
         bool translucent;
-        float opacity = CandidateOpacity(query.CandidateInstanceID(), query.CandidatePrimitiveIndex(), query.CandidateTriangleBarycentrics(), translucent);
+        float3 through = CandidateTransmission(query.CandidateInstanceID(), query.CandidatePrimitiveIndex(), query.CandidateTriangleBarycentrics(), translucent);
         if (translucent)
-            transmittance *= 1.0 - opacity;
-        if ((!translucent && opacity > 0.0) || transmittance < 0.01)
+            transmittance *= through;
+        if ((!translucent && through.x < 1.0) || all(transmittance < 0.01))
             query.CommitNonOpaqueTriangleHit();
     }
     return query.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? 0.0 : transmittance;
@@ -418,32 +527,45 @@ float Transmittance(float3 origin, float3 direction, float tMax, uint mask, uint
 // `mask` is g_frame.sunShadowMask, or g_frame.bounceMask for the light of indirect bounces. As VRAD did
 // (TestLine_DoesHitSky in src/utils/vrad/trace.cpp), rays from the map that reach the sky go on through the 3D
 // skybox, whose buildings and terrain shadow the map.
-float SunVisibility(float3 origin, uint mask, uint rayFlags = RAY_FLAG_NONE)
+float3 SunVisibility(float3 origin, uint mask, uint rayFlags = RAY_FLAG_NONE)
 {
-    float visibility = Transmittance(origin, g_frame.sunDirection, 65536.0, mask, rayFlags);
-    if (visibility > 0.0 && g_frame.worldToSky > 0.0 && (mask & kSkyboxMask) == 0) {
+    float3 visibility = Transmittance(origin, g_frame.sunDirection, 65536.0, mask, rayFlags);
+    if (any(visibility > 0.0) && g_frame.worldToSky > 0.0 && (mask & kSkyboxMask) == 0) {
         float3 camera = float3(g_frame.skyCameraX, g_frame.skyCameraY, g_frame.skyCameraZ);
         visibility *= Transmittance(camera + origin * g_frame.worldToSky, g_frame.sunDirection, 65536.0, kSkyboxMask);
     }
     return visibility;
 }
 
-// Sunlight reaching a hit surface, with its shadow ray starting at `origin`.
+// Sunlight reaching a hit surface, with its shadow ray starting at `origin`, off the side the ray came from. Leaves
+// (kInstanceIgnoreNormals) also take the sunlight that comes through from their other side, evenly scattered.
 float3 SunIrradiance(HitSurface hit, float3 origin, uint mask)
 {
-    float lambert = saturate(dot(hit.normal, g_frame.sunDirection));
-    if (g_frame.sunEnabled == 0.0 || lambert <= 0.0)
+    if (g_frame.sunEnabled == 0.0)
         return 0.0;
-    return g_frame.sunColor * lambert * SunVisibility(origin, mask);
+    float cosine = dot(hit.normal, g_frame.sunDirection);
+    bool leaf = (hit.flags & kInstanceIgnoreNormals) != 0;
+    if (leaf && cosine < 0.0)
+        return g_frame.sunColor * (kLeafTransmission * -cosine) * SunVisibility(2.0 * hit.position - origin, mask);
+    if (cosine <= 0.0)
+        return 0.0;
+    return g_frame.sunColor * (cosine * (leaf ? 1.0 - kLeafTransmission : 1.0)) * SunVisibility(origin, mask);
 }
 
-// Map lights that can reach a position: the (offset, count) range of light indices of its visibility cluster
-// (Scene::LightLists).
+// Map lights that can reach a position (Scene::LightLists): the (offset, count) range of the light indices its light
+// grid cell lists, or for the bake its visibility cluster's, and the range of the cell's tail, the other lights that
+// can reach it, sampled by weight (SampleTailLight).
 struct LightRanges
 {
     uint first;
     uint count;
+    uint tailFirst;
+    uint tailCount;
 };
+
+// Set on a listed light the PVS of its cell's clusters leaves out (kHiddenLight in src/scene.cpp): it may arrive
+// through gaps the PVS misses, but it takes no exact shadow ray.
+static const uint kHiddenLight = 0x80000000u;
 
 // The visibility cluster holding a point, as found by the engine's point-in-leaf walk, or the cluster count
 // when the point is in solid space or the map has no visibility data.
@@ -465,8 +587,9 @@ uint ClusterAt(float3 position)
     return cluster >= 0 ? uint(cluster) : g_frame.clusterCount;
 }
 
-// Surface points lie on leaf boundaries, so the lookup is made just off the surface.
-LightRanges LightsAt(float3 position, float3 normal)
+// The lights VRAD let reach a point (its PVSCheck), for the bake: those of its visibility cluster. Surface points lie on
+// leaf boundaries, so the lookup is made just off the surface. Without a tail; ClusterLightIndex reads them.
+LightRanges ClusterLights(float3 position, float3 normal)
 {
     LightRanges ranges = (LightRanges)0;
     if (g_frame.lightCount == 0)
@@ -478,27 +601,84 @@ LightRanges LightsAt(float3 position, float3 normal)
     return ranges;
 }
 
-uint LightRangeCount(LightRanges ranges) { return ranges.count; }
-
-// The i-th map light of LightsAt's ranges.
-uint LightRangeIndex(LightRanges ranges, uint i)
+uint ClusterLightIndex(LightRanges ranges, uint i)
 {
     ByteAddressBuffer indices = ResourceDescriptorHeap[g_frame.lightIndicesView];
     return indices.Load((ranges.first + i) * 4);
 }
 
+// The lights of the light grid cell holding a point; points outside the grid take the nearest cell.
+LightRanges LightsAt(float3 position)
+{
+    LightRanges ranges = (LightRanges)0;
+    if (g_frame.lightCount == 0 || g_frame.gridCellsView == kNoView)
+        return ranges;
+    int3 cell = clamp(int3(floor((position - g_frame.gridOrigin) / g_frame.gridCellSize)), 0, int3(g_frame.gridDims) - 1);
+    ByteAddressBuffer cells = ResourceDescriptorHeap[g_frame.gridCellsView];
+    uint4 range = cells.Load4(((cell.z * g_frame.gridDims.y + cell.y) * g_frame.gridDims.x + cell.x) * 16);
+    ranges.first = range.x;
+    ranges.count = range.y;
+    ranges.tailFirst = range.z;
+    ranges.tailCount = range.w;
+    return ranges;
+}
+
+uint LightRangeCount(LightRanges ranges) { return ranges.count; }
+
+// The i-th listed light of LightsAt's ranges, with kHiddenLight.
+uint LightRangeEntry(LightRanges ranges, uint i)
+{
+    ByteAddressBuffer indices = ResourceDescriptorHeap[g_frame.gridIndicesView];
+    return indices.Load((ranges.first + i) * 4);
+}
+
+uint LightRangeIndex(LightRanges ranges, uint i) { return LightRangeEntry(ranges, i) & ~kHiddenLight; }
+
+// One light of a cell's tail by its weight there, from `u` in [0, 1): its index and the probability of the pick; false
+// when the cell has no tail.
+bool SampleTailLight(LightRanges ranges, float u, out uint light, out float probability)
+{
+    light = 0;
+    probability = 0.0;
+    if (ranges.tailCount == 0)
+        return false;
+    // Entries are (light, cumulative weight up to 1); the first whose weight passes u.
+    ByteAddressBuffer tail = ResourceDescriptorHeap[g_frame.gridTailView];
+    uint low = 0;
+    uint high = ranges.tailCount - 1;
+    while (low < high) {
+        uint middle = (low + high) / 2;
+        if (asfloat(tail.Load((ranges.tailFirst + middle) * 8 + 4)) <= u)
+            low = middle + 1;
+        else
+            high = middle;
+    }
+    uint2 entry = tail.Load2((ranges.tailFirst + low) * 8);
+    float before = low > 0 ? asfloat(tail.Load((ranges.tailFirst + low - 1) * 8 + 4)) : 0.0;
+    light = entry.x;
+    probability = asfloat(entry.y) - before;
+    return probability > 0.0;
+}
+
 // Irradiance below which a light cannot change the encoded result (1/1024 after the tonemap scale), so its
 // shadow ray is not traced. VRAD's falloff never reaches zero, and maps have hundreds of lights.
 // The irradiance volume named by g_frame's probe views at a point, or -1 where there is none: the main view's
-// filled volume, or its indirect light alone for forward twins (shaders/forward_twin.hlsli).
-float3 VolumeIrradiance(float3 position, float3 normal)
+// filled volume, or its indirect light alone for forward twins (shaders/forward_twin.hlsli). Points outside its window
+// get -1, or with `nearest` the light of the window's nearest probes. The probes are read a cell out along the normal,
+// so all eight blended lie in front of the surface: probes just behind a wall see open space there and leaked its light
+// through the wall.
+float3 VolumeIrradiance(float3 position, float3 normal, bool nearest = false)
 {
     if (g_frame.probeRedView == kNoView)
         return -1.0;
+    position += normal * g_frame.probeSpacing;
     static const float3 kGrid = float3(32.0, 32.0, 16.0);
     float3 window = (position / g_frame.probeSpacing - 0.5) - float3(g_frame.probeOrigin);
-    if (any(window < 0.0) || any(window > kGrid - 1.0))
-        return -1.0;
+    if (any(window < 0.0) || any(window > kGrid - 1.0)) {
+        if (!nearest)
+            return -1.0;
+        position = (clamp(window, 0.0, kGrid - 1.0) + 0.5 + float3(g_frame.probeOrigin)) * g_frame.probeSpacing;
+    }
     float3 uvw = position / (g_frame.probeSpacing * kGrid);
     Texture3D<float4> red = ResourceDescriptorHeap[g_frame.probeRedView];
     Texture3D<float4> green = ResourceDescriptorHeap[g_frame.probeGreenView];
@@ -515,10 +695,9 @@ float VisibleIrradiance() { return (1.0 / 1024.0) / max(g_frame.tonemapScale, 1e
 // model surrounds the light, so occluders right next to them are ignored.
 static const float kAttachedLightClearance = 48.0;
 
-// kLocalPlayerMask in src/scene.h.
+// kLocalPlayerMask and kLampShellMask in src/scene.h.
 static const uint kLocalPlayerMask = 0x08;
-// kShadowlessPropMask in src/scene.h.
-static const uint kShadowlessPropMask = 0x20;
+static const uint kLampShellMask = 0x80;
 
 // Other lights' shadow rays stop this far short of them.
 static const float kLightClearance = 1.0;
@@ -526,16 +705,17 @@ static const float kLightClearance = 1.0;
 float ShadowRayLength(float clearance, float distance) { return distance - min(clearance, distance * 0.5); }
 
 // Shadow rays of local lights. Dynamic and projected lights are mostly the local player's own (flashlight, muzzle
-// flashes), which the game never shadows with the player's body.
-uint ShadowMask(bool attachedLight)
+// flashes), which the game never shadows with the player's body. Sealed map lights shine through lamp shells.
+uint ShadowMask(bool attachedLight, bool sealed = false)
 {
-    uint mask = g_frame.traceMask & ~kShadowlessPropMask;
+    uint mask = sealed ? g_frame.lightShadowMask & ~kLampShellMask : g_frame.lightShadowMask;
     return attachedLight ? mask & ~kLocalPlayerMask : mask;
 }
 
-// VRAD lights props that ignore normals (STATIC_PROP_IGNORE_NORMALS) as if every light met them at CONSTANT_DOT;
-// a zero normal stands for them.
-static const float kIgnoredNormalLambert = 0.35;
+// Set by a pass for a pixel of a prop that ignores normals, whose normal it turns towards the eye: light reaches it from
+// both sides (LeafTerm). g_toEye is the direction from the pixel to the eye.
+static bool g_twoSided = false;
+static float3 g_toEye = 0.0;
 
 // Set by a pass for the pixel it lights: Source's half-Lambert diffuse term ($halflambert, DiffuseTerm in
 // common_vertexlitgeneric_dx9.h).
@@ -544,10 +724,21 @@ static bool g_halfLambert = false;
 // Set by a pass for the pixel it lights: the light warp texture ($lightwarptexture), or kNoView.
 static uint g_lightWarpView = kNoView;
 
+// A thin leaf's diffuse term for light arriving at `cosine` to its eye-facing normal: diffuse reflection of the light
+// on the eye's side, and of the light behind it the share that comes through, partly scattered forward towards the eye.
+// The forward lobe, (power + 2) / 2 * pow(cos, power), carries as much light as even scattering.
+float LeafTerm(float cosine, float3 toLight)
+{
+    if (cosine >= 0.0)
+        return (1.0 - kLeafTransmission) * cosine;
+    float forward = (kLeafScatterPower + 2.0) * 0.5 * pow(saturate(dot(g_toEye, -toLight)), kLeafScatterPower);
+    return kLeafTransmission * -cosine * lerp(1.0, forward, kLeafForwardScatter);
+}
+
 float Lambert(float3 normal, float3 toLight)
 {
-    if (!any(normal != 0.0))
-        return kIgnoredNormalLambert;
+    if (g_twoSided)
+        return LeafTerm(dot(normal, toLight), toLight);
     if (g_halfLambert) {
         float wrapped = saturate(dot(normal, toLight) * 0.5 + 0.5);
         return wrapped * wrapped;
@@ -560,7 +751,7 @@ float Lambert(float3 normal, float3 toLight)
 // common_vertexlitgeneric_dx9.h). Highlights keep the plain term.
 float3 LightWarp(float3 normal, float3 toLight)
 {
-    if (g_lightWarpView == kNoView || !any(normal != 0.0))
+    if (g_lightWarpView == kNoView || g_twoSided)
         return 1.0;
     float cosine = dot(normal, toLight);
     float term = g_halfLambert ? saturate(cosine * 0.5 + 0.5) : saturate(cosine);
@@ -574,7 +765,7 @@ Light LoadLight(uint index)
 {
     if (index < g_frame.lightCount) {
         ByteAddressBuffer lights = ResourceDescriptorHeap[g_frame.lightsView];
-        Light light = lights.Load<Light>(index * 80);
+        Light light = lights.Load<Light>(index * kLightStride);
         if (g_frame.lightStylesView != kNoView && light.style < kLightStyles) {
             ByteAddressBuffer styles = ResourceDescriptorHeap[g_frame.lightStylesView];
             light.intensity *= asfloat(styles.Load(light.style * 4));
@@ -582,45 +773,56 @@ Light LoadLight(uint index)
         return light;
     }
     ByteAddressBuffer dynamicLights = ResourceDescriptorHeap[g_frame.dynamicLightsView];
-    return dynamicLights.Load<Light>((index - g_frame.lightCount) * 80);
+    return dynamicLights.Load<Light>((index - g_frame.lightCount) * kLightStride);
 }
 
-// Whether the straight path from a map light to a point crosses one of the light's convex hulls: the static prop
-// meshes VRAD shadowed it with (FixtureHulls in src/world.cpp). Points inside a hull with the light stay lit.
-bool HullBlocks(Light light, float3 position)
+// A map light's flags (Light::flags) and size (asuint), without loading the rest of it.
+uint2 MapLightShape(uint index)
 {
     ByteAddressBuffer lights = ResourceDescriptorHeap[g_frame.lightsView];
-    float3 path = position - light.origin;
-    // Paths that only touch a hull, within half a unit, pass.
-    float margin = 0.5 / max(length(path), 1.0);
-    uint offset = light.hullOffset;
-    for (uint h = 0; h < light.hullCount; ++h) {
-        uint planeCount = lights.Load(offset);
-        offset += 16;
-        float enter = 0.0;
-        float leave = 1.0;
-        for (uint p = 0; p < planeCount; ++p, offset += 16) {
-            float4 plane = lights.Load<float4>(offset);
-            float start = dot(plane.xyz, light.origin) - plane.w - 0.1;
-            float rate = dot(plane.xyz, path);
-            if (rate > 1e-6)
-                leave = min(leave, -start / rate);
-            else if (rate < -1e-6)
-                enter = max(enter, -start / rate);
-            else if (start > 0.0)
-                leave = -1.0;
-        }
-        if (leave - enter > margin && (enter > margin || leave < 1.0 - margin))
-            return true;
-    }
-    return false;
+    return lights.Load2(index * kLightStride + 68);
+}
+
+// A point of the disc a sphere of `radius` at `centre` shows `origin`, by two numbers in [0, 1).
+float3 DiscPoint(float3 centre, float radius, float3 origin, float2 jitter)
+{
+    float3 t, b;
+    BuildBasis(normalize(centre - origin), t, b);
+    float r = radius * sqrt(jitter.x);
+    float phi = 6.28318530718 * jitter.y;
+    return centre + (t * cos(phi) + b * sin(phi)) * r;
 }
 
 // Half the width, in world units, over which spot light cones fade at least: about one luxel of a finely lit floor.
 static const float kSpotEdgeBlur = 8.0;
 
-// Unshadowed irradiance from a light, following VRAD's GatherSampleStandardLightSSE. `toLight` and
-// `distance` describe the shadow ray.
+// A spot light's share of its light towards `-toLight`, 1 for other lights: VRAD's cone, the cosine to the spot's
+// axis times the fringe between its inner and outer cones (GatherSampleStandardLightSSE).
+float SpotFactor(Light light, float3 toLight, float distance)
+{
+    if (light.type != kLightSpot)
+        return 1.0;
+    float spot = -dot(toLight, light.normal);
+    // Lightmaps blur the cone's edge over their luxels; without that, cones whose inner and outer angles (nearly)
+    // match end in a hard line. The fringe spans at least kSpotEdgeBlur units on either side.
+    float edge = 0.5 * (light.stopdot + light.stopdot2);
+    float spread = sqrt(saturate(1.0 - edge * edge)) * kSpotEdgeBlur / distance;
+    float outer = max(min(light.stopdot2, edge - spread), -1.0);
+    float inner = min(max(light.stopdot, edge + spread), 1.0);
+    if (spot <= outer)
+        return 0.0;
+    if (spot > inner)
+        return spot;
+    float fringe = saturate((spot - outer) / max(inner - outer, 1e-4));
+    if (light.exponent != 0.0 && light.exponent != 1.0)
+        fringe = pow(fringe, light.exponent);
+    return spot * fringe;
+}
+
+// Unshadowed irradiance from a light. Map point and spot lights are spheres of their size (Light::size) whose light
+// falls off with the inverse square of the distance, matched to the mapper's attenuation at the light's reference
+// distance (Light::referenceScale); spot lights keep their cones. Surface lights (VRAD's emit_surface patches) fall off
+// with the inverse square and their own cosine. `toLight` and `distance` describe the shadow ray to the centre.
 float3 LightIrradiance(Light light, float3 position, float3 normal, out float3 toLight, out float distance)
 {
     float3 delta = light.origin - position;
@@ -628,9 +830,8 @@ float3 LightIrradiance(Light light, float3 position, float3 normal, out float3 t
     distance = sqrt(distanceSquared);
     toLight = delta / distance;
     float lambert = Lambert(normal, toLight);
-    if (lambert <= 0.0 || (light.radius > 0.0 && distance > light.radius))
+    if (lambert <= 0.0)
         return 0.0;
-    float falloffDistance = max(distance, 1.0);
     float falloff;
     if (light.type == kLightDynamic) {
         float r = distance / light.radius;
@@ -640,34 +841,10 @@ float3 LightIrradiance(Light light, float3 position, float3 normal, out float3 t
             falloff *= smoothstep(light.stopdot2, light.stopdot, -dot(toLight, light.normal));
         return light.intensity * (lambert * falloff) * g_frame.lightScale;
     }
-    if (light.type == kLightSurface) {
+    if (light.type == kLightSurface)
         falloff = saturate(-dot(toLight, light.normal)) / distanceSquared;
-    } else {
-        falloff = 1.0 / max(light.constantAttn + light.linearAttn * falloffDistance + light.quadraticAttn * falloffDistance * falloffDistance, 1e-4);
-        if (light.type == kLightSpot) {
-            float spot = -dot(toLight, light.normal);
-            // Lightmaps blur the cone's edge over their luxels; without that, cones whose inner and outer angles
-            // (nearly) match end in a hard line. The fringe spans at least kSpotEdgeBlur units on either side.
-            float edge = 0.5 * (light.stopdot + light.stopdot2);
-            float spread = sqrt(saturate(1.0 - edge * edge)) * kSpotEdgeBlur / distance;
-            float outer = max(min(light.stopdot2, edge - spread), -1.0);
-            float inner = min(max(light.stopdot, edge + spread), 1.0);
-            if (spot <= outer)
-                return 0.0;
-            falloff *= spot;
-            if (spot <= inner) {
-                float fringe = saturate((spot - outer) / max(inner - outer, 1e-4));
-                if (light.exponent != 0.0 && light.exponent != 1.0)
-                    fringe = pow(fringe, light.exponent);
-                falloff *= fringe;
-            }
-        }
-    }
-    // The engine stops lighting at the radius VRAD computed; fade the last part so the cut does not show.
-    if (light.radius > 0.0)
-        falloff *= saturate((light.radius - distance) / (0.2 * light.radius));
-    if (light.hullCount != 0 && HullBlocks(light, position))
-        return 0.0;
+    else
+        falloff = light.referenceScale / max(distanceSquared, light.size * light.size) * SpotFactor(light, toLight, distance);
     return light.intensity * (lambert * falloff) * g_frame.lightScale;
 }
 
@@ -680,6 +857,14 @@ Projector LoadProjector(uint index)
 float ProjectorClearance(Projector projector)
 {
     return (projector.flags & kProjectorLocalFlashlight) != 0 ? kLightClearance : kAttachedLightClearance;
+}
+
+// The share of a projected light that reaches `origin`, on the straight path from there to the projector.
+float3 ProjectorTransmittance(Projector projector, float3 origin)
+{
+    float3 path = projector.origin - origin;
+    float distance = max(length(path), 1e-3);
+    return Transmittance(origin, path / distance, ShadowRayLength(ProjectorClearance(projector), distance), ShadowMask(true));
 }
 
 // Below this distance from its lamp the local flashlight brightens more slowly than the inverse square: a
@@ -724,8 +909,8 @@ float3 ProjectorIrradiance(Projector projector, float3 position, float3 normal, 
     return cookie * projector.color * (attenuation * lambert * endFalloff);
 }
 
-// The lights that can reach a point, in one index space: its cluster's map lights, then the engine's dynamic
-// lights, then the projected lights.
+// The lights that can reach a point, in one index space: its grid cell's listed map lights, then the engine's dynamic
+// lights, then the projected lights; from `count` on, any map light by its index, as the cell's tail samples them.
 struct LightSet
 {
     LightRanges ranges;
@@ -734,10 +919,10 @@ struct LightSet
     uint count;
 };
 
-LightSet LightSetAt(float3 position, float3 normal)
+LightSet LightSetAt(float3 position)
 {
     LightSet set;
-    set.ranges = LightsAt(position, normal);
+    set.ranges = LightsAt(position);
     set.mapLights = LightRangeCount(set.ranges);
     set.pointLights = set.mapLights + g_frame.dynamicLightCount;
     set.count = set.pointLights + g_frame.projectorCount;
@@ -745,30 +930,47 @@ LightSet LightSetAt(float3 position, float3 normal)
 }
 
 // Dynamic and projected lights are the ones attached to players and weapons.
-bool IsAttachedLight(LightSet set, uint i) { return i >= set.mapLights; }
+bool IsAttachedLight(LightSet set, uint i) { return i >= set.mapLights && i < set.count; }
+
+// The index in the map's lights of a LightSet's i-th light that is a map light.
+uint SetMapLight(LightSet set, uint i) { return i >= set.count ? i - set.count : LightRangeIndex(set.ranges, i); }
 
 // Unshadowed irradiance from the i-th light of a LightSet.
 float3 SetLightIrradiance(LightSet set, uint i, float3 position, float3 normal, out float3 toLight, out float distance)
 {
-    if (i >= set.pointLights)
+    if (i >= set.pointLights && i < set.count)
         return ProjectorIrradiance(LoadProjector(i - set.pointLights), position, normal, toLight, distance);
-    uint index = i >= set.mapLights ? g_frame.lightCount + i - set.mapLights : LightRangeIndex(set.ranges, i);
+    uint index = IsAttachedLight(set, i) ? g_frame.lightCount + i - set.mapLights : SetMapLight(set, i);
     return LightIrradiance(LoadLight(index), position, normal, toLight, distance);
 }
 
-// The share of the i-th light of a LightSet that reaches `origin`, `distance` away along `toLight`.
-float LightTransmittance(LightSet set, uint i, float3 origin, float3 toLight, float distance, uint rayFlags = RAY_FLAG_NONE)
+// The share of the i-th light of a LightSet, centred at `lightPosition`, that reaches `origin`. The ray aims at the light
+// from the origin itself: origins sit off the surface by a bias that grows with the distance to the eye, and rays
+// parallel to the surface's own path ended beside the light, inside or outside its lamp as the camera moved. Map lights
+// are spheres (Light::size): `jitter`, two numbers in [0, 1), picks the point of the disc they show the origin that the
+// ray aims at, for soft shadows; kLightCentre aims at the centre.
+float3 LightTransmittance(LightSet set, uint i, float3 origin, float3 lightPosition, float2 jitter, uint rayFlags = RAY_FLAG_NONE)
 {
     bool attached = IsAttachedLight(set, i);
     float clearance = !attached ? kLightClearance : i >= set.pointLights ? ProjectorClearance(LoadProjector(i - set.pointLights)) : kAttachedLightClearance;
-    return Transmittance(origin, toLight, ShadowRayLength(clearance, distance), ShadowMask(attached), rayFlags);
+    bool sealed = false;
+    if (!attached) {
+        uint2 shape = MapLightShape(SetMapLight(set, i));
+        sealed = (shape.x & kLightSealed) != 0;
+        if (jitter.x >= 0.0)
+            lightPosition = DiscPoint(lightPosition, asfloat(shape.y), origin, jitter);
+    }
+    float3 path = lightPosition - origin;
+    float distance = max(length(path), 1e-3);
+    return Transmittance(origin, path / distance, ShadowRayLength(clearance, distance), ShadowMask(attached, sealed), rayFlags);
 }
 
 static const uint kLightCandidates = 8;
 
 // One light of a LightSet by resampled importance sampling: up to kLightCandidates lights drawn uniformly (every
-// light when there are no more), one of them, `picked`, kept in proportion to its unshadowed luminance. `irradiance`
-// is its unshadowed light divided by the probability of the pick; false when no candidate can light the point.
+// light when there are no more) and one from the cell's tail, one of them, `picked`, kept in proportion to its
+// unshadowed luminance over the probability of its draw. `irradiance` is its unshadowed light divided by the
+// probability of the pick; false when no candidate can light the point.
 bool SampleLight(LightSet set, float3 position, float3 normal, inout uint seed, out float3 irradiance, out float3 toLight, out float distance,
     out uint picked)
 {
@@ -776,30 +978,40 @@ bool SampleLight(LightSet set, float3 position, float3 normal, inout uint seed, 
     toLight = 0.0;
     distance = 0.0;
     picked = 0;
-    if (set.count == 0)
-        return false;
     bool exhaustive = set.count <= kLightCandidates;
     uint draws = exhaustive ? set.count : kLightCandidates;
-    // Uniform draws weigh each candidate by count / draws, which cancels out of the pick itself.
-    float drawWeight = exhaustive ? 1.0 : float(set.count) / float(draws);
+    // Uniform draws weigh each candidate by count / draws.
+    float drawWeight = exhaustive ? 1.0 : float(set.count) / float(max(draws, 1u));
     float total = 0.0;
-    float pickedWeight = 0.0;
+    float pickedLuminance = 0.0;
+    float3 candidateToLight;
+    float candidateDistance;
     for (uint d = 0; d < draws; ++d) {
         uint i = exhaustive ? d : min(uint(Random(seed) * set.count), set.count - 1);
-        float3 candidateToLight;
-        float candidateDistance;
-        float weight = Luminance(SetLightIrradiance(set, i, position, normal, candidateToLight, candidateDistance));
-        if (weight <= 0.0)
+        float luminance = Luminance(SetLightIrradiance(set, i, position, normal, candidateToLight, candidateDistance));
+        if (luminance <= 0.0)
             continue;
-        total += weight;
-        if (Random(seed) * total < weight) {
+        total += luminance * drawWeight;
+        if (Random(seed) * total < luminance * drawWeight) {
             picked = i;
-            pickedWeight = weight;
+            pickedLuminance = luminance;
+        }
+    }
+    uint tailLight;
+    float probability;
+    if (SampleTailLight(set.ranges, Random(seed), tailLight, probability)) {
+        float luminance = Luminance(SetLightIrradiance(set, set.count + tailLight, position, normal, candidateToLight, candidateDistance));
+        if (luminance > 0.0) {
+            total += luminance / probability;
+            if (Random(seed) * total < luminance / probability) {
+                picked = set.count + tailLight;
+                pickedLuminance = luminance;
+            }
         }
     }
     if (total <= 0.0)
         return false;
-    irradiance = SetLightIrradiance(set, picked, position, normal, toLight, distance) * (total * drawWeight / pickedWeight);
+    irradiance = SetLightIrradiance(set, picked, position, normal, toLight, distance) * (total / pickedLuminance);
     return true;
 }
 

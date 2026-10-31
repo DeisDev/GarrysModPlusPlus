@@ -12,10 +12,10 @@
 
 // x: 1 for additive draws, which add light and are not lit again; yzw: 1 / half the probe window's size.
 float4 g_ForwardDraw : FORWARD_CONSTANT(c217, c0);
-// rgb: irradiance outside the volume; w: 1 in debug views, which show the light alone on opaque surfaces.
+// w: 1 in debug views, which show the light alone on opaque surfaces.
 float4 g_ForwardFallback : FORWARD_CONSTANT(c218, c1);
 float4 g_ForwardFogColor : FORWARD_CONSTANT(c219, c2);
-// xyz: texture coordinates per world unit (1 / (spacing * grid size)); the textures wrap.
+// xyz: texture coordinates per world unit (1 / (spacing * grid size)); the textures wrap. w: the probe spacing.
 float4 g_ProbeScale : FORWARD_CONSTANT(c220, c3);
 // xyz: centre of the probe window, which ends where its outermost probes sit.
 float4 g_ProbeWindow : FORWARD_CONSTANT(c221, c4);
@@ -36,14 +36,17 @@ float4 SampleProbe(sampler3D probe, float3 uvw)
 
 float3 ProbeIrradiance(float3 position, float3 normal, sampler3D red, sampler3D green, sampler3D blue)
 {
+    // The probes are read a cell (g_ProbeScale.w) out along the normal, so all eight blended lie in front of the
+    // surface: probes just behind a wall see open space there and leaked its light through the wall. Beyond the
+    // window, its nearest probes: the sky's light lit far walls of dark rooms in mirrors.
+    position += normal * g_ProbeScale.w;
+    float3 halfWindow = 1.0 / g_ForwardDraw.yzw;
+    position = g_ProbeWindow.xyz + clamp(position - g_ProbeWindow.xyz, -halfWindow, halfWindow);
     float3 uvw = position * g_ProbeScale.xyz;
     float4 r = SampleProbe(red, uvw);
     float4 g = SampleProbe(green, uvw);
     float4 b = SampleProbe(blue, uvw);
-    float3 irradiance = max(float3(r.x + dot(r.yzw, normal), g.x + dot(g.yzw, normal), b.x + dot(b.yzw, normal)), 0.0);
-    float3 offset = abs(position - g_ProbeWindow.xyz) * g_ForwardDraw.yzw;
-    float fade = saturate((max(offset.x, max(offset.y, offset.z)) - 0.8) * 5.0);
-    return lerp(irradiance, g_ForwardFallback.rgb, fade);
+    return max(float3(r.x + dot(r.yzw, normal), g.x + dot(g.yzw, normal), b.x + dot(b.yzw, normal)), 0.0);
 }
 
 // The colour the game's lit shaders would write: albedo times light, times the tonemap scale, with range fog.

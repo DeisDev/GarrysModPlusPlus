@@ -324,7 +324,7 @@ std::vector<RowSpec> RowSpecs()
             {Text(TextId::PresetLow), Text(TextId::PresetMedium), Text(TextId::PresetHigh), Text(TextId::PresetUltra), Text(TextId::PresetCustom)}},
         {Row::IndirectLighting, "GmodppIndirectLighting", TextId::IndirectSource, {Text(TextId::IndirectRayTraced), Text(TextId::IndirectBaked)}},
         {Row::FoliageShadows, "GmodppFoliageShadows", TextId::FoliageShadows,
-            {Text(TextId::FoliageOff), Text(TextId::FoliageSun), Text(TextId::FoliageSunAndIndirect)}},
+            {Text(TextId::FoliageOff), Text(TextId::FoliageSun), Text(TextId::FoliageSunAndIndirect), Text(TextId::FoliageAll)}},
         {Row::Reflections, "GmodppReflections", TextId::Reflections, kOnOff},
         {Row::AmbientOcclusion, "GmodppAmbientOcclusion", TextId::AmbientOcclusion, kOnOff},
         {Row::VolumetricLight, "GmodppVolumetricLight", TextId::VolumetricLight, kOnOff},
@@ -399,6 +399,9 @@ void ShowSettings(const Added& added)
     // detail setting does nothing while it is on.
     if (added.shadowDetail != 0)
         CallPanels<void>(kSetEnabled, added.shadowDetail, !settings.realtimeLighting);
+    // Ambient occlusion darkens only baked indirect light.
+    if (void* combo = added.combos[static_cast<size_t>(Row::AmbientOcclusion)]; combo != nullptr)
+        CallPanels<void>(kSetEnabled, VPanelOf(combo), settings.indirectLighting == IndirectLighting::Baked);
 }
 
 // Lays the dialog out again around its changes: the anti-aliasing mode takes MSAA's place and the upscaling mode the

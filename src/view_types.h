@@ -50,8 +50,6 @@ inline constexpr float kProbeSpacing = 64.0f;
 struct ForwardConstants {
     std::array<float, 3> eye;
     float tonemapScale;
-    // Irradiance outside the volume.
-    std::array<float, 3> fallback;
     // The volume's first cell.
     std::array<int, 3> probeOrigin;
     // Unknown fog means none.

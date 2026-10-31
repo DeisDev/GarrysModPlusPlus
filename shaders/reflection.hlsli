@@ -77,9 +77,9 @@ float3 ReflectedRadiance(uint previousView, float3 origin, float3 direction, flo
     float3 toLight;
     float distance;
     uint picked;
-    LightSet set = LightSetAt(hit.position, hit.normal);
+    LightSet set = LightSetAt(hit.position);
     if (SampleLight(set, hit.position, hit.normal, seed, light, toLight, distance, picked))
-        irradiance += light * LightTransmittance(set, picked, shadowOrigin, toLight, distance);
+        irradiance += light * LightTransmittance(set, picked, shadowOrigin, hit.position + toLight * distance, float2(Random(seed), Random(seed)));
     return ClampSample(hit.albedo * irradiance + HitEmission(hit, hitInfo, hitDistance));
 }
 

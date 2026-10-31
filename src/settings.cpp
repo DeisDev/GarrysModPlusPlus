@@ -18,7 +18,7 @@ namespace gmodpp {
 namespace {
 
 using Field = std::variant<bool Settings::*, float Settings::*, int Settings::*, DebugView Settings::*, AntiAliasing Settings::*, UpscalingMode Settings::*,
-    QualityPreset Settings::*, FoliageShadows Settings::*, IndirectLighting Settings::*>;
+    QualityPreset Settings::*, FoliageShadows Settings::*, IndirectLighting Settings::*, EmissiveLighting Settings::*>;
 
 template <class Enum>
 Enum EnumValue(double value, Enum fallback)
@@ -72,6 +72,7 @@ constexpr NamedField kFields[] = {
     {"volumetric_steps", &Settings::volumetricSteps, {4.0f, 32.0f}},
     {"foliage_shadows", &Settings::foliageShadows},
     {"indirect_lighting", &Settings::indirectLighting},
+    {"emissive_lighting", &Settings::emissiveLighting},
     {"fast_alpha_tests", &Settings::fastAlphaTests},
     {"opacity_micromaps", &Settings::opacityMicromaps},
     {"display", &Settings::display, {0.0f, 16.0f}},
@@ -88,14 +89,15 @@ struct PresetValues {
     FoliageShadows foliageShadows;
     bool fastAlphaTests;
     IndirectLighting indirectLighting;
+    EmissiveLighting emissiveLighting;
 };
 
 // Low, Medium, High (the original quality) and Ultra.
 constexpr PresetValues kPresets[] = {
-    {1, 1, 1, 1, 1, 16, 8, FoliageShadows::Sun, true, IndirectLighting::Baked},
-    {2, 1, 1, 2, 1, 24, 12, FoliageShadows::SunAndIndirect, true, IndirectLighting::RayTraced},
-    {4, 2, 1, 2, 1, 32, 16, FoliageShadows::SunAndIndirect, false, IndirectLighting::RayTraced},
-    {8, 4, 2, 3, 2, 64, 32, FoliageShadows::SunAndIndirect, false, IndirectLighting::RayTraced},
+    {1, 1, 1, 1, 1, 16, 8, FoliageShadows::Sun, true, IndirectLighting::Baked, EmissiveLighting::Off},
+    {2, 1, 1, 2, 1, 24, 12, FoliageShadows::SunAndIndirect, true, IndirectLighting::RayTraced, EmissiveLighting::Bounce},
+    {4, 2, 1, 2, 1, 32, 16, FoliageShadows::All, false, IndirectLighting::RayTraced, EmissiveLighting::Full},
+    {8, 4, 2, 3, 2, 64, 32, FoliageShadows::All, false, IndirectLighting::RayTraced, EmissiveLighting::Full},
 };
 static_assert(std::size(kPresets) == static_cast<size_t>(QualityPreset::Custom));
 
@@ -132,6 +134,7 @@ void ApplyPreset(Settings& settings, QualityPreset preset)
     settings.foliageShadows = values.foliageShadows;
     settings.fastAlphaTests = values.fastAlphaTests;
     settings.indirectLighting = values.indirectLighting;
+    settings.emissiveLighting = values.emissiveLighting;
 }
 
 Settings& GetSettings()

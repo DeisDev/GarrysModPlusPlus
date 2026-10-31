@@ -1022,7 +1022,7 @@ std::string Translator::Assemble()
             text += "    gmodpp_target3.a = gmodpp_alpha.y;\n";
     }
     if (clearCoverage)
-        text += "    gmodpp_coverage = 0;\n";
+        text += m_variant.markMirror != 0 ? "    gmodpp_coverage = float4(0.0, 0.0, 1.0, 0.0);\n" : "    gmodpp_coverage = 0;\n";
     if (m_out.writesDepth)
         text += "    gmodpp_depth = oDepth.x;\n";
     return text + "}\n";

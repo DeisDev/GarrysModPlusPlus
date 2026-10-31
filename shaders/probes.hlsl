@@ -121,10 +121,10 @@ void Trace(uint3 id, uint thread)
                 float3 toLight;
                 float distance;
                 uint picked;
-                LightSet set = LightSetAt(surface.position, surface.normal);
+                LightSet set = LightSetAt(surface.position);
                 if (SampleLight(set, surface.position, surface.normal, seed, light, toLight, distance, picked))
-                    irradiance += light * LightTransmittance(set, picked, origin, toLight, distance);
-                radiance = ClampSample(surface.albedo * irradiance);
+                    irradiance += light * LightTransmittance(set, picked, origin, surface.position + toLight * distance, float2(Random(seed), Random(seed)));
+                radiance = ClampSample(surface.albedo * irradiance + BounceEmission(surface, hit, false));
             }
         }
         a += radiance;
@@ -170,7 +170,7 @@ void AddDirectLight(float3 position, inout float4 value[3])
 {
     if (g_frame.sunEnabled != 0.0)
         AddDirection(g_frame.sunColor * SunVisibility(position, g_frame.sunShadowMask), g_frame.sunDirection, value);
-    LightSet set = LightSetAt(position, 0.0);
+    LightSet set = LightSetAt(position);
     uint top[kProbeLights];
     float topWeight[kProbeLights];
     [unroll]
@@ -204,7 +204,7 @@ void AddDirectLight(float3 position, inout float4 value[3])
         float3 toLight;
         float distance;
         float3 irradiance = LightIrradiance(light, position, normalize(light.origin - position), toLight, distance);
-        AddDirection(irradiance * LightTransmittance(set, top[k], position, toLight, distance), toLight, value);
+        AddDirection(irradiance * LightTransmittance(set, top[k], position, light.origin, kLightCentre), toLight, value);
     }
 }
 

@@ -10,7 +10,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - A "Baked" indirect light option that reuses the map's own bounce light instead of tracing it, for faster frames; the Low preset uses it.
 - Glass and other translucent surfaces are lit by real-time light instead of baked light.
-- Ray-traced ambient occlusion, with an on/off switch and strength in the menu.
+- Ray-traced ambient occlusion for the "Baked" indirect light option, with an on/off switch and strength in the menu. Ray-traced indirect light already holds its own occlusion, so the setting is greyed out with it.
 - Volumetric light from the sun and flashlights, with an on/off switch and strength in the menu.
 - Debug views for reflections, motion vectors and ambient occlusion.
 - Particles and effects that ask the engine for the light at a point now get real-time light.
@@ -32,6 +32,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - In the native renderer, flowing water (`$flowmap`, also with a flowing base texture) and water with `$lightmapwaterfog` get ray-traced reflections like other water.
 - In the native renderer, textured water (`$basetexture`) is lit in real time instead of by its baked light, with its ripples and ray-traced reflections.
 - In the native renderer, models and world surfaces with a light warp texture take real-time light through it as in the game.
+- Glowing surfaces such as screens and light panels light their surroundings, with a "Glowing surfaces" setting (Off, Bounce light, Full). Light textures the map already turned into lights keep the map's lights instead.
 - In the native renderer, reflections show the sky as the game draws it, including painted skies, and the 3D skybox, instead of a flat colour.
 
 ### Changed
@@ -41,10 +42,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Shadows of many lights are less noisy: the strongest lights are always traced, and the rest are denoised.
 - Reflections are steadier and sparkle less.
 - Skin materials support more detail texture blend modes.
-- Lights inside lamp models are blocked by the lamp the way the map's baked lighting was, so rooms are no longer brighter than intended.
-- Grass and other props the map marks as casting no shadows now cast shadows from the sun.
+- Light through glass and other translucent surfaces takes their colour: stained glass throws coloured light, and Refract glass windows tint the light by their own tint instead of letting it all through.
+- Map lights are no longer limited to the areas the map's visibility data says they can see, so light that comes through gaps it misses still arrives. Each spot evaluates at most 64 lights and samples the rest.
+- Map lights no longer stop at the maximum distance set in the map, which the map's own baked lighting ignored too, and faint lights no longer switch on and off as the exposure changes.
+- Map lights fall off with distance like real light, from a bulb-sized source with soft shadow edges. Each light keeps the brightness its mapper set at 100 units (or at its 50% distance), so most lights look the same there; lights set to fade linearly or not at all are brighter up close and dimmer far away.
+- Character skin scatters light under its surface, softening and reddening shadow edges up close.
+- Leaves, grass and other props the map lights without their normals are lit from both sides: 30% of the light passes through them and scatters forward, so they glow when the sun is behind them.
+- Lamp models block light with their real shape: light leaves open lamps through their openings, and lights sealed inside a lamp shine through it as through frosted glass.
+- Grass and other props the map marks as casting no shadows now block all light: the sun, lamps and bounced light. The "Foliage shadows" setting can limit this for speed in grassy maps.
 - Values in `gmodpp_settings.ini` are limited to the ranges the menu offers.
-- Grassy areas render faster: later indirect light bounces pass through grass, and alpha tests read less data.
+- Grassy areas render faster: alpha tests read less data.
 - The DirectX 12 Agility SDK runtime is installed to `bin/win64/D3D12`; without it, opacity micromaps are unavailable.
 - Spot light pools have soft edges like the map's baked lighting instead of a hard line.
 - The ray-traced flashlight and other projected lights fall off with distance like real light beyond the range where they reach full strength.
@@ -76,6 +83,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Fixed mirrors washing out with the flashlight on, and far walls in mirrors, camera screens and glass being lit with the sky's light or with light from behind them. Mirrors now get real-time light.
+- Fixed light from lamps fading in and out as the camera moves closer or further away.
 - Fixed holes in the first-person hands and other rim-lit skin where the surface faces the camera.
 - Fixed UnlitTwoTexture and MonitorScreen materials being lit in the native renderer.
 - Fixed jagged shadow shards on characters where their surface turns away from a light.

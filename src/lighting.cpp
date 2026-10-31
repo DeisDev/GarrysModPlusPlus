@@ -57,6 +57,7 @@ namespace {
 constexpr UINT kConstantsStride = 4 * D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT;
 static_assert(sizeof(FrameConstants) <= kConstantsStride);
 static_assert(offsetof(FrameConstants, lightWarpViews) % 16 == 0);
+static_assert(offsetof(FrameConstants, skyboxFogParams) % 16 == 0);
 // Each slot has the view's constants and a copy for the passes Ray Reconstruction runs at render resolution.
 constexpr UINT kConstantsPerSlot = 2;
 // Per slot: colour copy, depth, G-buffer normal, flags, light, albedo and self-illumination views, then projector cookies.
@@ -144,7 +145,7 @@ float FullStrengthDistance(const std::array<float, 3>& attenuation)
         x = (1.0f - c) / l;
     return x > 0.0f ? 1.0f / x : 0.0f;
 }
-constexpr UINT kTraceMask = kWorldMask | kStaticPropMask | kShadowlessPropMask | kDynamicMask | kLocalPlayerMask;
+constexpr UINT kTraceMask = kWorldMask | kStaticPropMask | kShadowlessPropMask | kLampShellMask | kDynamicMask | kLocalPlayerMask;
 // The viewmodel is drawn inside the local player's body, which would shadow it.
 constexpr UINT kViewmodelTraceMask = kTraceMask & ~kLocalPlayerMask;
 constexpr UINT kFilterSteps[] = {1, 2, 4, 8, 16};
@@ -927,6 +928,15 @@ bool Lighting::FillConstants(FrameConstants& constants, const Scene& scene, cons
     constants.lightWarpCount = static_cast<uint32_t>(std::min(inputs.lightWarps.size(), std::size(constants.lightWarpViews)));
     std::copy_n(inputs.lightWarps.begin(), constants.lightWarpCount, constants.lightWarpViews);
     constants.clusterCount = lists.clusterCount;
+    std::memcpy(constants.gridOrigin, &lists.gridOrigin, sizeof(constants.gridOrigin));
+    constants.gridCellSize = lists.gridCellSize;
+    std::copy_n(lists.gridDims, 3, constants.gridDims);
+    constants.gridCellsView = lists.gridCellsView;
+    constants.gridIndicesView = lists.gridIndicesView;
+    constants.gridTailView = lists.gridTailView;
+    constants.emissiveLighting = static_cast<uint32_t>(settings.emissiveLighting);
+    constants.emittersView = scene.EmittersView();
+    constants.emitterCount = settings.emissiveLighting == EmissiveLighting::Full && !skybox ? scene.EmitterCount() : 0u;
     constants.viewmodel = inputs.kind == gbuffer::ViewKind::Viewmodel ? 1u : 0u;
     // The skybox view shares the main view's orientation, so it finds last frame's sky (reflections.hlsl).
     if (inputs.kind != gbuffer::ViewKind::Viewmodel) {
@@ -1206,8 +1216,6 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
         constants.probeOrigin[i] = m_probeOrigin[i];
     }
     constants.probeSpacing = gbuffer::kProbeSpacing;
-    // The 3D skybox's scaled-down scene has no contact shadows worth tracing.
-    const bool ambientOcclusion = GetSettings().ambientOcclusion && inputs.kind != gbuffer::ViewKind::Skybox;
     constants.aoView = kInvalidView;
     constants.aoIntensity = GetSettings().aoIntensity;
     constants.volumetricView = kInvalidView;
@@ -1226,6 +1234,9 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
         constants.leafAmbientView = baked.leafAmbientView;
         constants.ambientSamplesView = baked.ambientSamplesView;
     }
+    // Ambient occlusion darkens only the baked indirect light (shaders/deferred_lighting.hlsl): traced light holds its
+    // own occlusion. The 3D skybox's scaled-down scene has no contact shadows worth tracing.
+    const bool ambientOcclusion = GetSettings().ambientOcclusion && inputs.kind != gbuffer::ViewKind::Skybox && constants.bakedTrianglesView != kInvalidView;
 
     ID3D12CommandQueue* queue = m_queue;
     const bool projectedLights = inputs.kind != gbuffer::ViewKind::Skybox && GetSettings().projectedLights;
@@ -1366,10 +1377,12 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     else
         constants.traceMask = inputs.kind == gbuffer::ViewKind::Viewmodel ? kViewmodelTraceMask : kTraceMask;
     const FoliageShadows foliage = GetSettings().foliageShadows;
-    constants.sunShadowMask = foliage == FoliageShadows::Off ? constants.traceMask & ~kShadowlessPropMask : constants.traceMask;
+    const auto withFoliage = [&](UINT mask, FoliageShadows from) { return foliage >= from ? mask : mask & ~kShadowlessPropMask; };
+    constants.sunShadowMask = withFoliage(constants.traceMask, FoliageShadows::Sun);
     const UINT indirectMask = constants.traceMask & ~kLocalPlayerMask;
-    constants.indirectMask = foliage == FoliageShadows::SunAndIndirect ? indirectMask : indirectMask & ~kShadowlessPropMask;
-    constants.bounceMask = indirectMask & ~kShadowlessPropMask;
+    constants.indirectMask = withFoliage(indirectMask, FoliageShadows::SunAndIndirect);
+    constants.bounceMask = withFoliage(indirectMask, FoliageShadows::All);
+    constants.lightShadowMask = withFoliage(constants.traceMask, FoliageShadows::All);
     // The baked light holds the occlusion by static geometry, so ambient occlusion counts only what moves.
     if (constants.bakedTrianglesView != kInvalidView)
         constants.indirectMask = constants.traceMask & (kDynamicMask | kLocalPlayerMask);

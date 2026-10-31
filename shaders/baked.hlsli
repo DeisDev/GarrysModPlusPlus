@@ -201,10 +201,28 @@ float3 LeafAmbient(float3 position, float3 normal)
     float3 cube[6];
     if (!LeafAmbientCube(position, cube))
         return -1.0;
-    if (all(normal == 0.0))
-        return (cube[0] + cube[1] + cube[2] + cube[3] + cube[4] + cube[5]) / 6.0;
     float3 squared = normal * normal;
     return squared.x * cube[normal.x < 0.0 ? 1 : 0] + squared.y * cube[normal.y < 0.0 ? 3 : 2] + squared.z * cube[normal.z < 0.0 ? 5 : 4];
+}
+
+// A pixel's untraced indirect light with indirect_lighting = 1: VRAD's bounce light on the world, the leaf ambient light
+// elsewhere, or the sky's light. Leaves (`leaf`, `normal` towards the eye) take kLeafTransmission of it from behind.
+float3 BakedIndirect(int2 pixel, float3 position, float3 normal, bool leaf)
+{
+    float3 baked = BakedIrradiance(pixel, normal);
+    if (baked.x < 0.0)
+        baked = leaf ? lerp(LeafAmbient(position, normal), LeafAmbient(position, -normal), kLeafTransmission) : LeafAmbient(position, normal);
+    if (baked.x < 0.0)
+        baked = leaf ? lerp(SkyLight(normal), SkyLight(-normal), kLeafTransmission) : SkyLight(normal);
+    return baked;
+}
+
+// A pixel's G-buffer normal and whether it is a leaf (a prop that ignores normals), whose normal faces the eye.
+float3 LitNormal(int2 pixel, float3 normal, out bool leaf)
+{
+    Texture2D<uint> pixelFlags = ResourceDescriptorHeap[g_frame.pixelFlagsView];
+    leaf = (pixelFlags.Load(int3(pixel, 0)) & kPixelIgnoreNormals) != 0;
+    return leaf && dot(normal, GeometricNormalAt(pixel)) < 0.0 ? -normal : normal;
 }
 
 #endif

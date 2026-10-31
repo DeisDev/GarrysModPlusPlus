@@ -1,3 +1,4 @@
+#include "baked.hlsli"
 #include "water.hlsli"
 
 // Final shading: albedo times (direct light + denoised light) plus self-illumination, reflections and the light
@@ -59,6 +60,87 @@ float3 WarpedTotalLight(int2 pixel, float3 light)
     return light * (2.0 * warp.SampleLevel(g_linearClamp, float2(0.5 * length(light), 0.5), 0.0).rgb);
 }
 
+// Skin: $halflambert materials on character models (kInstanceCharacter).
+bool IsSkin(int2 pixel)
+{
+    if (g_frame.traceMask == 0 || g_frame.visibilityView == kNoView)
+        return false;
+    Texture2D<float4> flags = ResourceDescriptorHeap[g_frame.flagsView];
+    if ((MaterialBits(flags.Load(int3(pixel, 0))) & kMaterialHalfLambert) == 0)
+        return false;
+    Texture2D<uint4> visibility = ResourceDescriptorHeap[g_frame.visibilityView];
+    uint instance = visibility.Load(int3(pixel, 0)).x;
+    return instance != kNoView && (LoadInstance(instance).flags & kInstanceCharacter) != 0;
+}
+
+// Light scatters under skin before it leaves: its scatter distance per colour (Jensen et al. 2001, skin1's mean free
+// paths of 3.67, 1.37 and 0.68 mm, in inch units), as the shape of Burley's normalized diffusion profile
+// R(r) = (e^(-r/d) + e^(-r/3d)) / (8 pi d r), which reaches about 3 d.
+static const float3 kSkinScatter = float3(3.67, 1.37, 0.68) / 25.4;
+static const uint kSkinTaps = 16;
+
+// A skin pixel's exact direct light spread by the profile over the skin around it, which softens and reddens shadow
+// edges. The taps cover a disc evenly, each standing for the same area; taps off the skin or off the pixel's plane are
+// left out, and each colour's weights are normalised, so no light is gained or lost. Under a pixel's width it changes
+// nothing. The rest of the light was denoised and is soft already.
+float3 SkinDirect(int2 pixel, float3 position, float3 normal, float3 direct, Texture2D<float4> directTexture)
+{
+    float reach = 3.0 * kSkinScatter.r;
+    float depth = mul(g_frame.viewProj, float4(position, 1.0)).w;
+    float radius = reach * 0.5 * float(g_frame.size.y) * length(g_frame.viewProj[1].xyz) / max(depth, 1e-3);
+    if (radius < 1.0)
+        return direct;
+    radius = min(radius, 48.0);
+    // The pixel itself stands for the disc's middle, half a tap's spacing out.
+    float centre = 0.5 * reach / sqrt(float(kSkinTaps));
+    float3 weights = (exp(-centre / kSkinScatter) + exp(-centre / (3.0 * kSkinScatter))) / (25.1327412 * kSkinScatter * centre);
+    float3 sum = direct * weights;
+    for (uint k = 0; k < kSkinTaps; ++k) {
+        float angle = 2.39996323 * k;
+        int2 tap = pixel + int2(round(float2(cos(angle), sin(angle)) * (radius * sqrt((k + 0.5) / kSkinTaps))));
+        if (any(tap < 0) || any(tap >= int2(g_frame.size)) || all(tap == pixel) || SurfaceAt(g_frame.surfaceView, tap).w <= 0.0 || !IsSkin(tap))
+            continue;
+        float3 offset = WorldPositionFromDepth(tap, DepthAt(tap)) - position;
+        if (abs(dot(normal, offset)) > reach)
+            continue;
+        float r = max(length(offset), centre);
+        float3 w = (exp(-r / kSkinScatter) + exp(-r / (3.0 * kSkinScatter))) / (25.1327412 * kSkinScatter * r);
+        sum += directTexture.Load(int3(tap, 0)).rgb * w;
+        weights += w;
+    }
+    return sum / weights;
+}
+
+// Ray Reconstruction's guides for a mirror's pixels (IsMirror), which show the game's reflection view: a perfect
+// mirror whose reflection lies as far away as a traced ray along the mirrored view finds, so it follows the reflection
+// as the camera moves rather than smearing it over the glass.
+void MirrorGuides(int2 pixel)
+{
+    if (g_pass.output1 == kNoView || g_frame.traceMask == 0 || any(pixel + 1 >= int2(g_frame.size)))
+        return;
+    Texture2D<float4> flags = ResourceDescriptorHeap[g_frame.flagsView];
+    float depth = DepthAt(pixel);
+    if (depth >= 1.0 || !IsMirror(flags.Load(int3(pixel, 0))))
+        return;
+    float3 position = WorldPositionFromDepth(pixel, depth);
+    float3 normal = cross(WorldPositionFromDepth(pixel + int2(1, 0), DepthAt(pixel + int2(1, 0))) - position,
+        WorldPositionFromDepth(pixel + int2(0, 1), DepthAt(pixel + int2(0, 1))) - position);
+    float3 toEye = g_frame.eyePosition - position;
+    float eyeDistance = length(toEye);
+    normal = normalize(normal);
+    if (dot(normal, toEye) < 0.0)
+        normal = -normal;
+    HitInfo hit;
+    float3 direction = reflect(-toEye / max(eyeDistance, 1e-4), normal);
+    float hitDistance = TraceHit(position + normal * SurfaceBias(eyeDistance), direction, 65536.0, g_frame.traceMask, hit) ? hit.t : kSkyHitDistance;
+    RWTexture2D<float4> specular = ResourceDescriptorHeap[g_pass.output1];
+    RWTexture2D<float> roughness = ResourceDescriptorHeap[g_pass.output2];
+    RWTexture2D<float> distanceGuide = ResourceDescriptorHeap[g_pass.output3];
+    specular[pixel] = float4(1.0, 1.0, 1.0, 1.0);
+    roughness[pixel] = 0.0;
+    distanceGuide[pixel] = hitDistance;
+}
+
 [RootSignature(ROOT_SIGNATURE)]
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID)
@@ -96,6 +178,7 @@ void main(uint3 id : SV_DispatchThreadID)
     if (!covered) {
         float3 sky = Decode(color.rgb) + VolumetricLight(pixel);
         output[pixel] = float4(g_frame.outputLinear != 0 ? sky : Encode(sky), color.a);
+        MirrorGuides(pixel);
         return;
     }
     Texture2D<float4> albedos = ResourceDescriptorHeap[g_frame.albedoView];
@@ -120,17 +203,24 @@ void main(uint3 id : SV_DispatchThreadID)
     Texture2D<float4> directTexture = ResourceDescriptorHeap[g_pass.input3];
     float4 directLight = directTexture.Load(int3(pixel, 0));
     float3 direct = directLight.rgb;
+    if (g_frame.debugView == 0 && IsSkin(pixel))
+        direct = SkinDirect(pixel, position, surface.xyz, direct, directTexture);
     float3 indirect = SkyLight(surface.xyz);
     if (g_pass.input0 != kNoView) {
         Texture2D<float4> indirectTexture = ResourceDescriptorHeap[g_pass.input0];
         indirect = indirectTexture.Load(int3(pixel, 0)).rgb;
     }
     indirect *= g_frame.indirectScale;
+    // Ambient occlusion (set only with baked indirect light) darkens the baked light alone: the denoised light also
+    // holds the traced remainder of the direct light, which already has its shadows. The baked light is taken again
+    // here, unfiltered, to keep the occlusion sharp.
     float ambientOcclusion = 1.0;
     if (g_frame.aoView != kNoView) {
         Texture2D<float> ao = ResourceDescriptorHeap[g_frame.aoView];
         ambientOcclusion = ao.Load(int3(pixel, 0));
-        indirect *= lerp(1.0, ambientOcclusion, g_frame.aoIntensity);
+        bool leaf;
+        float3 baked = BakedIndirect(pixel, position, LitNormal(pixel, surface.xyz, leaf), leaf) * g_frame.indirectScale;
+        indirect = max(indirect - baked * (g_frame.aoIntensity * (1.0 - ambientOcclusion)), 0.0);
     }
 
     float3 result;

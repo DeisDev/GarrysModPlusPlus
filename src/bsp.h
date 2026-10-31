@@ -51,6 +51,10 @@ struct Light {
     int32_t style;
     // VRAD added the light's direct light to the leaf ambient samples (DWL_FLAGS_INAMBIENTCUBE: dim surface lights).
     bool inAmbientCube;
+    // Where the mapper's brightness holds: 100 units, where VRAD scales point and spot lights' intensity to it, or a
+    // light entity's _fifty_percent_distance, whose falloff VRAD solves for instead (SetLightFalloffParams in
+    // src/utils/vrad/lightmap.cpp).
+    float referenceDistance = 100.0f;
 };
 
 // A world BSP node; a negative child is leaf -child - 1.
@@ -207,6 +211,8 @@ struct WorldGeometry {
     std::vector<Mesh> brushModels;
     // Material name of each texdata entry, as in "materials/<name>.vmt".
     std::vector<std::string> materials;
+    // The texdata entries VRAD made emit_surface lights of (a texinfo with SURF_LIGHT uses them).
+    std::vector<bool> lightMaterials;
     SunLight sun;
     // Point, spot and surface lights; the sky lights are in `sun`.
     std::vector<Light> lights;

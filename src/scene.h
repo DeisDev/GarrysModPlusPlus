@@ -1,7 +1,6 @@
 #pragma once
 
 #include "bsp.h"
-#include "convex_hull.h"
 #include "descriptor_heap.h"
 #include "engine_interfaces.h"
 #include "opacity_micromaps.h"
@@ -28,13 +27,15 @@ constexpr UINT kDynamicMask = 0x04;
 constexpr UINT kLocalPlayerMask = 0x08;
 // The 3D skybox's scaled-down scene, which only the skybox view's rays meet.
 constexpr UINT kSkyboxMask = 0x10;
-// Static props the map marks as casting no shadows (often foliage). They shadow the sun but not local lights, so a
-// lamp model marked this way still lets its own light out as VRAD did.
+// Static props the map marks as casting no shadows (often foliage). VRAD let all light through them; they block
+// light by FoliageShadows (src/settings.h).
 constexpr UINT kShadowlessPropMask = 0x20;
 // Static props and brushes as VRAD's shadows saw them (collision models or mesh hulls, every side of opaque brushes),
-// traced only by the residual bake, with the sky faces that end VRAD's sun rays.
+// traced only by the residual bake, with the sky faces that end VRAD's sun rays (kInstanceVradSky).
 constexpr UINT kVradOccluderMask = 0x40;
-constexpr UINT kVradSkyMask = 0x80;
+// Static props that enclose a map light (SealedLights in src/world.cpp). The lights they seal shine through them, as
+// through a diffuser; to every other ray they are static props.
+constexpr UINT kLampShellMask = 0x80;
 
 // SceneInstance::flags, read by shaders from the instance record.
 constexpr uint32_t kInstanceIgnoreNormals = 0x01;
@@ -43,6 +44,39 @@ constexpr uint32_t kInstanceSelfIllum = 0x02;
 // Set by Scene for dynamic models (kDynamicMask, kLocalPlayerMask), whose back faces shadow rays may skip (their
 // instances allow culling; shaders/direct.hlsl).
 constexpr uint32_t kInstanceModel = 0x04;
+// The sky faces among VRAD's occluders (kVradOccluderMask).
+constexpr uint32_t kInstanceVradSky = 0x08;
+// Instances whose self-illuminated triangles are emitters (Scene::SetEmitters): with EmissiveLighting::Full their
+// glow reaches surfaces directly, so indirect rays from the G-buffer take none at them.
+constexpr uint32_t kInstanceEmitter = 0x10;
+// Set by Scene for instances of character models (Scene::MarkCharacter), whose $halflambert materials are skin.
+constexpr uint32_t kInstanceCharacter = 0x20;
+
+// A static self-illuminated triangle sampled as an area light (Emitter in shaders/scene.hlsli): its corners in world
+// space, its scene instance and triangle, and the share of all emitters' emission times area up to and with it.
+struct GpuEmitter {
+    float p0[3];
+    uint32_t instance;
+    float p1[3];
+    uint32_t primitive;
+    float p2[3];
+    float cdf;
+};
+static_assert(sizeof(GpuEmitter) == 48);
+
+// Map light flags (Light::flags in shaders/scene.hlsli): the light sits inside lamp shells (kLampShellMask), which its
+// shadow rays pass.
+constexpr uint32_t kLightSealed = 0x01;
+
+// Map lights have no size in Hammer; they are lit as spheres of this radius, about a bulb's.
+constexpr float kBulbRadius = 2.0f;
+
+// What the scene adds to a map light (bsp::Light): kLightSealed, and the radius it is lit with (kBulbRadius, or its
+// lamp shell's).
+struct MapLightShape {
+    uint32_t flags = 0;
+    float radius = kBulbRadius;
+};
 
 // Triangles for Scene::AddModel. Alpha-tested and translucent triangles come last, from `opaqueTriangles` on; each
 // has an entry in `alphaTriangles` (Scene::PackAlpha or Scene::PackTranslucent), and then the model needs `uvs`.
@@ -54,6 +88,8 @@ struct ModelGeometry {
     UINT opaqueTriangles;
     std::span<const bsp::Float2> uvs;
     std::span<const uint32_t> alphaTriangles;
+    // A Scene::PackTint value for each of alphaTriangles; translucent triangles colour the light through them by it.
+    std::span<const uint32_t> alphaTints;
     // Each triangle's Scene::AddMaterial index, or Scene::kNoMaterial; empty when the model has none.
     std::span<const uint32_t> triangleMaterials;
 };
@@ -78,20 +114,13 @@ struct GpuMaterial {
     float padding[2];
 };
 
-// A convex hull that blocks a map light (index into bsp::WorldGeometry::lights) wherever the straight path from
-// the light to a point crosses it.
-struct LightHull {
-    uint32_t light;
-    std::vector<hull::Plane> planes;
-};
-
 struct SceneInstance {
     int model = -1;
     // Geometry the scene does not own (skinned models): their BLAS and positions view replace the model's.
     D3D12_GPU_VIRTUAL_ADDRESS blas = 0;
     UINT positionsView = DescriptorHeap::kInvalid;
     UINT mask = 0;
-    // kInstanceIgnoreNormals.
+    // kInstanceIgnoreNormals, kInstanceVradSky.
     uint32_t flags = 0;
     float transform[3][4];
     // Where the instance was last frame, for motion vectors: its transform when `previousKnown`, and a skinned
@@ -112,7 +141,7 @@ static_assert(sizeof(BakedTriangle) == 32);
 
 // The format of the baked residual cache (gmodpp_cache\baked): bump when shaders/baked_residual.hlsl or the data it
 // reads changes.
-inline constexpr uint32_t kBakeVersion = 12;
+inline constexpr uint32_t kBakeVersion = 13;
 
 // VRAD's baked light on the GPU (indirect_lighting = 1): raw views of bsp::BakedLighting and of the world's
 // BakedTriangles, and the residual shaders/baked_residual.hlsl writes: the baked light less the direct light VRAD
@@ -172,9 +201,9 @@ public:
 
     // With `opacityMicromaps`, models get opacity micromaps for their alpha-tested and translucent triangles.
     bool Initialize(ID3D12Device5* device, ID3D12CommandQueue* queue, DescriptorHeap& descriptors, bool opacityMicromaps);
-    // The map's lights and sun come from `world`, with the hulls that block some lights; its triangles from
+    // The map's lights and sun come from `world`, with each light's shape in `lightShapes`; its triangles from
     // `worldGeometry`.
-    bool LoadMap(const std::string& name, const bsp::WorldGeometry& world, std::span<const LightHull> lightHulls, const ModelGeometry& worldGeometry);
+    bool LoadMap(const std::string& name, const bsp::WorldGeometry& world, std::span<const MapLightShape> lightShapes, const ModelGeometry& worldGeometry);
     // Uploads the map's baked light for indirect_lighting = 1, with the world model's triangles in their BLAS order;
     // false (logged) when the map has none or the upload fails. A filtered residual from an earlier bake of the same
     // map (`cachedResidual`, empty for none) makes the bake unnecessary.
@@ -202,10 +231,18 @@ public:
     // with DescriptorHeap::kInvalid) times `opacity`. Shadow rays pass through what is left; other rays stop at
     // surfaces at least half opaque.
     static uint32_t PackTranslucent(UINT textureView, float opacity);
+    // How a translucent triangle colours the light through it (AlphaTriangle::tint in shaders/scene.hlsli): kTintFilter
+    // passes (1 - opacity) and the covered part filtered by the texture's colour times `tint`; kTintRefract passes
+    // `tint` times the texture's colour (Refract glass).
+    static constexpr uint32_t kTintFilter = 1;
+    static constexpr uint32_t kTintRefract = 2;
+    static uint32_t PackTint(const bsp::Float3& tint, uint32_t mode);
 
     static constexpr uint32_t kNoMaterial = 0xFFFFFFFF;
     // GpuMaterial::flags: UnlitGeneric and its relatives show their albedo unlit.
     static constexpr uint32_t kMaterialUnlit = 1;
+    // A face's light texture, which VRAD made emit_surface lights of: its glow shows but lights nothing again.
+    static constexpr uint32_t kMaterialLightTexture = 2;
     static constexpr uint32_t kMaskOff = 0xFFFFFFFF;
     // A mask from one channel (0-3: r, g, b, a) of a texture, optionally inverted; kInvalid as the texture
     // makes it constant 1.
@@ -233,6 +270,16 @@ public:
     std::optional<ModelBuffers> Buffers(int model) const;
     // Static props, and the 3D skybox's geometry with kSkyboxMask; a mask of 0 means kStaticPropMask.
     void SetStaticInstances(std::vector<SceneInstance> instances);
+    // Marks a model as a character's: its instances get kInstanceCharacter.
+    void MarkCharacter(int model)
+    {
+        if (model >= 0 && static_cast<size_t>(model) < m_models.size())
+            m_models[model].character = true;
+    }
+    // The map's emitters, in the order of their cumulative weights; `worldEmits` gives the world kInstanceEmitter.
+    bool SetEmitters(std::span<const GpuEmitter> emitters, bool worldEmits);
+    UINT EmittersView() const { return m_emittersView; }
+    UINT EmitterCount() const { return m_emitterCount; }
     bool HasSkybox() const { return m_hasSkybox; }
     // The engine's dynamic lights for the next RecordFrame.
     void SetDynamicLights(std::span<const engine::DynamicLight> lights) { m_dynamicLights.assign(lights.begin(), lights.end()); }
@@ -249,8 +296,11 @@ public:
     UINT LightCount() const { return m_lightCount; }
 
     // The map lights each visibility cluster can see and be reached by, found per point by walking the BSP tree
-    // (LightsAt in shaders/scene.hlsli). `rangesView` holds an (offset, count) range of light indices per cluster
-    // and one more, after them, with every light for points outside any cluster.
+    // (ClusterLights in shaders/scene.hlsli, for the bake: VRAD's PVSCheck). `rangesView` holds an (offset, count) range
+    // of light indices per cluster and one more, after them, with every light for points outside any cluster.
+    // The light grid (LightsAt) serves everything else: per cell (x fastest), `gridCellsView` holds the range of its
+    // listed lights in `gridIndicesView`, the strongest that can reach it, and of its tail in `gridTailView`: every other
+    // light that can reach it, with cumulative weights for importance sampling.
     struct LightLists {
         UINT rangesView = DescriptorHeap::kInvalid;
         UINT indicesView = DescriptorHeap::kInvalid;
@@ -259,6 +309,12 @@ public:
         // bsp::Visibility::sunClusters as bits, or kInvalid for every cluster.
         UINT sunClustersView = DescriptorHeap::kInvalid;
         UINT clusterCount = 0;
+        UINT gridCellsView = DescriptorHeap::kInvalid;
+        UINT gridIndicesView = DescriptorHeap::kInvalid;
+        UINT gridTailView = DescriptorHeap::kInvalid;
+        bsp::Float3 gridOrigin = {};
+        float gridCellSize = 0.0f;
+        uint32_t gridDims[3] = {};
     };
     const LightLists& Lights() const { return m_lightLists; }
 
@@ -288,6 +344,7 @@ private:
         Microsoft::WRL::ComPtr<ID3D12Resource> micromapIndices;
         bool hasMicromaps = false;
         bool selfIllum = false;
+        bool character = false;
         UINT positionsView = DescriptorHeap::kInvalid;
         UINT indicesView = DescriptorHeap::kInvalid;
         UINT albedoView = DescriptorHeap::kInvalid;
@@ -331,6 +388,10 @@ private:
     bool EnsureDynamicLights(FrameTlas& frame);
     bool EnsureLightStyles(FrameTlas& frame);
     bool BuildLightLists(std::span<const bsp::Light> lights, const bsp::Visibility& visibility);
+    // The light grid of LightLists over the world's triangles. A cell lists the lights with the largest bound there
+    // (LightBound), lights its clusters' PVS leaves out weighed down but kept, and samples the rest.
+    bool BuildLightGrid(std::span<const GpuLight> lights, std::span<const bsp::Light> mapLights, const bsp::Visibility& visibility,
+        std::span<const bsp::Float3> worldPositions);
     // Bakes and records the build of a model's opacity micromap array and points its alpha geometry at it.
     bool AddMicromaps(Model& model, const ModelGeometry& geometry, D3D12_RAYTRACING_GEOMETRY_DESC& alphaGeometry,
         D3D12_RAYTRACING_GEOMETRY_TRIANGLES_DESC& triangles, D3D12_RAYTRACING_GEOMETRY_OMM_LINKAGE_DESC& linkage,
@@ -361,6 +422,11 @@ private:
     // Which materials are self-illuminated (GpuMaterial::selfIllumMask set).
     std::vector<bool> m_selfIllumMaterials;
     std::vector<SceneInstance> m_staticInstances;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_emitters;
+    UINT m_emittersView = DescriptorHeap::kInvalid;
+    UINT m_emitterCount = 0;
+    // kInstanceEmitter when the world has emitters.
+    uint32_t m_worldFlags = 0;
     std::vector<std::pair<int, UINT>> m_recorded;
     bool m_hasSkybox = false;
     std::vector<engine::DynamicLight> m_dynamicLights;
@@ -379,6 +445,9 @@ private:
     LightLists m_lightLists;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_lightRanges;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_lightIndices;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_gridCells;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_gridIndices;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_gridTail;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_bspNodes;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_leafClusters;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_sunClusters;

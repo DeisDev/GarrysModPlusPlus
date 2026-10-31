@@ -78,14 +78,15 @@ bool CanLightRenderTargetView()
     const DynamicState& dynamic = Dynamic();
     if (dynamic.colorTargets[0] == kDefaultTarget || dynamic.colorTargets[0] == 0)
         return false;
-    // The water's own views keep the game's light: its reflections are traced (shaders/water.hlsli), so the game's
-    // reflection is not shown, and lighting the refraction view as it is drawn costs about 3 ms at 2560x1440.
+    // The water's refraction view keeps the game's light: lighting it as it is drawn costs about 3 ms at 2560x1440.
+    // The reflection view is lit: mirrors (func_reflective_glass) show it, and the game's own flashlight passes went
+    // wrong there.
     const Texture* target = TextureFromHandle(dynamic.colorTargets[0]);
     std::string name = target != nullptr ? target->name : std::string();
     std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     if (GetOptions().devMode && g_state.loggedTargets.insert(name).second && g_state.loggedTargets.size() <= 16)
         log::Info("Real-time lighting: a view is drawn into '{}'", name);
-    return !name.starts_with("_rt_water");
+    return !name.starts_with("_rt_waterrefraction");
 }
 
 void Finish(gbuffer::ViewKind kind)

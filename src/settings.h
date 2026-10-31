@@ -32,12 +32,16 @@ enum class UpscalingMode : uint32_t { Native = 0, Quality, Balanced, Performance
 enum class QualityPreset : uint32_t { Low = 0, Medium, High, Ultra, Custom, Count };
 
 // What static props the map marks as casting no shadows (mostly foliage) block: nothing, as in the game's baked
-// lighting; the sun; or the sun and the first bounce of indirect light. Later bounces always pass through them.
-enum class FoliageShadows : uint32_t { Off = 0, Sun, SunAndIndirect, Count };
+// lighting; the sun; the sun and the first bounce of indirect light; or all light. The lower levels are faster in grass.
+enum class FoliageShadows : uint32_t { Off = 0, Sun, SunAndIndirect, All, Count };
 
 // Where indirect light comes from: traced bounces, or VRAD's baked bounce light with the direct light it held taken
 // out (cheaper; the sun and local lights are still traced).
 enum class IndirectLighting : uint32_t { RayTraced = 0, Baked, Count };
+
+// What self-illuminated surfaces light: nothing; what indirect rays meet (bounce light); or also the surfaces around
+// them directly, as area lights with shadows.
+enum class EmissiveLighting : uint32_t { Off = 0, Bounce, Full, Count };
 
 // Options shown in the in-game menu. Read on the render thread; the menu edits them on the same thread.
 struct Settings {
@@ -63,7 +67,8 @@ struct Settings {
     float indirectIntensity = 1.0f;
     float projectedIntensity = 1.0f;
     float reflectionIntensity = 1.0f;
-    // How much ambient occlusion darkens indirect light, which already holds the larger-scale occlusion.
+    // How much ambient occlusion darkens the baked indirect light (IndirectLighting::Baked), which holds VRAD's
+    // occlusion by static geometry but not what moves. Traced light holds its own occlusion.
     float aoIntensity = 1.0f;
     // Scales the haze's density.
     float volumetricIntensity = 1.0f;
@@ -85,8 +90,9 @@ struct Settings {
     // Rays per update of each irradiance volume probe.
     int volumeRays = 32;
     int volumetricSteps = 16;
-    FoliageShadows foliageShadows = FoliageShadows::SunAndIndirect;
+    FoliageShadows foliageShadows = FoliageShadows::All;
     IndirectLighting indirectLighting = IndirectLighting::RayTraced;
+    EmissiveLighting emissiveLighting = EmissiveLighting::Full;
     // Indirect light and ambient occlusion rays take alpha-tested surfaces from their opacity micromaps alone.
     bool fastAlphaTests = false;
     bool opacityMicromaps = true;

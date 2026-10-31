@@ -95,6 +95,7 @@ struct FrameConstants {
     uint32_t sunShadowMask;
     uint32_t indirectMask;
     uint32_t bounceMask;
+    uint32_t lightShadowMask;
     uint32_t indirectRayFlags;
     uint32_t dispatchOriginView;
     uint32_t probeRedView;
@@ -122,6 +123,18 @@ struct FrameConstants {
     // or kInvalidView.
     uint32_t skyCubeView;
     uint32_t skyLightView;
+    // Scene::LightLists' light grid.
+    float gridOrigin[3];
+    float gridCellSize;
+    uint32_t gridDims[3];
+    uint32_t gridCellsView;
+    uint32_t gridIndicesView;
+    uint32_t gridTailView;
+    // Scene::EmittersView and EmitterCount (0 without EmissiveLighting::Full), and the EmissiveLighting setting.
+    uint32_t emittersView;
+    uint32_t emitterCount;
+    uint32_t emissiveLighting;
+    uint32_t padding[2];
     // The 3D skybox's fog (ViewInputs::skyboxFog), for reflected rays that continue into it.
     float skyboxFogParams[4];
     float skyboxFogColor[3];

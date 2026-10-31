@@ -56,8 +56,8 @@ bool TraceGBufferSurface(float3 origin, float3 direction, out float t)
     query.TraceRayInline(g_scene, RAY_FLAG_NONE, g_frame.traceMask & ~kLocalPlayerMask, ray);
     while (query.Proceed()) {
         bool translucent;
-        float opacity = CandidateOpacity(query.CandidateInstanceID(), query.CandidatePrimitiveIndex(), query.CandidateTriangleBarycentrics(), translucent);
-        if (!translucent && opacity > 0.0)
+        float3 through = CandidateTransmission(query.CandidateInstanceID(), query.CandidatePrimitiveIndex(), query.CandidateTriangleBarycentrics(), translucent);
+        if (!translucent && through.x < 1.0)
             query.CommitNonOpaqueTriangleHit();
     }
     t = query.CommittedRayT();

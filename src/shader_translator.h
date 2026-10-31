@@ -31,6 +31,8 @@ struct Variant {
     // Pixel shaders writing oC0 alone that also write 0 to SV_Target1, the G-buffer's coverage, so the lighting leaves
     // what they draw as the game drew it.
     std::uint8_t clearCoverage : 1 = 0;
+    // With clearCoverage, write a mirror's mark, (0, 0, 1, 0), instead (IsMirror in shaders/water.hlsli).
+    std::uint8_t markMirror : 1 = 0;
     // G-buffer twins of light-warped materials: the flags target's alpha (oC3.a) takes gmodpp_alpha.y, the warp
     // texture's slot in the view's table (shaderapi_capture.h, LightWarpSlot).
     std::uint8_t lightWarpSlot : 1 = 0;

@@ -2,7 +2,7 @@
 
 // The bounce light and sky ambient of VRAD's style-0 lightmaps: VRAD summed direct, bounce and sky ambient light
 // into each luxel (FinalLightFace in src/utils/vrad/lightmap.cpp adds the bounce to style 0 only), so the direct
-// light of the style-0 lights and sun, recomputed here with VRAD's falloff (LightIrradiance) and occluders (the world
+// light of the style-0 lights and sun, recomputed here with VRAD's falloff (VradLightIrradiance) and occluders (the world
 // and static props that cast shadows), is taken out; ray tracing adds it back exactly. A thread per luxel, run in
 // parts over several frames; g_frame holds the map's lights and sun at their baked strength.
 // Step 0 (bake): the direct light at each luxel's sample. input0: BakeLuxels; input2: FaceLightmaps; input3: first
@@ -24,10 +24,8 @@
 // in place; output1: counters (3: samples with a cube side clamped at zero).
 
 // VRAD's occluders: the world and the 3D skybox, static props and brushes as VRAD shaped them, and the sky faces
-// (kWorldMask, kSkyboxMask, kVradOccluderMask and kVradSkyMask in src/scene.h).
-static const uint kVradOccluders = 0x01 | 0x10 | 0x40 | 0x80;
-// The sky faces (kVradSkyMask): VRAD's sun rays end there unblocked.
-static const uint kVradSky = 0x80;
+// (kWorldMask, kSkyboxMask and kVradOccluderMask in src/scene.h), whose instances have kInstanceVradSky.
+static const uint kVradOccluders = 0x01 | 0x10 | 0x40;
 // A luxel counts as clamped when the direct light exceeds the baked light by more than this share of it.
 static const float kClampTolerance = 0.05;
 static const uint kCellSampled = 0x80000000u;
@@ -71,10 +69,32 @@ float SolidSkyVisibility(float3 origin)
     ray.Direction = g_frame.sunDirection;
     ray.TMin = 0.01;
     ray.TMax = 65536.0;
-    query.TraceRayInline(g_scene, RAY_FLAG_NONE, kVradSky, ray);
+    query.TraceRayInline(g_scene, RAY_FLAG_NONE, kVradOccluders, ray);
     query.Proceed();
-    float sky = query.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? query.CommittedRayT() : ray.TMax;
-    return SolidTransmittance(origin, g_frame.sunDirection, sky, kVradOccluders & ~kVradSky);
+    if (query.CommittedStatus() != COMMITTED_TRIANGLE_HIT)
+        return 1.0;
+    return (LoadInstance(query.CommittedInstanceID()).flags & kInstanceVradSky) != 0 ? 1.0 : 0.0;
+}
+
+// A light's unshadowed irradiance as VRAD gathered it into the lightmaps (GatherSampleStandardLightSSE): its constant,
+// linear and quadratic attenuation, from at least a unit away. The light's _distance (radius) does not limit it there.
+float3 VradLightIrradiance(Light light, float3 position, float3 normal, out float3 toLight, out float distance)
+{
+    float3 delta = light.origin - position;
+    float distanceSquared = max(dot(delta, delta), 1e-4);
+    distance = sqrt(distanceSquared);
+    toLight = delta / distance;
+    float lambert = saturate(dot(normal, toLight));
+    if (lambert <= 0.0)
+        return 0.0;
+    float falloff;
+    if (light.type == kLightSurface) {
+        falloff = saturate(-dot(toLight, light.normal)) / distanceSquared;
+    } else {
+        float d = max(distance, 1.0);
+        falloff = SpotFactor(light, toLight, distance) / max(light.constantAttn + light.linearAttn * d + light.quadraticAttn * d * d, 1e-4);
+    }
+    return light.intensity * (lambert * falloff) * g_frame.lightScale;
 }
 
 // SunVisibility (shaders/scene.hlsli) as VRAD's TestLine_DoesHitSky: then again from the matching point of the 3D
@@ -114,15 +134,15 @@ void DirectLight(BakeLuxel luxel, FaceLightmap face, out float3 direct[4])
         for (uint n = 0; n < count && visibility > 0.0; ++n)
             direct[n] += g_frame.sunColor * saturate(dot(normals[n], g_frame.sunDirection)) * visibility;
     }
-    LightRanges ranges = LightsAt(luxel.position, luxel.normal);
-    for (uint i = 0; i < LightRangeCount(ranges); ++i) {
-        Light light = LoadLight(LightRangeIndex(ranges, i));
+    LightRanges ranges = ClusterLights(luxel.position, luxel.normal);
+    for (uint i = 0; i < ranges.count; ++i) {
+        Light light = LoadLight(ClusterLightIndex(ranges, i));
         // Other styles have their own lightmaps, which hold no bounce light.
         if (light.style != 0)
             continue;
         float3 toLight;
         float distance;
-        float3 flat = LightIrradiance(light, origin, normals[0], toLight, distance);
+        float3 flat = VradLightIrradiance(light, origin, normals[0], toLight, distance);
         if (all(flat <= 0.0))
             continue;
         float visibility = SolidTransmittance(origin, toLight, ShadowRayLength(kLightClearance, distance), kVradOccluders);
@@ -130,7 +150,7 @@ void DirectLight(BakeLuxel luxel, FaceLightmap face, out float3 direct[4])
             continue;
         direct[0] += flat * visibility;
         for (uint n = 1; n < count; ++n)
-            direct[n] += LightIrradiance(light, origin, normals[n], toLight, distance);
+            direct[n] += VradLightIrradiance(light, origin, normals[n], toLight, distance);
     }
 }
 

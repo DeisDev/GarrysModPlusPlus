@@ -251,6 +251,15 @@ private:
     std::unordered_map<uint64_t, uint32_t> m_edges;
 };
 
+// How far `point` lies outside the hull's planes; negative inside.
+float Distance(std::span<const Plane> planes, const bsp::Float3& point)
+{
+    float distance = -INFINITY;
+    for (const Plane& plane : planes)
+        distance = std::max(distance, plane.normal.x * point.x + plane.normal.y * point.y + plane.normal.z * point.z - plane.distance);
+    return distance;
+}
+
 // Builds the hull of `points` and checks it holds every point; false when it could not be built.
 bool BuildChecked(std::span<const bsp::Float3> points, std::vector<Plane>& planes, std::vector<bsp::Float3>* triangles)
 {
@@ -284,25 +293,11 @@ bool BuildChecked(std::span<const bsp::Float3> points, std::vector<Plane>& plane
 
 }
 
-std::vector<Plane> Build(std::span<const bsp::Float3> points)
-{
-    std::vector<Plane> planes;
-    return BuildChecked(points, planes, nullptr) ? planes : std::vector<Plane>{};
-}
-
 std::vector<bsp::Float3> Triangles(std::span<const bsp::Float3> points)
 {
     std::vector<Plane> planes;
     std::vector<bsp::Float3> triangles;
     return BuildChecked(points, planes, &triangles) ? triangles : std::vector<bsp::Float3>{};
-}
-
-float Distance(std::span<const Plane> planes, const bsp::Float3& point)
-{
-    float distance = -INFINITY;
-    for (const Plane& plane : planes)
-        distance = std::max(distance, plane.normal.x * point.x + plane.normal.y * point.y + plane.normal.z * point.z - plane.distance);
-    return distance;
 }
 
 }

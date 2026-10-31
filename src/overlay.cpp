@@ -293,7 +293,9 @@ void DrawLightingTab(Settings& settings)
     if (BeginOptionTable("indirect")) {
         ToggleRow(TextId::IndirectLight, settings.indirectLight, settings, &Settings::indirectIntensity);
         ToggleRow(TextId::Denoiser, settings.denoiser, settings, nullptr);
+        ImGui::BeginDisabled(settings.indirectLighting != IndirectLighting::Baked);
         ToggleRow(TextId::AmbientOcclusion, settings.ambientOcclusion, settings, &Settings::aoIntensity);
+        ImGui::EndDisabled();
         ToggleRow(TextId::Reflections, settings.reflections, settings, &Settings::reflectionIntensity);
         ToggleRow(TextId::TranslucentLighting, settings.translucentLighting, settings, nullptr);
         ToggleRow(TextId::RenderTargetLighting, settings.renderTargetLighting, settings, nullptr);
@@ -337,7 +339,7 @@ void DrawRayTracingTab(Settings& settings)
         ImGui::TableNextColumn();
         ImGui::TextUnformatted(Text(TextId::FoliageShadows));
         ImGui::TableNextColumn();
-        const TextId foliage[] = {TextId::FoliageOff, TextId::FoliageSun, TextId::FoliageSunAndIndirect};
+        const TextId foliage[] = {TextId::FoliageOff, TextId::FoliageSun, TextId::FoliageSunAndIndirect, TextId::FoliageAll};
         static_assert(std::size(foliage) == static_cast<size_t>(FoliageShadows::Count));
         const int mode = static_cast<int>(settings.foliageShadows);
         ImGui::SetNextItemWidth(-FLT_MIN);
@@ -345,6 +347,23 @@ void DrawRayTracingTab(Settings& settings)
             for (int i = 0; i < static_cast<int>(std::size(foliage)); ++i) {
                 if (ImGui::Selectable(Text(foliage[i]), i == mode) && i != mode) {
                     settings.foliageShadows = static_cast<FoliageShadows>(i);
+                    settings.qualityPreset = QualityPreset::Custom;
+                }
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn();
+        ImGui::TextUnformatted(Text(TextId::EmissiveLighting));
+        ImGui::TableNextColumn();
+        const TextId emissive[] = {TextId::EmissiveOff, TextId::EmissiveBounce, TextId::EmissiveFull};
+        static_assert(std::size(emissive) == static_cast<size_t>(EmissiveLighting::Count));
+        const int emissiveMode = static_cast<int>(settings.emissiveLighting);
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        if (ImGui::BeginCombo("##emissive", Text(emissive[emissiveMode]))) {
+            for (int i = 0; i < static_cast<int>(std::size(emissive)); ++i) {
+                if (ImGui::Selectable(Text(emissive[i]), i == emissiveMode) && i != emissiveMode) {
+                    settings.emissiveLighting = static_cast<EmissiveLighting>(i);
                     settings.qualityPreset = QualityPreset::Custom;
                 }
             }
@@ -373,7 +392,9 @@ void DrawRayTracingTab(Settings& settings)
         }
         IntSliderRow(TextId::IndirectRays, settings, &Settings::indirectRays);
         IntSliderRow(TextId::IndirectBounces, settings, &Settings::indirectBounces);
+        ImGui::BeginDisabled(settings.indirectLighting != IndirectLighting::Baked);
         IntSliderRow(TextId::AoRays, settings, &Settings::aoRays);
+        ImGui::EndDisabled();
         IntSliderRow(TextId::VolumeRays, settings, &Settings::volumeRays);
         ImGui::EndTable();
     }

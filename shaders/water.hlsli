@@ -19,6 +19,8 @@ static const float kWaterIor = 1.333;
 static const float kWaterF0 = 0.02;
 
 bool IsWater(float4 flags) { return flags.r < 0.5 && flags.g > 0.5; }
+// A mirror's surface (translator::Variant::markMirror), which shows the game's reflection view.
+bool IsMirror(float4 flags) { return flags.r < 0.5 && flags.g < 0.5 && flags.b > 0.5; }
 
 static const float kNoEyeAngle = 10.0;
 
@@ -55,7 +57,7 @@ float3 SunGlint(float3 position, float3 normal, float3 toEye)
     float k = kGlintRoughness * 0.5;
     float g = (nl / (nl * (1.0 - k) + k)) * (nv / (nv * (1.0 - k) + k));
     float f = Schlick(dot(halfway, toEye));
-    float visibility = SunVisibility(position + normal * 2.0, g_frame.sunShadowMask);
+    float3 visibility = SunVisibility(position + normal * 2.0, g_frame.sunShadowMask);
     return ClampSample(g_frame.sunColor * (d * g * f / (4.0 * nv)) * visibility);
 }
 

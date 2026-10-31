@@ -20,6 +20,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <execution>
 #include <format>
 #include <fstream>
 #include <memory>
@@ -39,6 +40,8 @@ constexpr UINT kMapPollInterval = 30;
 constexpr int kMaxBones = 256;
 // The bone weapons' world models are merged onto (their root bone) and players hold them by.
 constexpr char kRightHandBone[] = "ValveBiped.Bip01_R_Hand";
+// Humanoid characters' skeletons have this bone, wherever the model lives (HL2's NPCs are in models/ itself).
+constexpr char kHeadBone[] = "ValveBiped.Bip01_Head1";
 constexpr bsp::Float3 kDefaultReflectivity = {0.5f, 0.5f, 0.5f};
 constexpr float kDefaultAlphaReference = 0.5f;
 // Alpha and mask textures are read from a mip no larger than this; shadows and reflections need no more detail.
@@ -49,11 +52,6 @@ constexpr uint32_t kDroppedTriangle = 0x7FFFFFFF;
 
 constexpr uint32_t kJitterSamples = 8;
 constexpr uint32_t kRayReconstructionPhases = 32;
-// VRAD shadows a static prop by the convex pieces of its collision model's first solid or, without one, by the
-// convex hull of each of its meshes (CreateCollisionModel and AddPolysForRayTrace in
-// utils/vrad/vradstaticprops.cpp). Lights placed in lamp models lose most of their light to those hulls, which the
-// lamps' open meshes let out, so lights this close to a hull are blocked by it.
-constexpr float kFixtureMargin = 2.0f;
 
 unsigned Hex(HRESULT hr) { return static_cast<unsigned>(hr); }
 
@@ -83,11 +81,17 @@ struct ModelEntry {
 };
 
 struct MaterialInfo {
-    // Translucent surfaces (glass, foliage) let part of the light through; alpha-tested ones (foliage, fences) are
-    // cut by their alpha. Clear ones block nothing: additive light effects (beams, glows) and Refract glass, which
-    // VBSP makes a non-solid window brush that VRAD's shadows ignore (FindMiptex, AddBrushToRaytraceEnvironment).
+    // Translucent surfaces (glass, foliage) let part of the light through, coloured by their texture; alpha-tested ones
+    // (foliage, fences) are cut by their alpha. Refract glass passes light tinted by $refracttint and its
+    // $refracttinttexture. Clear ones block nothing: additive light effects (beams, glows) only add light.
     bool translucent = false;
     bool clear = false;
+    bool refract = false;
+    // $refracttint in linear light, as the Refract shader sets it (SetPixelShaderConstantGammaToLinear, c1; confirmed in
+    // GMod's stdshader_dx9.dll at 0x180017210, called with the refract tint from 0x180044070, whose $REFRACTTINT
+    // defaults to [1 1 1] in the parameter table at 0x1800be7c0), and its tint texture (sampler 5, read as sRGB).
+    bsp::Float3 refractTint = {1.0f, 1.0f, 1.0f};
+    std::string refractTintTexture;
     bool alphaTest = false;
     float alphaReference = kDefaultAlphaReference;
     // $alpha.
@@ -104,8 +108,18 @@ struct MaterialInfo {
 struct TriangleData {
     UINT opaqueTriangles = 0;
     std::vector<uint32_t> alphaTriangles;
+    // TriangleTintFor of each of alphaTriangles.
+    std::vector<uint32_t> alphaTints;
     // Scene material of each triangle.
     std::vector<uint32_t> materials;
+};
+
+// A self-illuminated triangle of a model, in the model's space: its corners, its index in the model's BLAS order and
+// the luminance of its emission (albedo times $selfillumtint; its mask is read where it is sampled).
+struct ModelEmitter {
+    bsp::Float3 corners[3];
+    uint32_t primitive;
+    float emission;
 };
 
 struct SceneTexture {
@@ -132,6 +146,13 @@ struct State {
     // Textures uploaded for alpha tests and material masks, by VTF path.
     std::unordered_map<std::string, SceneTexture> textures;
     std::vector<std::string> mapMaterials;
+    // bsp::WorldGeometry::lightMaterials of the map.
+    std::vector<bool> lightMaterials;
+    // A copy of each scene material (AddSceneMaterial), and the light-texture copy of self-illuminated ones.
+    std::vector<GpuMaterial> sceneMaterials;
+    std::unordered_map<uint32_t, uint32_t> lightTextureMaterials;
+    // The self-illuminated triangles of each scene model (ModelEmitters), for the emitters of its static instances.
+    std::unordered_map<int, std::vector<ModelEmitter>> modelEmitters;
     uint32_t modelErrors = 0;
     std::vector<entities::ModelEntity> entities;
     std::vector<SceneInstance> dynamicInstances;
@@ -317,6 +338,56 @@ std::string ShaderName(std::string_view vmt)
 // like lit ones, so the material table tells them apart.
 bool IsUnlitShader(std::string_view shader) { return shader == "unlitgeneric" || shader == "unlittwotexture" || shader == "monitorscreen"; }
 
+// Adds a material to the scene, keeping a copy for emitters and light-texture copies.
+uint32_t AddSceneMaterial(const GpuMaterial& material)
+{
+    const uint32_t index = g_state.scene.AddMaterial(material);
+    if (index != Scene::kNoMaterial) {
+        if (g_state.sceneMaterials.size() <= index)
+            g_state.sceneMaterials.resize(index + 1);
+        g_state.sceneMaterials[index] = material;
+    }
+    return index;
+}
+
+// The scene material of a face whose texture VRAD made emit_surface lights of (bsp::WorldGeometry::lightMaterials):
+// a self-illuminated one is copied with Scene::kMaterialLightTexture, so its glow lights nothing a second time.
+uint32_t LightTextureMaterial(uint32_t material)
+{
+    if (material >= g_state.sceneMaterials.size() || g_state.sceneMaterials[material].selfIllumMask == Scene::kMaskOff)
+        return material;
+    if (const auto found = g_state.lightTextureMaterials.find(material); found != g_state.lightTextureMaterials.end())
+        return found->second;
+    GpuMaterial copy = g_state.sceneMaterials[material];
+    copy.flags |= Scene::kMaterialLightTexture;
+    const uint32_t index = AddSceneMaterial(copy);
+    g_state.lightTextureMaterials[material] = index;
+    return index;
+}
+
+// A model's self-illuminated triangles that light the scene (not light textures), from its geometry in BLAS order.
+std::vector<ModelEmitter> ModelEmitters(std::span<const bsp::Float3> positions, std::span<const uint32_t> indices,
+    std::span<const uint32_t> triangleAlbedo, std::span<const uint32_t> triangleMaterials)
+{
+    std::vector<ModelEmitter> emitters;
+    for (size_t t = 0; t < triangleMaterials.size() && t < triangleAlbedo.size(); ++t) {
+        const uint32_t material = triangleMaterials[t];
+        if (material >= g_state.sceneMaterials.size())
+            continue;
+        const GpuMaterial& gpu = g_state.sceneMaterials[material];
+        if (gpu.selfIllumMask == Scene::kMaskOff || (gpu.flags & Scene::kMaterialLightTexture) != 0)
+            continue;
+        const uint32_t albedo = triangleAlbedo[t];
+        const float rgb[3] = {static_cast<float>(albedo & 0xFF) / 255.0f, static_cast<float>((albedo >> 8) & 0xFF) / 255.0f,
+            static_cast<float>((albedo >> 16) & 0xFF) / 255.0f};
+        const float emission = 0.2126f * rgb[0] * gpu.selfIllumTint[0] + 0.7152f * rgb[1] * gpu.selfIllumTint[1] + 0.0722f * rgb[2] * gpu.selfIllumTint[2];
+        if (emission <= 0.0f)
+            continue;
+        emitters.push_back({{positions[indices[t * 3]], positions[indices[t * 3 + 1]], positions[indices[t * 3 + 2]]}, static_cast<uint32_t>(t), emission});
+    }
+    return emitters;
+}
+
 // The scene material for a VMT's env_cubemap reflection and self-illumination (as LightmappedGeneric and
 // VertexLitGeneric compute their masks) and whether it is unlit, or Scene::kNoMaterial when it has none of them.
 uint32_t SceneMaterial(std::string_view vmt, std::string_view shader, const std::string& baseTexture, bool unlit)
@@ -373,7 +444,7 @@ uint32_t SceneMaterial(std::string_view vmt, std::string_view shader, const std:
     }
     if (material.envmapMask == Scene::kMaskOff && material.selfIllumMask == Scene::kMaskOff && !unlit)
         return Scene::kNoMaterial;
-    return g_state.scene.AddMaterial(material);
+    return AddSceneMaterial(material);
 }
 
 // The first of a texture's candidate VMTs that exists, with what the scene needs from it.
@@ -410,7 +481,15 @@ const std::optional<MaterialInfo>& MaterialFor(const std::string& vmtPath)
             entry->opacity = std::clamp(value, 0.0f, 1.0f);
     }
     entry->translucent = enabled("$translucent") || entry->opacity < 1.0f;
-    entry->clear = enabled("$additive") || shader == "refract";
+    entry->clear = enabled("$additive");
+    if (shader == "refract") {
+        entry->refract = true;
+        const bsp::Float3 tint = MaterialColor(text, "$refracttint", {1.0f, 1.0f, 1.0f});
+        // Source's GammaToLinear for colour constants up to 1 (src/mathlib/color_conversion.cpp): 1 from 0.95 up.
+        const auto linear = [](float c) { return c > 1.0f ? c : c >= 0.95f ? 1.0f : std::pow(std::max(c, 0.0f), 2.2f); };
+        entry->refractTint = {linear(tint.x), linear(tint.y), linear(tint.z)};
+        entry->refractTintTexture = studio::MaterialTexture(text, "$refracttinttexture");
+    }
     entry->alphaTest = enabled("$alphatest");
     if (std::optional<std::string> reference = studio::MaterialValue(text, "$alphatestreference")) {
         float value = 0.0f;
@@ -431,25 +510,49 @@ const std::optional<MaterialInfo>& MaterialFor(const std::string& vmtPath)
     return entry;
 }
 
+// The first of a model texture's candidate VMTs that exists, or nullptr.
+const MaterialInfo* TextureMaterial(const std::vector<std::string>& vmtPaths)
+{
+    for (const std::string& vmtPath : vmtPaths) {
+        if (const std::optional<MaterialInfo>& material = MaterialFor(vmtPath))
+            return &*material;
+    }
+    return nullptr;
+}
+
 // The alpha-test or translucency entry of a material's triangles, kOpaqueTriangle, or kDroppedTriangle for
 // clear materials.
 uint32_t TriangleAlphaFor(const MaterialInfo& material)
 {
     if (material.clear)
         return kDroppedTriangle;
+    if (material.refract) {
+        const SceneTexture* tint = material.refractTintTexture.empty() ? nullptr : &TextureFor(material.refractTintTexture);
+        return Scene::PackTranslucent(tint != nullptr ? tint->view : DescriptorHeap::kInvalid, 1.0f);
+    }
     if (!material.alphaTest && !material.translucent)
         return kOpaqueTriangle;
     const SceneTexture* texture = material.baseTexture.empty() ? nullptr : &TextureFor(material.baseTexture);
-    const UINT alphaView = texture != nullptr && texture->view != DescriptorHeap::kInvalid && texture->alpha ? texture->view : DescriptorHeap::kInvalid;
-    if (material.alphaTest)
-        return alphaView != DescriptorHeap::kInvalid ? Scene::PackAlpha(alphaView, material.alphaReference) : kOpaqueTriangle;
-    return Scene::PackTranslucent(alphaView, material.opacity);
+    if (material.alphaTest) {
+        const bool alpha = texture != nullptr && texture->view != DescriptorHeap::kInvalid && texture->alpha;
+        return alpha ? Scene::PackAlpha(texture->view, material.alphaReference) : kOpaqueTriangle;
+    }
+    // A texture without alpha reads as opaque, leaving $alpha; its colour filters the light either way.
+    return Scene::PackTranslucent(texture != nullptr ? texture->view : DescriptorHeap::kInvalid, material.opacity);
+}
+
+// How a translucent triangle colours the light through it (Scene::PackTint): by Refract's tint, or for other translucent
+// surfaces by their texture's colour.
+uint32_t TriangleTintFor(const MaterialInfo& material)
+{
+    return material.refract ? Scene::PackTint(material.refractTint, Scene::kTintRefract) : Scene::PackTint({1.0f, 1.0f, 1.0f}, Scene::kTintFilter);
 }
 
 // Moves the triangles whose `triangleAlpha` is not kOpaqueTriangle behind the others and removes those marked
 // kDroppedTriangle, reordering `indices` and every per-triangle vector in `perTriangle` alike.
 template <class... PerTriangle>
-TriangleData PartitionTriangles(std::vector<uint32_t>& indices, const std::vector<uint32_t>& triangleAlpha, PerTriangle&... perTriangle)
+TriangleData PartitionTriangles(std::vector<uint32_t>& indices, const std::vector<uint32_t>& triangleAlpha, const std::vector<uint32_t>& triangleTint,
+    PerTriangle&... perTriangle)
 {
     std::vector<size_t> order;
     order.reserve(triangleAlpha.size());
@@ -461,8 +564,10 @@ TriangleData PartitionTriangles(std::vector<uint32_t>& indices, const std::vecto
     const auto firstAlpha = std::stable_partition(order.begin(), order.end(), [&](size_t t) { return triangleAlpha[t] == kOpaqueTriangle; });
     TriangleData partition;
     partition.opaqueTriangles = static_cast<UINT>(firstAlpha - order.begin());
-    for (auto it = firstAlpha; it != order.end(); ++it)
+    for (auto it = firstAlpha; it != order.end(); ++it) {
         partition.alphaTriangles.push_back(triangleAlpha[*it]);
+        partition.alphaTints.push_back(triangleTint[*it]);
+    }
     if (partition.alphaTriangles.empty() && triangles == triangleAlpha.size())
         return partition;
     std::vector<uint32_t> sortedIndices(triangles * 3);
@@ -494,19 +599,26 @@ const std::optional<MaterialInfo>* MapMaterial(uint32_t texdata)
 ModelGeometry PrepareMesh(bsp::Mesh& mesh, TriangleData& triangles)
 {
     std::vector<uint32_t> triangleAlpha(mesh.triangleMaterials.size(), kOpaqueTriangle);
+    std::vector<uint32_t> triangleTint(mesh.triangleMaterials.size(), 0);
     for (size_t t = 0; t < triangleAlpha.size(); ++t) {
         const std::optional<MaterialInfo>* material = MapMaterial(mesh.triangleMaterials[t]);
-        if (material != nullptr && *material)
+        if (material != nullptr && *material) {
             triangleAlpha[t] = TriangleAlphaFor(**material);
+            triangleTint[t] = TriangleTintFor(**material);
+        }
     }
-    triangles = PartitionTriangles(mesh.indices, triangleAlpha, mesh.triangleAlbedo, mesh.triangleMaterials, mesh.triangleFaces);
+    triangles = PartitionTriangles(mesh.indices, triangleAlpha, triangleTint, mesh.triangleAlbedo, mesh.triangleMaterials, mesh.triangleFaces);
     triangles.materials.resize(mesh.triangleMaterials.size(), Scene::kNoMaterial);
     for (size_t t = 0; t < triangles.materials.size(); ++t) {
         const std::optional<MaterialInfo>* material = MapMaterial(mesh.triangleMaterials[t]);
-        if (material != nullptr && *material)
-            triangles.materials[t] = (*material)->sceneMaterial;
+        if (material != nullptr && *material) {
+            const uint32_t texdata = mesh.triangleMaterials[t];
+            const bool lightTexture = texdata < g_state.lightMaterials.size() && g_state.lightMaterials[texdata];
+            triangles.materials[t] = lightTexture ? LightTextureMaterial((*material)->sceneMaterial) : (*material)->sceneMaterial;
+        }
     }
-    return {mesh.positions, mesh.indices, mesh.triangleAlbedo, triangles.opaqueTriangles, mesh.uvs, triangles.alphaTriangles, triangles.materials};
+    return {mesh.positions, mesh.indices, mesh.triangleAlbedo, triangles.opaqueTriangles, mesh.uvs, triangles.alphaTriangles, triangles.alphaTints,
+        triangles.materials};
 }
 
 uint32_t PackAlbedo(const bsp::Float3& c)
@@ -557,34 +669,39 @@ const ModelEntry& ModelFor(const std::string& mdlPath, int skin = 0)
         std::vector<bool> skip(texturePaths.size(), false);
         std::vector<uint32_t> textureAlbedo(texturePaths.size(), PackAlbedo(kDefaultReflectivity));
         std::vector<uint32_t> textureAlpha(texturePaths.size(), kOpaqueTriangle);
+        std::vector<uint32_t> textureTint(texturePaths.size(), 0);
         std::vector<uint32_t> textureMaterial(texturePaths.size(), Scene::kNoMaterial);
         std::vector<uint32_t> textureSway(texturePaths.size(), SwayingModel::kNoSway);
         for (size_t t = 0; t < texturePaths.size(); ++t) {
-            for (const std::string& vmtPath : texturePaths[t]) {
-                const std::optional<MaterialInfo>& material = MaterialFor(vmtPath);
-                if (!material)
-                    continue;
-                skip[t] = material->clear;
-                textureAlbedo[t] = PackAlbedo(material->reflectivity);
-                textureAlpha[t] = TriangleAlphaFor(*material);
-                textureMaterial[t] = material->sceneMaterial;
-                textureSway[t] = material->swayMaterial;
-                break;
-            }
+            const MaterialInfo* material = TextureMaterial(texturePaths[t]);
+            if (material == nullptr)
+                continue;
+            skip[t] = material->clear;
+            textureAlbedo[t] = PackAlbedo(material->reflectivity);
+            textureAlpha[t] = TriangleAlphaFor(*material);
+            textureTint[t] = TriangleTintFor(*material);
+            textureMaterial[t] = material->sceneMaterial;
+            textureSway[t] = material->swayMaterial;
         }
         if (studio::BuildGeometry(mdl, vvd, vtx, skip, geometry, error, skin) && !geometry.indices.empty()) {
             std::vector<uint32_t> triangleAlbedo(geometry.triangleTextures.size());
             std::vector<uint32_t> triangleAlpha(geometry.triangleTextures.size());
+            std::vector<uint32_t> triangleTint(geometry.triangleTextures.size());
             for (size_t i = 0; i < triangleAlbedo.size(); ++i) {
                 const uint16_t texture = geometry.triangleTextures[i];
                 triangleAlbedo[i] = texture < textureAlbedo.size() ? textureAlbedo[texture] : PackAlbedo(kDefaultReflectivity);
                 triangleAlpha[i] = texture < textureAlpha.size() ? textureAlpha[texture] : kOpaqueTriangle;
+                triangleTint[i] = texture < textureTint.size() ? textureTint[texture] : 0;
             }
-            TriangleData triangles = PartitionTriangles(geometry.indices, triangleAlpha, triangleAlbedo, geometry.triangleTextures);
+            TriangleData triangles = PartitionTriangles(geometry.indices, triangleAlpha, triangleTint, triangleAlbedo, geometry.triangleTextures);
             for (uint16_t texture : geometry.triangleTextures)
                 triangles.materials.push_back(texture < textureMaterial.size() ? textureMaterial[texture] : Scene::kNoMaterial);
             entry.sceneModel = g_state.scene.AddModel({geometry.positions, geometry.indices, triangleAlbedo, triangles.opaqueTriangles, geometry.uvs,
-                triangles.alphaTriangles, triangles.materials});
+                triangles.alphaTriangles, triangles.alphaTints, triangles.materials});
+            if (entry.sceneModel >= 0) {
+                if (std::vector<ModelEmitter> emitters = ModelEmitters(geometry.positions, geometry.indices, triangleAlbedo, triangles.materials); !emitters.empty())
+                    g_state.modelEmitters[entry.sceneModel] = std::move(emitters);
+            }
             if (entry.sceneModel >= 0 && std::any_of(textureSway.begin(), textureSway.end(), [](uint32_t sway) { return sway != SwayingModel::kNoSway; })) {
                 auto swaying = std::make_shared<SwayingModel>();
                 swaying->sceneModel = entry.sceneModel;
@@ -603,6 +720,11 @@ const ModelEntry& ModelFor(const std::string& mdlPath, int skin = 0)
                 if (poseToBone.size() == 1)
                     entry.rootPoseToBone = poseToBone[0];
                 entry.rightHand = studio::BoneIndex(mdl, kRightHandBone);
+                // Characters: players, humans and other character folders, or a humanoid skeleton. Their $halflambert
+                // materials are lit as skin (subsurface scattering, shaders/deferred_lighting.hlsl).
+                if (mdlPath.starts_with("models/player/") || mdlPath.starts_with("models/humans/") || mdlPath.starts_with("models/characters/") ||
+                    studio::BoneIndex(mdl, kHeadBone) >= 0)
+                    g_state.scene.MarkCharacter(entry.sceneModel);
                 if (entry.rightHand >= 0 && static_cast<size_t>(entry.rightHand) < poseToBone.size())
                     entry.rightHandPoseToBone = poseToBone[entry.rightHand];
             }
@@ -654,86 +776,214 @@ std::vector<std::vector<bsp::Float3>> VradPropHulls(const std::string& path, boo
     return hulls;
 }
 
-// The convex hulls of static props that VRAD's shadows hid most of a light behind: those the light sits in or
-// against.
-std::vector<LightHull> FixtureHulls(const bsp::WorldGeometry& world)
+// Ray tests of SealedLights: rays from a light stop at triangles within kShellReach, and when all but kSealedEscape of
+// kSealRays directions stop, the light is sealed. A light inside a hollow building prop reaches walls further away.
+constexpr int kSealRays = 128;
+constexpr float kShellReach = 64.0f;
+constexpr float kSealedEscape = 0.1f;
+// Props whose bounds come this close to a light may seal it.
+constexpr float kShellMargin = 1.0f;
+
+bsp::Float3 Subtract(const bsp::Float3& a, const bsp::Float3& b) { return {a.x - b.x, a.y - b.y, a.z - b.z}; }
+float Dot(const bsp::Float3& a, const bsp::Float3& b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+bsp::Float3 Cross(const bsp::Float3& a, const bsp::Float3& b) { return {a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x}; }
+
+// Where a ray meets a triangle from either side (Moller-Trumbore), or tMax when it misses before it.
+float RayTriangle(const bsp::Float3& origin, const bsp::Float3& direction, const bsp::Float3* corner, float tMax)
 {
-    struct PropModel {
-        bool read = false;
-        bool bounded = false;
-        bsp::Float3 mins = {};
-        bsp::Float3 maxs = {};
-        bool hullsRead = false;
-        bool fromCollision = false;
-        // Model-space points of each convex hull VRAD shadowed the model with.
-        std::vector<std::vector<bsp::Float3>> hulls;
-    };
-    std::vector<PropModel> models(world.propModels.size());
+    const bsp::Float3 edge1 = Subtract(corner[1], corner[0]);
+    const bsp::Float3 edge2 = Subtract(corner[2], corner[0]);
+    const bsp::Float3 p = Cross(direction, edge2);
+    const float determinant = Dot(edge1, p);
+    if (std::fabs(determinant) < 1e-8f)
+        return tMax;
+    const float inverse = 1.0f / determinant;
+    const bsp::Float3 s = Subtract(origin, corner[0]);
+    const float u = Dot(s, p) * inverse;
+    if (u < 0.0f || u > 1.0f)
+        return tMax;
+    const bsp::Float3 q = Cross(s, edge1);
+    const float v = Dot(direction, q) * inverse;
+    if (v < 0.0f || u + v > 1.0f)
+        return tMax;
+    const float t = Dot(edge2, q) * inverse;
+    return t > 0.01f && t < tMax ? t : tMax;
+}
+
+// A model's opaque triangles in model space, three positions each: those TriangleAlphaFor leaves opaque, of LOD0 and
+// the skin family.
+std::vector<bsp::Float3> OpaqueModelTriangles(const std::string& mdlPath, int skin)
+{
+    std::vector<bsp::Float3> triangles;
+    const std::string base = mdlPath.size() > 4 ? mdlPath.substr(0, mdlPath.size() - 4) : mdlPath;
+    const std::vector<std::byte> mdl = ReadOptional(mdlPath);
+    std::vector<std::vector<std::string>> texturePaths;
+    std::string error;
+    if (mdl.empty() || !studio::ReadMaterialPaths(mdl, texturePaths, error))
+        return triangles;
+    std::vector<bool> skip(texturePaths.size(), false);
+    for (size_t t = 0; t < texturePaths.size(); ++t) {
+        const MaterialInfo* material = TextureMaterial(texturePaths[t]);
+        skip[t] = material != nullptr && TriangleAlphaFor(*material) != kOpaqueTriangle;
+    }
+    studio::Geometry geometry;
+    if (!studio::BuildGeometry(mdl, ReadOptional(base + ".vvd"), ReadOptional(base + ".dx90.vtx"), skip, geometry, error, skin))
+        return triangles;
+    triangles.reserve(geometry.indices.size());
+    for (uint32_t index : geometry.indices)
+        triangles.push_back(geometry.positions[index]);
+    return triangles;
+}
+
+// Map lights sealed inside static props, as mappers placed lights in lamp models that VRAD's prop hulls then blocked.
+// Rays leave each light whose prop bounds hold it towards the opaque triangles of those props and of the world close
+// by. A sealed light gets kLightSealed, and the props its rays stopped at become lamp shells (`shells`, by prop),
+// which its shadow rays pass as if the shell were a diffuser; to other rays they stay solid. It takes the shell's size:
+// the mean distance to it, but not past the nearest world surface. Lamps with openings let their light out only
+// through them. Returns each light's shape.
+std::vector<MapLightShape> SealedLights(const bsp::WorldGeometry& world, const ModelGeometry& worldGeometry, std::vector<bool>& shells)
+{
+    std::vector<MapLightShape> shapes(world.lights.size());
+    shells.assign(world.props.size(), false);
     const auto transform = [](const float m[3][4], const bsp::Float3& p) {
         return bsp::Float3{m[0][0] * p.x + m[0][1] * p.y + m[0][2] * p.z + m[0][3], m[1][0] * p.x + m[1][1] * p.y + m[1][2] * p.z + m[1][3],
             m[2][0] * p.x + m[2][1] * p.y + m[2][2] * p.z + m[2][3]};
     };
-    std::vector<LightHull> result;
-    std::vector<uint32_t> nearby;
-    size_t collisionHulls = 0;
-    size_t failedHulls = 0;
-    std::string failedModels;
-    for (const bsp::StaticProp& prop : world.props) {
-        if (prop.noShadow)
-            continue;
-        PropModel& model = models[prop.model];
-        const std::string& path = world.propModels[prop.model];
-        if (!model.read) {
-            model.read = true;
-            model.bounded = studio::ReadBounds(ReadOptional(path), model.mins, model.maxs);
+    struct ModelBounds {
+        bool read = false;
+        bool bounded = false;
+        bsp::Float3 mins = {};
+        bsp::Float3 maxs = {};
+    };
+    std::vector<ModelBounds> modelBounds(world.propModels.size());
+    std::vector<std::pair<bsp::Float3, bsp::Float3>> propBoxes(world.props.size());
+    for (size_t p = 0; p < world.props.size(); ++p) {
+        const bsp::StaticProp& prop = world.props[p];
+        ModelBounds& bounds = modelBounds[prop.model];
+        if (!bounds.read) {
+            bounds.read = true;
+            bounds.bounded = studio::ReadBounds(ReadOptional(world.propModels[prop.model]), bounds.mins, bounds.maxs);
         }
-        bsp::Float3 low = {INFINITY, INFINITY, INFINITY};
-        bsp::Float3 high = {-INFINITY, -INFINITY, -INFINITY};
-        for (int corner = 0; corner < 8 && model.bounded; ++corner) {
-            const bsp::Float3 p = transform(prop.transform, {corner & 1 ? model.maxs.x : model.mins.x, corner & 2 ? model.maxs.y : model.mins.y,
-                corner & 4 ? model.maxs.z : model.mins.z});
-            low = {std::min(low.x, p.x - kFixtureMargin), std::min(low.y, p.y - kFixtureMargin), std::min(low.z, p.z - kFixtureMargin)};
-            high = {std::max(high.x, p.x + kFixtureMargin), std::max(high.y, p.y + kFixtureMargin), std::max(high.z, p.z + kFixtureMargin)};
-        }
-        nearby.clear();
-        for (uint32_t i = 0; i < world.lights.size(); ++i) {
-            if (!model.bounded || bsp::InBounds(world.lights[i].origin, low, high))
-                nearby.push_back(i);
-        }
-        if (nearby.empty())
-            continue;
-        if (!model.hullsRead) {
-            model.hullsRead = true;
-            model.hulls = VradPropHulls(path, model.fromCollision);
-        }
-        for (const std::vector<bsp::Float3>& piece : model.hulls) {
-            if (piece.empty())
-                continue;
-            std::vector<bsp::Float3> points(piece.size());
-            std::transform(piece.begin(), piece.end(), points.begin(), [&](const bsp::Float3& p) { return transform(prop.transform, p); });
-            std::vector<hull::Plane> planes = hull::Build(points);
-            if (planes.empty()) {
-                if (++failedHulls <= 4)
-                    failedModels += (failedModels.empty() ? "" : ", ") + path;
-                continue;
-            }
-            for (uint32_t light : nearby) {
-                if (hull::Distance(planes, world.lights[light].origin) <= kFixtureMargin) {
-                    result.push_back({light, planes});
-                    collisionHulls += model.fromCollision ? 1 : 0;
-                }
-            }
+        auto& [low, high] = propBoxes[p];
+        low = {INFINITY, INFINITY, INFINITY};
+        high = {-INFINITY, -INFINITY, -INFINITY};
+        for (int corner = 0; corner < 8 && bounds.bounded; ++corner) {
+            const bsp::Float3 c = transform(prop.transform, {corner & 1 ? bounds.maxs.x : bounds.mins.x, corner & 2 ? bounds.maxs.y : bounds.mins.y,
+                corner & 4 ? bounds.maxs.z : bounds.mins.z});
+            low = {std::min(low.x, c.x - kShellMargin), std::min(low.y, c.y - kShellMargin), std::min(low.z, c.z - kShellMargin)};
+            high = {std::max(high.x, c.x + kShellMargin), std::max(high.y, c.y + kShellMargin), std::max(high.z, c.z + kShellMargin)};
         }
     }
-    std::vector<uint32_t> lights;
-    for (const LightHull& entry : result)
-        lights.push_back(entry.light);
-    std::sort(lights.begin(), lights.end());
-    log::Info("Scene: {} lights sit in or against {} static prop hulls ({} from collision models), which block them as in VRAD ({} flat or "
-              "failed hulls{}{})",
-        std::unique(lights.begin(), lights.end()) - lights.begin(), result.size(), collisionHulls, failedHulls, failedModels.empty() ? "" : ": ",
-        failedModels);
-    return result;
+
+    struct Candidate {
+        uint32_t light;
+        std::vector<uint32_t> props;
+        std::vector<uint32_t> shells;
+        float radius = kBulbRadius;
+    };
+    std::vector<Candidate> candidates;
+    for (uint32_t i = 0; i < world.lights.size(); ++i) {
+        if (world.lights[i].type == bsp::LightType::Surface)
+            continue;
+        Candidate candidate{i};
+        for (uint32_t p = 0; p < world.props.size(); ++p) {
+            if (bsp::InBounds(world.lights[i].origin, propBoxes[p].first, propBoxes[p].second))
+                candidate.props.push_back(p);
+        }
+        if (!candidate.props.empty())
+            candidates.push_back(std::move(candidate));
+    }
+    // Read once, here: materials and files go through the shared state.
+    std::unordered_map<uint64_t, std::vector<bsp::Float3>> modelTriangles;
+    const auto modelKey = [&](uint32_t p) { return static_cast<uint64_t>(world.props[p].model) | static_cast<uint64_t>(world.props[p].skin) << 32; };
+    for (const Candidate& candidate : candidates) {
+        for (uint32_t p : candidate.props) {
+            if (!modelTriangles.contains(modelKey(p)))
+                modelTriangles[modelKey(p)] = OpaqueModelTriangles(world.propModels[world.props[p].model], world.props[p].skin);
+        }
+    }
+
+    std::for_each(std::execution::par, candidates.begin(), candidates.end(), [&](Candidate& candidate) {
+        const bsp::Float3 origin = world.lights[candidate.light].origin;
+        const bsp::Float3 low = {origin.x - kShellReach, origin.y - kShellReach, origin.z - kShellReach};
+        const bsp::Float3 high = {origin.x + kShellReach, origin.y + kShellReach, origin.z + kShellReach};
+        // World-space corners of each triangle in reach, and the index in candidate.props of its prop (-1: the world).
+        std::vector<bsp::Float3> corners;
+        std::vector<int32_t> owners;
+        for (size_t n = 0; n < candidate.props.size(); ++n) {
+            const bsp::StaticProp& prop = world.props[candidate.props[n]];
+            for (const bsp::Float3& p : modelTriangles.at(modelKey(candidate.props[n])))
+                corners.push_back(transform(prop.transform, p));
+            owners.resize(corners.size() / 3, static_cast<int32_t>(n));
+        }
+        for (size_t t = 0; t < worldGeometry.opaqueTriangles; ++t) {
+            const bsp::Float3* triangle[3];
+            bsp::Float3 tLow = {INFINITY, INFINITY, INFINITY};
+            bsp::Float3 tHigh = {-INFINITY, -INFINITY, -INFINITY};
+            for (int k = 0; k < 3; ++k) {
+                triangle[k] = &worldGeometry.positions[worldGeometry.indices[t * 3 + k]];
+                tLow = {std::min(tLow.x, triangle[k]->x), std::min(tLow.y, triangle[k]->y), std::min(tLow.z, triangle[k]->z)};
+                tHigh = {std::max(tHigh.x, triangle[k]->x), std::max(tHigh.y, triangle[k]->y), std::max(tHigh.z, triangle[k]->z)};
+            }
+            if (tHigh.x < low.x || tLow.x > high.x || tHigh.y < low.y || tLow.y > high.y || tHigh.z < low.z || tLow.z > high.z)
+                continue;
+            for (int k = 0; k < 3; ++k)
+                corners.push_back(*triangle[k]);
+            owners.push_back(-1);
+        }
+        std::vector<uint32_t> hits(candidate.props.size(), 0);
+        int escaped = 0;
+        float shellDistance = 0.0f;
+        float nearestWorld = kShellReach;
+        for (int r = 0; r < kSealRays; ++r) {
+            // Directions spread evenly over the sphere (a Fibonacci lattice).
+            const float z = 1.0f - (2.0f * static_cast<float>(r) + 1.0f) / kSealRays;
+            const float ring = std::sqrt(std::max(1.0f - z * z, 0.0f));
+            const float angle = 2.39996323f * static_cast<float>(r);
+            const bsp::Float3 direction = {ring * std::cos(angle), ring * std::sin(angle), z};
+            float nearest = kShellReach;
+            int32_t owner = -2;
+            for (size_t t = 0; t < owners.size(); ++t) {
+                const float hit = RayTriangle(origin, direction, &corners[t * 3], nearest);
+                if (hit < nearest) {
+                    nearest = hit;
+                    owner = owners[t];
+                }
+            }
+            if (owner == -2) {
+                ++escaped;
+            } else if (owner >= 0) {
+                ++hits[owner];
+                shellDistance += nearest;
+            } else {
+                nearestWorld = std::min(nearestWorld, nearest);
+            }
+        }
+        if (escaped > kSealedEscape * kSealRays)
+            return;
+        uint32_t shellHits = 0;
+        for (size_t n = 0; n < hits.size(); ++n) {
+            if (hits[n] != 0)
+                candidate.shells.push_back(candidate.props[n]);
+            shellHits += hits[n];
+        }
+        if (shellHits != 0)
+            candidate.radius = std::clamp(shellDistance / static_cast<float>(shellHits), std::min(kBulbRadius, nearestWorld), nearestWorld);
+    });
+
+    size_t sealed = 0;
+    for (const Candidate& candidate : candidates) {
+        if (candidate.shells.empty())
+            continue;
+        shapes[candidate.light] = {kLightSealed, candidate.radius};
+        ++sealed;
+        for (uint32_t p : candidate.shells)
+            shells[p] = true;
+    }
+    log::Info("Scene: {} of {} lights in static props are sealed in {} lamp shells, which let their light out; the rest shine through their "
+              "props' openings",
+        sealed, candidates.size(), std::count(shells.begin(), shells.end(), true));
+    return shapes;
 }
 
 // Static props as VRAD shadowed them when the map was compiled without -StaticPropPolys (AddPolysForRayTrace in
@@ -747,7 +997,7 @@ void AddVradOccluders(const bsp::WorldGeometry& world, std::vector<SceneInstance
         std::vector<uint32_t> indices(triangles.size());
         std::iota(indices.begin(), indices.end(), 0u);
         const std::vector<uint32_t> albedo(triangles.size() / 3, PackAlbedo({0.5f, 0.5f, 0.5f}));
-        return g_state.scene.AddModel({triangles, indices, albedo, static_cast<UINT>(albedo.size()), {}, {}, {}});
+        return g_state.scene.AddModel({triangles, indices, albedo, static_cast<UINT>(albedo.size()), {}, {}, {}, {}});
     };
     size_t collisionProps = 0;
     size_t meshProps = 0;
@@ -778,18 +1028,72 @@ void AddVradOccluders(const bsp::WorldGeometry& world, std::vector<SceneInstance
         ++(fromCollision[prop.model] ? collisionProps : meshProps);
     }
     const float identity[3][4] = {{1.0f, 0.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 1.0f, 0.0f}};
-    for (const auto& [triangles, mask] : {std::pair(&world.brushOccluders, kVradOccluderMask), std::pair(&world.skyOccluders, kVradSkyMask)}) {
+    for (const auto& [triangles, flags] : {std::pair(&world.brushOccluders, 0u), std::pair(&world.skyOccluders, kInstanceVradSky)}) {
         if (triangles->empty())
             continue;
         SceneInstance instance;
         instance.model = addModel(*triangles);
-        instance.mask = mask;
+        instance.mask = kVradOccluderMask;
+        instance.flags = flags;
         std::memcpy(instance.transform, identity, sizeof(instance.transform));
         if (instance.model >= 0)
             instances.push_back(instance);
     }
     log::Info("Scene: VRAD's shadows for the bake: {} props by collision model, {} by mesh hulls; {} brush triangles, {} sky triangles", collisionProps,
         meshProps, world.brushOccluders.size() / 3, world.skyOccluders.size() / 3);
+}
+
+// The scene's emitters (Scene::SetEmitters): the self-illuminated triangles of the world and of static props outside
+// the 3D skybox, in world space, picked in proportion to their emission times their area. Instances with some get
+// kInstanceEmitter; the world is instance 0 and static instance i is i + 1 (Scene::RecordFrame).
+void SetEmitters(const std::vector<ModelEmitter>& worldEmitters, std::vector<SceneInstance>& instances)
+{
+    std::vector<GpuEmitter> emitters;
+    std::vector<double> power;
+    const auto add = [&](const std::vector<ModelEmitter>& model, uint32_t instance, const float (*m)[4]) {
+        for (const ModelEmitter& emitter : model) {
+            bsp::Float3 p[3];
+            for (int k = 0; k < 3; ++k) {
+                const bsp::Float3& c = emitter.corners[k];
+                p[k] = m == nullptr ? c
+                                    : bsp::Float3{m[0][0] * c.x + m[0][1] * c.y + m[0][2] * c.z + m[0][3], m[1][0] * c.x + m[1][1] * c.y + m[1][2] * c.z + m[1][3],
+                                          m[2][0] * c.x + m[2][1] * c.y + m[2][2] * c.z + m[2][3]};
+            }
+            const bsp::Float3 n = Cross(Subtract(p[1], p[0]), Subtract(p[2], p[0]));
+            const double area = 0.5 * std::sqrt(static_cast<double>(Dot(n, n)));
+            if (area <= 0.0)
+                continue;
+            emitters.push_back({{p[0].x, p[0].y, p[0].z}, instance, {p[1].x, p[1].y, p[1].z}, emitter.primitive, {p[2].x, p[2].y, p[2].z}, 0.0f});
+            power.push_back(area * emitter.emission);
+        }
+    };
+    add(worldEmitters, 0, nullptr);
+    const bool worldEmits = !emitters.empty();
+    for (size_t i = 0; i < instances.size(); ++i) {
+        if (instances[i].mask == kSkyboxMask)
+            continue;
+        const auto found = g_state.modelEmitters.find(instances[i].model);
+        if (found == g_state.modelEmitters.end())
+            continue;
+        const size_t before = emitters.size();
+        add(found->second, static_cast<uint32_t>(i + 1), instances[i].transform);
+        if (emitters.size() != before)
+            instances[i].flags |= kInstanceEmitter;
+    }
+    double total = 0.0;
+    for (double p : power)
+        total += p;
+    double cumulative = 0.0;
+    for (size_t e = 0; e < emitters.size(); ++e) {
+        cumulative += power[e];
+        emitters[e].cdf = static_cast<float>(cumulative / total);
+    }
+    if (!emitters.empty())
+        emitters.back().cdf = 1.0f;
+    if (!g_state.scene.SetEmitters(emitters, worldEmits))
+        log::Info("Scene: the {} self-illuminated triangles could not be uploaded; glowing surfaces light only what indirect rays meet", emitters.size());
+    else
+        log::Info("Scene: {} self-illuminated triangles light the scene", emitters.size());
 }
 
 bool IsFirstPersonModel(const std::string& path)
@@ -837,6 +1141,9 @@ void ClearScene()
     g_state.textures.clear();
     // Scene material indices and texture views are reset with the scene.
     g_state.materials.clear();
+    g_state.sceneMaterials.clear();
+    g_state.lightTextureMaterials.clear();
+    g_state.modelEmitters.clear();
     g_state.swayMaterials.clear();
     g_state.ropeModels.clear();
     g_state.loggedRopes = false;
@@ -878,9 +1185,12 @@ void UpdateScene()
     } else if (bsp::LoadWorld(file, world, error)) {
         ClearScene();
         g_state.mapMaterials = std::move(world.materials);
+        g_state.lightMaterials = world.lightMaterials;
         TriangleData worldTriangles;
         const ModelGeometry worldGeometry = PrepareMesh(world.mesh, worldTriangles);
-        if (g_state.scene.LoadMap(level, world, FixtureHulls(world), worldGeometry)) {
+        std::vector<bool> shells;
+        const std::vector<MapLightShape> lightShapes = SealedLights(world, worldGeometry, shells);
+        if (g_state.scene.LoadMap(level, world, lightShapes, worldGeometry)) {
             g_state.brushModels = std::move(world.brushModels);
             g_state.skyboxTest.visibility.nodes = std::move(world.visibility.nodes);
             g_state.skyboxTest.visibility.leaves = std::move(world.visibility.leaves);
@@ -889,12 +1199,17 @@ void UpdateScene()
             g_state.skyboxTest.skyMaxs = world.skyMaxs;
             std::vector<SceneInstance> instances;
             std::vector<SwayingProp> swayingProps;
-            const auto addProps = [&](const std::vector<bsp::StaticProp>& props, UINT mask) {
-                for (const bsp::StaticProp& prop : props) {
+            // `propShells` marks the props that are lamp shells.
+            const auto addProps = [&](const std::vector<bsp::StaticProp>& props, UINT mask, const std::vector<bool>& propShells) {
+                for (size_t p = 0; p < props.size(); ++p) {
+                    const bsp::StaticProp& prop = props[p];
                     const ModelEntry& model = ModelFor(world.propModels[prop.model], prop.skin);
                     SceneInstance instance;
                     instance.model = model.sceneModel;
-                    instance.mask = mask == 0 && prop.noShadow ? kShadowlessPropMask : mask;
+                    if (mask == 0 && p < propShells.size() && propShells[p])
+                        instance.mask = kLampShellMask;
+                    else
+                        instance.mask = mask == 0 && prop.noShadow ? kShadowlessPropMask : mask;
                     instance.flags = prop.ignoreNormals ? kInstanceIgnoreNormals : 0;
                     std::memcpy(instance.transform, prop.transform, sizeof(instance.transform));
                     // The 3D skybox's scaled-down props sway too little to matter.
@@ -904,7 +1219,7 @@ void UpdateScene()
                         instances.push_back(instance);
                 }
             };
-            addProps(world.props, 0);
+            addProps(world.props, 0, shells);
             const size_t worldProps = swayingProps.size() +
                 std::count_if(instances.begin(), instances.end(), [](const SceneInstance& instance) { return instance.model >= 0; });
             if (!world.skybox.indices.empty()) {
@@ -915,8 +1230,12 @@ void UpdateScene()
                 const float identity[3][4] = {{1.0f, 0.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 1.0f, 0.0f}};
                 std::memcpy(skybox.transform, identity, sizeof(skybox.transform));
             }
-            addProps(world.skyboxProps, kSkyboxMask);
+            addProps(world.skyboxProps, kSkyboxMask, {});
             std::erase_if(instances, [](const SceneInstance& instance) { return instance.model < 0; });
+            SetEmitters(ModelEmitters(world.mesh.positions, world.mesh.indices, world.mesh.triangleAlbedo, worldTriangles.materials), instances);
+            log::Info("Scene: {} of {} textures are VRAD light textures; {} of those glow ($selfillum) and light nothing again",
+                std::count(g_state.lightMaterials.begin(), g_state.lightMaterials.end(), true), g_state.lightMaterials.size(),
+                g_state.lightTextureMaterials.size());
             // A residual baked before for this map, by the map's contents (gmodpp_cache\baked).
             const std::filesystem::path cachePath = GetOptions().gameDirectory / L"gmodpp_cache" / L"baked" / std::format(L"{:016x}.bin", FileHash(file));
             std::vector<std::byte> cached;
@@ -988,7 +1307,7 @@ int RopeModelFor(const std::string& material)
         return model;
     const ropes::Prism prism = ropes::UnitPrism();
     const std::vector<uint32_t> albedo(prism.indices.size() / 3, PackAlbedo(info ? info->reflectivity : kDefaultReflectivity));
-    model = g_state.scene.AddModel({prism.positions, prism.indices, albedo, static_cast<UINT>(albedo.size()), {}, {}, {}});
+    model = g_state.scene.AddModel({prism.positions, prism.indices, albedo, static_cast<UINT>(albedo.size()), {}, {}, {}, {}});
     return model;
 }
 
@@ -1248,9 +1567,6 @@ std::optional<gbuffer::ForwardConstants> ForwardLighting(const ViewInputs& input
     if (const std::optional<std::array<float, 3>> eye = EyePosition(inputs.viewProj))
         forward.eye = *eye;
     forward.tonemapScale = inputs.tonemapScale;
-    const bsp::Float3& ambient = g_state.scene.Sun().ambient;
-    const float sky = GetSettings().skyIntensity * g_state.scene.LightStyle(g_state.scene.Sun().ambientStyle);
-    forward.fallback = {ambient.x * sky, ambient.y * sky, ambient.z * sky};
     forward.probeOrigin = g_state.lighting->VolumeOrigin();
     if (GetSettings().fog)
         forward.fog = inputs.fog;

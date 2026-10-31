@@ -1096,6 +1096,7 @@ void DrawPass(const ShadowState& shadow, const MeshDraw& mesh)
         pixelVariant.alphaTest = static_cast<std::uint8_t>(shadow.alphaFunc + 1);
     pixelVariant.forwardLighting = pass.forwardFrame != 0 ? 1 : 0;
     pixelVariant.clearCoverage = clearCoverage ? 1 : 0;
+    pixelVariant.markMirror = clearCoverage && pass.marksMirror ? 1 : 0;
     if (pass.route == capture::Pass::Route::GBuffer && pass.lightWarpSampler >= 0 && pass.lightWarpSampler < kSamplers) {
         pixelVariant.lightWarpSlot = 1;
         pixelState.alpha[1] = LightWarpSlot(dynamic.textures[static_cast<size_t>(pass.lightWarpSampler)], ((shadow.srgbRead >> pass.lightWarpSampler) & 1) != 0);

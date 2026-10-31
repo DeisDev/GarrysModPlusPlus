@@ -33,9 +33,9 @@ float3 PreviousIrradiance(float3 position, float3 normal)
     return denoised.Load(int3(pixel, 0)).rgb + direct.Load(int3(pixel, 0)).rgb;
 }
 
-// Indirect light at an off-screen hit: more diffuse bounces, each seeing the sky or a sunlit surface. Rays after the
-// first pass through shadowless props (g_frame.bounceMask): in grass they would cross many alpha-tested blades for
-// light the denoiser blurs anyway.
+// Indirect light at an off-screen hit: more diffuse bounces, each seeing the sky or a sunlit surface. Below
+// foliage_shadows' "All light", rays after the first pass through shadowless props (g_frame.bounceMask): in grass they
+// cross many alpha-tested blades for light the denoiser blurs anyway.
 float3 FurtherBounces(HitSurface hit, float3 origin, inout uint seed)
 {
     float3 irradiance = 0.0;
@@ -43,10 +43,11 @@ float3 FurtherBounces(HitSurface hit, float3 origin, inout uint seed)
     for (uint bounce = 1; bounce < g_frame.indirectBounces; ++bounce) {
         float3 direction = CosineSample(hit.normal, Random(seed), Random(seed));
         HitSurface next;
-        if (!TraceClosest(origin, direction, kMaxDistance, g_frame.bounceMask, next, g_frame.indirectRayFlags))
+        HitInfo nextHit;
+        if (!TraceClosest(origin, direction, kMaxDistance, g_frame.bounceMask, next, nextHit, g_frame.indirectRayFlags))
             return irradiance + throughput * SkyLight(direction);
         origin = next.position + next.normal;
-        irradiance += throughput * next.albedo * SunIrradiance(next, origin, g_frame.bounceMask);
+        irradiance += throughput * (next.albedo * SunIrradiance(next, origin, g_frame.bounceMask) + BounceEmission(next, nextHit, false));
         throughput *= next.albedo;
         hit = next;
     }
@@ -63,7 +64,7 @@ float3 ProjectorLight(HitSurface hit, float3 origin)
         float distance;
         float3 light = ProjectorIrradiance(projector, hit.position, hit.normal, toLight, distance);
         if (Luminance(light) > 0.0)
-            irradiance += light * Transmittance(origin, toLight, ShadowRayLength(ProjectorClearance(projector), distance), ShadowMask(true));
+            irradiance += light * ProjectorTransmittance(projector, origin);
     }
     return irradiance;
 }
@@ -82,9 +83,9 @@ float3 HitIrradiance(HitSurface hit, inout uint seed)
     float3 toLight;
     float distance;
     uint picked;
-    LightSet set = LightSetAt(hit.position, hit.normal);
+    LightSet set = LightSetAt(hit.position);
     if (SampleLight(set, hit.position, hit.normal, seed, light, toLight, distance, picked))
-        irradiance += light * LightTransmittance(set, picked, origin, toLight, distance);
+        irradiance += light * LightTransmittance(set, picked, origin, hit.position + toLight * distance, float2(Random(seed), Random(seed)));
     return irradiance + FurtherBounces(hit, origin, seed);
 }
 
@@ -108,28 +109,28 @@ void main(uint3 id : SV_DispatchThreadID)
     float bias = SurfaceBias(surface.w);
     float3 geometricNormal = GeometricNormalAt(pixel);
     float3 origin = SurfaceRayOrigin(position, geometricNormal, surface.w);
-    // Props that ignore normals gather light from every direction, as VRAD lit them; rays through their thin
-    // surfaces start on the far side.
-    Texture2D<uint> pixelFlags = ResourceDescriptorHeap[g_frame.pixelFlagsView];
-    bool ignoreNormals = (pixelFlags.Load(int3(pixel, 0)) & kPixelIgnoreNormals) != 0;
+    // Leaves (props that ignore normals) turn their normal towards the eye and take kLeafTransmission of their light
+    // through them from behind (LeafTerm, without its forward lobe); rays through them start on the far side.
+    bool leaf;
+    normal = LitNormal(pixel, normal, leaf);
     Texture2D<float4> remainder = ResourceDescriptorHeap[g_pass.input1];
     if (g_frame.bakedTrianglesView != kNoView) {
-        float3 baked = BakedIrradiance(pixel, normal);
-        if (baked.x < 0.0)
-            baked = LeafAmbient(position, ignoreNormals ? 0.0 : normal);
-        if (baked.x < 0.0)
-            baked = SkyLight(normal);
-        output[pixel] = float4(baked + remainder.Load(int3(pixel, 0)).rgb, 1.0);
+        output[pixel] = float4(BakedIndirect(pixel, position, normal, leaf) + remainder.Load(int3(pixel, 0)).rgb, 1.0);
         return;
     }
     uint samples = max(g_pass.step, 1u);
     float3 estimate = 0.0;
     for (uint s = 0; s < samples; ++s) {
-        float3 direction = ignoreNormals ? UniformSphere(Random(seed), Random(seed))
-                                           : AboveSurface(CosineSample(normal, Random(seed), Random(seed)), geometricNormal);
+        // A leaf's side is picked in proportion to the light it takes from it, which leaves each sample weighing 1.
+        bool through = false;
+        if (leaf)
+            through = Random(seed) < kLeafTransmission;
+        float3 side = through ? -geometricNormal : geometricNormal;
+        float3 direction = AboveSurface(CosineSample(through ? -normal : normal, Random(seed), Random(seed)), side);
         HitSurface hit;
-        if (TraceClosest(ignoreNormals ? position + direction * bias : origin, direction, kMaxDistance, g_frame.indirectMask, hit, g_frame.indirectRayFlags))
-            estimate += ClampSample(hit.albedo * HitIrradiance(hit, seed));
+        HitInfo hitInfo;
+        if (TraceClosest(through ? position - geometricNormal * bias : origin, direction, kMaxDistance, g_frame.indirectMask, hit, hitInfo, g_frame.indirectRayFlags))
+            estimate += ClampSample(hit.albedo * HitIrradiance(hit, seed) + BounceEmission(hit, hitInfo, true));
         else
             estimate += SkyLight(direction);
     }

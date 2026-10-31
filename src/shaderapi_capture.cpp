@@ -488,9 +488,9 @@ void BeginForward(const gbuffer::ForwardConstants& constants)
     using gbuffer::kProbeSpacing;
     const float extent[3] = {kProbeSpacing * kProbeGrid[0], kProbeSpacing * kProbeGrid[1], kProbeSpacing * kProbeGrid[2]};
     auto& c = g_state.forwardConstants;
-    c[1] = {constants.fallback[0], constants.fallback[1], constants.fallback[2], constants.lightOnly ? 1.0f : 0.0f};
+    c[1] = {0.0f, 0.0f, 0.0f, constants.lightOnly ? 1.0f : 0.0f};
     c[2] = {constants.fog.color[0], constants.fog.color[1], constants.fog.color[2], 0.0f};
-    c[3] = {1.0f / extent[0], 1.0f / extent[1], 1.0f / extent[2], 0.0f};
+    c[3] = {1.0f / extent[0], 1.0f / extent[1], 1.0f / extent[2], kProbeSpacing};
     // The window ends at the centres of its outermost probes.
     c[0] = {0.0f, 2.0f / (extent[0] - kProbeSpacing), 2.0f / (extent[1] - kProbeSpacing), 2.0f / (extent[2] - kProbeSpacing)};
     c[4] = {(constants.probeOrigin[0] + kProbeGrid[0] * 0.5f) * kProbeSpacing, (constants.probeOrigin[1] + kProbeGrid[1] * 0.5f) * kProbeSpacing,
@@ -551,6 +551,13 @@ Pass Prepare(std::span<const DWORD> vertexCode, std::span<const DWORD> pixelCode
     const bool additive = blend && destinationBlend == kBlendOne;
 
     if (g_state.forwardActive) {
+        // Flashlights and projected textures are ray traced here too (the forward constants' projectors), so the game's
+        // own passes for them are skipped, as in captured views.
+        if (shaderClass.kind == ShaderKind::Flashlight || shaderClass.kind == ShaderKind::ProjectedShadow) {
+            Count(pixelFile, shaderClass.kind == ShaderKind::Flashlight ? Path::Flashlight : Path::ProjectedShadow);
+            pass.route = Pass::Route::Skip;
+            return pass;
+        }
         // Forward twins trace their own light; additive draws add light and are shown as drawn.
         const std::span<const DWORD> twin = !additive && g_state.twinFrame != 0 && g_state.twinScene != 0 && pixelFile != nullptr && pixelCombo.header != nullptr
             ? twins::ForwardShader(pixelFile, *pixelCombo.header, pixelCombo.staticIndex, pixelCombo.dynamicIndex)
@@ -627,6 +634,7 @@ Pass Prepare(std::span<const DWORD> vertexCode, std::span<const DWORD> pixelCode
         if (gameTarget && pixel != nullptr)
             Count(pixelFile, modulate ? Path::Decal : Path::Unlit);
         pass.clearsCoverage = gameTarget && pixel != nullptr && depthTest && !blend;
+        pass.marksMirror = pass.clearsCoverage && pixelFile != nullptr && std::string_view(pixelFile).starts_with("lightmappedreflective_ps");
         return pass;
     }
     const std::span<const DWORD> twin = !water && pixelFile != nullptr && pixelCombo.header != nullptr

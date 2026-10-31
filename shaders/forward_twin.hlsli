@@ -17,7 +17,7 @@ float3 ForwardSunLight(float3 position, float3 normal)
 
 float3 ForwardLocalLight(float3 position, float3 normal)
 {
-    LightSet set = LightSetAt(position, normal);
+    LightSet set = LightSetAt(position);
     uint top[kForwardLights];
     float topWeight[kForwardLights];
     [unroll]
@@ -27,6 +27,13 @@ float3 ForwardLocalLight(float3 position, float3 normal)
     }
     float3 toLight;
     float distance;
+    // The lights left out of the strongest, and the cell's tail, share one shadow ray picked in proportion to their light
+    // (weighted reservoir sampling, as shaders/direct.hlsl's remainder): with only the strongest, surfaces lit by many
+    // lamps, such as a room's far end in a mirror, came out darker than the room.
+    uint seed = Hash(asuint(position.x) * 73856093u ^ asuint(position.y) * 19349663u ^ asuint(position.z) * 83492791u ^ g_frame.frameIndex * 0x9E3779B9u);
+    float remainder = 0.0;
+    uint picked = 0;
+    float pickedLuminance = 0.0;
     for (uint i = 0; i < set.pointLights; ++i) {
         uint candidate = i;
         float candidateWeight = Luminance(SetLightIrradiance(set, i, position, normal, toLight, distance));
@@ -41,19 +48,43 @@ float3 ForwardLocalLight(float3 position, float3 normal)
                 candidateWeight = w;
             }
         }
+        if (candidateWeight > 0.0) {
+            remainder += candidateWeight;
+            if (Random(seed) * remainder < candidateWeight) {
+                picked = candidate;
+                pickedLuminance = candidateWeight;
+            }
+        }
+    }
+    uint tailLight;
+    float probability;
+    if (SampleTailLight(set.ranges, Random(seed), tailLight, probability)) {
+        float luminance = Luminance(SetLightIrradiance(set, set.count + tailLight, position, normal, toLight, distance));
+        if (luminance > 0.0) {
+            remainder += luminance / probability;
+            if (Random(seed) * remainder < luminance / probability) {
+                picked = set.count + tailLight;
+                pickedLuminance = luminance;
+            }
+        }
     }
     float3 light = 0.0;
     [unroll]
     for (uint k = 0; k < kForwardLights; ++k) {
-        if (topWeight[k] <= VisibleIrradiance())
+        if (topWeight[k] <= 0.0)
             break;
         float3 irradiance = SetLightIrradiance(set, top[k], position, normal, toLight, distance);
-        light += irradiance * LightTransmittance(set, top[k], position + toLight * 0.5, toLight, max(distance - 0.5, 0.0));
+        light += irradiance * LightTransmittance(set, top[k], position + toLight * 0.5, position + toLight * distance, kLightCentre);
+    }
+    if (remainder > 0.0) {
+        float3 irradiance = SetLightIrradiance(set, picked, position, normal, toLight, distance);
+        light += irradiance * LightTransmittance(set, picked, position + toLight * 0.5, position + toLight * distance, kLightCentre) *
+            (remainder / pickedLuminance);
     }
     for (uint p = set.pointLights; p < set.count; ++p) {
         float3 irradiance = SetLightIrradiance(set, p, position, normal, toLight, distance);
         if (Luminance(irradiance) > VisibleIrradiance())
-            light += irradiance * LightTransmittance(set, p, position + toLight * 0.5, toLight, max(distance - 0.5, 0.0));
+            light += irradiance * LightTransmittance(set, p, position + toLight * 0.5, position + toLight * distance, kLightCentre);
     }
     return light;
 }
@@ -64,7 +95,8 @@ float3 ForwardLocalLight(float3 position, float3 normal)
 float4 gmodpp_ForwardTwin(float4 albedo, float4 normal, float4 emissive, float4 position)
 {
     float3 n = dot(normal.xyz, normal.xyz) > 0.0625 ? normalize(normal.xyz) : float3(0.0, 0.0, 1.0);
-    float3 indirect = VolumeIrradiance(position.xyz, n);
+    // Beyond the volume's window, its nearest probes: the sky's colour lit far walls of dark rooms in mirrors.
+    float3 indirect = VolumeIrradiance(position.xyz, n, true);
     if (indirect.x < 0.0)
         indirect = g_frame.skyColor;
     float3 light = ForwardSunLight(position.xyz, n) + ForwardLocalLight(position.xyz, n) + indirect * g_frame.indirectScale;

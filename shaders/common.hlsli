@@ -91,11 +91,12 @@ struct FrameConstants
     uint volumeRays;
     uint volumetricSteps;
     // traceMask without what may not block each kind of ray: sun shadows, the first indirect bounce (and ambient
-    // occlusion), and later bounces (shadowless props, by FoliageShadows). Indirect rays never meet the local player,
-    // whose hidden first-person body would darken the ground under it.
+    // occlusion), later bounces and local lights' shadows (shadowless props, by FoliageShadows). Indirect rays never
+    // meet the local player, whose hidden first-person body would darken the ground under it.
     uint sunShadowMask;
     uint indirectMask;
     uint bounceMask;
+    uint lightShadowMask;
     // Ray flags added to indirect light and ambient occlusion rays.
     uint indirectRayFlags;
     // The corner of the rectangle a view's passes are dispatched over (shaders/view_rect.hlsl), or kNoView.
@@ -134,6 +135,18 @@ struct FrameConstants
     // The 2D sky as the game draws it and its blurred light for indirect rays (SkyRadiance, SkyLight), or kNoView.
     uint skyCubeView;
     uint skyLightView;
+    // Scene::LightLists' light grid (LightsAt in shaders/scene.hlsli).
+    float3 gridOrigin;
+    float gridCellSize;
+    uint3 gridDims;
+    uint gridCellsView;
+    uint gridIndicesView;
+    uint gridTailView;
+    // Scene::EmittersView and EmitterCount (0 without EmissiveLighting::Full), and the EmissiveLighting setting.
+    uint emittersView;
+    uint emitterCount;
+    uint emissiveLighting;
+    uint2 padding;
     // The 3D skybox's fog, for reflected rays that continue into it (shaders/reflection.hlsli).
     float4 skyboxFogParams;
     float3 skyboxFogColor;

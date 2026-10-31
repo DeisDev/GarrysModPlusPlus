@@ -61,8 +61,7 @@ float4 March(int2 pixel)
             Projector projector = LoadProjector(p);
             float3 irradiance = ProjectorIrradiance(projector, position, normalize(projector.origin - position), toLight, distance);
             if (Luminance(irradiance) > 0.0)
-                scattered += irradiance * Phase(dot(direction, -toLight)) *
-                    Transmittance(position, toLight, ShadowRayLength(ProjectorClearance(projector), distance), ShadowMask(true));
+                scattered += irradiance * Phase(dot(direction, -toLight)) * ProjectorTransmittance(projector, position);
         }
         // Radiance scattered from irradiance E is density * phase * pi * E in the units the lighting uses.
         if (underwater)

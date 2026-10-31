@@ -59,6 +59,9 @@ struct Pass {
     // An opaque draw of the game's own shader into a captured view: what it draws hides the G-buffer behind it (an
     // eyeball over the face mesh behind it), so it clears the coverage there (translator::Variant::clearCoverage).
     bool clearsCoverage = false;
+    // A mirror's surface (LightmappedReflective, func_reflective_glass), which shows the game's reflection view: it
+    // marks the coverage as a mirror's instead (translator::Variant::markMirror).
+    bool marksMirror = false;
     // The sampler register of a G-buffer twin's light warp texture, or -1 (translator::Variant::lightWarpSlot).
     int lightWarpSampler = -1;
     // A forward twin, lit in the shader from these frame constants and scene (translator::Variant::forwardLighting).

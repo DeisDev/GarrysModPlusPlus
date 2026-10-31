@@ -53,6 +53,9 @@ constexpr int kLumpFacesHdr = 58;
 
 // dworldlight_t::flags (bspfile.h).
 constexpr int32_t kWorldLightInAmbientCube = 0x0001;
+// VRAD marks the texinfos of faces with a light texture from lights.rad, which it turns into emit_surface lights
+// (MakePatchForFace in src/utils/vrad/vrad.cpp).
+constexpr int32_t kSurfLight = 0x0001;
 constexpr int32_t kSurfSky2D = 0x0002;
 constexpr int32_t kSurfSky = 0x0004;
 constexpr int32_t kSurfWarp = 0x0008;
@@ -1286,8 +1289,51 @@ void ReadLeafAmbient(std::span<const std::byte> file, const Header& header, cons
     }
 }
 
+// The origins and _fifty_percent_distance of the light and light_spot entities that have one, the only entities VRAD
+// gives that falloff (ParseLightPoint, ParseLightSpot and SetLightFalloffParams in src/utils/vrad/lightmap.cpp).
+std::vector<std::pair<Float3, float>> ReadFiftyPercentDistances(std::span<const std::byte> file, const Header& header)
+{
+    std::vector<std::pair<Float3, float>> result;
+    const Lump& lump = header.lumps[kLumpEntities];
+    if (lump.offset < 0 || lump.length <= 0 || static_cast<size_t>(lump.offset) + lump.length > file.size())
+        return result;
+    const std::string_view entities(reinterpret_cast<const char*>(file.data() + lump.offset), lump.length);
+    for (size_t start = entities.find('{'); start != std::string_view::npos; start = entities.find('{', start + 1)) {
+        const size_t end = entities.find('}', start);
+        if (end == std::string_view::npos)
+            break;
+        std::string_view classname;
+        Float3 origin = {};
+        bool hasOrigin = false;
+        float distance = 0.0f;
+        // "key" "value" pairs.
+        for (size_t at = start + 1;;) {
+            const size_t keyStart = entities.find('"', at);
+            const size_t keyEnd = keyStart < end ? entities.find('"', keyStart + 1) : std::string_view::npos;
+            const size_t valueStart = keyEnd < end ? entities.find('"', keyEnd + 1) : std::string_view::npos;
+            const size_t valueEnd = valueStart < end ? entities.find('"', valueStart + 1) : std::string_view::npos;
+            if (valueEnd >= end)
+                break;
+            const std::string_view key = entities.substr(keyStart + 1, keyEnd - keyStart - 1);
+            const std::string value(entities.substr(valueStart + 1, valueEnd - valueStart - 1));
+            if (key == "classname")
+                classname = entities.substr(valueStart + 1, valueEnd - valueStart - 1);
+            else if (key == "origin")
+                hasOrigin = sscanf_s(value.c_str(), "%f %f %f", &origin.x, &origin.y, &origin.z) == 3;
+            else if (key == "_fifty_percent_distance")
+                sscanf_s(value.c_str(), "%f", &distance);
+            at = valueEnd + 1;
+        }
+        if ((classname == "light" || classname == "light_spot") && hasOrigin && distance != 0.0f)
+            result.emplace_back(origin, distance);
+        start = end;
+    }
+    return result;
+}
+
 void ReadLights(std::span<const std::byte> file, const Header& header, WorldGeometry& world)
 {
+    const std::vector<std::pair<Float3, float>> fiftyPercent = ReadFiftyPercentDistances(file, header);
     for (int lumpIndex : {kLumpWorldLightsHdr, kLumpWorldLights}) {
         const Lump& lump = header.lumps[lumpIndex];
         size_t stride = lump.version == 1 ? kWorldLightV1Size : sizeof(WorldLight);
@@ -1317,6 +1363,12 @@ void ReadLights(std::span<const std::byte> file, const Header& header, WorldGeom
                 world.lights.push_back({static_cast<LightType>(light.type), light.origin, light.intensity, light.normal, light.stopdot,
                     light.stopdot2, light.exponent, light.radius, light.constantAttn, light.linearAttn, light.quadraticAttn, light.cluster, light.style,
                     (light.flags & kWorldLightInAmbientCube) != 0});
+                // VRAD gives a light its entity's origin (AllocDLight).
+                for (const auto& [origin, distance] : fiftyPercent) {
+                    if (light.type != static_cast<int32_t>(LightType::Surface) && std::fabs(origin.x - light.origin.x) < 0.01f &&
+                        std::fabs(origin.y - light.origin.y) < 0.01f && std::fabs(origin.z - light.origin.z) < 0.01f)
+                        world.lights.back().referenceDistance = distance;
+                }
                 break;
             default:
                 break;
@@ -1660,6 +1712,11 @@ bool LoadWorld(std::span<const std::byte> file, WorldGeometry& world, std::strin
     }
 
     ReadMaterialNames(file, header, lumps.texdatas, world.materials);
+    world.lightMaterials.assign(world.materials.size(), false);
+    for (const Texinfo& texinfo : lumps.texinfos) {
+        if ((texinfo.flags & kSurfLight) != 0 && texinfo.texdata >= 0 && static_cast<size_t>(texinfo.texdata) < world.lightMaterials.size())
+            world.lightMaterials[texinfo.texdata] = true;
+    }
     ReadLights(file, header, world);
     ReadVisibility(file, header, world.sun, world.visibility);
     ReadLeafAmbient(file, header, world.visibility, world.baked);
