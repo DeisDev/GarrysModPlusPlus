@@ -131,8 +131,8 @@ add_d3d9_shader(shaders/water_flow_surface.hlsl main g_waterFlowSurfaceAlphaFogP
 add_d3d9_shader(shaders/water_flow_surface.hlsl main g_waterFlowSurfaceLightmapFogPS PROFILE ps_2_b /D REFRACT_ALPHA_FOG=1 /D LIGHTMAP_FOG=1)
 add_d3d9_shader(shaders/water_flow_surface.hlsl main g_waterFlowSurfaceOpaqueFogPS PROFILE ps_2_b /D REFRACT_ALPHA_FOG=1 /D LIGHTMAP_FOG=1 /D OPAQUE_FOG=1)
 
-# NVIDIA DLSS SDK (Ray Reconstruction): headers, the NGX static library for the static runtime, and the
-# release feature DLL, each pinned by hash.
+# NVIDIA DLSS SDK (Ray Reconstruction): headers, the NGX static library for the static runtime, the
+# release feature DLL and the licence, each pinned by hash.
 set(DLSS_SDK_VERSION v310.9.16)
 set(DLSS_SDK_DIR "${CMAKE_CURRENT_BINARY_DIR}/_deps/dlss-${DLSS_SDK_VERSION}")
 set(DLSS_SDK_FILES
@@ -147,6 +147,7 @@ set(DLSS_SDK_FILES
     "include/nvsdk_ngx_params_dlssd.h|d41e3ba8f1d72583b55273092c99bf426dc4a0d46de827229e25d5b1325a370e"
     "lib/Windows_x86_64/x64/nvsdk_ngx_s.lib|7b9a5239c1145af5f645ab472aa066f9ea79db36ac819562312aae69d65f3765"
     "lib/Windows_x86_64/rel/nvngx_dlssd.dll|b49435ae346f227feafe7bbe937d88277ea0ee7323975ec06488f377fdb46cee"
+    "LICENSE.txt|d4216e39ebef5f9b50a6712ebb37beeb5379862a67733a9999c651f21592aaf0"
 )
 foreach(entry IN LISTS DLSS_SDK_FILES)
     string(REPLACE "|" ";" parts "${entry}")
@@ -305,23 +306,48 @@ target_include_directories(gmodpp BEFORE PRIVATE "${AGILITY_SDK_DIR}/build/nativ
 target_include_directories(gmodpp PRIVATE "${DXC_DIR}/inc" "${SHADER_OUTPUT_DIR}" "${DLSS_SDK_DIR}/include")
 target_link_libraries(gmodpp PRIVATE d3d12 dxgi dxguid lzma_dec dbghelp comctl32 minhook imgui "${DLSS_SDK_DIR}/lib/Windows_x86_64/x64/nvsdk_ngx_s.lib")
 
+# The mod laid out as the game folder: the loader in the root and everything else in gmodplusplus, with the licences
+# every bundled component requires. deploy copies it into the game and release zips it.
+set(STAGE_DIR "${CMAKE_CURRENT_BINARY_DIR}/release/GarrysModPP")
+set(STAGE_MOD "${STAGE_DIR}/gmodplusplus")
+set(STAGE_LICENSES "${STAGE_MOD}/licenses")
+add_custom_target(stage
+    COMMAND ${CMAKE_COMMAND} -E rm -rf "${STAGE_DIR}"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${STAGE_MOD}/D3D12" "${STAGE_MOD}/hlsl" "${STAGE_MOD}/twins" "${STAGE_LICENSES}"
+    COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:gmodpp_loader> "${STAGE_DIR}/winmm.dll"
+    COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:gmodpp> "${DXC_DIR}/bin/x64/dxcompiler.dll" "${DLSS_FEATURE_DLL}" "${STAGE_MOD}/"
+    COMMAND ${CMAKE_COMMAND} -E copy "${AGILITY_RUNTIME_DIR}/D3D12Core.dll" "${AGILITY_RUNTIME_DIR}/d3d12SDKLayers.dll" "${STAGE_MOD}/D3D12/"
+    COMMAND ${CMAKE_COMMAND} -E copy ${LIGHTING_HEADERS} "${STAGE_MOD}/hlsl/"
+    COMMAND ${CMAKE_COMMAND} -E copy ${TWIN_SOURCES} ${SDK_SHADER_PATHS} "${CMAKE_CURRENT_SOURCE_DIR}/shaders/twins/LICENSE"
+        "${CMAKE_CURRENT_SOURCE_DIR}/shaders/twins/thirdpartylegalnotices.txt" "${STAGE_MOD}/twins/"
+    COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE" "${CMAKE_CURRENT_SOURCE_DIR}/THIRD_PARTY_NOTICES.md"
+        "${STAGE_LICENSES}/"
+    COMMAND ${CMAKE_COMMAND} -E copy "${minhook_SOURCE_DIR}/LICENSE.txt" "${STAGE_LICENSES}/MinHook.txt"
+    COMMAND ${CMAKE_COMMAND} -E copy "${imgui_SOURCE_DIR}/LICENSE.txt" "${STAGE_LICENSES}/DearImGui.txt"
+    COMMAND ${CMAKE_COMMAND} -E copy "${DXC_DIR}/LICENSE-LLVM.txt" "${STAGE_LICENSES}/DXC-LLVM.txt"
+    COMMAND ${CMAKE_COMMAND} -E copy "${DXC_DIR}/LICENSE-MIT.txt" "${STAGE_LICENSES}/DXC-MIT.txt"
+    COMMAND ${CMAKE_COMMAND} -E copy "${DXC_DIR}/LICENSE-MS.txt" "${STAGE_LICENSES}/DXC-Microsoft.txt"
+    COMMAND ${CMAKE_COMMAND} -E copy "${AGILITY_SDK_DIR}/LICENSE.txt" "${STAGE_LICENSES}/DirectX-Agility-SDK.txt"
+    COMMAND ${CMAKE_COMMAND} -E copy "${DLSS_SDK_DIR}/LICENSE.txt" "${STAGE_LICENSES}/NVIDIA-DLSS-SDK.txt"
+    DEPENDS gmodpp_loader gmodpp
+    COMMENT "Staging the mod in ${STAGE_DIR}"
+)
+
+set(RELEASE_ZIP "${CMAKE_CURRENT_BINARY_DIR}/release/GarrysModPP.zip")
+add_custom_target(release
+    COMMAND ${CMAKE_COMMAND} -E rm -f "${RELEASE_ZIP}"
+    COMMAND ${CMAKE_COMMAND} -E chdir "${STAGE_DIR}" ${CMAKE_COMMAND} -E tar cf "${RELEASE_ZIP}" --format=zip winmm.dll gmodplusplus
+    DEPENDS stage
+    COMMENT "Packaging ${RELEASE_ZIP}"
+)
+
 if(GMOD_DIR)
     add_custom_target(deploy
         COMMAND ${CMAKE_COMMAND} "-DTARGET=${GMOD_DIR}/bin/win64/d3d9.dll" -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/remove_old_proxy.cmake"
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${DLSS_FEATURE_DLL}" "${GMOD_DIR}/bin/win64/nvngx_dlssd.dll"
-        COMMAND ${CMAKE_COMMAND} -E make_directory "${GMOD_DIR}/bin/win64/D3D12"
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${AGILITY_RUNTIME_DIR}/D3D12Core.dll" "${AGILITY_RUNTIME_DIR}/d3d12SDKLayers.dll"
-            "${GMOD_DIR}/bin/win64/D3D12/"
-        COMMAND ${CMAKE_COMMAND} "-DSOURCE=$<TARGET_FILE:gmodpp_loader>" "-DDESTINATION=${GMOD_DIR}/winmm.dll"
+        COMMAND ${CMAKE_COMMAND} -E copy_directory "${STAGE_MOD}" "${GMOD_DIR}/gmodplusplus"
+        COMMAND ${CMAKE_COMMAND} "-DSOURCE=${STAGE_DIR}/winmm.dll" "-DDESTINATION=${GMOD_DIR}/winmm.dll"
             -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/deploy_loader.cmake"
-        COMMAND ${CMAKE_COMMAND} -E make_directory "${GMOD_DIR}/bin/win64/gmodpp"
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:gmodpp> "${GMOD_DIR}/bin/win64/gmodpp/gmodpp.dll"
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${DXC_DIR}/bin/x64/dxcompiler.dll" "${GMOD_DIR}/bin/win64/gmodpp/dxcompiler.dll"
-        COMMAND ${CMAKE_COMMAND} -E make_directory "${GMOD_DIR}/bin/win64/gmodpp/hlsl"
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${LIGHTING_HEADERS} "${GMOD_DIR}/bin/win64/gmodpp/hlsl/"
-        COMMAND ${CMAKE_COMMAND} -E make_directory "${GMOD_DIR}/bin/win64/gmodpp/twins"
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${TWIN_SOURCES} ${SDK_SHADER_PATHS} "${GMOD_DIR}/bin/win64/gmodpp/twins/"
-        DEPENDS gmodpp_loader gmodpp
-        COMMENT "Deploying nvngx_dlssd.dll, the Agility SDK runtime, winmm.dll, gmodpp.dll and the shader twins to ${GMOD_DIR}"
+        DEPENDS stage
+        COMMENT "Deploying the mod to ${GMOD_DIR}"
     )
 endif()

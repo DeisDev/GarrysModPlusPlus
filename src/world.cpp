@@ -2,6 +2,7 @@
 
 #include "bsp.h"
 #include "client_hooks.h"
+#include "command_line.h"
 #include "convex_hull.h"
 #include "engine_interfaces.h"
 #include "entities.h"
@@ -133,7 +134,7 @@ struct State {
     DescriptorHeap* descriptors = nullptr;
     bool opacityMicromaps = false;
     uint64_t frame = 0;
-    // The main view's size, whose centre gmodpp_probe.request reports by default.
+    // The main view's size, whose centre probe.request reports by default.
     UINT width = 0;
     UINT height = 0;
     std::unique_ptr<Lighting> lighting;
@@ -185,7 +186,7 @@ void RunConsoleRequests(bool console)
     if (!options.devMode || !g_state.scene.Ready())
         return;
     // "x y": a pixel of the main view, by default its centre.
-    const std::filesystem::path probe = options.gameDirectory / L"gmodpp_probe.request";
+    const std::filesystem::path probe = ModDirectory() / L"probe.request";
     if (FILE* request = nullptr; _wfopen_s(&request, probe.c_str(), L"r") == 0) {
         unsigned x = 0;
         unsigned y = 0;
@@ -196,7 +197,7 @@ void RunConsoleRequests(bool console)
     }
     if (!console)
         return;
-    const std::filesystem::path path = options.gameDirectory / L"gmodpp_console.txt";
+    const std::filesystem::path path = ModDirectory() / L"console.txt";
     FILE* file = nullptr;
     if (_wfopen_s(&file, path.c_str(), L"r") != 0)
         return;
@@ -1236,8 +1237,8 @@ void UpdateScene()
             log::Info("Scene: {} of {} textures are VRAD light textures; {} of those glow ($selfillum) and light nothing again",
                 std::count(g_state.lightMaterials.begin(), g_state.lightMaterials.end(), true), g_state.lightMaterials.size(),
                 g_state.lightTextureMaterials.size());
-            // A residual baked before for this map, by the map's contents (gmodpp_cache\baked).
-            const std::filesystem::path cachePath = GetOptions().gameDirectory / L"gmodpp_cache" / L"baked" / std::format(L"{:016x}.bin", FileHash(file));
+            // A residual baked before for this map, by the map's contents (gmodplusplus\cache\baked).
+            const std::filesystem::path cachePath = ModDirectory() / L"cache" / L"baked" / std::format(L"{:016x}.bin", FileHash(file));
             std::vector<std::byte> cached;
             std::error_code sizeError;
             const uintmax_t cacheSize = std::filesystem::file_size(cachePath, sizeError);
@@ -1488,7 +1489,7 @@ void OnPresent(UINT width, UINT height, bool consoleRequests)
     light_queries::TryInstall();
     entities::TryInitialize();
     if (g_state.frame % kMapPollInterval == 0)
-        SyncSettingsFile(GetOptions().gameDirectory / L"gmodpp_settings.ini");
+        SyncSettingsFile(ModDirectory() / L"settings.ini");
     if (g_state.lighting && g_state.frame % kMapPollInterval == 0) {
         UpdateScene();
         RunConsoleRequests(consoleRequests);

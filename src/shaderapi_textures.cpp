@@ -39,7 +39,7 @@ constexpr unsigned kVtfIsCubeMap = 29;
 constexpr unsigned kVtfImageData = 38;
 constexpr int kCubeFaces = 6;
 
-// GMod's shaderapidx9.dll answers for each ImageFormat on the reference machine (gmodpp_caps.txt): the nearest
+// GMod's shaderapidx9.dll answers for each ImageFormat on the reference machine (caps.txt): the nearest
 // supported texture format (the same with and without filtering) and the nearest render target format.
 constexpr std::array<int, kImageFormats> kNearestFormat = { 12, 12, 16, 16, 17, 5, 6, -1, 8, -1, -1, 12, 12, 13, 14, 15, 16, 17, 18, 19, 13,
     21, 22, 23, 24, 25, 26, 27, -1, 29, 30, 31, 32, -1, -1, -1, 36, 37, 38, -1, -1 };

@@ -114,7 +114,7 @@ bool Connect(DeviceManagerObject*, CreateInterfaceFn factory)
 {
     const std::filesystem::path game = ExecutablePath().parent_path();
     if (!PrewarmIsCurrent(game))
-        PrewarmWithProgressWindow(game, game / L"bin" / L"win64" / L"gmodpp");
+        PrewarmWithProgressWindow(game, ModDirectory());
     Backend& backend = GetBackend();
     backend.shaderUtil = factory != nullptr ? factory("VShaderUtil001", nullptr) : nullptr;
     // shaderapidx9.dll asks for VFileSystem022 and reads files through its IBaseFileSystem base, which IFileSystem
@@ -295,7 +295,7 @@ void SetHardwareGammaRamp(NativeObject*, float, float, float, float, bool) {}
 
 bool Backend::CreateDevice()
 {
-    const std::filesystem::path runtime = ExecutablePath().parent_path() / L"bin" / L"win64" / L"D3D12";
+    const std::filesystem::path runtime = ModDirectory() / L"D3D12";
     ComPtr<ID3D12DeviceFactory> agility = AgilityDeviceFactory(runtime);
     if (HasArgument(L"-gmodpp_debug")) {
         ComPtr<ID3D12Debug1> debug;
@@ -586,11 +586,11 @@ void Backend::Present()
         static int limit = -1;
         static unsigned presents = 0;
         if (++presents % kDevFilePollPresents == 0) {
-            const std::filesystem::path request = ExecutablePath().parent_path() / L"gmodpp_drawlog.request";
+            const std::filesystem::path request = ModDirectory() / L"drawlog.request";
             std::error_code ignored;
             if (std::filesystem::remove(request, ignored))
                 LogNextDraws(200);
-            const std::filesystem::path limitRequest = ExecutablePath().parent_path() / L"gmodpp_drawlimit.request";
+            const std::filesystem::path limitRequest = ModDirectory() / L"drawlimit.request";
             if (std::filesystem::exists(limitRequest, ignored)) {
                 std::ifstream(limitRequest) >> limit;
                 std::filesystem::remove(limitRequest, ignored);

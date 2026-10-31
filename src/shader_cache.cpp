@@ -1,6 +1,6 @@
 #include "shader_cache.h"
 
-#include "options.h"
+#include "command_line.h"
 
 #include <algorithm>
 #include <format>
@@ -24,13 +24,13 @@ std::uint64_t Fnv(const void* data, size_t size, std::uint64_t hash = 1469598103
     return hash;
 }
 
-// The lighting headers forward twins include (bin\win64\gmodpp\hlsl), which their translations depend on too.
+// The lighting headers forward twins include (gmodplusplus\hlsl), which their translations depend on too.
 std::uint64_t LightingHeadersHash()
 {
     static const std::uint64_t hash = [] {
         std::vector<std::filesystem::path> files;
         std::error_code error;
-        for (const auto& item : std::filesystem::directory_iterator(GetOptions().gameDirectory / L"bin" / L"win64" / L"gmodpp" / L"hlsl", error))
+        for (const auto& item : std::filesystem::directory_iterator(ModDirectory() / L"hlsl", error))
             files.push_back(item.path());
         std::sort(files.begin(), files.end());
         std::uint64_t result = 14695981039346656037ull;
@@ -53,9 +53,9 @@ std::filesystem::path FilePath(const std::filesystem::path& directory, std::uint
 
 }
 
-std::filesystem::path Directory(const std::filesystem::path& gameDirectory)
+std::filesystem::path Directory()
 {
-    return gameDirectory / L"gmodpp_cache" / L"shaders";
+    return ModDirectory() / L"cache" / L"shaders";
 }
 
 std::uint64_t Key(std::span<const DWORD> code, const translator::Variant& variant)

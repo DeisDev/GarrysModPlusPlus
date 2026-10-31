@@ -1,7 +1,7 @@
 #include "shader_twins.h"
 
+#include "command_line.h"
 #include "log.h"
-#include "options.h"
 
 #include <d3dcompiler.h>
 
@@ -88,9 +88,9 @@ constexpr Family kFamilies[] = {
     { "teeth_ps20b", "teeth_ps2x.fxc", "ps20b", "ps_2_b", "SHADER_MODEL_PS_2_B", 8, 4, 0x08da8ae0, &KeepNone, "PIXELFOGTYPE WRITE_DEPTH_TO_DESTALPHA" },
 };
 
-std::filesystem::path TwinDirectory() { return GetOptions().gameDirectory / L"bin" / L"win64" / L"gmodpp" / L"twins"; }
+std::filesystem::path TwinDirectory() { return ModDirectory() / L"twins"; }
 
-std::filesystem::path CacheDirectory() { return GetOptions().gameDirectory / L"gmodpp_cache" / L"twins"; }
+std::filesystem::path CacheDirectory() { return ModDirectory() / L"cache" / L"twins"; }
 
 std::uint64_t Fnv(std::string_view data, std::uint64_t hash = 14695981039346656037ull)
 {
@@ -274,7 +274,7 @@ std::mutex& FamilyMutex()
     return mutex;
 }
 
-// Compiles a twin for a combo's switch values, or loads it from the cache (gmodpp_cache\twins) when the same files
+// Compiles a twin for a combo's switch values, or loads it from the cache (gmodplusplus\cache\twins) when the same files
 // were compiled for the same values before.
 bool Compile(LoadedFamily& entry, const Values& values, bool forward, std::vector<DWORD>& code, std::string& error)
 {
@@ -384,8 +384,12 @@ std::uint64_t SourceHash()
 {
     std::vector<std::filesystem::path> files;
     std::error_code error;
-    for (const auto& item : std::filesystem::directory_iterator(TwinDirectory(), error))
-        files.push_back(item.path());
+    // Only the shader sources: Valve's licence files sit beside them.
+    for (const auto& item : std::filesystem::directory_iterator(TwinDirectory(), error)) {
+        const std::filesystem::path extension = item.path().extension();
+        if (extension == L".fxc" || extension == L".h")
+            files.push_back(item.path());
+    }
     std::sort(files.begin(), files.end());
     std::uint64_t hash = Fnv("");
     for (const std::filesystem::path& path : files) {

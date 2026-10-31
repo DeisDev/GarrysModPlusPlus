@@ -68,10 +68,11 @@ void InstallShaderApiRedirect()
     std::filesystem::path exe = ExecutablePath();
     if (!IsGameExecutable(exe) || !HasArgument(L"-insecure"))
         return;
-    std::filesystem::path gameDirectory = exe.parent_path();
-    log::Open((gameDirectory / L"gmodpp_loader.log").c_str());
+    std::error_code error;
+    std::filesystem::create_directories(ModDirectory() / L"logs", error);
+    log::Open((ModDirectory() / L"logs" / L"loader.log").c_str());
 
-    g_shaderApiPath = gameDirectory / L"bin" / L"win64" / L"gmodpp" / L"gmodpp.dll";
+    g_shaderApiPath = ModDirectory() / L"gmodpp.dll";
     MH_STATUS status = MH_Initialize();
     if (status == MH_OK)
         status = MH_CreateHookApi(L"kernel32", "LoadLibraryExA", reinterpret_cast<LPVOID>(&LoadLibraryExAHook), reinterpret_cast<LPVOID*>(&g_loadLibraryExA));

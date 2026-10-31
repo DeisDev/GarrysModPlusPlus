@@ -3,7 +3,7 @@
 #include "shaderapi_native.h"
 
 // IMaterialSystemHardwareConfig answers as GMod's shaderapidx9.dll does on the reference machine (an RTX GPU at DX
-// level 95), from the shim's caps dump (gmodpp_caps.request), so materials pick the same shader combos as vanilla.
+// level 95), from the shim's caps dump (caps.request), so materials pick the same shader combos as vanilla.
 
 namespace gmodpp::native {
 

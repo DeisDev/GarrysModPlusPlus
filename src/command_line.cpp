@@ -42,6 +42,12 @@ std::filesystem::path ExecutablePath()
     }
 }
 
+const std::filesystem::path& ModDirectory()
+{
+    static const std::filesystem::path directory = ExecutablePath().parent_path() / L"gmodplusplus";
+    return directory;
+}
+
 bool IsGameExecutable(const std::filesystem::path& exe)
 {
     return EqualsNoCase(exe.filename().native(), L"gmod_win64.exe");

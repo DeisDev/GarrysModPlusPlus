@@ -139,6 +139,9 @@ constexpr std::array<const char*, static_cast<size_t>(TextId::Count)> kEnglish =
     // The display's number and its size in pixels.
     "Display {0}: {1}x{2}",
     "Display {0}: {1}x{2} (primary)",
+    "Credits",
+    "Uses NVIDIA DLSS. NVIDIA and DLSS are trademarks of NVIDIA Corporation.",
+    "GarrysMod++ is licensed under the Mozilla Public License 2.0. Its licences and those of the software it includes are in the gmodplusplus\\licenses folder.",
 };
 
 }

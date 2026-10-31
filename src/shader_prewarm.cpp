@@ -1,5 +1,6 @@
 #include "shader_prewarm.h"
 
+#include "command_line.h"
 #include "engine_interfaces.h"
 #include "log.h"
 #include "shader_cache.h"
@@ -42,9 +43,9 @@ std::filesystem::path VpkPath(const std::filesystem::path& gameDirectory)
     return gameDirectory / L"garrysmod" / L"garrysmod_dir.vpk";
 }
 
-std::filesystem::path MarkerPath(const std::filesystem::path& gameDirectory)
+std::filesystem::path MarkerPath()
 {
-    return shader_cache::Directory(gameDirectory) / L"prewarm.txt";
+    return shader_cache::Directory() / L"prewarm.txt";
 }
 
 // The translator version and the shader VPK's size and time, which a game update changes.
@@ -218,7 +219,7 @@ std::vector<const vcs::Combo*> UniqueCombos(const std::vector<vcs::Combo>& combo
 bool PrewarmIsCurrent(const std::filesystem::path& gameDirectory)
 {
     const std::optional<std::string> expected = MarkerText(gameDirectory);
-    std::ifstream file(MarkerPath(gameDirectory));
+    std::ifstream file(MarkerPath());
     std::stringstream text;
     text << file.rdbuf();
     return expected && file && text.str() == *expected;
@@ -238,9 +239,9 @@ void PrewarmShaders(const std::filesystem::path& gameDirectory, const std::files
         log::Info("Shader prewarm: {}", error);
         return;
     }
-    const std::filesystem::path cache = shader_cache::Directory(gameDirectory);
+    const std::filesystem::path cache = shader_cache::Directory();
     std::filesystem::create_directories(cache);
-    const std::filesystem::path failureDirectory = gameDirectory / L"gmodpp_cache" / L"prewarm_failures";
+    const std::filesystem::path failureDirectory = ModDirectory() / L"cache" / L"prewarm_failures";
     std::filesystem::remove_all(failureDirectory);
     std::filesystem::create_directories(failureDirectory);
 
@@ -444,7 +445,7 @@ void PrewarmShaders(const std::filesystem::path& gameDirectory, const std::files
     log::Info("Shader prewarm: {} combos, {} shaders compiled, {} translation and {} compile failures in {:.1f} s on {} threads", total,
         compiled.load(), translateFailures.load(), compileFailures.load(), seconds, threads);
     if (const std::optional<std::string> marker = MarkerText(gameDirectory))
-        std::ofstream(MarkerPath(gameDirectory), std::ios::trunc) << *marker;
+        std::ofstream(MarkerPath(), std::ios::trunc) << *marker;
 }
 
 }

@@ -131,6 +131,9 @@ enum class TextId {
     VideoDisplayDefault,
     VideoDisplayItem,
     VideoDisplayPrimary,
+    SectionCredits,
+    CreditsDlss,
+    CreditsLicenses,
     Count
 };
 

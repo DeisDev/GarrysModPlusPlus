@@ -364,19 +364,18 @@ bool Initialize()
     if (g_cache.initialized)
         return g_cache.usable;
     g_cache.initialized = true;
-    const std::filesystem::path game = ExecutablePath().parent_path();
     std::string error;
-    if (!g_cache.compiler.Load(game / L"bin" / L"win64" / L"gmodpp", error)) {
+    if (!g_cache.compiler.Load(ModDirectory(), error)) {
         log::Info("Native: the shader compiler is unavailable: {}", error);
         return false;
     }
-    g_cache.cacheDirectory = shader_cache::Directory(game);
+    g_cache.cacheDirectory = shader_cache::Directory();
     std::error_code ignored;
     std::filesystem::create_directories(g_cache.cacheDirectory, ignored);
     if (!CreateRootSignature() || !CreateZeroBuffer())
         return false;
     CreateNullViews();
-    OpenPipelineLibrary(game / L"gmodpp_cache" / L"pipelines.bin");
+    OpenPipelineLibrary(ModDirectory() / L"cache" / L"pipelines.bin");
     g_cache.usable = true;
     return true;
 }

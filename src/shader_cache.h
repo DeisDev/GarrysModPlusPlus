@@ -12,8 +12,8 @@ namespace gmodpp::shader_cache {
 // Bumped whenever the translator's output changes, so the disk cache misses old translations.
 inline constexpr std::uint32_t kTranslatorVersion = 4;
 
-// gmodpp_cache\shaders in the game directory.
-std::filesystem::path Directory(const std::filesystem::path& gameDirectory);
+// gmodplusplus\cache\shaders.
+std::filesystem::path Directory();
 
 // A translation's key: the bytecode, the variant and the translator version.
 std::uint64_t Key(std::span<const DWORD> code, const translator::Variant& variant);

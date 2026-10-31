@@ -128,9 +128,7 @@ void OnDeviceReady()
         g_state.block = RealtimeBlock::Unsupported;
         return;
     }
-    // nvngx_dlssd.dll is deployed next to the game's DLLs.
-    const std::filesystem::path dlssDirectory = ExecutablePath().parent_path() / L"bin" / L"win64";
-    g_state.available = world::Initialize(device.Get(), backend.Queue(), backend.Descriptors(), support.opacityMicromaps, dlssDirectory);
+    g_state.available = world::Initialize(device.Get(), backend.Queue(), backend.Descriptors(), support.opacityMicromaps, ModDirectory());
     overlay::Initialize(backend.Window(), backend.Device(), backend.Queue(), backend.Descriptors(), Backend::kBackBufferFormat, Backend::kFrames);
 }
 
@@ -179,7 +177,7 @@ void OnPresent()
     overlay::EnsureWindowHook();
     video_menu::TryInstall();
     Backend& backend = GetBackend();
-    // gmodpp_console.txt is read by the shim (shaderapi_shim.cpp).
+    // console.txt is read by the shim (shaderapi_shim.cpp).
     world::OnPresent(backend.Width(), backend.Height(), false);
 }
 

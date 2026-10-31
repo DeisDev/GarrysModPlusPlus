@@ -139,7 +139,7 @@ struct BakedTriangle {
 };
 static_assert(sizeof(BakedTriangle) == 32);
 
-// The format of the baked residual cache (gmodpp_cache\baked): bump when shaders/baked_residual.hlsl or the data it
+// The format of the baked residual cache (gmodplusplus\cache\baked): bump when shaders/baked_residual.hlsl or the data it
 // reads changes.
 inline constexpr uint32_t kBakeVersion = 13;
 

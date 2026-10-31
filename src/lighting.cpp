@@ -1,5 +1,6 @@
 #include "lighting.h"
 
+#include "command_line.h"
 #include "light_queries.h"
 #include "log.h"
 #include "options.h"
@@ -547,7 +548,7 @@ bool Lighting::Initialize(ID3D12Device5* device, ID3D12CommandQueue* queue, Desc
     m_sway.Initialize(m_device, *m_descriptors);
     for (UINT i = 0; i < RrInputCount; ++i)
         m_rrInputs[i].uav = m_rrInputUavs + i;
-    GetStatistics().rayReconstructionAvailable = m_rayReconstruction.Initialize(m_device, dlssDirectory, GetOptions().gameDirectory);
+    GetStatistics().rayReconstructionAvailable = m_rayReconstruction.Initialize(m_device, dlssDirectory, ModDirectory() / L"logs");
     GetStatistics().opacityMicromapsAvailable = micromaps;
     log::Info("Lighting: initialized");
     return true;

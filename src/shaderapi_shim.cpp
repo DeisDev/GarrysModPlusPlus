@@ -158,7 +158,6 @@ struct Benchmark {
 };
 
 struct Shim {
-    std::filesystem::path gameDirectory;
     CreateInterfaceFn gameCreateInterface = nullptr;
     CreateInterfaceFn connectFactory = nullptr;
     CreateInterfaceFn internalFactory = nullptr;
@@ -681,10 +680,10 @@ void TrackLevel()
     g_shim->inGameLevel = std::move(current);
 }
 
-// Runs gmodpp_console.txt once the client is in game, on the thread that loaded the shim (the engine's main thread).
+// Runs console.txt once the client is in game, on the thread that loaded the shim (the engine's main thread).
 void RunConsoleRequest()
 {
-    std::filesystem::path path = g_shim->gameDirectory / L"gmodpp_console.txt";
+    std::filesystem::path path = ModDirectory() / L"console.txt";
     if (g_shim->inGameLevel.empty())
         return;
     std::ifstream file(path);
@@ -701,14 +700,14 @@ void RunConsoleRequest()
 
 bool TakeRequest(const wchar_t* name)
 {
-    std::filesystem::path path = g_shim->gameDirectory / name;
+    std::filesystem::path path = ModDirectory() / name;
     return DeleteFileW(path.c_str()) != FALSE;
 }
 
-// gmodpp_bench.request holds the duration in seconds, or nothing for the default.
+// bench.request holds the duration in seconds, or nothing for the default.
 void StartBenchmark()
 {
-    std::filesystem::path path = g_shim->gameDirectory / L"gmodpp_bench.request";
+    std::filesystem::path path = ModDirectory() / L"bench.request";
     std::ifstream file(path);
     if (!file)
         return;
@@ -761,22 +760,25 @@ void __fastcall PresentOverride(Wrapper* self)
         LogCallCounts(g_shim->objectTraces);
     }
     if (g_shim->devMode && frame % kDevFilePollFrames == 0) {
-        if (TakeRequest(L"gmodpp_capture.request"))
-            Capture(g_shim->gameDirectory / std::format(L"gmodpp_capture_{}.bmp", frame));
-        if (TakeRequest(L"gmodpp_caps.request"))
-            DumpCaps(g_shim->gameDirectory / L"gmodpp_caps.txt");
-        if (TakeRequest(L"gmodpp_trace.request")) {
+        if (TakeRequest(L"capture.request")) {
+            std::error_code error;
+            std::filesystem::create_directories(ModDirectory() / L"captures", error);
+            Capture(ModDirectory() / L"captures" / std::format(L"capture_{}.bmp", frame));
+        }
+        if (TakeRequest(L"caps.request"))
+            DumpCaps(ModDirectory() / L"caps.txt");
+        if (TakeRequest(L"trace.request")) {
             log::Info("TRACE frame {}", frame + 1);
             StartTrace();
         }
         if (!g_shim->benchmarking)
             StartBenchmark();
-        if (TakeRequest(L"gmodpp_profile.request"))
+        if (TakeRequest(L"profile.request"))
             watchdog::ProfileThisThread(10);
-        if (TakeRequest(L"gmodpp_shaders.request") && !g_prewarming.exchange(true)) {
-            std::thread([directory = g_shim->gameDirectory] {
+        if (TakeRequest(L"shaders.request") && !g_prewarming.exchange(true)) {
+            std::thread([] {
                 PrewarmProgress progress;
-                PrewarmShaders(directory, directory / L"bin" / L"win64" / L"gmodpp", progress);
+                PrewarmShaders(GetOptions().gameDirectory, ModDirectory(), progress);
                 g_prewarming = false;
             }).detach();
         }
@@ -924,10 +926,10 @@ HMODULE LoadSystemD3D9()
 
 Shim* LoadShim()
 {
-    std::filesystem::path gameDirectory = ExecutablePath().parent_path();
-    log::Open((gameDirectory / L"gmodpp.log").c_str());
+    std::error_code error;
+    std::filesystem::create_directories(ModDirectory() / L"logs", error);
+    log::Open((ModDirectory() / L"logs" / L"gmodpp.log").c_str());
     auto* shim = new Shim{};
-    shim->gameDirectory = gameDirectory;
     shim->devMode = HasArgument(L"-gmodpp_dev");
     shim->mainThread = GetCurrentThreadId();
     g_shim = shim;
@@ -940,7 +942,7 @@ Shim* LoadShim()
         // its directory, so loading the system one first keeps our bin\win64\d3d9.dll out of the reference.
         if (LoadSystemD3D9() == nullptr)
             log::Info("Failed to load the system d3d9.dll: {}", GetLastError());
-        std::filesystem::path path = gameDirectory / L"bin" / L"win64" / L"shaderapidx9.dll";
+        std::filesystem::path path = GetOptions().gameDirectory / L"bin" / L"win64" / L"shaderapidx9.dll";
         HMODULE module = LoadLibraryExW(path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
         if (module == nullptr) {
             log::Info("Failed to load {}: {}", path.string(), GetLastError());
@@ -955,7 +957,7 @@ Shim* LoadShim()
         log::Info("Vanilla reference: tracing {}", path.string());
         TraceObjectClasses(module);
     }
-    if (shim->devMode && TakeRequest(L"gmodpp_trace.request")) {
+    if (shim->devMode && TakeRequest(L"trace.request")) {
         log::Info("TRACE from startup");
         StartTrace();
     }

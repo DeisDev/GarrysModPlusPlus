@@ -23,8 +23,8 @@ bool Ready();
 void WaitForGpu();
 
 // Once per presented frame, with the size of the main view: installs the engine hooks, follows the settings file,
-// loads the map's scene and, every few frames, the developer requests (gmodpp_probe.request and, with
-// `consoleRequests`, gmodpp_console.txt).
+// loads the map's scene and, every few frames, the developer requests (probe.request and, with
+// `consoleRequests`, console.txt).
 void OnPresent(UINT width, UINT height, bool consoleRequests);
 
 // The clip-space jitter (NDC units) for the next captured view of an output this size, for temporal anti-aliasing

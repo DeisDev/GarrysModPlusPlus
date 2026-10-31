@@ -33,7 +33,7 @@ constexpr unsigned kShaderUtilOnDrawMeshLists = 20;
 constexpr unsigned kShaderUtilOnDrawMesh = 21;
 // IMaterial::GetVertexFormat (public/materialsystem/imaterial.h).
 constexpr unsigned kMaterialGetVertexFormat = 20;
-// GMod's dynamic vertex buffer size and dynamic index count (gmodpp_caps.txt: GetCurrentDynamicVBSize,
+// GMod's dynamic vertex buffer size and dynamic index count (caps.txt: GetCurrentDynamicVBSize,
 // GetMaxIndicesToRender), which bound how much materialsystem batches into one dynamic mesh.
 constexpr int kDynamicVertexBytes = 1572864;
 constexpr int kDynamicIndices = 32768;

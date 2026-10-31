@@ -35,9 +35,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Glowing surfaces such as screens and light panels light their surroundings, with a "Glowing surfaces" setting (Off, Bounce light, Full). Light textures the map already turned into lights keep the map's lights instead.
 - In the native renderer, reflections show the sky as the game draws it, including painted skies, and the 3D skybox, instead of a flat colour.
 - The project is licensed under the Mozilla Public License 2.0. `THIRD_PARTY_NOTICES.md` lists the parts under other licences.
+- The settings menu's General tab credits NVIDIA DLSS and says where the licences are.
 
 ### Changed
 
+- The mod keeps all its files in a `gmodplusplus` folder in the game folder: its DLLs, settings, logs, shader caches and developer files. Only the loader, `winmm.dll`, stays in the game folder itself.
 - In the native renderer, indirect light from the sky takes the skybox's colours from each direction, at the map's sky light brightness.
 - The native renderer always turns MSAA off, so real-time lighting no longer needs it turned off by hand.
 - Shadows of many lights are less noisy: the strongest lights are always traced, and the rest are denoised.

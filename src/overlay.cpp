@@ -1,7 +1,7 @@
 #include "overlay.h"
 
+#include "command_line.h"
 #include "log.h"
-#include "options.h"
 #include "settings.h"
 #include "ui_text.h"
 
@@ -276,6 +276,9 @@ void DrawGeneralTab(Settings& settings)
     }
     if (ImGui::Button(Text(TextId::ResetDefaults)))
         settings = Settings{};
+    ImGui::SeparatorText(Text(TextId::SectionCredits));
+    ImGui::TextWrapped("%s", Text(TextId::CreditsDlss));
+    ImGui::TextWrapped("%s", Text(TextId::CreditsLicenses));
 }
 
 void DrawLightingTab(Settings& settings)
@@ -554,7 +557,7 @@ bool Initialize(HWND window, ID3D12Device* device, ID3D12CommandQueue* queue, De
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     // Keeps the menu's size and position between sessions.
-    static const std::string iniPath = (GetOptions().gameDirectory / L"gmodpp_menu.ini").string();
+    static const std::string iniPath = (ModDirectory() / L"menu.ini").string();
     io.IniFilename = iniPath.c_str();
     io.MouseDrawCursor = true;
     ImGui::StyleColorsDark();
