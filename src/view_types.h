@@ -54,6 +54,8 @@ struct ForwardConstants {
     std::array<int, 3> probeOrigin;
     // Unknown fog means none.
     Fog fog;
+    // Lighting::LitFogScale: the fog's colour is scaled by the volume's average irradiance times this, or kept with 0.
+    float litFogScale;
     // Debug views show the light alone, as if the albedo were white.
     bool lightOnly;
     // Native forward twins (shaders/forward_twin.hlsli): the GPU addresses of their frame constants and ray-traced

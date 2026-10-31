@@ -1568,8 +1568,10 @@ std::optional<gbuffer::ForwardConstants> ForwardLighting(const ViewInputs& input
         forward.eye = *eye;
     forward.tonemapScale = inputs.tonemapScale;
     forward.probeOrigin = g_state.lighting->VolumeOrigin();
-    if (GetSettings().fog)
+    if (GetSettings().fog) {
         forward.fog = inputs.fog;
+        forward.litFogScale = g_state.lighting->LitFogScale();
+    }
     forward.lightOnly = GetSettings().debugView != DebugView::Final;
     forward.twinFrame = g_state.lighting->ForwardFrame();
     forward.twinScene = g_state.lighting->ForwardScene();

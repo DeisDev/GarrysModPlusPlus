@@ -104,9 +104,14 @@ float4 gmodpp_ForwardTwin(float4 albedo, float4 normal, float4 emissive, float4 
     bool lightOnly = g_frame.debugView != 0;
     float3 color = ((lightOnly ? 1.0 : albedo.rgb) * light + emissive.rgb) * g_frame.tonemapScale;
     if (g_frame.fogEnabled != 0) {
-        float viewDepth = mul(g_frame.viewProj, float4(position.xyz, 1.0)).w;
-        float fog = saturate(min(g_frame.fogParams.z, viewDepth * g_frame.fogParams.w - g_frame.fogParams.x));
-        color = lerp(color, g_frame.fogColor, g_frame.fogParams.y > 0.0 ? fog : fog * fog);
+        float fog = FogOpacity(mul(g_frame.viewProj, float4(position.xyz, 1.0)).w);
+        // Lit fog (shaders/volumetrics.hlsl) is lit where it meets the surface, a unit towards the eye.
+        float3 fogColor = g_frame.fogColor;
+        if (g_frame.volumetricFog != 0) {
+            float3 air = position.xyz + normalize(g_frame.eyePosition - position.xyz);
+            fogColor = LitFog(air, uint3(g_frame.probeRedView, g_frame.probeGreenView, g_frame.probeBlueView)) * g_frame.tonemapScale;
+        }
+        color = lerp(color, fogColor, fog);
     }
     return float4(color, lightOnly ? 1.0 : albedo.a);
 }

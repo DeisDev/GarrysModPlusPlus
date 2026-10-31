@@ -134,7 +134,9 @@ struct FrameConstants {
     uint32_t emittersView;
     uint32_t emitterCount;
     uint32_t emissiveLighting;
-    uint32_t padding[2];
+    // 1 when volumetricView holds the map's fog, lit (shaders/volumetrics.hlsl), in place of Source's flat fog.
+    uint32_t volumetricFog;
+    uint32_t padding;
     // The 3D skybox's fog (ViewInputs::skyboxFog), for reflected rays that continue into it.
     float skyboxFogParams[4];
     float skyboxFogColor[3];
@@ -225,8 +227,10 @@ public:
         m_historyValid = false;
         m_probeHistoryValid = false;
     }
-    // Whether the last main view filled the irradiance volume, and the volume's first cell.
+    // Whether the last main view filled the irradiance volume for translucent surfaces, and the volume's first cell.
     bool VolumeReady() const { return m_volumeReady; }
+    // 1 / the irradiance volume's average in open sunlit air when the last main view drew its fog lit, or 0.
+    float LitFogScale() const { return m_litFogScale; }
     // The last main view's frame constants and scene for forward twins (shaders/forward_twin.hlsli); 0 before one ran
     // with its irradiance volume.
     D3D12_GPU_VIRTUAL_ADDRESS ForwardFrame() const { return m_volumeReady ? m_forwardFrame : 0; }
@@ -378,6 +382,7 @@ private:
     std::array<int, 3> m_probeOrigin = {};
     bool m_probeHistoryValid = false;
     bool m_volumeReady = false;
+    float m_litFogScale = 0.0f;
     // Copies of the filled volume per frame slot, read once the slot's frame is done for the engine's lighting
     // queries (light_queries).
     std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, kSlots> m_volumeReadback;

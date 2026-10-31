@@ -489,7 +489,7 @@ void BeginForward(const gbuffer::ForwardConstants& constants)
     const float extent[3] = {kProbeSpacing * kProbeGrid[0], kProbeSpacing * kProbeGrid[1], kProbeSpacing * kProbeGrid[2]};
     auto& c = g_state.forwardConstants;
     c[1] = {0.0f, 0.0f, 0.0f, constants.lightOnly ? 1.0f : 0.0f};
-    c[2] = {constants.fog.color[0], constants.fog.color[1], constants.fog.color[2], 0.0f};
+    c[2] = {constants.fog.color[0], constants.fog.color[1], constants.fog.color[2], constants.fog.known ? constants.litFogScale : 0.0f};
     c[3] = {1.0f / extent[0], 1.0f / extent[1], 1.0f / extent[2], kProbeSpacing};
     // The window ends at the centres of its outermost probes.
     c[0] = {0.0f, 2.0f / (extent[0] - kProbeSpacing), 2.0f / (extent[1] - kProbeSpacing), 2.0f / (extent[2] - kProbeSpacing)};

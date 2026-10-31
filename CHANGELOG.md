@@ -27,7 +27,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - A `winmm.dll` loader in the game folder. With `-insecure -gmodpp_vanilla` it runs the game's own renderer through `gmodpp.dll`, as a reference for the coming native Direct3D 12 renderer.
 - In the native renderer, GMod's Advanced video options have settings for anti-aliasing (TAA or DLSS), the upscaling mode next to it and, in their own section, real-time lighting, ray tracing quality, indirect light, foliage shadows, reflections, ambient occlusion, volumetric light, translucent lighting and camera and mirror lighting. MSAA and Direct3D 9Ex are hidden there, MSAA is turned off when the options are applied, shadow detail is greyed out while real-time lighting is on, and the two DirectX level rows are replaced by one that names the renderer (DirectX 12).
 - In the native renderer, a "Display" setting in the Advanced video options moves the game window to another monitor.
-- In the native renderer, camera screens, mirrors and scopes that draw the world into a texture get real-time light ("Cameras and mirrors" in the menu; about 1 ms for a 512x512 view). The water's own views keep the game's light.
+- In the native renderer, camera screens, mirrors and scopes that draw the world into a texture get real-time light ("Cameras and mirrors" in the menu, off by default; about 1 ms for a 512x512 view). The water's own views keep the game's light.
 - The menu says why real-time lighting is paused: no ray tracing support, or multicore rendering on.
 - In the native renderer, flowing water (`$flowmap`, also with a flowing base texture) and water with `$lightmapwaterfog` get ray-traced reflections like other water.
 - In the native renderer, textured water (`$basetexture`) is lit in real time instead of by its baked light, with its ripples and ray-traced reflections.
@@ -74,7 +74,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - In the native renderer, glass and other translucent surfaces no longer hitch the first time they appear: their shaders are prepared with the rest after a game update.
 
 - In the native renderer, "Wait for vertical sync" works in a window and borderless too, not only in full screen.
-- Volumetric haze is thinner and scatters more towards the light, so distant buildings, the 3D skybox and water are no longer washed out in the sun.
+- Volumetric haze is much thinner and scatters more towards the light, so maps without fog no longer look hazy; it shows mainly as sun shafts and light beams.
+- With volumetric light on, a map's fog is lit by the real lights: it keeps the map's fog colour in open sunlight, darkens in shadow and indoors, glows around lamps, and shows sun shafts and flashlight beams. Translucent surfaces and the 3D skybox get the lit fog too. Fog under water is unchanged.
 
 ### Removed
 

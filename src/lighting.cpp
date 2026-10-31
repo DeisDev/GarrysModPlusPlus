@@ -1206,8 +1206,13 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
             log::Info("Lighting: the camera of view kind {} cannot be inverted; view left unlit ({} times)", static_cast<int>(inputs.kind), m_cameraFailures);
         return;
     }
-    // The irradiance volume follows the main view's camera in whole cells.
-    const bool volume = main && scene.Ready() && GetSettings().translucentLighting && m_probeVolume[0].resource;
+    const bool volumetricSetting = GetSettings().volumetricLight && GetSettings().volumetricIntensity > 0.0f;
+    // The map's fog above water is drawn lit by the volumetric pass, in the main view and the 3D skybox; Source's water
+    // fog stays flat.
+    const bool litFog = volumetricSetting && constants.fogEnabled != 0 && constants.fogParams[1] <= 0.0f;
+    // The irradiance volume follows the main view's camera in whole cells. Lit fog reads its indirect light even when
+    // translucent surfaces do not use it.
+    const bool volume = main && scene.Ready() && (GetSettings().translucentLighting || litFog) && m_probeVolume[0].resource;
     if (main)
         m_volumeReady = false;
     for (int i = 0; i < 3; ++i) {
@@ -1219,11 +1224,15 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     constants.aoView = kInvalidView;
     constants.aoIntensity = GetSettings().aoIntensity;
     constants.volumetricView = kInvalidView;
-    // Haze thin enough that light crosses about 6,000 units at the default intensity.
-    // 1/6000 per unit washed every distant surface out in the sun (gm_construct, 2026-10-31).
-    constexpr float kVolumetricDensity = 1.0f / 20000.0f;
+    constants.volumetricFog = 0;
+    // Haze thin enough to show only as shafts against the light at the default intensity (shaders/volumetrics.hlsl).
+    // 1/6000 per unit washed every distant surface out in the sun (gm_construct), and 1/20000 still hazed maps over
+    // (2026-10-31).
+    constexpr float kVolumetricDensity = 1.0f / 60000.0f;
     constants.volumetricDensity = kVolumetricDensity * GetSettings().volumetricIntensity;
-    const bool volumetrics = main && GetSettings().volumetricLight && GetSettings().volumetricIntensity > 0.0f;
+    const bool volumetrics = (main && volumetricSetting) || (inputs.kind == gbuffer::ViewKind::Skybox && litFog);
+    if (main)
+        m_litFogScale = 0.0f;
     // indirect_lighting = 1: VRAD's bounce light replaces traced indirect light once the map's residual is baked.
     const bool bakedIndirect = GetSettings().indirectLighting == IndirectLighting::Baked && scene.HasBaked();
     if (bakedIndirect && scene.Baked().Ready()) {
@@ -1255,7 +1264,9 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
         resources.push_back(inputs.skyCube);
     // The game's probe volume textures, filled by copies at the end of the irradiance volume passes.
     const std::array<ID3D12Resource*, 3>& probeTargets = inputs.probes;
-    const bool copyVolume = volume && probeTargets[0] != nullptr && probeTargets[1] != nullptr && probeTargets[2] != nullptr;
+    const bool copyVolume = volume && GetSettings().translucentLighting && probeTargets[0] != nullptr && probeTargets[1] != nullptr &&
+        probeTargets[2] != nullptr;
+    bool volumeFilled = false;
     ID3D12Resource* color = inputs.color;
     ID3D12Resource* depth = inputs.depth;
     ID3D12Resource* normal = inputs.normal;
@@ -1474,7 +1485,7 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     for (Texture* texture : {&m_visibility, &m_motion, &m_previousDistance, &m_pixelFlags, &m_geometricNormal})
         Use(*texture, read);
     mark();
-    if (copyVolume && constants.traceMask != 0) {
+    if (volume && constants.traceMask != 0) {
         auto& last = m_probeHistory[previous];
         auto& next = m_probeHistory[current];
         for (Texture& texture : last)
@@ -1507,7 +1518,7 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
                 .output0 = m_probeVolume[0].uav, .output1 = m_probeVolume[1].uav, .output2 = m_probeVolume[2].uav,
                 .output3 = m_probeIndirect[0].resource ? m_probeIndirect[0].uav : kInvalidView, .step = 1}, probes / 32, 1, 1);
         }
-        for (size_t i = 0; i < probeTargets.size(); ++i) {
+        for (size_t i = 0; i < probeTargets.size() && copyVolume; ++i) {
             Use(m_probeVolume[i], D3D12_RESOURCE_STATE_COPY_SOURCE);
             D3D12_RESOURCE_BARRIER barrier = Transition(probeTargets[i], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
             m_list->ResourceBarrier(1, &barrier);
@@ -1521,11 +1532,12 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
                 m_list->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
             }
         }
-        m_volumeReadbackPending[slot] = m_volumeReadback[slot] != nullptr;
+        m_volumeReadbackPending[slot] = copyVolume && m_volumeReadback[slot] != nullptr;
         m_volumeReadbackOrigin[slot] = m_probeOrigin;
         // The baked fill leaves the traced history behind.
         m_probeHistoryValid = constants.bakedTrianglesView == kInvalidView;
-        m_volumeReady = true;
+        volumeFilled = true;
+        m_volumeReady = copyVolume;
     }
     mark();
     Texture& direct = m_direct[current];
@@ -1659,17 +1671,40 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     if (volumetrics && constants.traceMask != 0) {
         const UINT halfWidth = (m_gridWidth + 1) / 2;
         const UINT halfHeight = (m_gridHeight + 1) / 2;
+        constants.volumetricFog = litFog ? 1u : 0u;
+        // Lit fog darkens where the irradiance volume's indirect light is weaker than the open sky's.
+        const bool indirectVolume = volumeFilled && m_probeIndirect[0].resource;
+        if (indirectVolume) {
+            for (Texture& texture : m_probeIndirect)
+                Use(texture, read);
+        }
         Use(m_volumetricMarch, write);
-        DispatchGroups(Pass::Volumetrics, {.output0 = m_volumetricMarch.uav, .step = 0}, (halfWidth + 7) / 8, (halfHeight + 7) / 8, 1);
+        // Map and dynamic lights scatter in the main view's fog; the 3D skybox is lit without them.
+        DispatchGroups(Pass::Volumetrics, {.input0 = indirectVolume ? m_probeIndirect[0].srv : kInvalidView,
+            .input1 = indirectVolume ? m_probeIndirect[1].srv : kInvalidView, .input2 = indirectVolume ? m_probeIndirect[2].srv : kInvalidView,
+            .input3 = main ? 1u : 0u, .output0 = m_volumetricMarch.uav, .step = 0}, (halfWidth + 7) / 8, (halfHeight + 7) / 8, 1);
         Use(m_volumetricMarch, read);
         Use(m_volumetricHistory[previous], read);
         Use(m_volumetricHistory[current], write);
+        // The 3D skybox's march is not accumulated: the main view's history holds the main view's.
         DispatchGroups(Pass::Volumetrics, {.input0 = m_volumetricMarch.srv, .input1 = m_volumetricHistory[previous].srv,
-            .input2 = m_volumetricHistoryValid ? 1u : 0u, .output0 = m_volumetricHistory[current].uav, .step = 1}, (halfWidth + 7) / 8, (halfHeight + 7) / 8, 1);
+            .input2 = main && m_volumetricHistoryValid ? 1u : 0u, .output0 = m_volumetricHistory[current].uav, .step = 1}, (halfWidth + 7) / 8,
+            (halfHeight + 7) / 8, 1);
         Use(m_volumetricHistory[current], read);
         constants.volumetricView = m_volumetricHistory[current].srv;
-        if (rayReconstruction)
-            reinterpret_cast<FrameConstants*>(slotConstants + kConstantsStride)->volumetricView = m_volumetricHistory[current].srv;
+        if (rayReconstruction) {
+            FrameConstants& render = *reinterpret_cast<FrameConstants*>(slotConstants + kConstantsStride);
+            render.volumetricView = m_volumetricHistory[current].srv;
+            render.volumetricFog = constants.volumetricFog;
+        }
+        // Translucent surfaces drawn by the game take the lit fog's colour from the full irradiance volume
+        // (shaders/forward_light.hlsli), relative to its average in open sunlit air: a quarter of the sun's irradiance
+        // and half the sky's.
+        if (main && litFog) {
+            const auto luminance = [](const float* c) { return 0.2126f * c[0] + 0.7152f * c[1] + 0.0722f * c[2]; };
+            const float openAir = (constants.sunEnabled != 0.0f ? 0.25f * luminance(constants.sunColor) : 0.0f) + 0.5f * luminance(constants.skyColor);
+            m_litFogScale = 1.0f / std::max(openAir, 1e-6f);
+        }
     }
     if (main)
         m_volumetricHistoryValid = volumetrics && constants.traceMask != 0 && constants.historyValid != 0;

@@ -662,15 +662,11 @@ bool SampleTailLight(LightRanges ranges, float u, out uint light, out float prob
 
 // Irradiance below which a light cannot change the encoded result (1/1024 after the tonemap scale), so its
 // shadow ray is not traced. VRAD's falloff never reaches zero, and maps have hundreds of lights.
-// The irradiance volume named by g_frame's probe views at a point, or -1 where there is none: the main view's
-// filled volume, or its indirect light alone for forward twins (shaders/forward_twin.hlsli). Points outside its window
-// get -1, or with `nearest` the light of the window's nearest probes. The probes are read a cell out along the normal,
+// The irradiance volume whose red, green and blue coefficients are `views` at a point. Points outside its window get -1, or with `nearest` the light of the window's nearest probes. The probes are read a cell out along the normal,
 // so all eight blended lie in front of the surface: probes just behind a wall see open space there and leaked its light
 // through the wall.
-float3 VolumeIrradiance(float3 position, float3 normal, bool nearest = false)
+float3 VolumeIrradiance(uint3 views, float3 position, float3 normal, bool nearest = false)
 {
-    if (g_frame.probeRedView == kNoView)
-        return -1.0;
     position += normal * g_frame.probeSpacing;
     static const float3 kGrid = float3(32.0, 32.0, 16.0);
     float3 window = (position / g_frame.probeSpacing - 0.5) - float3(g_frame.probeOrigin);
@@ -680,13 +676,41 @@ float3 VolumeIrradiance(float3 position, float3 normal, bool nearest = false)
         position = (clamp(window, 0.0, kGrid - 1.0) + 0.5 + float3(g_frame.probeOrigin)) * g_frame.probeSpacing;
     }
     float3 uvw = position / (g_frame.probeSpacing * kGrid);
-    Texture3D<float4> red = ResourceDescriptorHeap[g_frame.probeRedView];
-    Texture3D<float4> green = ResourceDescriptorHeap[g_frame.probeGreenView];
-    Texture3D<float4> blue = ResourceDescriptorHeap[g_frame.probeBlueView];
+    Texture3D<float4> red = ResourceDescriptorHeap[views.r];
+    Texture3D<float4> green = ResourceDescriptorHeap[views.g];
+    Texture3D<float4> blue = ResourceDescriptorHeap[views.b];
     float4 r = red.SampleLevel(g_linearWrap, uvw, 0.0);
     float4 g = green.SampleLevel(g_linearWrap, uvw, 0.0);
     float4 b = blue.SampleLevel(g_linearWrap, uvw, 0.0);
     return max(float3(r.x + dot(r.yzw, normal), g.x + dot(g.yzw, normal), b.x + dot(b.yzw, normal)), 0.0);
+}
+
+// The volume named by g_frame's probe views, or -1 without one: the main view's filled volume, or its indirect light
+// alone for forward twins (shaders/forward_twin.hlsli).
+float3 VolumeIrradiance(float3 position, float3 normal, bool nearest = false)
+{
+    if (g_frame.probeRedView == kNoView)
+        return -1.0;
+    return VolumeIrradiance(uint3(g_frame.probeRedView, g_frame.probeGreenView, g_frame.probeBlueView), position, normal, nearest);
+}
+
+// The map's fog lit at a point, before the tonemap scale (shaders/volumetrics.hlsl). In open sunlit air it is the fog's
+// colour as the game blends it; shadowed air loses the sun's share and air that less indirect light reaches than the
+// open sky's (`volume`, an indirect light volume, or kNoView to take the open sky's) loses some of the sky's. The shares
+// are of the irradiance averaged over all directions in open air: a quarter of the sun's, half the sky's.
+float3 LitFog(float3 position, uint3 volume)
+{
+    float sunLight = g_frame.sunEnabled != 0.0 ? 0.25 * Luminance(g_frame.sunColor) : 0.0;
+    float skyLight = 0.5 * Luminance(g_frame.skyColor);
+    float sunShare = sunLight / max(sunLight + skyLight, 1e-6);
+    float3 sun = sunShare > 0.0 ? SunVisibility(position, g_frame.sunShadowMask) : 0.0;
+    float ambient = 1.0;
+    if (volume.r != kNoView) {
+        float3 indirect = VolumeIrradiance(volume, position, 0.0);
+        if (indirect.r >= 0.0)
+            ambient = saturate(Luminance(indirect) / max(skyLight, 1e-6));
+    }
+    return g_frame.fogColor / max(g_frame.tonemapScale, 1e-3) * (sunShare * sun + (1.0 - sunShare) * ambient);
 }
 
 float VisibleIrradiance() { return (1.0 / 1024.0) / max(g_frame.tonemapScale, 1e-3); }
@@ -721,6 +745,9 @@ static float3 g_toEye = 0.0;
 // common_vertexlitgeneric_dx9.h).
 static bool g_halfLambert = false;
 
+// Set by a pass that lights the air (shaders/volumetrics.hlsl): light reaches a point from every side.
+static bool g_inAir = false;
+
 // Set by a pass for the pixel it lights: the light warp texture ($lightwarptexture), or kNoView.
 static uint g_lightWarpView = kNoView;
 
@@ -737,6 +764,8 @@ float LeafTerm(float cosine, float3 toLight)
 
 float Lambert(float3 normal, float3 toLight)
 {
+    if (g_inAir)
+        return 1.0;
     if (g_twoSided)
         return LeafTerm(dot(normal, toLight), toLight);
     if (g_halfLambert) {

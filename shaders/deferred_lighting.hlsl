@@ -23,15 +23,14 @@ float3 VolumetricLight(int2 pixel)
     return volumetric.SampleLevel(g_linearClamp, position / textureSize, 0.0).rgb * g_frame.tonemapScale;
 }
 
-// Source's range fog (CalcRangeFog and BlendPixelFog in common_ps_fxc.h), applied after the tonemap scale.
+// Source's range fog, applied after the tonemap scale. Lit fog (volumetricFog) only hides the surface here: the fog's
+// own light comes with the volumetric light.
 float3 ApplyFog(float3 color, float3 position)
 {
     if (g_frame.fogEnabled == 0)
         return color;
-    float viewDepth = mul(g_frame.viewProj, float4(position, 1.0)).w;
-    float fog = saturate(min(g_frame.fogParams.z, viewDepth * g_frame.fogParams.w - g_frame.fogParams.x));
-    // fogParams.y: 1 under water, whose fog Source blends in linearly.
-    return lerp(color, g_frame.fogColor, g_frame.fogParams.y > 0.0 ? fog : fog * fog);
+    float fog = FogOpacity(mul(g_frame.viewProj, float4(position, 1.0)).w);
+    return g_frame.volumetricFog != 0 ? color * (1.0 - fog) : lerp(color, g_frame.fogColor, fog);
 }
 
 // Source's rim light also adds the ambient light seen along the view (vRimAmbientCubeColor in skin_ps20b) times its

@@ -146,7 +146,9 @@ struct FrameConstants
     uint emittersView;
     uint emitterCount;
     uint emissiveLighting;
-    uint2 padding;
+    // 1 when volumetricView holds the map's fog, lit (shaders/volumetrics.hlsl), in place of Source's flat fog.
+    uint volumetricFog;
+    uint padding;
     // The 3D skybox's fog, for reflected rays that continue into it (shaders/reflection.hlsli).
     float4 skyboxFogParams;
     float3 skyboxFogColor;
@@ -319,6 +321,14 @@ float3 SkyRadiance(float3 direction)
     TextureCube<float4> sky = ResourceDescriptorHeap[g_frame.skyCubeView];
     float3 radiance = sky.SampleLevel(g_linearClamp, direction, 0.0).rgb;
     return all(radiance >= 0.0) ? radiance : g_frame.skyColor;
+}
+
+// Source's range fog (CalcRangeFog and BlendPixelFog in common_ps_fxc.h): the share of the fog colour over a surface at
+// a view depth. fogParams.y: 1 under water, whose fog Source blends in linearly.
+float FogOpacity(float viewDepth)
+{
+    float fog = saturate(min(g_frame.fogParams.z, viewDepth * g_frame.fogParams.w - g_frame.fogParams.x));
+    return g_frame.fogParams.y > 0.0 ? fog : fog * fog;
 }
 
 // The sky's light arriving from a direction, for indirect light: the drawn sky blurred, as bright overall as the

@@ -58,7 +58,7 @@ struct Settings {
     // Translucent surfaces lit from the ray-traced irradiance volume instead of baked light.
     bool translucentLighting = true;
     // Views drawn into textures (cameras, mirrors, scopes) lit like translucent surfaces.
-    bool renderTargetLighting = true;
+    bool renderTargetLighting = false;
     bool volumetricLight = true;
     bool fog = true;
     float sunIntensity = 1.0f;
