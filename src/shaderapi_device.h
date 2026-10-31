@@ -41,6 +41,13 @@ private:
     std::vector<SIZE_T> m_free;
 };
 
+// A monitor, in the order Displays() lists them.
+struct DisplayInfo {
+    RECT area;
+    bool primary;
+};
+std::vector<DisplayInfo> Displays();
+
 // The Direct3D 12 device, the game window's flip-model swap chain and the frame's command list. Commands are recorded
 // into one list per frame, which Present submits; the backend keeps kFrames frames in flight.
 class Backend {
@@ -60,6 +67,8 @@ public:
 
     bool SetMode(HWND window, const ShaderDeviceInfo& info);
     void Present();
+    // Moves the game window onto the display Settings::display names, when that changed since the last call.
+    void PlaceWindow();
     // Submits the commands recorded so far and waits for the GPU, then continues recording. For readbacks, and to
     // reclaim staging memory while the game loads many resources between two presents.
     void Flush();
@@ -134,6 +143,7 @@ private:
 
     bool CreateDevice();
     bool CreateSwapChain();
+    int m_placedDisplay = -1;
     bool CreateDepthBuffer();
     TrackedResource& SwapChainBuffer() { return m_backBuffers[m_swapChain->GetCurrentBackBufferIndex()]; }
     void DrainDebugMessages();

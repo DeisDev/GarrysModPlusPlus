@@ -25,7 +25,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Water has ray-traced reflections over the game's refraction, a sun glint and a physical Fresnel term.
 - Underwater, the surface shows the world above through Snell's window and mirrors the water below beyond it, and sunlight scatters in the water's colour.
 - A `winmm.dll` loader in the game folder. With `-insecure -gmodpp_vanilla` it runs the game's own renderer through `gmodpp.dll`, as a reference for the coming native Direct3D 12 renderer.
-- In the native renderer, GMod's Advanced video options have settings for anti-aliasing (TAA or DLSS), the DLSS mode, real-time lighting, ray tracing quality and indirect light. MSAA and Direct3D 9Ex are hidden there, MSAA is turned off when the options are applied, and the two DirectX level rows are replaced by one that names the renderer (DirectX 12).
+- In the native renderer, GMod's Advanced video options have settings for anti-aliasing (TAA or DLSS), the upscaling mode next to it and, in their own section, real-time lighting, ray tracing quality, indirect light, foliage shadows, reflections, ambient occlusion, volumetric light, translucent lighting and camera and mirror lighting. MSAA and Direct3D 9Ex are hidden there, MSAA is turned off when the options are applied, shadow detail is greyed out while real-time lighting is on, and the two DirectX level rows are replaced by one that names the renderer (DirectX 12).
+- In the native renderer, a "Display" setting in the Advanced video options moves the game window to another monitor.
 - In the native renderer, camera screens, mirrors and scopes that draw the world into a texture get real-time light ("Cameras and mirrors" in the menu; about 1 ms for a 512x512 view). The water's own views keep the game's light.
 - The menu says why real-time lighting is paused: no ray tracing support, or multicore rendering on.
 - In the native renderer, flowing water (`$flowmap`, also with a flowing base texture) and water with `$lightmapwaterfog` get ray-traced reflections like other water.
@@ -63,6 +64,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - In the native renderer, characters with `$rimlight` (many Half-Life 2 models and the first-person hands) get their rim highlights from real-time light.
 - In the native renderer, glass and other translucent surfaces no longer hitch the first time they appear: their shaders are prepared with the rest after a game update.
 
+- In the native renderer, "Wait for vertical sync" works in a window and borderless too, not only in full screen.
+- Volumetric haze is thinner and scatters more towards the light, so distant buildings, the 3D skybox and water are no longer washed out in the sun.
+
 ### Removed
 
 - The Direct3D 9 build (`bin/win64/d3d9.dll` with D3D9On12). `-insecure` now starts the native Direct3D 12 renderer through the `winmm.dll` loader; deploying removes the old `d3d9.dll`.
@@ -70,6 +74,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Fixed holes in the first-person hands and other rim-lit skin where the surface faces the camera.
 - Fixed UnlitTwoTexture and MonitorScreen materials being lit in the native renderer.
 - Fixed jagged shadow shards on characters where their surface turns away from a light.
 - Fixed bright green or white specks in the lighting, most visible with DLSS.

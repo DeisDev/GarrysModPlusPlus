@@ -48,8 +48,8 @@ enum class TextId {
     AntiAliasingOff,
     AntiAliasingTemporal,
     AntiAliasingDlss,
-    DlssMode,
-    DlssDlaa,
+    Upscaling,
+    UpscalingNative,
     DlssQuality,
     DlssBalanced,
     DlssPerformance,
@@ -122,6 +122,10 @@ enum class TextId {
     VideoAntiAliasingDlss,
     VideoRenderer,
     VideoRendererName,
+    VideoDisplay,
+    VideoDisplayDefault,
+    VideoDisplayItem,
+    VideoDisplayPrimary,
     Count
 };
 

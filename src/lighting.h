@@ -371,7 +371,7 @@ private:
     float m_viewToClip[16] = {};
     Texture m_rrOutput;
     RayReconstruction m_rayReconstruction;
-    DlssMode m_rrSizeMode = DlssMode::Count;
+    UpscalingMode m_rrSizeMode = UpscalingMode::Count;
     UINT m_rrSize[4] = {};
     bool m_lastMainUsedRr = false;
     UINT m_width = 0;

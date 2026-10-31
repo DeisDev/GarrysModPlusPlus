@@ -17,7 +17,7 @@ namespace gmodpp {
 
 namespace {
 
-using Field = std::variant<bool Settings::*, float Settings::*, int Settings::*, DebugView Settings::*, AntiAliasing Settings::*, DlssMode Settings::*,
+using Field = std::variant<bool Settings::*, float Settings::*, int Settings::*, DebugView Settings::*, AntiAliasing Settings::*, UpscalingMode Settings::*,
     QualityPreset Settings::*, FoliageShadows Settings::*, IndirectLighting Settings::*>;
 
 template <class Enum>
@@ -59,7 +59,7 @@ constexpr NamedField kFields[] = {
     {"projected_intensity", &Settings::projectedIntensity, {0.0f, 8.0f}},
     {"reflection_intensity", &Settings::reflectionIntensity, {0.0f, 4.0f}},
     {"anti_aliasing", &Settings::antiAliasing},
-    {"dlss_mode", &Settings::dlssMode},
+    {"upscaling", &Settings::upscaling},
     {"taa_history_weight", &Settings::taaHistoryWeight, {0.5f, 0.98f}},
     {"sharpening", &Settings::sharpening, {0.0f, 1.0f}},
     {"quality_preset", &Settings::qualityPreset},
@@ -74,6 +74,7 @@ constexpr NamedField kFields[] = {
     {"indirect_lighting", &Settings::indirectLighting},
     {"fast_alpha_tests", &Settings::fastAlphaTests},
     {"opacity_micromaps", &Settings::opacityMicromaps},
+    {"display", &Settings::display, {0.0f, 16.0f}},
 };
 
 struct PresetValues {

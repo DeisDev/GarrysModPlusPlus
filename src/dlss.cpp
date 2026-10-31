@@ -15,11 +15,11 @@ namespace {
 constexpr const char* kProjectId = "6b1f0c2e-9d4a-4f3e-8a57-2c1b9e7d4f10";
 constexpr const char* kEngineVersion = "1.0";
 
-NVSDK_NGX_PerfQuality_Value QualityValue(DlssMode mode)
+NVSDK_NGX_PerfQuality_Value QualityValue(UpscalingMode mode)
 {
     constexpr NVSDK_NGX_PerfQuality_Value kValues[] = {NVSDK_NGX_PerfQuality_Value_DLAA, NVSDK_NGX_PerfQuality_Value_MaxQuality,
         NVSDK_NGX_PerfQuality_Value_Balanced, NVSDK_NGX_PerfQuality_Value_MaxPerf, NVSDK_NGX_PerfQuality_Value_UltraPerformance};
-    static_assert(std::size(kValues) == static_cast<size_t>(DlssMode::Count));
+    static_assert(std::size(kValues) == static_cast<size_t>(UpscalingMode::Count));
     return kValues[static_cast<size_t>(mode)];
 }
 
@@ -72,7 +72,7 @@ void RayReconstruction::Shutdown()
     m_available = false;
 }
 
-bool RayReconstruction::RenderSize(DlssMode mode, UINT outputWidth, UINT outputHeight, UINT& width, UINT& height)
+bool RayReconstruction::RenderSize(UpscalingMode mode, UINT outputWidth, UINT outputHeight, UINT& width, UINT& height)
 {
     if (!m_available)
         return false;
@@ -84,7 +84,7 @@ bool RayReconstruction::RenderSize(DlssMode mode, UINT outputWidth, UINT outputH
     return NVSDK_NGX_SUCCEED(result) && width != 0 && height != 0;
 }
 
-bool RayReconstruction::NeedsNewFeature(DlssMode mode, UINT width, UINT height, UINT outputWidth, UINT outputHeight) const
+bool RayReconstruction::NeedsNewFeature(UpscalingMode mode, UINT width, UINT height, UINT outputWidth, UINT outputHeight) const
 {
     const UINT size[4] = {width, height, outputWidth, outputHeight};
     return m_feature == nullptr || mode != m_featureMode || !std::equal(std::begin(size), std::end(size), std::begin(m_featureSize));
@@ -95,10 +95,10 @@ void RayReconstruction::ReleaseFeature()
     if (m_feature != nullptr)
         NVSDK_NGX_D3D12_ReleaseFeature(m_feature);
     m_feature = nullptr;
-    m_featureMode = DlssMode::Count;
+    m_featureMode = UpscalingMode::Count;
 }
 
-bool RayReconstruction::Evaluate(ID3D12GraphicsCommandList* list, DlssMode mode, UINT outputWidth, UINT outputHeight, const Inputs& inputs)
+bool RayReconstruction::Evaluate(ID3D12GraphicsCommandList* list, UpscalingMode mode, UINT outputWidth, UINT outputHeight, const Inputs& inputs)
 {
     if (!m_available || m_failed)
         return false;

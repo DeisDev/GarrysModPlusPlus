@@ -418,16 +418,16 @@ void DrawImageTab(Settings& settings)
         if (settings.antiAliasing == AntiAliasing::RayReconstruction) {
             ImGui::TableNextRow();
             ImGui::TableNextColumn();
-            ImGui::TextUnformatted(Text(TextId::DlssMode));
+            ImGui::TextUnformatted(Text(TextId::Upscaling));
             ImGui::TableNextColumn();
-            const TextId modes[] = {TextId::DlssDlaa, TextId::DlssQuality, TextId::DlssBalanced, TextId::DlssPerformance, TextId::DlssUltraPerformance};
-            static_assert(std::size(modes) == static_cast<size_t>(DlssMode::Count));
-            int mode = static_cast<int>(settings.dlssMode);
+            const TextId modes[] = {TextId::UpscalingNative, TextId::DlssQuality, TextId::DlssBalanced, TextId::DlssPerformance, TextId::DlssUltraPerformance};
+            static_assert(std::size(modes) == static_cast<size_t>(UpscalingMode::Count));
+            int mode = static_cast<int>(settings.upscaling);
             ImGui::SetNextItemWidth(-FLT_MIN);
             if (ImGui::BeginCombo("##dlssmode", Text(modes[mode]))) {
                 for (int i = 0; i < static_cast<int>(std::size(modes)); ++i) {
                     if (ImGui::Selectable(Text(modes[i]), i == mode))
-                        settings.dlssMode = static_cast<DlssMode>(i);
+                        settings.upscaling = static_cast<UpscalingMode>(i);
                 }
                 ImGui::EndCombo();
             }

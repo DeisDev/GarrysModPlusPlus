@@ -376,13 +376,14 @@ float4 main( PS_INPUT i ) : COLOR
 	// shaders/forward_twin.hlsli lights the draw at its world position.
 	twin.flags = float4( i.worldPos_atten3.xyz, twinAlpha );
 #else
-	// Rim light: red holds the rim's mask, Fresnel and tint above coverage's 0.5, and the material bits its boost.
+	// Rim light: red holds the rim's mask, Fresnel and tint from 128/255 (shaders/common.hlsli RimScale), a step above
+	// coverage's 0.5 so an 8-bit target cannot round a zero rim below it, and the material bits its boost.
 	float twinRim = saturate( fRimMask * fRimFresnel * dot( vSpecularTint, float3( 1.0f, 1.0f, 1.0f ) / 3.0f ) );
 	float twinRimBoost = round( saturate( g_fRimBoost / 7.75f ) * 31.0f );
 	// Green: 1 less the material bits over 255 (shaders/common.hlsli kMaterialHalfLambert, kMaterialRimLight,
 	// kMaterialLightWarp); with light warp the translator puts the warp texture's slot in alpha.
 	float twinBits = ( HALFLAMBERT ? 1.0f : 0.0f ) + ( bDoRimLighting ? 2.0f + 4.0f * twinRimBoost : 0.0f ) + ( LIGHTWARPTEXTURE ? 128.0f : 0.0f );
-	twin.flags = float4( bDoRimLighting ? 0.5f + 0.5f * twinRim : 1.0f, 1.0f - twinBits / 255.0f, twinSpecular, twinAlpha );
+	twin.flags = float4( bDoRimLighting ? ( 128.0f + 127.0f * twinRim ) / 255.0f : 1.0f, 1.0f - twinBits / 255.0f, twinSpecular, twinAlpha );
 #endif
 	return twin;
 #else

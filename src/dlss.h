@@ -41,15 +41,15 @@ public:
     bool Initialize(ID3D12Device* device, const std::filesystem::path& featureDirectory, const std::filesystem::path& logDirectory);
     bool Usable() const { return m_available && !m_failed; }
     // The render size NVIDIA recommends for a mode and output size; false when the mode is unavailable.
-    bool RenderSize(DlssMode mode, UINT outputWidth, UINT outputHeight, UINT& width, UINT& height);
+    bool RenderSize(UpscalingMode mode, UINT outputWidth, UINT outputHeight, UINT& width, UINT& height);
     // Records the evaluation into `list`, creating the feature for this mode and these sizes first when needed.
     // Inputs must be in NON_PIXEL_SHADER_RESOURCE and the output in UNORDERED_ACCESS. The list's descriptor
     // heaps and root signature must be set again afterwards.
-    bool Evaluate(ID3D12GraphicsCommandList* list, DlssMode mode, UINT outputWidth, UINT outputHeight, const Inputs& inputs);
+    bool Evaluate(ID3D12GraphicsCommandList* list, UpscalingMode mode, UINT outputWidth, UINT outputHeight, const Inputs& inputs);
     // Frees the feature; the GPU must be done with it.
     void ReleaseFeature();
     // True when Evaluate would have to create a new feature, which needs the GPU idle if one exists.
-    bool NeedsNewFeature(DlssMode mode, UINT width, UINT height, UINT outputWidth, UINT outputHeight) const;
+    bool NeedsNewFeature(UpscalingMode mode, UINT width, UINT height, UINT outputWidth, UINT outputHeight) const;
 
 private:
     void Shutdown();
@@ -59,7 +59,7 @@ private:
     NVSDK_NGX_Handle* m_feature = nullptr;
     bool m_available = false;
     bool m_failed = false;
-    DlssMode m_featureMode = DlssMode::Count;
+    UpscalingMode m_featureMode = UpscalingMode::Count;
     UINT m_featureSize[4] = {};
 };
 

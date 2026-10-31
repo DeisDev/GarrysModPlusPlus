@@ -52,8 +52,8 @@ constexpr std::array<const char*, static_cast<size_t>(TextId::Count)> kEnglish =
     "Off",
     "TAA",
     "DLSS Ray Reconstruction",
-    "DLSS mode",
-    "DLAA",
+    "Upscaling",
+    "Native resolution",
     "Quality",
     "Balanced",
     "Performance",
@@ -128,6 +128,11 @@ constexpr std::array<const char*, static_cast<size_t>(TextId::Count)> kEnglish =
     "DLSS",
     "Renderer",
     "DirectX 12",
+    "Display",
+    "Default",
+    // The display's number and its size in pixels.
+    "Display {0}: {1}x{2}",
+    "Display {0}: {1}x{2} (primary)",
 };
 
 }

@@ -5,6 +5,7 @@
 #include "log.h"
 #include "native_lighting.h"
 #include "overlay.h"
+#include "settings.h"
 #include "shader_prewarm.h"
 #include "shaderapi.h"
 #include "shaderapi_meshes.h"
@@ -260,6 +261,7 @@ void Present(NativeObject*)
     GetBackend().Present();
     if (g_pendingMode)
         ApplyPendingMode();
+    GetBackend().PlaceWindow();
 }
 
 // The window the game draws for (SetView, shaderapidx9 0x180024050). Vanilla presents into it when it is not the
@@ -474,15 +476,18 @@ D3D12_CPU_DESCRIPTOR_HANDLE Backend::BackBufferView(bool srgb) const
 bool Backend::SetMode(HWND window, const ShaderDeviceInfo& info)
 {
     m_window = window;
-    // 0x1800280a0: windowed modes present immediately whatever mat_vsync says; fullscreen waits for vsync unless
-    // -forcenovsync.
-    m_vsync = !info.windowed && info.waitForVSync && !HasArgument(L"-forcenovsync");
+    // Vanilla (0x1800280a0) presents windowed modes immediately whatever mat_vsync says, as Direct3D 9 could not sync
+    // them well; the flip model syncs every mode, so the video option counts in a window and borderless too.
+    m_vsync = info.waitForVSync && !HasArgument(L"-forcenovsync");
     RECT client = {};
     GetClientRect(window, &client);
     m_width = info.displayMode.width > 0 ? static_cast<UINT>(info.displayMode.width) : static_cast<UINT>(client.right - client.left);
     m_height = info.displayMode.height > 0 ? static_cast<UINT>(info.displayMode.height) : static_cast<UINT>(client.bottom - client.top);
+    // The engine makes the window a borderless popup of the mode's size at the display's corner, which is borderless
+    // full screen when the mode is the display's.
     if (!info.windowed)
         log::Info("Native: exclusive fullscreen was requested; presenting borderless at {}x{} instead", m_width, m_height);
+    m_placedDisplay = -1;
     if (m_device == nullptr) {
         m_renderThread = GetCurrentThreadId();
         if (!CreateDevice())
@@ -492,6 +497,48 @@ bool Backend::SetMode(HWND window, const ShaderDeviceInfo& info)
     if (info.aaSamples > 1)
         log::Info("Native: the game asked for {}x MSAA; drawing without it", info.aaSamples);
     return CreateSwapChain();
+}
+
+std::vector<DisplayInfo> Displays()
+{
+    std::vector<DisplayInfo> displays;
+    EnumDisplayMonitors(nullptr, nullptr,
+        [](HMONITOR monitor, HDC, LPRECT, LPARAM param) -> BOOL {
+            MONITORINFO info = {};
+            info.cbSize = sizeof(info);
+            if (GetMonitorInfoW(monitor, &info))
+                reinterpret_cast<std::vector<DisplayInfo>*>(param)->push_back({info.rcMonitor, (info.dwFlags & MONITORINFOF_PRIMARY) != 0});
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&displays));
+    return displays;
+}
+
+// The engine places the window on the primary display (centred when it has a frame, at the corner when it is a
+// borderless popup); a chosen display gets it placed the same way there.
+void Backend::PlaceWindow()
+{
+    const int display = GetSettings().display;
+    if (display == m_placedDisplay || m_window == nullptr)
+        return;
+    m_placedDisplay = display;
+    if (display <= 0)
+        return;
+    const std::vector<DisplayInfo> displays = Displays();
+    if (display > static_cast<int>(displays.size())) {
+        log::Info("Native: display {} is not connected ({} displays); the window stays where it is", display, displays.size());
+        return;
+    }
+    const RECT& area = displays[static_cast<size_t>(display) - 1].area;
+    RECT window = {};
+    GetWindowRect(m_window, &window);
+    const int width = window.right - window.left;
+    const int height = window.bottom - window.top;
+    const bool framed = (GetWindowLongW(m_window, GWL_STYLE) & WS_CAPTION) == WS_CAPTION;
+    const int x = framed ? area.left + (area.right - area.left - width) / 2 : area.left;
+    const int y = framed ? area.top + (area.bottom - area.top - height) / 2 : area.top;
+    SetWindowPos(m_window, nullptr, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    log::Info("Native: window placed on display {} at {}, {}", display, x, y);
 }
 
 void Backend::WaitForGpu()

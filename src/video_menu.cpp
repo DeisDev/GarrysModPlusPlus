@@ -3,6 +3,7 @@
 #include "log.h"
 #include "module_scan.h"
 #include "settings.h"
+#include "shaderapi_device.h"
 #include "ui_text.h"
 
 #include <MinHook.h>
@@ -13,7 +14,9 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <format>
 #include <optional>
+#include <string>
 #include <string_view>
 #include <unordered_map>
 #include <vector>
@@ -60,6 +63,7 @@ constexpr size_t kIsVisible = 15;
 constexpr size_t kGetChildCount = 17;
 constexpr size_t kGetChild = 18;
 constexpr size_t kGetName = 36;
+constexpr size_t kSetEnabled = 57;
 
 using VPanel = std::uintptr_t;
 using CreateInterfaceFn = void*(__cdecl*)(const char* name, int* returnCode);
@@ -88,11 +92,27 @@ MethodFn g_applyChanges = nullptr;
 MethodFn g_resetData = nullptr;
 bool g_attempted = false;
 
-enum class Row { RealtimeLighting, Quality, AntiAliasing, DlssMode, IndirectLighting, Count };
+// The settings the Advanced video dialog offers, each a combo box.
+enum class Row {
+    AntiAliasing,
+    Upscaling,
+    RealtimeLighting,
+    Quality,
+    IndirectLighting,
+    FoliageShadows,
+    Reflections,
+    AmbientOcclusion,
+    VolumetricLight,
+    TranslucentLighting,
+    RenderTargetLighting,
+    Display,
+    Count
+};
 
-// The combo boxes added to one dialog, by Row.
+// The controls added to one Advanced dialog.
 struct Added {
     std::array<void*, static_cast<size_t>(Row::Count)> combos = {};
+    VPanel shadowDetail = 0;
 };
 std::unordered_map<void*, Added> g_dialogs;
 
@@ -230,7 +250,7 @@ size_t FindMsaaMember(HMODULE module, const void* applyChanges)
     return 0;
 }
 
-void* NewComboBox(void* dialog, const char* name, std::initializer_list<const char*> items)
+void* NewComboBox(void* dialog, const char* name, const std::vector<const char*>& items)
 {
     void* memory = g_gameUi.allocate(g_gameUi.comboBoxSize);
     if (memory == nullptr)
@@ -247,6 +267,118 @@ void* NewLabel(void* dialog, const char* name, const char* text)
     return memory != nullptr ? g_gameUi.label(memory, dialog, name, text, 1) : nullptr;
 }
 
+// Adds a combo box with its label; returns the combo box.
+void* AddCombo(void* dialog, const char* name, ui::TextId label, const Rect& comboRect, const Rect& labelRect, const std::vector<const char*>& items)
+{
+    const std::string labelName = std::string(name) + "Label";
+    void* combo = NewComboBox(dialog, name, items);
+    void* text = NewLabel(dialog, labelName.c_str(), ui::Text(label));
+    if (combo == nullptr || text == nullptr)
+        return nullptr;
+    Place(VPanelOf(combo), comboRect);
+    Place(VPanelOf(text), labelRect);
+    return combo;
+}
+
+const std::vector<const char*> kOnOff = {"#gameui_disabled", "#gameui_enabled"};
+
+// The display row's texts, kept for the combo boxes' lifetime.
+std::vector<std::string> g_displayItems;
+
+std::vector<const char*> DisplayItems()
+{
+    g_displayItems = {ui::Text(ui::TextId::VideoDisplayDefault)};
+    const std::vector<native::DisplayInfo> displays = native::Displays();
+    for (size_t i = 0; i < displays.size(); ++i) {
+        const RECT& area = displays[i].area;
+        const size_t number = i + 1;
+        const long width = area.right - area.left;
+        const long height = area.bottom - area.top;
+        g_displayItems.push_back(std::vformat(ui::Text(displays[i].primary ? ui::TextId::VideoDisplayPrimary : ui::TextId::VideoDisplayItem),
+            std::make_format_args(number, width, height)));
+    }
+    std::vector<const char*> items;
+    for (const std::string& item : g_displayItems)
+        items.push_back(item.c_str());
+    return items;
+}
+
+struct RowSpec {
+    Row row;
+    const char* name;
+    ui::TextId label;
+    std::vector<const char*> items;
+};
+
+std::vector<RowSpec> RowSpecs()
+{
+    using ui::Text;
+    using ui::TextId;
+    return {
+        {Row::AntiAliasing, "GmodppAntiAliasing", TextId::SectionAntiAliasing,
+            {Text(TextId::AntiAliasingOff), Text(TextId::AntiAliasingTemporal), Text(TextId::VideoAntiAliasingDlss)}},
+        {Row::Upscaling, "GmodppUpscaling", TextId::Upscaling,
+            {Text(TextId::UpscalingNative), Text(TextId::DlssQuality), Text(TextId::DlssBalanced), Text(TextId::DlssPerformance), Text(TextId::DlssUltraPerformance)}},
+        {Row::RealtimeLighting, "GmodppRealtimeLighting", TextId::RealtimeLighting, kOnOff},
+        {Row::Quality, "GmodppQuality", TextId::VideoRayTracingQuality,
+            {Text(TextId::PresetLow), Text(TextId::PresetMedium), Text(TextId::PresetHigh), Text(TextId::PresetUltra), Text(TextId::PresetCustom)}},
+        {Row::IndirectLighting, "GmodppIndirectLighting", TextId::IndirectSource, {Text(TextId::IndirectRayTraced), Text(TextId::IndirectBaked)}},
+        {Row::FoliageShadows, "GmodppFoliageShadows", TextId::FoliageShadows,
+            {Text(TextId::FoliageOff), Text(TextId::FoliageSun), Text(TextId::FoliageSunAndIndirect)}},
+        {Row::Reflections, "GmodppReflections", TextId::Reflections, kOnOff},
+        {Row::AmbientOcclusion, "GmodppAmbientOcclusion", TextId::AmbientOcclusion, kOnOff},
+        {Row::VolumetricLight, "GmodppVolumetricLight", TextId::VolumetricLight, kOnOff},
+        {Row::TranslucentLighting, "GmodppTranslucentLighting", TextId::TranslucentLighting, kOnOff},
+        {Row::RenderTargetLighting, "GmodppRenderTargetLighting", TextId::RenderTargetLighting, kOnOff},
+        {Row::Display, "GmodppDisplay", TextId::VideoDisplay, DisplayItems()},
+    };
+}
+
+int RowValue(const Settings& settings, Row row)
+{
+    switch (row) {
+    case Row::AntiAliasing: return static_cast<int>(settings.antiAliasing);
+    case Row::Upscaling: return static_cast<int>(settings.upscaling);
+    case Row::RealtimeLighting: return settings.realtimeLighting ? 1 : 0;
+    case Row::Quality: return static_cast<int>(settings.qualityPreset);
+    case Row::IndirectLighting: return static_cast<int>(settings.indirectLighting);
+    case Row::FoliageShadows: return static_cast<int>(settings.foliageShadows);
+    case Row::Reflections: return settings.reflections ? 1 : 0;
+    case Row::AmbientOcclusion: return settings.ambientOcclusion ? 1 : 0;
+    case Row::VolumetricLight: return settings.volumetricLight ? 1 : 0;
+    case Row::TranslucentLighting: return settings.translucentLighting ? 1 : 0;
+    case Row::RenderTargetLighting: return settings.renderTargetLighting ? 1 : 0;
+    case Row::Display: return settings.display;
+    default: return 0;
+    }
+}
+
+// Sets one setting from its combo box row. Detail settings a preset decides leave the preset for Custom.
+void SetRowValue(Settings& settings, Row row, int value)
+{
+    switch (row) {
+    case Row::AntiAliasing: settings.antiAliasing = static_cast<AntiAliasing>(value); break;
+    case Row::Upscaling: settings.upscaling = static_cast<UpscalingMode>(value); break;
+    case Row::RealtimeLighting: settings.realtimeLighting = value == 1; break;
+    case Row::Quality: ApplyPreset(settings, static_cast<QualityPreset>(value)); break;
+    case Row::IndirectLighting:
+        settings.indirectLighting = static_cast<IndirectLighting>(value);
+        settings.qualityPreset = QualityPreset::Custom;
+        break;
+    case Row::FoliageShadows:
+        settings.foliageShadows = static_cast<FoliageShadows>(value);
+        settings.qualityPreset = QualityPreset::Custom;
+        break;
+    case Row::Reflections: settings.reflections = value == 1; break;
+    case Row::AmbientOcclusion: settings.ambientOcclusion = value == 1; break;
+    case Row::VolumetricLight: settings.volumetricLight = value == 1; break;
+    case Row::TranslucentLighting: settings.translucentLighting = value == 1; break;
+    case Row::RenderTargetLighting: settings.renderTargetLighting = value == 1; break;
+    case Row::Display: settings.display = value; break;
+    default: break;
+    }
+}
+
 // MSAA is hidden and off: the game's lighting needs it off, and anti-aliasing comes from TAA or DLSS.
 void TurnOffMsaa(void* dialog)
 {
@@ -258,18 +390,22 @@ void TurnOffMsaa(void* dialog)
 void ShowSettings(const Added& added)
 {
     const Settings& settings = GetSettings();
-    const std::array<int, static_cast<size_t>(Row::Count)> rows = {settings.realtimeLighting ? 1 : 0, static_cast<int>(settings.qualityPreset),
-        static_cast<int>(settings.antiAliasing), static_cast<int>(settings.dlssMode), static_cast<int>(settings.indirectLighting)};
-    for (size_t i = 0; i < rows.size(); ++i) {
-        if (added.combos[i] != nullptr)
-            CallVirtual<void>(added.combos[i], kActivateItemByRow, rows[i]);
+    for (const RowSpec& spec : RowSpecs()) {
+        void* combo = added.combos[static_cast<size_t>(spec.row)];
+        if (combo != nullptr)
+            CallVirtual<void>(combo, kActivateItemByRow, std::clamp(RowValue(settings, spec.row), 0, static_cast<int>(spec.items.size()) - 1));
     }
+    // Real-time lighting ray traces the flashlight's shadows and skips the game's projected shadows, so the shadow
+    // detail setting does nothing while it is on.
+    if (added.shadowDetail != 0)
+        CallPanels<void>(kSetEnabled, added.shadowDetail, !settings.realtimeLighting);
 }
 
-// Lays the dialog out again around its changes: the anti-aliasing mode takes MSAA's place, the DLSS mode the field of
-// view's when that is hidden, the other settings a new row under HDR, the two DirectX level rows become one naming
-// the renderer, and the Direct3D 9Ex row goes. Positions are
-// taken from the dialog's own controls, so proportional scaling carries over.
+// Lays the dialog out again around its changes: the anti-aliasing mode takes MSAA's place and the upscaling mode the
+// filtering mode's next to it, which moves to the field of view's when that is hidden (a row of its own otherwise);
+// the display goes next to HDR, the ray tracing settings fill three rows under a divider below the game's, the two
+// DirectX level rows become one naming the renderer, and the Direct3D 9Ex row goes.
+// Positions are taken from the dialog's own controls, so proportional scaling carries over.
 bool Extend(void* dialog)
 {
     const VPanel root = VPanelOf(dialog);
@@ -280,12 +416,12 @@ bool Extend(void* dialog)
     const std::vector<VPanel> children = ChildrenOf(root);
     auto find = [&](std::string_view name) { return ChildNamed(children, name); };
     const auto modelDetail = find("ModelDetail"), modelLabel = find("Label3"), waterDetail = find("WaterDetail"), textureDetail = find("TextureDetail"),
-               shaderDetail = find("ShaderDetail"), msaa = find("AntialiasingMode"), msaaLabel = find("Label5"), filtering = find("FilteringMode"),
-               multicore = find("Multicore"), multicoreLabel = find("MulticoreLabel"), hdr = find("HDR"), divider = find("Divider1"),
-               d3d9ex = find("D3D9Ex"), d3d9exLabel = find("D3D9ExLabel"), dxLevel = find("dxlabel"), dxLevelLabel = find("Label1"),
-               dxInstalled = find("dxinstalledlabel"), dxInstalledLabel = find("Label2"), fov = find("FovSlider");
-    if (!modelDetail || !modelLabel || !waterDetail || !textureDetail || !shaderDetail || !msaa || !msaaLabel || !filtering || !multicore ||
-        !multicoreLabel || !hdr || !divider || !d3d9ex || !d3d9exLabel || !dxLevel || !dxLevelLabel || !dxInstalled || !dxInstalledLabel) {
+               shaderDetail = find("ShaderDetail"), shadowDetail = find("ShadowDetail"), msaa = find("AntialiasingMode"), msaaLabel = find("Label5"),
+               filtering = find("FilteringMode"), multicore = find("Multicore"), multicoreLabel = find("MulticoreLabel"), hdr = find("HDR"), divider = find("Divider1"), d3d9ex = find("D3D9Ex"), d3d9exLabel = find("D3D9ExLabel"),
+               dxLevel = find("dxlabel"), dxLevelLabel = find("Label1"), dxInstalled = find("dxinstalledlabel"), dxInstalledLabel = find("Label2"),
+               fov = find("FovSlider");
+    if (!modelDetail || !modelLabel || !waterDetail || !textureDetail || !shaderDetail || !shadowDetail || !msaa || !msaaLabel || !filtering || !multicore || !multicoreLabel || !hdr ||
+        !divider || !d3d9ex || !d3d9exLabel || !dxLevel || !dxLevelLabel || !dxInstalled || !dxInstalledLabel) {
         log::Info("Video menu: the Advanced video dialog's layout is not the expected one; left unchanged");
         return false;
     }
@@ -295,9 +431,10 @@ bool Extend(void* dialog)
     const int labelOffset = model.y - RectOf(*modelLabel).y;
     const int labelHeight = RectOf(*modelLabel).h;
     const std::array<int, 3> columns = {model.x, RectOf(*textureDetail).x, RectOf(*shaderDetail).x};
-    auto labelRect = [&](int column, int comboY) {
-        const int right = column + 1 < static_cast<int>(columns.size()) ? columns[column + 1] : dialogRect.w - model.x;
-        return Rect{columns[column], comboY - labelOffset, right - columns[column] - 4, labelHeight};
+    auto comboAt = [&](int column, int y) { return Rect{columns[static_cast<size_t>(column)], y, model.w, model.h}; };
+    auto labelAt = [&](int column, int comboY) {
+        const int right = column + 1 < static_cast<int>(columns.size()) ? columns[static_cast<size_t>(column) + 1] : dialogRect.w - model.x;
+        return Rect{columns[static_cast<size_t>(column)], comboY - labelOffset, right - columns[static_cast<size_t>(column)] - 4, labelHeight};
     };
     auto shift = [&](int fromY, int by) {
         for (VPanel child : children) {
@@ -317,10 +454,13 @@ bool Extend(void* dialog)
     const int d3d9exStep = d3d9exY - dxLevelY;
     const int dxLevelStep = dxLevelY - RectOf(*dxInstalled).y;
     const bool fovSlot = !fov || !CallPanels<bool>(kIsVisible, *fov);
-    const int newRows = fovSlot ? 1 : 2;
-    const int newRowY = RectOf(*hdr).y + step;
+    const int newRows = fovSlot ? 3 : 4;
+    // Half a row for the divider between the game's settings and ours.
+    const int grow = newRows * step + step / 2;
+    const Rect hdrRect = RectOf(*hdr);
+    const int firstRowY = hdrRect.y + step + step / 2;
     const int dividerY = RectOf(*divider).y;
-    CallPanels<void>(kSetSize, root, dialogRect.w, dialogRect.h + newRows * step - d3d9exStep - dxLevelStep);
+    CallPanels<void>(kSetSize, root, dialogRect.w, dialogRect.h + grow - d3d9exStep - dxLevelStep);
 
     // Direct3D 9Ex does nothing natively.
     CallPanels<void>(kSetVisible, *d3d9ex, false);
@@ -329,7 +469,10 @@ bool Extend(void* dialog)
     for (VPanel panel : {*dxLevel, *dxLevelLabel, *dxInstalled, *dxInstalledLabel})
         CallPanels<void>(kSetVisible, panel, false);
     shift(dxLevelY + 1, -dxLevelStep);
-    shift(dividerY, newRows * step);
+    shift(dividerY, grow);
+    Rect dividerRect = RectOf(*divider);
+    dividerRect.y = (hdrRect.y + hdrRect.h + firstRowY - labelOffset) / 2;
+    Place(*divider, dividerRect);
     void* renderer = NewLabel(dialog, "GmodppRenderer", ui::Text(ui::TextId::VideoRendererName));
     void* rendererLabel = NewLabel(dialog, "GmodppRendererLabel", ui::Text(ui::TextId::VideoRenderer));
     if (renderer != nullptr && rendererLabel != nullptr) {
@@ -338,33 +481,51 @@ bool Extend(void* dialog)
     }
 
     Added added;
-    const auto add = [&](Row row, const char* name, const char* labelName, ui::TextId label, Rect comboRect, Rect labelRectValue, std::initializer_list<const char*> items) {
-        void* combo = NewComboBox(dialog, name, items);
-        void* text = NewLabel(dialog, labelName, ui::Text(label));
-        if (combo == nullptr || text == nullptr)
-            return;
-        Place(VPanelOf(combo), comboRect);
-        Place(VPanelOf(text), labelRectValue);
-        added.combos[static_cast<size_t>(row)] = combo;
-    };
+    added.shadowDetail = *shadowDetail;
     const Rect msaaRect = RectOf(*msaa);
     CallPanels<void>(kSetVisible, *msaa, false);
     CallPanels<void>(kSetVisible, *msaaLabel, false);
-    add(Row::AntiAliasing, "GmodppAntiAliasing", "GmodppAntiAliasingLabel", ui::TextId::SectionAntiAliasing, msaaRect, RectOf(*msaaLabel),
-        {ui::Text(ui::TextId::AntiAliasingOff), ui::Text(ui::TextId::AntiAliasingTemporal), ui::Text(ui::TextId::VideoAntiAliasingDlss)});
-    auto comboAt = [&](int column, int y) { return Rect{columns[column], y, model.w, model.h}; };
-    const std::initializer_list<const char*> dlssItems = {ui::Text(ui::TextId::DlssDlaa), ui::Text(ui::TextId::DlssQuality), ui::Text(ui::TextId::DlssBalanced),
-        ui::Text(ui::TextId::DlssPerformance), ui::Text(ui::TextId::DlssUltraPerformance)};
-    const int dlssY = fovSlot ? RectOf(*multicore).y : newRowY + step;
-    const int dlssColumn = fovSlot ? 1 : 0;
-    add(Row::DlssMode, "GmodppDlssMode", "GmodppDlssModeLabel", ui::TextId::DlssMode, comboAt(dlssColumn, dlssY), labelRect(dlssColumn, dlssY), dlssItems);
-    add(Row::RealtimeLighting, "GmodppRealtimeLighting", "GmodppRealtimeLightingLabel", ui::TextId::RealtimeLighting, comboAt(0, newRowY), labelRect(0, newRowY),
-        {"#gameui_disabled", "#gameui_enabled"});
-    add(Row::Quality, "GmodppQuality", "GmodppQualityLabel", ui::TextId::VideoRayTracingQuality, comboAt(1, newRowY), labelRect(1, newRowY),
-        {ui::Text(ui::TextId::PresetLow), ui::Text(ui::TextId::PresetMedium), ui::Text(ui::TextId::PresetHigh), ui::Text(ui::TextId::PresetUltra),
-            ui::Text(ui::TextId::PresetCustom)});
-    add(Row::IndirectLighting, "GmodppIndirectLighting", "GmodppIndirectLightingLabel", ui::TextId::IndirectSource, comboAt(2, newRowY), labelRect(2, newRowY),
-        {ui::Text(ui::TextId::IndirectRayTraced), ui::Text(ui::TextId::IndirectBaked)});
+    const Rect filteringRect = RectOf(*filtering);
+    // The filtering mode's label: the nearest child above it in its column.
+    std::optional<Rect> filteringLabel;
+    for (VPanel child : children) {
+        const Rect rect = RectOf(child);
+        if (rect.x == filteringRect.x && rect.y < filteringRect.y && (!filteringLabel || rect.y > filteringLabel->y))
+            filteringLabel = rect;
+    }
+    if (!filteringLabel)
+        return false;
+    const int filteringY = fovSlot ? RectOf(*multicore).y : firstRowY + 3 * step;
+    const int filteringColumn = fovSlot ? 1 : 0;
+    Place(*filtering, comboAt(filteringColumn, filteringY));
+    for (VPanel child : children) {
+        const Rect rect = RectOf(child);
+        if (rect.x == filteringLabel->x && rect.y == filteringLabel->y) {
+            Rect moved = labelAt(filteringColumn, filteringY);
+            if (fovSlot)
+                moved.y = RectOf(*multicoreLabel).y;
+            Place(child, moved);
+        }
+    }
+    for (const RowSpec& spec : RowSpecs()) {
+        Rect comboRect, labelRect;
+        if (spec.row == Row::AntiAliasing) {
+            comboRect = msaaRect;
+            labelRect = RectOf(*msaaLabel);
+        } else if (spec.row == Row::Upscaling) {
+            comboRect = filteringRect;
+            labelRect = *filteringLabel;
+        } else if (spec.row == Row::Display) {
+            comboRect = comboAt(1, hdrRect.y);
+            labelRect = labelAt(1, hdrRect.y);
+        } else {
+            const int index = static_cast<int>(spec.row) - static_cast<int>(Row::RealtimeLighting);
+            const int y = firstRowY + (index / 3) * step;
+            comboRect = comboAt(index % 3, y);
+            labelRect = labelAt(index % 3, y);
+        }
+        added.combos[static_cast<size_t>(spec.row)] = AddCombo(dialog, spec.name, spec.label, comboRect, labelRect, spec.items);
+    }
     g_dialogs[dialog] = added;
     ShowSettings(added);
     TurnOffMsaa(dialog);
@@ -388,34 +549,31 @@ void __fastcall HookResetData(void* dialog)
     }
 }
 
-// The game applies its own settings only when one of them changed; ours are compared with the current ones.
+// The game applies its own settings only when one of them changed; ours are compared with the current ones. A changed
+// preset decides the detail rows, which are shown again afterwards.
 void __fastcall HookApplyChanges(void* dialog)
 {
     g_applyChanges(dialog);
     const auto found = g_dialogs.find(dialog);
     if (found == g_dialogs.end())
         return;
-    auto row = [&](Row which) {
-        void* combo = found->second.combos[static_cast<size_t>(which)];
-        return combo != nullptr ? g_gameUi.getActiveItem(combo) : -1;
-    };
     Settings& settings = GetSettings();
     const Settings before = settings;
-    if (const int value = row(Row::RealtimeLighting); value >= 0)
-        settings.realtimeLighting = value == 1;
-    if (const int value = row(Row::Quality); value >= 0 && value < static_cast<int>(QualityPreset::Count) &&
-        static_cast<QualityPreset>(value) != settings.qualityPreset) {
-        settings.qualityPreset = static_cast<QualityPreset>(value);
-        ApplyPreset(settings, settings.qualityPreset);
+    bool presetChanged = false;
+    for (const RowSpec& spec : RowSpecs()) {
+        void* combo = found->second.combos[static_cast<size_t>(spec.row)];
+        const int value = combo != nullptr ? g_gameUi.getActiveItem(combo) : -1;
+        if (value < 0 || value >= static_cast<int>(spec.items.size()) || value == RowValue(settings, spec.row))
+            continue;
+        if (spec.row == Row::Quality)
+            presetChanged = true;
+        else if ((spec.row == Row::IndirectLighting || spec.row == Row::FoliageShadows) && presetChanged)
+            continue;
+        SetRowValue(settings, spec.row, value);
     }
-    if (const int value = row(Row::AntiAliasing); value >= 0 && value < static_cast<int>(AntiAliasing::Count))
-        settings.antiAliasing = static_cast<AntiAliasing>(value);
-    if (const int value = row(Row::DlssMode); value >= 0 && value < static_cast<int>(DlssMode::Count))
-        settings.dlssMode = static_cast<DlssMode>(value);
-    if (const int value = row(Row::IndirectLighting); value >= 0 && value < static_cast<int>(IndirectLighting::Count))
-        settings.indirectLighting = static_cast<IndirectLighting>(value);
     if (!(settings == before))
         MarkSettingsChanged();
+    ShowSettings(found->second);
 }
 
 bool Hook(void* target, void* hook, void** original, const char* name)
@@ -472,6 +630,7 @@ void TryInstall()
     const auto offset = [&](const void* address) { return reinterpret_cast<uintptr_t>(address) - reinterpret_cast<uintptr_t>(gameUi); };
     log::Info("Video menu: hooked the Advanced video dialog (GameUI.dll+{:#x}, ComboBox {:#x}, Label {:#x})", offset(dialog), offset(comboBox),
         offset(label));
+
 }
 
 }

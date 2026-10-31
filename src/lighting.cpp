@@ -1045,10 +1045,10 @@ bool Lighting::RayReconstructionSize(UINT outputWidth, UINT outputHeight, UINT& 
     const Settings& settings = GetSettings();
     if (settings.antiAliasing != AntiAliasing::RayReconstruction || settings.debugView != DebugView::Final || !m_rayReconstruction.Usable())
         return false;
-    if (m_rrSizeMode != settings.dlssMode || m_rrSize[0] != outputWidth || m_rrSize[1] != outputHeight) {
-        if (!m_rayReconstruction.RenderSize(settings.dlssMode, outputWidth, outputHeight, m_rrSize[2], m_rrSize[3]))
+    if (m_rrSizeMode != settings.upscaling || m_rrSize[0] != outputWidth || m_rrSize[1] != outputHeight) {
+        if (!m_rayReconstruction.RenderSize(settings.upscaling, outputWidth, outputHeight, m_rrSize[2], m_rrSize[3]))
             return false;
-        m_rrSizeMode = settings.dlssMode;
+        m_rrSizeMode = settings.upscaling;
         m_rrSize[0] = outputWidth;
         m_rrSize[1] = outputHeight;
     }
@@ -1132,7 +1132,7 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
         statistics.renderWidth = renderWidth;
         statistics.renderHeight = renderHeight;
     }
-    if (rayReconstruction && m_rayReconstruction.NeedsNewFeature(GetSettings().dlssMode, renderWidth, renderHeight, m_width, m_height)) {
+    if (rayReconstruction && m_rayReconstruction.NeedsNewFeature(GetSettings().upscaling, renderWidth, renderHeight, m_width, m_height)) {
         WaitForGpu();
         m_rayReconstruction.ReleaseFeature();
         m_historyValid = false;
@@ -1165,7 +1165,8 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     constants.aoIntensity = GetSettings().aoIntensity;
     constants.volumetricView = kInvalidView;
     // Haze thin enough that light crosses about 6,000 units at the default intensity.
-    constexpr float kVolumetricDensity = 1.0f / 6000.0f;
+    // 1/6000 per unit washed every distant surface out in the sun (gm_construct, 2026-10-31).
+    constexpr float kVolumetricDensity = 1.0f / 20000.0f;
     constants.volumetricDensity = kVolumetricDensity * GetSettings().volumetricIntensity;
     const bool volumetrics = main && GetSettings().volumetricLight && GetSettings().volumetricIntensity > 0.0f;
     // indirect_lighting = 1: VRAD's bounce light replaces traced indirect light once the map's residual is baked.
@@ -1637,7 +1638,7 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
             m_surface[current].resource.Get(), m_rrInputs[RrAlbedo].resource.Get(), m_rrSpecularAlbedo.resource.Get(), m_rrRoughness.resource.Get(),
             m_rrHitDistance.resource.Get(), m_rrOutput.resource.Get(), m_worldToView, m_viewToClip, renderWidth, renderHeight, inputs.jitterX,
             inputs.jitterY, !m_historyValid};
-        rayReconstructed = m_rayReconstruction.Evaluate(m_list.Get(), GetSettings().dlssMode, m_width, m_height, rr);
+        rayReconstructed = m_rayReconstruction.Evaluate(m_list.Get(), GetSettings().upscaling, m_width, m_height, rr);
         // NGX leaves its own descriptor heap and root signature bound.
         bindCompute(slotConstantsGpu);
         m_gridWidth = m_width;

@@ -14,7 +14,8 @@
 static const float kMaxDistance = 4096.0;
 // Sky pixels scatter over less: the sky texture already shows the haze outside.
 static const float kSkyDistance = 1024.0;
-static const float kPhaseG = 0.4;
+// Forward scattering: the haze shows mostly as beams seen against the light, not as a wash over everything.
+static const float kPhaseG = 0.6;
 static const float kMaxSamples = 32.0;
 
 float Phase(float cosine)

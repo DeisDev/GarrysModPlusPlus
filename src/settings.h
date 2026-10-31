@@ -24,8 +24,9 @@ enum class DebugView : uint32_t {
 
 enum class AntiAliasing : uint32_t { Off = 0, Temporal = 1, RayReconstruction = 2, Count };
 
-// DLSS quality modes, from native resolution (DLAA) to the lowest render resolution.
-enum class DlssMode : uint32_t { Dlaa = 0, Quality, Balanced, Performance, UltraPerformance, Count };
+// Upscaling modes of the anti-aliasing upscaler (DLSS today), from native resolution (DLAA) to the lowest render
+// resolution.
+enum class UpscalingMode : uint32_t { Native = 0, Quality, Balanced, Performance, UltraPerformance, Count };
 
 // Ray tracing quality presets; Custom keeps the detail settings as they are.
 enum class QualityPreset : uint32_t { Low = 0, Medium, High, Ultra, Custom, Count };
@@ -67,7 +68,7 @@ struct Settings {
     // Scales the haze's density.
     float volumetricIntensity = 1.0f;
     AntiAliasing antiAliasing = AntiAliasing::Temporal;
-    DlssMode dlssMode = DlssMode::Quality;
+    UpscalingMode upscaling = UpscalingMode::Quality;
     // Share of the reprojected history kept each frame; higher is smoother but slower to react.
     float taaHistoryWeight = 0.9f;
     float sharpening = 0.3f;
@@ -89,6 +90,9 @@ struct Settings {
     // Indirect light and ambient occlusion rays take alpha-tested surfaces from their opacity micromaps alone.
     bool fastAlphaTests = false;
     bool opacityMicromaps = true;
+    // The display the game window goes on, 1-based in the order Displays() lists them; 0 leaves it where the game
+    // puts it (the primary display).
+    int display = 0;
 
     bool operator==(const Settings&) const = default;
 };
