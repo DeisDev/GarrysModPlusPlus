@@ -99,6 +99,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- In the native renderer, swaying grass and plants whose material sets no sway falloff (concrete_cool_house's grass) are no longer missing from the view and from shadows.
 - With DLSS Ray Reconstruction, map lights and the flashlight are no longer blotchy and noisy.
 - Map lights no longer show square blotches with "Importance sampled" or "Reused samples" light sampling.
 - Glass and other see-through surfaces no longer sparkle with noise.

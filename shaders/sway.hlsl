@@ -47,6 +47,26 @@ struct SwayMaterial
 };
 
 static const uint kNoSway = 0xFFFFFFFFu;
+static const float kFloatMax = 3.402823466e+38;
+
+// Direct3D 9's rcp, pow and nrm, as the game's shader runs them: 1/0 is FLT_MAX, pow(0, 0) is 1 and a zero vector
+// normalizes to 0, where HLSL's give NaN for 0/0 and may for pow(0, 0) (see D3DSIO_POW in src/shader_translator.cpp).
+float D3D9Rcp(float x)
+{
+    return x == 0.0 ? kFloatMax : 1.0 / x;
+}
+
+float D3D9Pow(float x, float y)
+{
+    x = abs(x);
+    return exp2(y * (x == 0.0 ? -kFloatMax : log2(x)));
+}
+
+float3 D3D9Normalize(float3 v)
+{
+    float lengthSquared = dot(v, v);
+    return lengthSquared != 0.0 ? v * rsqrt(lengthSquared) : 0.0;
+}
 
 float3 TreeSway(float3 position, SwayMaterial m, float3x3 rotation, float3 root, float time, float2 wind)
 {
@@ -57,19 +77,19 @@ float3 TreeSway(float3 position, SwayMaterial m, float3x3 rotation, float3 root,
     // The wind in model space: the shader multiplies it by the transposed model rotation.
     float3 windOS = mul(float3(wind, 0.0), rotation);
 
-    float swayScaleHeight = saturate((position.z - m.height * m.startHeight) / ((1.0 - m.startHeight) * m.height));
-    float swayScaleRadius = saturate(length(position.xy - m.radius * m.startRadius) / ((1.0 - m.startRadius) * m.radius));
+    float swayScaleHeight = saturate((position.z - m.height * m.startHeight) * D3D9Rcp((1.0 - m.startHeight) * m.height));
+    float swayScaleRadius = saturate(length(position.xy - m.radius * m.startRadius) * D3D9Rcp((1.0 - m.startRadius) * m.radius));
     float heightThreshold = m.mode == 2 ? step(position.z - m.height * m.startHeight, 0.0) : step(0.0, position.z - m.height * m.startHeight);
     float orthoBranchScale = abs(dot(windOS, float3(position.xy, 0.0)));
     orthoBranchScale = 1.0 - saturate(orthoBranchScale / (max(length(windOS), 0.0001) * max(length(position.xy), 0.0001)));
 
-    float swayScaleTrunk = m.intensity * pow(swayScaleHeight, m.falloff);
+    float swayScaleTrunk = m.intensity * D3D9Pow(swayScaleHeight, m.falloff);
     float swayScaleBranches = m.mode == 2 ? 0.0 : m.intensity * orthoBranchScale * swayScaleRadius * heightThreshold;
     float windTimeOffset = dot(root, float3(1.0, 1.0, 1.0)) * kWindOffsetScale;
     float slowSwayTime = (time + windTimeOffset) * m.speed;
 
-    float3 scrumblePosition = normalize(position) * m.scrumbleWaveCount;
-    float scrumbleScale = pow(swayScaleRadius, m.scrumbleFalloff) * m.scrumbleIntensity * heightThreshold;
+    float3 scrumblePosition = D3D9Normalize(position) * m.scrumbleWaveCount;
+    float scrumbleScale = D3D9Pow(swayScaleRadius, m.scrumbleFalloff) * m.scrumbleIntensity * heightThreshold;
     float speedLerp = smoothstep(m.lerpStart, m.lerpEnd, windIntensity);
     float4 sines = sin(float4(1.0, 2.31, m.fastSpeedScale, 2.14 * m.fastSpeedScale) * slowSwayTime);
     sines.xy = lerp(sines.xy, sines.zw, speedLerp);

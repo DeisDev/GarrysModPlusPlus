@@ -111,6 +111,7 @@ const char* kHelpers = R"(static const float gmodpp_max = 3.402823466e+38;
 float gmodpp_rcp(float x) { return x == 0 ? gmodpp_max : (x == 1 ? 1 : 1 / x); }
 float gmodpp_rsq(float x) { x = abs(x); return x == 0 ? gmodpp_max : (x == 1 ? 1 : rsqrt(x)); }
 float gmodpp_log(float x) { x = abs(x); return x == 0 ? -gmodpp_max : log2(x); }
+float gmodpp_pow(float x, float y) { return exp2(y * gmodpp_log(x)); }
 float4 gmodpp_nrm(float4 v) { float f = dot(v.xyz, v.xyz); return v * (f != 0 ? rsqrt(f) : gmodpp_max); }
 float4 gmodpp_lit(float4 s)
 {
@@ -616,7 +617,9 @@ bool Translator::Instruction(DWORD token, const DWORD* p, const DWORD* end)
     case D3DSIO_M3x4: return matrix(4, ".xyz");
     case D3DSIO_M3x3: return matrix(3, ".xyz");
     case D3DSIO_M3x2: return matrix(2, ".xyz");
-    case D3DSIO_POW: return binary("pow(abs(({}).x), ({}).x)");
+    // Direct3D 9's pow is exp(src1 * log(src0)) with log(0) = -FLT_MAX (pow - vs, log - vs), so pow(0, 0) is 1;
+    // HLSL leaves it to the GPU, and NaN dropped the bases of swaying grass ($treeswayfalloffexp 0).
+    case D3DSIO_POW: return binary("gmodpp_pow(({}).x, ({}).x)");
     case D3DSIO_CRS: return binary("float4(cross(({}).xyz, ({}).xyz), 0)");
     case D3DSIO_SGN:
         return withDestination(-1, [&](const Operand&, const std::vector<Operand>& s) -> std::optional<std::string> {

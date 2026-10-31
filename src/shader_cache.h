@@ -10,7 +10,7 @@
 namespace gmodpp::shader_cache {
 
 // Bumped whenever the translator's output changes, so the disk cache misses old translations.
-inline constexpr std::uint32_t kTranslatorVersion = 4;
+inline constexpr std::uint32_t kTranslatorVersion = 5;
 
 // gmodplusplus\cache\shaders.
 std::filesystem::path Directory();
