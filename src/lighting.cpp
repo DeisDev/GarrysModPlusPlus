@@ -64,6 +64,7 @@
 #include <g_sharcResolveCS.h>
 #include <g_sharcUpdateCS.h>
 #include <g_sharcUpdateOmmCS.h>
+#include <g_skinCS.h>
 #include <g_skyCS.h>
 #include <g_surfaceCS.h>
 #include <g_swayCS.h>
@@ -542,7 +543,7 @@ bool Lighting::Initialize(ID3D12Device5* device, ID3D12CommandQueue* queue, Desc
         cache ? std::span<const BYTE>(g_reflectionsCacheCS) : g_reflectionsCS, g_reflectionTemporalCS, g_dlssInputsCS, g_dlssResolveCS, g_directWideCS,
         g_swayCS, g_translucentDepthCS, g_viewRectCS, g_bakedBounceCS, g_skyCS, cache ? std::span<const BYTE>(g_sharcUpdateCS) : none,
         cache ? std::span<const BYTE>(g_sharcResolveCS) : none, g_directSunCS, g_restirPdfCS, g_restirPresampleCS, g_restirRegirCS, g_restirInitialCS,
-        g_restirTemporalCS, g_restirSpatialCS, g_restirShadeCS, g_nrdInputsCS, g_nrdResolveCS, g_sunShadowCS, g_causticsCS};
+        g_restirTemporalCS, g_restirSpatialCS, g_restirShadeCS, g_nrdInputsCS, g_nrdResolveCS, g_sunShadowCS, g_causticsCS, g_skinCS};
     static_assert(std::size(shaders) == static_cast<size_t>(Pass::Count));
     for (size_t i = 0; i < m_pipelines.size() && SUCCEEDED(hr); ++i) {
         if (shaders[i].empty())
@@ -1325,6 +1326,16 @@ void Lighting::UpdateSway(const Scene& scene, UINT slot, const gbuffer::SwayCloc
     std::copy_n(clock.wind, 2, m_swayWind);
 }
 
+void Lighting::UpdateSkinned(const Scene& scene, const std::vector<SkinnedEntity>& skinned, UINT slot, D3D12_GPU_VIRTUAL_ADDRESS frameConstants)
+{
+    if (const std::optional<SkinnedCasters::Jobs> jobs = m_skinned.BeginUpdate(m_list.Get(), scene, skinned)) {
+        // The pass traces nothing, so the scene's root slot holds any valid address.
+        BindCompute(frameConstants, frameConstants, slot);
+        DispatchGroups(Pass::Skin, {.input0 = jobs->jobsView}, jobs->groupsX, jobs->count, 1);
+    }
+    m_skinned.FinishUpdate(m_list.Get(), scene, m_frameInstances);
+}
+
 void Lighting::PublishVolume(UINT slot)
 {
     const UINT* grid = gbuffer::kProbeGrid;
@@ -2014,7 +2025,7 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     }
 
     m_frameInstances.assign(dynamic.begin(), dynamic.end());
-    m_skinned.Record(m_list.Get(), scene, skinned, m_frameInstances);
+    UpdateSkinned(scene, skinned, slot, slotConstantsGpu);
     if (main)
         UpdateSway(scene, slot, inputs.sway, constants.eyePosition, slotConstantsGpu);
     m_sway.Append(m_frameInstances);

@@ -353,6 +353,7 @@ private:
         NrdResolve,
         SunShadow,
         Caustics,
+        Skin,
         Count
     };
     // Mirrors PassConstants in shaders/common.hlsli: descriptor indices (none by default) and a parameter.
@@ -420,6 +421,8 @@ private:
     void DispatchGroups(Pass pass, const PassArgs& args, UINT x, UINT y, UINT z);
     // Moves the swaying props near the eye to this frame's sway (SwayingProps).
     void UpdateSway(const Scene& scene, UINT slot, const gbuffer::SwayClock& clock, const float (&eye)[3], D3D12_GPU_VIRTUAL_ADDRESS frameConstants);
+    // Skins `skinned` (shaders/skin.hlsl), refits their BLASes and adds their instances to m_frameInstances.
+    void UpdateSkinned(const Scene& scene, const std::vector<SkinnedEntity>& skinned, UINT slot, D3D12_GPU_VIRTUAL_ADDRESS frameConstants);
     // Hands the slot's copy of the irradiance volume to light_queries.
     void PublishVolume(UINT slot);
     void Use(Texture& texture, D3D12_RESOURCE_STATES state);

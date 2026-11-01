@@ -52,6 +52,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Characters, NPCs and ragdolls are posed for ray tracing on the GPU instead of the CPU each frame, and their shapes stay in video memory, so maps with many players and NPCs render faster.
 - Props and models that appear for the first time during play no longer pause the game while their ray tracing data is uploaded: the upload no longer waits for the frames in flight to finish.
 - Volumetric light traces one shadow ray per step to the flashlights and projected lights, picked by how much light each adds there, instead of one to each of them: rooms with several projected lights render faster, with the same light on average. With one light, as with a lone flashlight, nothing changes.
 - Faster frames: the view of the weapon in your hands traces the main view's ray tracing scene instead of building its own every frame; with DLSS Ray Reconstruction, the sun's shadow rays stop at the first thing that blocks them, since only their light is used; every ray query skips the procedural primitives the scene never has; draws no longer look up the bound render targets again for each texture they sample; and constants set again to the values they already hold are no longer uploaded again.
