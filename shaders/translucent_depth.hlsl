@@ -47,7 +47,7 @@ float DepthAround(float2 centre)
 // The nearest surface the G-buffer can hold along a ray: translucent ones are drawn after it.
 bool TraceGBufferSurface(float3 origin, float3 direction, out float t)
 {
-    RayQuery<RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> query;
+    SCENE_RAY_QUERY(RAY_FLAG_NONE) query;
     RayDesc ray;
     ray.Origin = origin;
     ray.Direction = direction;

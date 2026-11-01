@@ -110,6 +110,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- With opacity micromaps on, the passes for lit surfaces, water caustics, glass depth and baked bounce light traced the micromaps without the opt-in that DirectX requires, which leaves the result undefined. They now use them like the other ray-traced passes, which also makes them faster in grass and foliage.
 - Fixed the weapon in your hands getting no shadows, occlusion or reflections from characters, NPCs and other players: its view traced a scene without them.
 - Fixed a missing GPU synchronisation in water caustics, where clearing and tracing the sun map could overlap on some GPUs.
 - Glass and other translucent surfaces no longer freeze the game for many seconds the first time they appear: their shaders compile about 9 times faster.

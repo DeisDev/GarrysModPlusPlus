@@ -10,6 +10,11 @@
 #include <g_bakedBounceCS.h>
 #include <g_causticsCS.h>
 #include <g_aoOmmCS.h>
+#include <g_bakedBounceOmmCS.h>
+#include <g_causticsOmmCS.h>
+#include <g_deferredLightingCacheOmmCS.h>
+#include <g_deferredLightingOmmCS.h>
+#include <g_translucentDepthOmmCS.h>
 #include <g_compositeCoveredPS.h>
 #include <g_compositeDepthPS.h>
 #include <g_compositePS.h>
@@ -553,7 +558,9 @@ bool Lighting::Initialize(ID3D12Device5* device, ID3D12CommandQueue* queue, Desc
         {Pass::Direct, g_directOmmCS}, {Pass::GiTrace, cache ? std::span<const BYTE>(g_giTraceCacheOmmCS) : g_giTraceOmmCS},
         {Pass::Reflections, cache ? std::span<const BYTE>(g_reflectionsCacheOmmCS) : g_reflectionsOmmCS}, {Pass::DirectWide, g_directWideOmmCS},
         {Pass::SharcUpdate, cache ? std::span<const BYTE>(g_sharcUpdateOmmCS) : none}, {Pass::DirectSun, g_directSunOmmCS},
-        {Pass::RestirInitial, g_restirInitialOmmCS}, {Pass::RestirShade, g_restirShadeOmmCS}, {Pass::SunShadow, g_sunShadowOmmCS}};
+        {Pass::RestirInitial, g_restirInitialOmmCS}, {Pass::RestirShade, g_restirShadeOmmCS}, {Pass::SunShadow, g_sunShadowOmmCS},
+        {Pass::Lighting, cache ? std::span<const BYTE>(g_deferredLightingCacheOmmCS) : g_deferredLightingOmmCS},
+        {Pass::TranslucentDepth, g_translucentDepthOmmCS}, {Pass::Baked, g_bakedBounceOmmCS}, {Pass::Caustics, g_causticsOmmCS}};
     for (size_t i = 0; i < std::size(micromapShaders) && SUCCEEDED(hr) && micromaps; ++i) {
         if (micromapShaders[i].second.empty())
             continue;
