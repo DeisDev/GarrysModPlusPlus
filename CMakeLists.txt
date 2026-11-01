@@ -399,8 +399,7 @@ add_library(gmodpp SHARED
     src/shader_bytecode.cpp
     src/shader_compiler.cpp
     src/shader_cache.cpp
-    src/shader_prewarm.cpp
-    src/prewarm_window.cpp
+    src/shader_precache.cpp
     src/shader_translator.cpp
     src/ui_text.cpp
     src/vcs.cpp
@@ -452,7 +451,7 @@ target_include_directories(gmodpp BEFORE PRIVATE "${AGILITY_SDK_DIR}/build/nativ
 target_include_directories(gmodpp PRIVATE "${DXC_DIR}/inc" "${SHADER_OUTPUT_DIR}" "${DLSS_SDK_DIR}/include" "${RTXDI_DIR}/Include")
 # ReSTIRDI.cpp leaves a parameter unused in release builds (its check is an assert).
 set_source_files_properties("${RTXDI_DIR}/Source/ReSTIRDI.cpp" PROPERTIES COMPILE_OPTIONS /wd4100)
-target_link_libraries(gmodpp PRIVATE d3d12 dxgi dxguid lzma_dec dbghelp comctl32 minhook imgui NRD "${DLSS_SDK_DIR}/lib/Windows_x86_64/x64/nvsdk_ngx_s.lib")
+target_link_libraries(gmodpp PRIVATE d3d12 dxgi dxguid lzma_dec dbghelp minhook imgui NRD "${DLSS_SDK_DIR}/lib/Windows_x86_64/x64/nvsdk_ngx_s.lib")
 
 # The mod laid out as the game folder: the loader in the root and everything else in gmodplusplus, with the licences
 # every bundled component requires. deploy copies it into the game and release zips it.

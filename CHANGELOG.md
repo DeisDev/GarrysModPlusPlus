@@ -52,6 +52,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Shaders are compiled for the materials a map uses, in the background while the map loads, instead of for every shader the game ships before the game starts. The loading screen shows "Compiling shaders..." while it waits for them; shaders compiled once are kept for later launches.
+- Compiled shaders are kept in one file, `gmodplusplus\cache\shaders.bin`, instead of one file per shader, so reading them is faster. The old `gmodplusplus\cache\shaders` folder is deleted in the background.
 - The Low preset picks how map lights are sampled automatically, like the other presets.
 - The settings menu has a new look: the game's own fonts, a page list on the left, switches and grouped sections.
 - Sun shadows are soft, sharp near the object and blurring with distance, as the real sun's size makes them.
@@ -93,7 +95,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Ambient occlusion is steadier while the camera moves.
 - In the native renderer, bump-mapped models and skin materials with `$halflambert` (most characters) take light with the game's half-Lambert shading.
 - In the native renderer, characters with `$rimlight` (many Half-Life 2 models and the first-person hands) get their rim highlights from real-time light.
-- In the native renderer, glass and other translucent surfaces no longer hitch the first time they appear: their shaders are prepared with the rest after a game update.
+- In the native renderer, glass and other translucent surfaces no longer hitch the first time they appear: their shaders are compiled while the map loads.
 
 - In the native renderer, "Wait for vertical sync" works in a window and borderless too, not only in full screen.
 - Volumetric haze is much thinner and scatters more towards the light, so maps without fog no longer look hazy; it shows mainly as sun shafts and light beams.
@@ -101,13 +103,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Removed
 
+- The "Preparing shaders" window at the first launch and after game updates. It compiled every shader combination the game ships, most of which no map uses.
 - The Direct3D 9 build (`bin/win64/d3d9.dll` with D3D9On12). `-insecure` now starts the native Direct3D 12 renderer through the `winmm.dll` loader; deploying removes the old `d3d9.dll`.
 - The "Game" flashlight option. It made props see-through and left them unlit by the flashlight.
 
 ### Fixed
 
 - Glass and other translucent surfaces no longer freeze the game for many seconds the first time they appear: their shaders compile about 9 times faster.
-- The shader prewarm runs again after a mod update changes the lighting shaders, so glass and translucent surfaces don't compile while you play.
+- After a mod update changes the lighting shaders, the shaders of glass and translucent surfaces are compiled again while the next map loads, not while you play.
 - Under water, the native renderer no longer runs at half the frame rate: Source's view of the air above the water was lit as a second scene.
 - Surfaces lit by the flashlight no longer look almost unlit in reflections.
 - Lamp and flashlight light in haze and fog now glows most when you look towards the light, not away from it.

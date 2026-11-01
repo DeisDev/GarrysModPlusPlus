@@ -9,6 +9,9 @@ namespace gmodpp::native {
 // CShaderManager at 0x180034cc0), or null when the file is missing or unreadable.
 const ShaderFile* FindShaderFile(const char* name, bool vertex);
 
+// Starts compiling, on worker threads, the shaders a new state snapshot's passes will draw with (shader_precache.h).
+void PrecacheShaders(const ShadowState& state);
+
 // The bound render and depth targets, moved into their writable states.
 struct Targets {
     D3D12_CPU_DESCRIPTOR_HANDLE colors[4] = {};

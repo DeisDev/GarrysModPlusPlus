@@ -323,9 +323,22 @@ bool Compile(LoadedFamily& entry, const Values& values, bool forward, std::vecto
     } else {
         code.resize(blob->GetBufferSize() / sizeof(DWORD));
         std::memcpy(code.data(), blob->GetBufferPointer(), code.size() * sizeof(DWORD));
-        std::error_code directoryError;
-        std::filesystem::create_directories(CacheDirectory(), directoryError);
-        std::ofstream(cached, std::ios::binary).write(reinterpret_cast<const char*>(code.data()), static_cast<std::streamsize>(code.size() * sizeof(DWORD)));
+        // Written beside the cache entry and renamed into place, so a thread reading the entry never sees it half written.
+        std::error_code fileError;
+        std::filesystem::create_directories(CacheDirectory(), fileError);
+        std::filesystem::path temporary = cached;
+        temporary += std::format(L".{}.tmp", GetCurrentThreadId());
+        bool written = false;
+        {
+            std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
+            file.write(reinterpret_cast<const char*>(code.data()), static_cast<std::streamsize>(code.size() * sizeof(DWORD)));
+            file.close();
+            written = static_cast<bool>(file);
+        }
+        if (written)
+            std::filesystem::rename(temporary, cached, fileError);
+        if (!written || fileError)
+            std::filesystem::remove(temporary, fileError);
     }
     if (blob != nullptr)
         blob->Release();
@@ -336,7 +349,8 @@ bool Compile(LoadedFamily& entry, const Values& values, bool forward, std::vecto
 
 std::span<const DWORD> Twin(std::string_view file, const vcs::Header& header, int staticIndex, int dynamicIndex, bool forward)
 {
-    // The prewarm compiles twins on worker threads while nothing draws; the render thread uses them alone later.
+    // Shader precaching (shader_precache.h) compiles twins on worker threads while the render thread draws with them;
+    // the maps are guarded by one mutex, and a compiled twin's code never moves once in `compiled`.
     std::mutex& mutex = FamilyMutex();
     static std::map<std::tuple<const LoadedFamily*, int, int, bool>, std::vector<DWORD>> compiled;
     LoadedFamily* entry = nullptr;

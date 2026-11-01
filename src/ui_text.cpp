@@ -126,13 +126,6 @@ constexpr std::array<const char*, static_cast<size_t>(TextId::Count)> kEnglish =
     "Opacity micromaps: {} triangles, {} maps",
     "Ambient occlusion",
     "3D skybox and viewmodel",
-    "Preparing shaders. This happens once and takes a few minutes. If you skip, the game starts now but may stutter until a later launch finishes this.",
-    // Shaders prepared so far, of all.
-    "{0:L} of {1:L}",
-    // Shaders prepared so far, of all, and the estimated minutes and seconds left.
-    "{0:L} of {1:L}, about {2}:{3:02} left",
-    "Starting...",
-    "Skip",
     // DLSS Ray Reconstruction, short enough for one of three buttons in a row.
     "DLSS",
     "Display",
@@ -168,6 +161,7 @@ constexpr std::array<const char*, static_cast<size_t>(TextId::Count)> kEnglish =
     // Status lines of the game's loading screen.
     "Preparing ray-traced lighting...",
     "Baking indirect light...",
+    "Compiling shaders...",
 };
 
 }

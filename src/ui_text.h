@@ -2,7 +2,7 @@
 
 namespace gmodpp::ui {
 
-// Every string the in-game menu and the shader preparation window show. Text() returns the current language's version; only English exists.
+// Every string the in-game menu and the loading screen show. Text() returns the current language's version; only English exists.
 enum class TextId {
     WindowTitle,
     MenuHint,
@@ -119,11 +119,6 @@ enum class TextId {
     StatMicromaps,
     PassAmbientOcclusion,
     PassOtherViews,
-    PrewarmMessage,
-    PrewarmProgress,
-    PrewarmTimeLeft,
-    PrewarmStarting,
-    PrewarmSkip,
     AntiAliasingDlssShort,
     Display,
     DisplayDefault,
@@ -155,6 +150,7 @@ enum class TextId {
     ValueMilliseconds,
     LoadingScene,
     LoadingBake,
+    LoadingShaders,
     Count
 };
 

@@ -2,6 +2,7 @@
 
 #include "log.h"
 #include "module_scan.h"
+#include "shader_precache.h"
 #include "ui_text.h"
 #include "world.h"
 
@@ -9,8 +10,10 @@
 
 #include <windows.h>
 
+#include <chrono>
 #include <string>
 #include <string_view>
+#include <thread>
 
 namespace gmodpp::loading {
 
@@ -49,13 +52,34 @@ void ShowProgress(void* self, float done, world::LoadStage stage)
     g_updateCustomProgressBar(self, done, text.c_str());
 }
 
+// The map's materials queued their shaders as they took their state snapshots (shader_precache.h); they are compiled
+// before the loading screen closes, so the first frames don't wait for them.
+void WaitForShaders(void* self)
+{
+    shader_precache::Progress progress = shader_precache::Status();
+    if (progress.done >= progress.total)
+        return;
+    const std::size_t first = progress.done;
+    const std::size_t requests = progress.total - first;
+    const std::wstring text = Wide(ui::Text(ui::TextId::LoadingShaders));
+    const auto start = std::chrono::steady_clock::now();
+    while (progress.done < progress.total) {
+        g_updateCustomProgressBar(self, static_cast<float>(progress.done - first) / static_cast<float>(progress.total - first), text.c_str());
+        std::this_thread::sleep_for(std::chrono::milliseconds(15));
+        progress = shader_precache::Status();
+    }
+    log::Info("Loading screen: waited {:.0f} ms for the shaders of {} material passes",
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count(), requests);
+}
+
 void __fastcall HookUpdateProgressBar(void* self, int progress)
 {
     ++g_depth;
     g_updateProgressBar(self, progress);
-    if (progress == kProgressReadyToPlay)
+    if (progress == kProgressReadyToPlay) {
         world::PrepareLevel([self](float done, world::LoadStage stage) { ShowProgress(self, done, stage); });
-    else
+        WaitForShaders(self);
+    } else
         world::BeginLevelLoad();
     --g_depth;
 }

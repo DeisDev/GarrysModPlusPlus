@@ -3,7 +3,7 @@
 #include "log.h"
 #include "module_scan.h"
 #include "options.h"
-#include "shader_prewarm.h"
+#include "shader_precache.h"
 #include "shaderapi_native.h"
 #include "shaderapi_commands.h"
 #include "shaderapi_slots.h"
@@ -26,7 +26,6 @@
 #include <span>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -181,7 +180,6 @@ struct Shim {
 
 Shim* g_shim = nullptr;
 std::atomic<int> g_traceLines = 0;
-std::atomic<bool> g_prewarming = false;
 
 void StartTrace()
 {
@@ -775,13 +773,8 @@ void __fastcall PresentOverride(Wrapper* self)
             StartBenchmark();
         if (TakeRequest(L"profile.request"))
             watchdog::ProfileThisThread(10);
-        if (TakeRequest(L"shaders.request") && !g_prewarming.exchange(true)) {
-            std::thread([] {
-                PrewarmProgress progress;
-                PrewarmShaders(GetOptions().gameDirectory, ModDirectory(), progress);
-                g_prewarming = false;
-            }).detach();
-        }
+        if (TakeRequest(L"shaders.request"))
+            shader_precache::EnqueueEveryShader(GetOptions().gameDirectory);
         TrackLevel();
         RunConsoleRequest();
     }

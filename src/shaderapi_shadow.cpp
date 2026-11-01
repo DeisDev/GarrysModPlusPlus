@@ -149,6 +149,7 @@ short TakeSnapshot(NativeObject*)
     const short id = static_cast<short>(g_snapshots.size());
     g_snapshots.push_back(g_state);
     g_snapshotIds.emplace(Bytes(g_snapshots.back()), id);
+    PrecacheShaders(g_state);
     return id;
 }
 

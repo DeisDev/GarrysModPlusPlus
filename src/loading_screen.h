@@ -1,7 +1,7 @@
 #pragma once
 
-// Keeps the game's loading screen up until the map's ray-traced lighting is ready, with its progress on the loading
-// dialog's bar.
+// Keeps the game's loading screen up until the map's ray-traced lighting and its materials' shaders are ready, with
+// their progress on the loading dialog's bar.
 namespace gmodpp::loading {
 
 // Hooks the engine's loading progress once engine.dll is loaded; safe to call every frame.

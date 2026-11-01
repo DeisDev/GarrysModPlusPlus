@@ -2,9 +2,11 @@
 
 #include "command_line.h"
 #include "log.h"
+#include "settings.h"
 #include "shaderapi_capture.h"
 #include "shader_cache.h"
 #include "shader_compiler.h"
+#include "shader_precache.h"
 #include "shader_translator.h"
 #include "shaderapi.h"
 #include "shaderapi_textures.h"
@@ -197,8 +199,8 @@ struct ConstantUpload {
 struct PipelineCache {
     bool initialized = false;
     bool usable = false;
+    // Compiles the copy shaders (StretchRect); translated shaders go through shader_precache::Build.
     ShaderCompiler compiler;
-    std::filesystem::path cacheDirectory;
     ComPtr<ID3D12RootSignature> rootSignature;
     ComPtr<ID3D12Resource> zeroBuffer;
     std::array<UINT, kTextureTypes> nullViews = {};
@@ -219,8 +221,9 @@ struct PipelineCache {
     std::vector<unsigned char> blitPixelShader;
     std::uint64_t boundGeneration = ~0ull;
     ID3D12PipelineState* boundPipeline = nullptr;
-    size_t compiled = 0;
-    double compileSeconds = 0;
+    // Shaders the render thread asked shader_precache::Build for, and the time it waited.
+    size_t built = 0;
+    double buildSeconds = 0;
     // Pipeline states saved across launches (ID3D12PipelineLibrary); the blob must outlive the library.
     ComPtr<ID3D12PipelineLibrary> library;
     std::vector<std::uint8_t> libraryBlob;
@@ -369,9 +372,6 @@ bool Initialize()
         log::Info("Native: the shader compiler is unavailable: {}", error);
         return false;
     }
-    g_cache.cacheDirectory = shader_cache::Directory();
-    std::error_code ignored;
-    std::filesystem::create_directories(g_cache.cacheDirectory, ignored);
     if (!CreateRootSignature() || !CreateZeroBuffer())
         return false;
     CreateNullViews();
@@ -418,31 +418,12 @@ const CompiledShader* CompiledByHash(std::span<const DWORD> code, const translat
     if (found != g_cache.shaders.end())
         return found->second->failed ? nullptr : found->second.get();
     auto shader = std::make_unique<CompiledShader>();
-    if (!shader_cache::Load(g_cache.cacheDirectory, key, shader->info, shader->dxil)) {
-        *shader = {};
-        const auto start = std::chrono::steady_clock::now();
-        std::string error;
-        if (!translator::Translate(code, variant, shader->info, error)) {
-            log::Info("Native: translating a combo of {} failed: {}", fileName, error);
-            shader->failed = true;
-        } else {
-            const wchar_t* profile = shader->info.stage == translator::Stage::Vertex ? L"vs_6_6" : L"ps_6_6";
-            if (!g_cache.compiler.Compile(shader->info.hlsl, profile, shader->dxil, error)) {
-                log::Info("Native: compiling a combo of {} failed: {}", fileName, error);
-                std::ofstream(g_cache.cacheDirectory / std::format("{:016x}.failed.hlsl", key)) << shader->info.hlsl << "\n/*\n" << error << "\n*/\n";
-                shader->failed = true;
-            } else {
-                shader_cache::Store(g_cache.cacheDirectory, key, shader->info, shader->dxil);
-                static const bool developer = HasArgument(L"-gmodpp_dev");
-                if (developer)
-                    std::ofstream(g_cache.cacheDirectory / std::format("{:016x}.{}.hlsl", key, fileName)) << shader->info.hlsl;
-            }
-        }
-        shader->info.hlsl.clear();
-        g_cache.compileSeconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-        if (++g_cache.compiled % 100 == 0)
-            log::Info("Native: {} shaders translated and compiled ({:.1f} s)", g_cache.compiled, g_cache.compileSeconds);
-    }
+    // Usually a read of what precaching compiled; otherwise the draw waits for the compile.
+    const auto start = std::chrono::steady_clock::now();
+    shader->failed = !shader_precache::Build(code, variant, fileName, shader->info, shader->dxil);
+    g_cache.buildSeconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    if (++g_cache.built % 1000 == 0)
+        log::Info("Native: {} shaders loaded or compiled on the render thread ({:.1f} s)", g_cache.built, g_cache.buildSeconds);
     shader->dxilHash = Fnv(shader->dxil.data(), shader->dxil.size());
     const CompiledShader* result = shader->failed ? nullptr : shader.get();
     g_cache.shaders.emplace(key, std::move(shader));
@@ -834,6 +815,28 @@ const ShaderFile* FindShaderFile(const char* name, bool vertex)
         return nullptr;
     }
     return g_cache.files.emplace(key, std::move(file)).first->second.get();
+}
+
+void PrecacheShaders(const ShadowState& state)
+{
+    // Twins are drawn only by real-time lighting (shaderapi_capture.cpp's Prepare).
+    const bool twins = GetSettings().realtimeLighting && GetStatistics().realtimeBlock != RealtimeBlock::Unsupported;
+    for (const ShaderFile* file : { state.vertexShader, state.pixelShader }) {
+        if (file == nullptr)
+            continue;
+        shader_precache::Request request;
+        request.name = file->name.c_str();
+        request.file = file->bytes;
+        request.directory = &file->directory;
+        request.staticIndex = file == state.vertexShader ? state.vertexStaticIndex : state.pixelStaticIndex;
+        if (file == state.pixelShader) {
+            // As DrawPass chooses them.
+            request.alphaTest = state.alphaTest ? static_cast<std::uint8_t>(state.alphaFunc + 1) : 0;
+            request.gbufferTwin = twins && !state.blend && state.depthTest;
+            request.forwardTwin = twins && state.blend;
+        }
+        shader_precache::Enqueue(request);
+    }
 }
 
 void TargetSize(UINT& width, UINT& height)

@@ -6,7 +6,6 @@
 #include "native_lighting.h"
 #include "overlay.h"
 #include "settings.h"
-#include "shader_prewarm.h"
 #include "shaderapi.h"
 #include "shaderapi_meshes.h"
 #include "shaderapi_pipelines.h"
@@ -109,12 +108,8 @@ struct DeviceManagerObject : NativeObject {
     std::vector<void (*)()> modeChangeCallbacks;
 };
 
-// The shaders are compiled ahead the first time, before the game opens its window.
 bool Connect(DeviceManagerObject*, CreateInterfaceFn factory)
 {
-    const std::filesystem::path game = ExecutablePath().parent_path();
-    if (!PrewarmIsCurrent(game))
-        PrewarmWithProgressWindow(game, ModDirectory());
     Backend& backend = GetBackend();
     backend.shaderUtil = factory != nullptr ? factory("VShaderUtil001", nullptr) : nullptr;
     // shaderapidx9.dll asks for VFileSystem022 and reads files through its IBaseFileSystem base, which IFileSystem
