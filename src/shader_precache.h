@@ -42,18 +42,19 @@ struct Request {
 
 // Queues compiling every dynamic combo of the request's static combo on worker threads, in the variants its draws
 // usually take: vertex shaders as they are and, when they read a normal, for compressed vertices; pixel shaders with
-// the pass's alpha test; and the requested twins. A request equal to an earlier one is ignored.
+// the pass's alpha test; and the requested twins. A request equal to an earlier one is ignored, and so is every request
+// when the shader cache cannot store what the workers compile.
 void Enqueue(const Request& request);
 
 // Developer tool (-gmodpp_dev, shaders.request): queues every static combo of every shader the game ships, with both
-// twins, to find combos the translator or the compiler cannot handle.
+// twins, to find combos the translator or the compiler cannot handle. Status leaves these out.
 void EnqueueEveryShader(const std::filesystem::path& gameDirectory);
 
 struct Progress {
     std::size_t done = 0;
     std::size_t total = 0;
 };
-// Requests finished, of those queued so far.
+// Enqueue's requests finished, of those queued so far.
 Progress Status();
 
 }

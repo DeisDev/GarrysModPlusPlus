@@ -66,6 +66,7 @@ void RemoveLegacyCache()
     if (legacy.empty())
         return;
     // Detached: the process may exit before it finishes, and the next launch carries on.
+    PinThisModule();
     std::thread([legacy = std::move(legacy)] {
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
         for (const std::filesystem::path& directory : legacy) {
@@ -161,6 +162,20 @@ bool Deserialize(std::span<const unsigned char> payload, translator::Translation
 
 class PackFile {
 public:
+    bool Contains(std::uint64_t key)
+    {
+        std::scoped_lock lock(m_mutex);
+        Open();
+        return m_index.contains(key);
+    }
+
+    bool Writable()
+    {
+        std::scoped_lock lock(m_mutex);
+        Open();
+        return m_writable;
+    }
+
     bool Find(std::uint64_t key, std::vector<unsigned char>& payload)
     {
         std::scoped_lock lock(m_mutex);
@@ -348,6 +363,10 @@ void Store(std::uint64_t key, const translator::Translation& info, std::span<con
 {
     Pack().Append(key, Serialize(info, dxil));
 }
+
+bool Contains(std::uint64_t key) { return Pack().Contains(key); }
+
+bool Writable() { return Pack().Writable(); }
 
 std::filesystem::path DumpDirectory() { return CacheRoot() / L"shader_dumps"; }
 

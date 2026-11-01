@@ -829,10 +829,12 @@ void PrecacheShaders(const ShadowState& state)
         request.directory = &file->directory;
         request.staticIndex = file == state.vertexShader ? state.vertexStaticIndex : state.pixelStaticIndex;
         if (file == state.pixelShader) {
-            // As DrawPass chooses them.
+            // As DrawPass and capture::Prepare choose them: captured passes with a depth test draw G-buffer twins,
+            // translucent passes after the capture draw forward twins, and so does every pass of a view drawn into a
+            // texture when such views are lit ("Cameras and mirrors").
             request.alphaTest = state.alphaTest ? static_cast<std::uint8_t>(state.alphaFunc + 1) : 0;
-            request.gbufferTwin = twins && !state.blend && state.depthTest;
-            request.forwardTwin = twins && state.blend;
+            request.gbufferTwin = twins && state.depthTest;
+            request.forwardTwin = twins && (state.blend || GetSettings().renderTargetLighting);
         }
         shader_precache::Enqueue(request);
     }

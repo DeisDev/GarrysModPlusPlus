@@ -26,6 +26,10 @@ std::uint64_t Key(std::span<const DWORD> code, const translator::Variant& varian
 // Load fills everything Store wrote (the translation without its HLSL, and the DXIL).
 bool Load(std::uint64_t key, translator::Translation& info, std::vector<unsigned char>& dxil);
 void Store(std::uint64_t key, const translator::Translation& info, std::span<const unsigned char> dxil);
+// Whether the file holds `key`, from its index alone.
+bool Contains(std::uint64_t key);
+// Whether compiled shaders can be stored (the file could be created or opened for writing).
+bool Writable();
 
 // Where the HLSL of translations that fail to compile, and with -gmodpp_dev every compiled translation, is written.
 std::filesystem::path DumpDirectory();

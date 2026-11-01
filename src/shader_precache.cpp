@@ -29,12 +29,13 @@ namespace gmodpp::shader_precache {
 
 namespace {
 
-// The keys being compiled, and those that failed.
+// The keys being compiled, those that failed, and the files with a failure logged.
 struct InFlight {
     std::mutex mutex;
     std::condition_variable finished;
     std::unordered_set<std::uint64_t> building;
     std::unordered_set<std::uint64_t> failed;
+    std::unordered_set<std::string> loggedFiles;
 };
 
 InFlight& Flight()
@@ -64,19 +65,31 @@ void Dump(const std::filesystem::path& path, std::string_view text)
     std::ofstream(path, std::ios::binary | std::ios::trunc) << text;
 }
 
+// A file's combos usually fail alike, and precaching tries them all: only its first failure is logged and dumped.
+bool FirstFailureOf(const char* name)
+{
+    InFlight& flight = Flight();
+    std::scoped_lock lock(flight.mutex);
+    return flight.loggedFiles.insert(name).second;
+}
+
 bool Compile(std::span<const DWORD> code, const translator::Variant& variant, const char* name, std::uint64_t key, translator::Translation& info,
     std::vector<unsigned char>& dxil)
 {
     std::string error;
     if (!translator::Translate(code, variant, info, error)) {
-        log::Info("Shaders: translating a combo of {} failed: {}", name, error);
+        if (FirstFailureOf(name))
+            log::Info("Shaders: translating a combo of {} failed (later failures of the file are not logged): {}", name, error);
         return false;
     }
     const ShaderCompiler* compiler = Compiler(error);
     const wchar_t* profile = info.stage == translator::Stage::Vertex ? L"vs_6_6" : L"ps_6_6";
     if (compiler == nullptr || !compiler->Compile(info.hlsl, profile, dxil, error)) {
-        log::Info("Shaders: compiling a combo of {} failed: {}", name, std::string_view(error).substr(0, error.find('\n')));
-        Dump(shader_cache::DumpDirectory() / std::format("{:016x}.failed.hlsl", key), info.hlsl + "\n/*\n" + error + "\n*/\n");
+        if (FirstFailureOf(name)) {
+            log::Info("Shaders: compiling a combo of {} failed (later failures of the file are not logged): {}", name,
+                std::string_view(error).substr(0, error.find('\n')));
+            Dump(shader_cache::DumpDirectory() / std::format("{:016x}.failed.hlsl", key), info.hlsl + "\n/*\n" + error + "\n*/\n");
+        }
         info.hlsl.clear();
         return false;
     }
@@ -111,6 +124,16 @@ std::optional<translator::Variant> CompressedVariant(const translator::Translati
     return normal ? std::optional(variant) : std::nullopt;
 }
 
+// Build for workers, which keep nothing: a shader the cache holds is not read.
+void Ensure(std::span<const DWORD> code, const translator::Variant& variant, const char* name)
+{
+    if (shader_cache::Contains(shader_cache::Key(code, variant)))
+        return;
+    translator::Translation info;
+    std::vector<unsigned char> dxil;
+    Build(code, variant, name, info, dxil);
+}
+
 // What DrawPass (shaderapi_pipelines.cpp) compiles for the request's combos, as far as the snapshot tells.
 void Run(const Request& request)
 {
@@ -126,21 +149,23 @@ void Run(const Request& request)
     const bool lightWarp = request.gbufferTwin && twins::LightWarpSampler(request.name, header, request.staticIndex) >= 0;
     std::unordered_set<std::string_view> seen;
     std::unordered_set<const DWORD*> seenTwins;
-    translator::Translation info;
-    std::vector<unsigned char> dxil;
     for (const vcs::Combo& combo : combos) {
         const std::string_view bytes(reinterpret_cast<const char*>(combo.bytecode.data()), combo.bytecode.size() * sizeof(DWORD));
         if (seen.insert(bytes).second) {
             translator::Variant variant;
             const bool vertex = !combo.bytecode.empty() && (combo.bytecode[0] & 0xFFFF0000u) == 0xFFFE0000u;
             if (vertex) {
-                if (Build(combo.bytecode, variant, request.name, info, dxil)) {
-                    if (const std::optional<translator::Variant> compressed = CompressedVariant(info))
-                        Build(combo.bytecode, *compressed, request.name, info, dxil);
+                Ensure(combo.bytecode, variant, request.name);
+                // The compressed variant depends on the inputs the translation lists; translating without compiling is
+                // cheap.
+                translator::Translation base;
+                if (translator::Translate(combo.bytecode, variant, base, error)) {
+                    if (const std::optional<translator::Variant> compressed = CompressedVariant(base))
+                        Ensure(combo.bytecode, *compressed, request.name);
                 }
             } else {
                 variant.alphaTest = request.alphaTest;
-                Build(combo.bytecode, variant, request.name, info, dxil);
+                Ensure(combo.bytecode, variant, request.name);
             }
         }
         for (const bool forward : { false, true }) {
@@ -155,7 +180,7 @@ void Run(const Request& request)
             variant.alphaTest = request.alphaTest;
             variant.forwardLighting = forward ? 1 : 0;
             variant.lightWarpSlot = !forward && lightWarp ? 1 : 0;
-            Build(twin, variant, request.name, info, dxil);
+            Ensure(twin, variant, request.name);
         }
     }
 }
@@ -164,7 +189,8 @@ void Run(const Request& request)
 // one. The pool lives as long as the process; its threads are detached, as the process ends them at exit.
 class Pool {
 public:
-    void Enqueue(const Request& request)
+    // `counted` requests are waited for by the loading screen (Status).
+    void Enqueue(const Request& request, bool counted)
     {
         {
             std::scoped_lock lock(m_mutex);
@@ -172,10 +198,11 @@ public:
                 request.forwardTwin);
             if (!m_seen.insert(id).second)
                 return;
-            m_queue.push_back(request);
-            ++m_total;
+            m_queue.push_back({ request, counted });
+            m_total += counted ? 1 : 0;
             if (!m_started) {
                 m_started = true;
+                PinThisModule();
                 const unsigned threads = std::max(2u, std::thread::hardware_concurrency()) - 1;
                 for (unsigned i = 0; i < threads; ++i)
                     std::thread([this] { Work(); }).detach();
@@ -196,22 +223,27 @@ private:
     {
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
         for (;;) {
-            Request request;
+            Queued queued;
             {
                 std::unique_lock lock(m_mutex);
                 m_ready.wait(lock, [&] { return !m_queue.empty(); });
-                request = m_queue.front();
+                queued = m_queue.front();
                 m_queue.pop_front();
             }
-            Run(request);
+            Run(queued.request);
             std::scoped_lock lock(m_mutex);
-            ++m_done;
+            m_done += queued.counted ? 1 : 0;
         }
     }
 
+    struct Queued {
+        Request request;
+        bool counted = true;
+    };
+
     std::mutex m_mutex;
     std::condition_variable m_ready;
-    std::deque<Request> m_queue;
+    std::deque<Queued> m_queue;
     std::set<std::tuple<const void*, std::int32_t, std::uint8_t, bool, bool>> m_seen;
     std::size_t m_total = 0;
     std::size_t m_done = 0;
@@ -263,12 +295,22 @@ bool Build(std::span<const DWORD> code, const translator::Variant& variant, cons
     return built;
 }
 
-void Enqueue(const Request& request)
+namespace {
+
+void EnqueueRequest(const Request& request, bool counted)
 {
     if (request.name == nullptr || request.directory == nullptr || request.file.empty() || request.staticIndex < 0)
         return;
-    ThePool().Enqueue(request);
+    // Without a cache file what workers compile would be lost, and draws would compile it again.
+    static const bool writable = shader_cache::Writable();
+    if (!writable)
+        return;
+    ThePool().Enqueue(request, counted);
 }
+
+}
+
+void Enqueue(const Request& request) { EnqueueRequest(request, true); }
 
 void EnqueueEveryShader(const std::filesystem::path& gameDirectory)
 {
@@ -313,7 +355,7 @@ void EnqueueEveryShader(const std::filesystem::path& gameDirectory)
             // Files without twins (vertex shaders among them) have none to compile.
             request.gbufferTwin = true;
             request.forwardTwin = true;
-            Enqueue(request);
+            EnqueueRequest(request, false);
             ++requests;
         }
     }

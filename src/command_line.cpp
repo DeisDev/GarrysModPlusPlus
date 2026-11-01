@@ -42,6 +42,12 @@ std::filesystem::path ExecutablePath()
     }
 }
 
+void PinThisModule()
+{
+    HMODULE module = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, reinterpret_cast<LPCWSTR>(&PinThisModule), &module);
+}
+
 const std::filesystem::path& ModDirectory()
 {
     static const std::filesystem::path directory = ExecutablePath().parent_path() / L"gmodplusplus";
