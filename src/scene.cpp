@@ -298,18 +298,30 @@ void Scene::WaitFor(uint64_t value)
     WaitForSingleObject(m_fenceEvent, INFINITE);
 }
 
+void Scene::Abandon()
+{
+    if (m_listOpen)
+        m_list->Close();
+    m_listOpen = false;
+}
+
 void Scene::BeginCommands()
 {
+    // An upload that failed before submitting leaves its commands unrun; they are dropped here rather than run later
+    // under another slot's fence.
+    Abandon();
     m_upload = (m_upload + 1) % kUploadSlots;
     UploadSlot& slot = m_uploads[m_upload];
     WaitFor(slot.fence);
     slot.keepAlive.clear();
     slot.allocator->Reset();
     m_list->Reset(slot.allocator.Get(), nullptr);
+    m_listOpen = true;
 }
 
 bool Scene::Execute()
 {
+    m_listOpen = false;
     HRESULT hr = m_list->Close();
     if (FAILED(hr)) {
         log::Info("Scene: closing the upload commands failed ({:#010x})", Hex(hr));
@@ -535,7 +547,7 @@ int Scene::AddModel(const ModelGeometry& geometry)
     }
     if (!model.positions || !model.indices || !model.albedo || (uvs && !model.uvs) || (alphaTriangles != 0 && !model.alpha) ||
         (materials && !model.materials)) {
-        m_list->Close();
+        Abandon();
         return -1;
     }
 
@@ -549,7 +561,7 @@ int Scene::AddModel(const ModelGeometry& geometry)
     D3D12_RAYTRACING_GEOMETRY_OMM_LINKAGE_DESC linkage;
     if (m_opacityMicromaps && alphaTriangles != 0) {
         if (!AddMicromaps(model, geometry, descs[inputs.NumDescs - 1], alphaTriangleDesc, linkage, staging)) {
-            m_list->Close();
+            Abandon();
             return -1;
         }
         // Turning opacity micromaps off in the settings disables them per instance.
@@ -563,7 +575,7 @@ int Scene::AddModel(const ModelGeometry& geometry)
     model.blas = CreateBuffer(info.ResultDataMaxSizeInBytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
         D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE);
     if (!scratch || !model.blas) {
-        m_list->Close();
+        Abandon();
         return -1;
     }
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC desc = {};
@@ -585,7 +597,7 @@ int Scene::AddModel(const ModelGeometry& geometry)
     if (model.positionsView == DescriptorHeap::kInvalid || model.indicesView == DescriptorHeap::kInvalid || model.albedoView == DescriptorHeap::kInvalid ||
         (uvs && model.uvsView == DescriptorHeap::kInvalid) || (alphaTriangles != 0 && model.alphaView == DescriptorHeap::kInvalid) ||
         (materials && model.materialsView == DescriptorHeap::kInvalid)) {
-        m_list->Close();
+        Abandon();
         ReleaseModel(model);
         return -1;
     }
@@ -773,8 +785,9 @@ bool Scene::LoadBaked(const bsp::BakedLighting& baked, std::span<const BakedTria
 
 void Scene::Clear()
 {
-    // Uploads still running (SubmitAsync) read what is released here.
-    WaitFor(m_fenceValue);
+    // Uploads still running (SubmitAsync) read what is released here. The scene may never have been initialized.
+    if (m_fence)
+        WaitFor(m_fenceValue);
     for (UploadSlot& slot : m_uploads)
         slot.keepAlive.clear();
     for (UINT* view : {&m_baked.facesView, &m_baked.trianglesView, &m_baked.luxelsView, &m_baked.leafAmbientView, &m_baked.ambientSamplesView,

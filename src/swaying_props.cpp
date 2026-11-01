@@ -147,15 +147,16 @@ bool SwayingProps::SetProps(const Scene& scene, std::span<const SwayMaterial> ma
         return fail("the descriptor heap is full");
 
     constexpr D3D12_RESOURCE_FLAGS kUav = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-    m_current = CreateBuffer(vertexBytes, D3D12_HEAP_TYPE_DEFAULT, kUav, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    m_previous = CreateBuffer(vertexBytes, D3D12_HEAP_TYPE_DEFAULT, kUav, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    // Buffers decay to COMMON after each command list: the sway pass promotes them to UNORDERED_ACCESS, and FinishUpdate
+    // moves them to ALL_SHADER_RESOURCE for the refits and the shaders that read hit surfaces.
+    m_current = CreateBuffer(vertexBytes, D3D12_HEAP_TYPE_DEFAULT, kUav, D3D12_RESOURCE_STATE_COMMON);
+    m_previous = CreateBuffer(vertexBytes, D3D12_HEAP_TYPE_DEFAULT, kUav, D3D12_RESOURCE_STATE_COMMON);
     m_blas = CreateBuffer(blasBytes, D3D12_HEAP_TYPE_DEFAULT, kUav, D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE);
     m_scratch = CreateBuffer(scratchBytes, D3D12_HEAP_TYPE_DEFAULT, kUav, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     m_jobsSlotSize = Align(sizeof(Header) + props.size() * sizeof(Job));
     m_jobs = CreateBuffer(m_jobsSlotSize * Scene::kFrameSlots, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
     if (!m_current || !m_previous || !m_blas || !m_scratch || !m_jobs || FAILED(m_jobs->Map(0, nullptr, reinterpret_cast<void**>(&m_jobsMapped))))
         return fail("creating buffers failed");
-    m_verticesWritable = true;
     m_currentUav = m_descriptors->CreateRawUav(m_current.Get());
     m_previousUav = m_descriptors->CreateRawUav(m_previous.Get());
     m_views.push_back(m_currentUav);
@@ -199,7 +200,7 @@ void SwayingProps::Clear()
     m_materialsView = m_currentUav = m_previousUav = DescriptorHeap::kInvalid;
 }
 
-std::optional<SwayingProps::Jobs> SwayingProps::BeginUpdate(ID3D12GraphicsCommandList4* list, const Scene& scene, UINT slot, const float (&eye)[3],
+std::optional<SwayingProps::Jobs> SwayingProps::BeginUpdate(const Scene& scene, UINT slot, const float (&eye)[3],
     float time, float previousTime, const float (&wind)[2], const float (&previousWind)[2])
 {
     if (m_props.empty())
@@ -231,14 +232,6 @@ std::optional<SwayingProps::Jobs> SwayingProps::BeginUpdate(ID3D12GraphicsComman
         return std::nullopt;
     Header header = {time, previousTime, {wind[0], wind[1]}, {previousWind[0], previousWind[1]}, {}};
     std::memcpy(base, &header, sizeof(header));
-    if (!m_verticesWritable) {
-        D3D12_RESOURCE_BARRIER barriers[] = {
-            Transition(m_current.Get(), D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
-            Transition(m_previous.Get(), D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
-        };
-        list->ResourceBarrier(2, barriers);
-        m_verticesWritable = true;
-    }
     return Jobs{m_jobsViews[slot], m_materialsView, m_currentUav, m_previousUav, count, (maxVertices + kThreadsPerGroup - 1) / kThreadsPerGroup};
 }
 
@@ -249,7 +242,6 @@ void SwayingProps::FinishUpdate(ID3D12GraphicsCommandList4* list, const Scene& s
         Transition(m_previous.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE),
     };
     list->ResourceBarrier(2, barriers);
-    m_verticesWritable = false;
     for (size_t i = 0; i < m_props.size(); ++i) {
         PropState& state = m_states[i];
         if (!state.moved)

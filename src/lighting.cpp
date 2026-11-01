@@ -1314,7 +1314,7 @@ void Lighting::UpdateSway(const Scene& scene, UINT slot, const gbuffer::SwayCloc
         std::copy_n(clock.wind, 2, m_swayWind);
         log::Info("Lighting: swaying props follow the game's wind ({:.2f} {:.2f}) from time {:.2f}", clock.wind[0], clock.wind[1], time);
     }
-    if (const std::optional<SwayingProps::Jobs> jobs = m_sway.BeginUpdate(m_list.Get(), scene, slot, eye, time, m_swayTime, clock.wind, m_swayWind)) {
+    if (const std::optional<SwayingProps::Jobs> jobs = m_sway.BeginUpdate(scene, slot, eye, time, m_swayTime, clock.wind, m_swayWind)) {
         // The pass traces nothing, so the scene's root slot holds any valid address.
         BindCompute(frameConstants, frameConstants, slot);
         DispatchGroups(Pass::Sway, {.input0 = jobs->jobsView, .input1 = jobs->materialsView, .output0 = jobs->currentUav, .output1 = jobs->previousUav},
@@ -2032,11 +2032,13 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     // The viewmodel, drawn after the main view of its frame, traces the same scene with its own mask
     // (kViewmodelTraceMask): it reuses the main view's acceleration structure and records, characters included, and
     // keeps the main view's slot from being rebuilt until it is done (m_slotFenceValues below).
-    const bool reuseScene = inputs.kind == gbuffer::ViewKind::Viewmodel && m_mainScene.tlas != 0 && m_mainSceneFrame == inputs.frame;
+    const bool reuseScene =
+        inputs.kind == gbuffer::ViewKind::Viewmodel && m_mainScene.tlas != 0 && m_mainSceneFrame == inputs.frame && m_mainSceneRun + 1 == m_run;
     const SceneFrame frame = reuseScene ? m_mainScene : scene.RecordFrame(m_list.Get(), slot, m_frameInstances, m_useMicromaps);
     if (main) {
         m_mainScene = frame;
         m_mainSceneFrame = inputs.frame;
+        m_mainSceneRun = m_run;
         m_mainSceneSlot = slot;
     }
     constants.instancesView = frame.instancesView;

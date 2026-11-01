@@ -650,9 +650,11 @@ private:
     float m_swayTime = 0.0f;
     float m_swayWind[2] = {};
     std::vector<SceneInstance> m_frameInstances;
-    // The scene the main view of frame m_mainSceneFrame traced, from slot m_mainSceneSlot, which the viewmodel reuses.
+    // The scene the main view of frame m_mainSceneFrame (run m_mainSceneRun) traced, from slot m_mainSceneSlot, which the
+    // viewmodel reuses when it is the next run: no other run has rebuilt that slot since.
     SceneFrame m_mainScene = {};
     uint64_t m_mainSceneFrame = ~0ull;
+    uint64_t m_mainSceneRun = ~0ull;
     UINT m_mainSceneSlot = 0;
     float m_prevViewProj[4][4] = {};
     float m_prevEye[3] = {};

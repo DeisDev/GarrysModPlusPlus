@@ -447,6 +447,8 @@ private:
     void BeginCommands();
     // Closes m_list and runs it; the slot's fence value marks its end.
     bool Execute();
+    // Closes m_list without running it, after a failure while recording.
+    void Abandon();
     // Runs the commands and waits for them.
     bool Submit();
     // Runs the commands without waiting: the queue runs them before any frame recorded later, and `keepAlive`, what they
@@ -486,6 +488,8 @@ private:
     std::array<UploadSlot, kUploadSlots> m_uploads;
     size_t m_upload = 0;
     Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList4> m_list;
+    // Whether m_list is recording (BeginCommands until Execute or Abandon).
+    bool m_listOpen = false;
     Microsoft::WRL::ComPtr<ID3D12Fence> m_fence;
     HANDLE m_fenceEvent = nullptr;
     uint64_t m_fenceValue = 0;

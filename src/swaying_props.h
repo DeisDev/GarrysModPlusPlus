@@ -76,7 +76,7 @@ public:
     };
     // Picks the props near `eye` and writes their jobs; nothing when none is near. The caller dispatches the
     // jobs and then calls FinishUpdate.
-    std::optional<Jobs> BeginUpdate(ID3D12GraphicsCommandList4* list, const Scene& scene, UINT slot, const float (&eye)[3], float time,
+    std::optional<Jobs> BeginUpdate(const Scene& scene, UINT slot, const float (&eye)[3], float time,
         float previousTime, const float (&wind)[2], const float (&previousWind)[2]);
     // Refits the BLASes of the props BeginUpdate moved.
     void FinishUpdate(ID3D12GraphicsCommandList4* list, const Scene& scene);
@@ -121,7 +121,6 @@ private:
     Microsoft::WRL::ComPtr<ID3D12Resource> m_previous;
     UINT m_currentUav = DescriptorHeap::kInvalid;
     UINT m_previousUav = DescriptorHeap::kInvalid;
-    bool m_verticesWritable = true;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_blas;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_scratch;
     // The jobs of each frame slot.

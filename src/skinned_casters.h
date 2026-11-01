@@ -48,8 +48,7 @@ public:
         UINT count;
         UINT groupsX;
     };
-    // Writes the skinning jobs of `entities`, each moved to its next slot, and makes their vertex buffers writable;
-    // nothing when none can be skinned. The caller dispatches the jobs, then calls FinishUpdate, with or without jobs.
+    // Writes the skinning jobs of `entities`, each moved to its next slot; nothing when none can be skinned. The caller dispatches the jobs, then calls FinishUpdate, with or without jobs.
     // Each entity's slot is reused every Scene::kFrameSlots calls with entities, so the caller must wait for the frame
     // that many calls back first.
     std::optional<Jobs> BeginUpdate(ID3D12GraphicsCommandList4* list, const Scene& scene, const std::vector<SkinnedEntity>& entities);
@@ -59,14 +58,14 @@ public:
 
 private:
     struct SlotState {
-        // This slot's skinned positions, written by shaders/skin.hlsl (UNORDERED_ACCESS while `writable`, otherwise
-        // ALL_SHADER_RESOURCE for the BLAS refit and the shaders that read hit surfaces).
+        // This slot's skinned positions, written by shaders/skin.hlsl. Buffers decay to COMMON after each command list, so
+        // the dispatch promotes the buffer to UNORDERED_ACCESS and FinishUpdate moves it to ALL_SHADER_RESOURCE for the
+        // BLAS refit and the shaders that read hit surfaces.
         Microsoft::WRL::ComPtr<ID3D12Resource> vertices;
         Microsoft::WRL::ComPtr<ID3D12Resource> scratch;
         Microsoft::WRL::ComPtr<ID3D12Resource> blas;
         UINT verticesView = DescriptorHeap::kInvalid;
         UINT verticesUav = DescriptorHeap::kInvalid;
-        bool writable = true;
         bool built = false;
     };
     struct EntityState {
@@ -111,6 +110,8 @@ private:
         D3D12_GPU_VIRTUAL_ADDRESS vertices, D3D12_GPU_VIRTUAL_ADDRESS indices, D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS& inputs,
         D3D12_RAYTRACING_GEOMETRY_DESC (&descs)[2], D3D12_RAYTRACING_GEOMETRY_TRIANGLES_DESC& triangles, D3D12_RAYTRACING_GEOMETRY_OMM_LINKAGE_DESC& linkage);
     void Release(EntityState& state);
+    // Releases the states entities left when their model changed, once frames that read them are done.
+    void ReleaseRetired(bool all);
 
     ID3D12Device5* m_device = nullptr;
     DescriptorHeap* m_descriptors = nullptr;
@@ -118,6 +119,9 @@ private:
     std::unordered_map<const SkinnedModel*, ModelSource> m_sources;
     std::array<JobBuffer, Scene::kFrameSlots> m_jobs;
     std::vector<Pending> m_pending;
+    // States replaced by a model change, with the m_records value of their replacement: frames still in flight may read
+    // them until the caller has waited for that update (Scene::kFrameSlots updates later).
+    std::vector<std::pair<uint64_t, EntityState>> m_retired;
     uint64_t m_frame = 0;
     uint64_t m_records = 0;
 };

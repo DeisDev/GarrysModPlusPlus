@@ -97,11 +97,10 @@ void SkinnedCasters::Describe(const SkinnedModel& model, const Scene& scene, int
 bool SkinnedCasters::PrepareSlot(SlotState& slot, const SkinnedModel& model, const Scene& scene, int sceneModel)
 {
     if (slot.blas)
-        return true;
+        return slot.verticesView != DescriptorHeap::kInvalid && slot.verticesUav != DescriptorHeap::kInvalid;
     const UINT vertexCount = static_cast<UINT>(model.geometry.positions.size());
     slot.vertices = CreateBuffer(Align16(sizeof(bsp::Float3) * vertexCount), D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    slot.writable = true;
+        D3D12_RESOURCE_STATE_COMMON);
     if (!slot.vertices)
         return false;
 
@@ -175,7 +174,11 @@ bool SkinnedCasters::EnsureJobs(JobBuffer& jobs, UINT64 size)
         return false;
     }
     jobs.view = m_descriptors->CreateRawView(jobs.buffer.Get());
-    return jobs.view != DescriptorHeap::kInvalid;
+    if (jobs.view == DescriptorHeap::kInvalid) {
+        jobs = {};
+        return false;
+    }
+    return true;
 }
 
 void SkinnedCasters::Release(EntityState& state)
@@ -187,9 +190,20 @@ void SkinnedCasters::Release(EntityState& state)
     state = {};
 }
 
+void SkinnedCasters::ReleaseRetired(bool all)
+{
+    std::erase_if(m_retired, [&](auto& entry) {
+        if (!all && m_records - entry.first < Scene::kFrameSlots)
+            return false;
+        Release(entry.second);
+        return true;
+    });
+}
+
 void SkinnedCasters::Clear()
 {
     m_pending.clear();
+    ReleaseRetired(true);
     for (auto& [key, state] : m_states)
         Release(state);
     m_states.clear();
@@ -210,6 +224,7 @@ std::optional<SkinnedCasters::Jobs> SkinnedCasters::BeginUpdate(ID3D12GraphicsCo
     if (entities.empty())
         return std::nullopt;
     ++m_records;
+    ReleaseRetired(false);
     // The jobs, then each job's bone transforms.
     const UINT64 jobsBytes = Align16(sizeof(Job) * entities.size());
     UINT64 bytes = jobsBytes;
@@ -225,7 +240,10 @@ std::optional<SkinnedCasters::Jobs> SkinnedCasters::BeginUpdate(ID3D12GraphicsCo
     for (const SkinnedEntity& entity : entities) {
         EntityState& state = m_states[entity.key];
         if (state.model != entity.model) {
-            Release(state);
+            // Frames in flight may still read the old model's slots.
+            if (state.model)
+                m_retired.emplace_back(m_records, std::move(state));
+            state = {};
             state.model = entity.model;
         }
         state.lastSeen = m_frame;
@@ -246,10 +264,6 @@ std::optional<SkinnedCasters::Jobs> SkinnedCasters::BeginUpdate(ID3D12GraphicsCo
         records[m_pending.size()] = {source->view, vertexCount, slot.verticesUav, static_cast<uint32_t>(bonesAt)};
         bonesAt += sizeof(studio::Matrix3x4) * model.poseToBone.size();
         maxVertices = std::max(maxVertices, vertexCount);
-        if (!slot.writable) {
-            barriers.push_back(Transition(slot.vertices.Get(), D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
-            slot.writable = true;
-        }
         m_pending.push_back({&state, entity.sceneModel, entity.mask, previousPositions});
     }
     if (!barriers.empty())
@@ -265,7 +279,6 @@ void SkinnedCasters::FinishUpdate(ID3D12GraphicsCommandList4* list, const Scene&
     for (const Pending& pending : m_pending) {
         SlotState& slot = pending.state->slots[pending.state->slot];
         barriers.push_back(Transition(slot.vertices.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE));
-        slot.writable = false;
     }
     if (!barriers.empty())
         list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
