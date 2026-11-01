@@ -4,7 +4,8 @@
 // the eye and each surface. On maps without fog the air is a thin, even haze; with the map's fog (g_frame.volumetricFog)
 // it is that fog, lit (MarchFog).
 // March (step 0): g_frame.volumetricSteps samples along each eye ray, offset per pixel and frame, each with a shadow ray to the
-// sun and to every projected light; a Henyey-Greenstein phase function favours light seen against its direction.
+// sun and to one projected light (ProjectorScatter); a Henyey-Greenstein phase function favours light seen against its
+// direction.
 // input0-2: the main view's indirect light volume (shaders/probes.hlsl) or kNoView; input3: 1 to scatter the map's and
 // the engine's lights in the fog; output0: in-scattered radiance before the tonemap scale, and the length marched.
 // Accumulate (step 1): blends the march, averaged with its neighbours of similar depth, into last frame's
@@ -34,19 +35,34 @@ int2 FullPixel(int2 pixel)
     return min(pixel * 2 + int2(frame & 1u, frame >> 1), int2(g_frame.size) - 1);
 }
 
-// Projected lights' irradiance at a point times the phase function towards the eye, with their shadows.
-float3 ProjectorScatter(float3 position, float3 direction)
+// Projected lights' irradiance at a point times the phase function towards the eye, with their shadows. Only one
+// shadow ray is traced: to a light picked in proportion to its unshadowed share (weighted reservoir sampling), whose
+// light is scaled by the inverse of that chance, as LampScatter samples lamps; the accumulation averages the noise.
+// Where one projected light reaches the point, as with a lone flashlight, it is always the one picked, and the result is
+// the same as tracing every light.
+float3 ProjectorScatter(float3 position, float3 direction, inout uint seed)
 {
-    float3 scattered = 0.0;
+    float total = 0.0;
+    float pickedWeight = 0.0;
+    float3 picked = 0.0;
+    uint pickedIndex = 0;
     for (uint p = 0; p < g_frame.projectorCount; ++p) {
         float3 toLight;
         float distance;
-        Projector projector = LoadProjector(p);
-        float3 irradiance = ProjectorIrradiance(projector, position, 0.0, toLight, distance);
-        if (Luminance(irradiance) > 0.0)
-            scattered += irradiance * Phase(dot(direction, toLight)) * ProjectorTransmittance(projector, position);
+        float3 unshadowed = ProjectorIrradiance(LoadProjector(p), position, 0.0, toLight, distance) * Phase(dot(direction, toLight));
+        float weight = Luminance(unshadowed);
+        if (weight <= 0.0)
+            continue;
+        total += weight;
+        if (Random(seed) * total < weight) {
+            picked = unshadowed;
+            pickedWeight = weight;
+            pickedIndex = p;
+        }
     }
-    return scattered;
+    if (total <= 0.0)
+        return 0.0;
+    return picked * (total / pickedWeight) * ProjectorTransmittance(LoadProjector(pickedIndex), position);
 }
 
 // Map and dynamic lights' irradiance at a point times the phase function towards the eye: one light picked by
@@ -87,7 +103,7 @@ float4 MarchFog(float3 direction, float distance, float depthPerUnit, uint seed)
         float gained = next - opacity;
         opacity = next;
         float3 position = g_frame.eyePosition + direction * (start + (s + Random(seed)) * step);
-        float3 scattered = ProjectorScatter(position, direction);
+        float3 scattered = ProjectorScatter(position, direction, seed);
         if (g_pass.input3 != 0)
             scattered += LampScatter(position, direction, seed);
         // Radiance scattered from irradiance E is opacity * phase * pi * E, as in the haze.
@@ -121,7 +137,7 @@ float4 MarchHaze(float3 direction, float rayLength, uint seed)
     for (uint s = 0; s < g_frame.volumetricSteps; ++s) {
         float t = (s + Random(seed)) * step;
         float3 position = g_frame.eyePosition + direction * t;
-        float3 scattered = ProjectorScatter(position, direction);
+        float3 scattered = ProjectorScatter(position, direction, seed);
         if (g_frame.sunEnabled != 0.0)
             scattered += g_frame.sunColor * sunPhase * SunVisibility(position, g_frame.sunShadowMask);
         // Radiance scattered from irradiance E is density * phase * pi * E in the units the lighting uses.
