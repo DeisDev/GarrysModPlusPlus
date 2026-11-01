@@ -106,6 +106,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Glass and other translucent surfaces no longer freeze the game for many seconds the first time they appear: their shaders compile about 9 times faster.
 - Under water, the native renderer no longer runs at half the frame rate: Source's view of the air above the water was lit as a second scene.
 - Surfaces lit by the flashlight no longer look almost unlit in reflections.
 - Lamp and flashlight light in haze and fog now glows most when you look towards the light, not away from it.
