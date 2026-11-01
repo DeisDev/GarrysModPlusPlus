@@ -3,6 +3,8 @@
 #include <windows.h>
 
 #include <array>
+#include <chrono>
+#include <cmath>
 #include <cstdint>
 
 namespace gmodpp::gbuffer {
@@ -22,6 +24,30 @@ struct ProjectedLight {
     std::array<float, 3> attenuation;
     // The game reads the cookie as sRGB (D3DSAMP_SRGBTEXTURE).
     bool cookieSrgb = false;
+};
+
+// The seconds the water's normal maps animate by (FrameConstants::waterTime): a steady clock that wraps every hour, which
+// keeps float time precise.
+inline float WaterClock()
+{
+    return static_cast<float>(std::fmod(std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(), 3600.0));
+}
+
+// The most water surfaces whose draws are kept (WaterSurfaceDraw).
+inline constexpr size_t kMaxWaterDraws = 8;
+
+// A water surface as the game last drew it: its fog colour (Water's pixel c6, its material's linear $fogcolor, which
+// names its body of water), the vertex shader's bump transform rows (cBumpTexCoordTransform, applied to (u, v, 0, 1)),
+// and when (WaterClock). Its normal map frame is ViewInputs::waterNormalMaps' entry.
+struct WaterSurfaceDraw {
+    std::array<float, 3> fog;
+    std::array<std::array<float, 4>, 2> bumpRows;
+    float time = 0.0f;
+    // Its texture coordinates at a world point, (dot(uvS.xyz, p) + uvS.w, the same with uvT), as its vertices hold
+    // them; `mapped` once they were read.
+    std::array<float, 4> uvS = {};
+    std::array<float, 4> uvT = {};
+    bool mapped = false;
 };
 
 // The time and wind the game last drew a swaying ($treesway) model with, and when (QueryPerformanceCounter ticks).

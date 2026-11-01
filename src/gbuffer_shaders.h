@@ -32,6 +32,8 @@ inline constexpr UINT kEmissiveTarget = 2;
 inline constexpr UINT kFlagsTarget = 3;
 // Pixel constants: the Water shader's g_WaterFogColor (shaders/water_surface.hlsl), cLightScale and g_LinearFogColor.
 inline constexpr UINT kWaterFogColorRegister = 6;
+// Water's NormalSampler (its CTAB, checked by IsRefractingWater and IsFlowingWater).
+inline constexpr UINT kWaterNormalSampler = 4;
 inline constexpr UINT kLightScaleRegister = 30;
 inline constexpr UINT kFogColorRegister = 29;
 // Vertex constants: cFogParams, and Source's model-view-projection (c4-c7) and view-projection (c8-c11) rows;
@@ -57,6 +59,8 @@ struct PixelShaderClass {
     // (shaders/forward_light.hlsli).
     std::array<UINT, 3> probeSamplers = {};
     std::array<UINT, bytecode::kForwardUniforms> forwardUniforms = {};
+    // Refract's glass with the registers its forward twin reads (shaders/twins/refract_ps2x.fxc).
+    bool refractGlass = false;
 };
 
 // `registerLimit`: flashlight parameters in registers from this one on are not tracked.
@@ -66,6 +70,8 @@ struct VertexShaderClass {
     FlashlightRegisters flashlight;
     // The tree sway shader's g_vMiscParams2 register (y time, zw wind), or -1.
     int swayRegister = -1;
+    // The Water vertex shader's cBumpTexCoordTransform (two rows), or -1.
+    int bumpTransformRegister = -1;
 };
 
 VertexShaderClass ClassifyVertexShader(std::span<const DWORD> code, UINT registerLimit);

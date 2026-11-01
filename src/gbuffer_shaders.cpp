@@ -231,6 +231,9 @@ PixelShaderClass ClassifyPixelShader(std::span<const DWORD> code, UINT registerL
             return result;
         }
     }
+    using bytecode::RegisterSet;
+    result.refractGlass = HasRegister(constants, "RefractSampler", RegisterSet::Sampler, 2) && HasRegister(constants, "NormalSampler", RegisterSet::Sampler, 3) &&
+        HasRegister(constants, "g_RefractTint", RegisterSet::Float4, 1);
     // Model shaders without a lighting preview combo (bumped VertexLitGeneric, skin) are drawn by their G-buffer
     // twins (shader_twins.h); without one they keep the game's shader.
     if ((HasConstant(constants, "g_DiffuseModulation") && HasConstant(constants, "BumpmapSampler")) || IsSkinShader(constants)) {
@@ -250,6 +253,7 @@ VertexShaderClass ClassifyVertexShader(std::span<const DWORD> code, UINT registe
     result.flashlight = FlashlightRegistersOf(constants, registerLimit);
     if (HasConstant(constants, "g_vMiscParams4"))
         result.swayRegister = RegisterOf(constants, {"g_vMiscParams2"}, bytecode::RegisterSet::Float4, registerLimit);
+    result.bumpTransformRegister = RegisterOf(constants, {"cBumpTexCoordTransform"}, bytecode::RegisterSet::Float4, registerLimit - 1);
     return result;
 }
 

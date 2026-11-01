@@ -23,10 +23,25 @@ float3 VolumetricLight(int2 pixel)
     return volumetric.SampleLevel(g_linearClamp, position / textureSize, 0.0).rgb * g_frame.tonemapScale;
 }
 
+// Under water the eye looks through the water it is in: its light gathers at this many points when the volumetric pass
+// does not gather it.
+static const uint kUnderwaterSteps = 2;
+
 // Source's range fog, applied after the tonemap scale. Lit fog (volumetricFog) only hides the surface here: the fog's
-// own light comes with the volumetric light.
-float3 ApplyFog(float3 color, float3 position)
+// own light comes with the volumetric light. Under water the water the eye looks through takes Source's water fog's
+// place (ThroughWater), its light with the volumetric light when that pass runs.
+float3 ApplyFog(float3 color, float3 position, int2 pixel)
 {
+    if (g_frame.eyeWater != kNoView) {
+        float3 toPosition = position - g_frame.eyePosition;
+        float distance = length(toPosition);
+        float3 transmitted = color * exp(-LoadWaterBody(g_frame.eyeWater).extinction * distance);
+        if (g_frame.volumetricView != kNoView)
+            return transmitted;
+        uint seed = PixelSeed(pixel, 0x77u);
+        return transmitted + ThroughWater(0.0, g_frame.eyePosition, toPosition / max(distance, 1e-4), distance, g_frame.eyeWater, kUnderwaterSteps, seed) *
+            g_frame.tonemapScale;
+    }
     if (g_frame.fogEnabled == 0)
         return color;
     float fog = FogOpacity(mul(g_frame.viewProj, float4(position, 1.0)).w);
@@ -159,10 +174,11 @@ void main(uint3 id : SV_DispatchThreadID)
     }
     Texture2D<float4> lightTexture = ResourceDescriptorHeap[g_frame.lightView];
     float3 additive = g_frame.additiveAfterResolve != 0 ? 0.0 : Decode(lightTexture.Load(int3(pixel, 0)).rgb);
-    if (!covered && surface.w < 0.0) {
+    // Water belongs to the main view's run; the viewmodel's run, over a rectangle of the same image, leaves it as lit.
+    if (!covered && surface.w < 0.0 && g_frame.viewmodel == 0) {
         float3 position = WorldPositionFromDepth(pixel, DepthAt(pixel));
         WaterResult water = ShadeWater(pixel, position);
-        float3 shaded = ApplyFog(water.color * g_frame.tonemapScale, position) + VolumetricLight(pixel);
+        float3 shaded = ApplyFog(water.color * g_frame.tonemapScale, position, pixel) + VolumetricLight(pixel);
         output[pixel] = float4(g_frame.outputLinear != 0 ? shaded : Encode(shaded), color.a);
         if (g_pass.output1 != kNoView) {
             RWTexture2D<float4> specular = ResourceDescriptorHeap[g_pass.output1];
@@ -175,7 +191,14 @@ void main(uint3 id : SV_DispatchThreadID)
         return;
     }
     if (!covered) {
-        float3 sky = Decode(color.rgb) + VolumetricLight(pixel);
+        float3 beyond = Decode(color.rgb);
+        // Under water, a pixel this view left undrawn looks through the water to nothing it meets; the back buffer
+        // still holds Source's view into the air there (its refraction view, which is not lit).
+        if (g_frame.eyeWater != kNoView && DepthAt(pixel) >= 1.0) {
+            float3 direction = normalize(WorldPositionFromDepth(pixel, 0.5) - g_frame.eyePosition);
+            beyond = ApplyFog(0.0, g_frame.eyePosition + direction * 65536.0, pixel);
+        }
+        float3 sky = beyond + VolumetricLight(pixel);
         output[pixel] = float4(g_frame.outputLinear != 0 ? sky : Encode(sky), color.a);
         MirrorGuides(pixel);
         return;
@@ -280,7 +303,7 @@ void main(uint3 id : SV_DispatchThreadID)
             Texture2D<float4> highlights = ResourceDescriptorHeap[g_frame.specularView];
             specular += highlights.Load(int3(pixel, 0)).rgb;
         }
-        float3 shaded = ApplyFog((albedo * light + emissive + added + specular) * g_frame.tonemapScale, position) + additive + VolumetricLight(pixel);
+        float3 shaded = ApplyFog((albedo * light + emissive + added + specular) * g_frame.tonemapScale, position, pixel) + additive + VolumetricLight(pixel);
         result = g_frame.outputLinear != 0 ? shaded : Encode(shaded);
         // NRD's validation overlay (debug view 15) over the image.
         if (g_frame.debugView == 15 && g_frame.nrdValidationView != kNoView) {

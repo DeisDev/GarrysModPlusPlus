@@ -119,7 +119,8 @@ struct FrameConstants {
     float worldToSky;
     // Phong highlights (shaders/direct.hlsl), added unlit by shaders/deferred_lighting.hlsl.
     uint32_t specularView;
-    uint32_t padding2;
+    // Each water surface triangle's body of water (Scene::Water), or kInvalidView.
+    uint32_t waterTrianglesView;
     // The light warp textures of the view's G-buffer twins (shaderapi_capture.h, LightWarpSlot).
     uint32_t lightWarpCount;
     // The 2D sky as the game draws it (ViewInputs::skyCube) and its blurred light for indirect rays (shaders/sky.hlsl),
@@ -151,6 +152,30 @@ struct FrameConstants {
     // Settings::viewmodelShadowRays.
     uint32_t viewmodelShadowRays;
     uint32_t padding;
+    // The map's bodies of water (Scene::Water), each BSP leaf's body, the normal map frames they animate through, and the
+    // highest surface; the body holding the eye (kInvalidView in air), the clock their normal maps animate by, and the
+    // main view's caustics (shaders/caustics.hlsl) over the square from causticsOrigin, 1 / causticsInvSize across.
+    uint32_t waterBodiesView;
+    uint32_t waterBodyCount;
+    uint32_t leafWaterView;
+    uint32_t waterFramesView;
+    float waterTop;
+    uint32_t eyeWater;
+    float waterTime;
+    uint32_t causticsView;
+    float causticsOrigin[2];
+    float causticsInvSize;
+    // The water surfaces as the game drew them (Lighting::WriteWaterDraws), one entry per body, or kInvalidView.
+    uint32_t waterDrawsView;
+    // The water's sun maps (shaders/caustics.hlsl): the fine one over the caustics' square, and the coarse one over
+    // the square from coarseCausticsOrigin, 1 / coarseCausticsInvSize across; kInvalidView without sunlight on water.
+    uint32_t waterSunView;
+    uint32_t coarseWaterSunView;
+    float coarseCausticsInvSize;
+    // The first brush entity body of water (WaterViews::brushFirst), found by its bounds alone.
+    uint32_t brushWaterFirst;
+    float coarseCausticsOrigin[2];
+    uint32_t padding5[2];
     uint32_t lightWarpViews[64];
 };
 
@@ -181,6 +206,10 @@ struct ProbeResult {
     float origin[3];
     int model;
     uint32_t mask;
+    // On water: the rippled normal the G-buffer holds there and the one shaders rebuild from the normal map.
+    bool water = false;
+    float drawnWaterNormal[3] = {};
+    float rebuiltWaterNormal[3] = {};
 };
 
 // What one view rendered: its colour target, which keeps what the G-buffer does not cover, and the G-buffer, with
@@ -228,6 +257,9 @@ struct ViewInputs {
     UINT skyFacesView = DescriptorHeap::kInvalid;
     // When the game last drew a swaying model.
     gbuffer::SwayClock sway;
+    // The water surfaces the game drew, last time each was drawn, and the normal map frame each had bound (or null).
+    std::span<const gbuffer::WaterSurfaceDraw> waterDraws;
+    std::span<ID3D12Resource* const> waterNormalMaps;
 };
 
 // Lights a view's G-buffer on the D3D12 queue the game shares and writes the result back into its colour
@@ -320,6 +352,7 @@ private:
         NrdInputs,
         NrdResolve,
         SunShadow,
+        Caustics,
         Count
     };
     // Mirrors PassConstants in shaders/common.hlsli: descriptor indices (none by default) and a parameter.
@@ -374,6 +407,14 @@ private:
         D3D12_GPU_VIRTUAL_ADDRESS frameConstants, D3D12_GPU_VIRTUAL_ADDRESS scene);
     bool CreateTarget(Texture& texture, UINT width, UINT height, DXGI_FORMAT format, UINT depth = 0);
     bool CreateSkyLight();
+    // Writes each body of water's surface as the game last drew it (the draw whose fog colour is the body's) into the
+    // slot's m_waterDraws, with views of their normal maps from `firstView` on, and points `constants` at them.
+    void WriteWaterDraws(UINT slot, const ViewInputs& inputs, const Scene& scene, UINT firstView, FrameConstants& constants);
+    // Traces the main view's caustics around its eye into m_caustics (shaders/caustics.hlsl) and points `constants` at
+    // them; without water near the eye or sunlight there are none.
+    void RecordCaustics(FrameConstants& constants, const Scene& scene);
+    // Points `constants` at the last caustics and sun maps RecordCaustics traced.
+    void SetCausticsConstants(FrameConstants& constants) const;
     // Binds the pass's pipeline: its opacity micromap variant while they are in use, when it has one.
     void SetPipeline(Pass pass);
     void DispatchGroups(Pass pass, const PassArgs& args, UINT x, UINT y, UINT z);
@@ -482,6 +523,11 @@ private:
     Microsoft::WRL::ComPtr<ID3D12Resource> m_projectors;
     std::byte* m_projectorsMapped = nullptr;
     std::array<UINT, kSlots> m_projectorViews = {};
+    // Per slot: each body of water's last drawn surface (WaterDraw in shaders/water_body.hlsli).
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_waterDraws;
+    std::byte* m_waterDrawsMapped = nullptr;
+    std::array<UINT, kSlots> m_waterDrawViews = {};
+    bool m_loggedWaterDraw = false;
     Microsoft::WRL::ComPtr<ID3D12RootSignature> m_computeRoot;
     std::array<Microsoft::WRL::ComPtr<ID3D12PipelineState>, static_cast<size_t>(Pass::Count)> m_pipelines;
     // Shader Model 6.9 variants of the passes that trace rays, which let traversal use opacity micromaps.
@@ -499,6 +545,18 @@ private:
     // (uav) and a cube (srv); ready once a main view has made it.
     Texture m_skyLight;
     bool m_skyLightReady = false;
+    // The main view's caustics and the water's sun maps (shaders/caustics.hlsl): the photon counts, how much the water
+    // focuses sunlight over the square from m_causticsOrigin, 1 / m_causticsInvSize across, and the sun maps of that
+    // square and of the coarse one that covers the map; ready once a main view has traced them this map.
+    Texture m_causticCounts;
+    Texture m_caustics;
+    Texture m_waterSun;
+    Texture m_coarseWaterSun;
+    bool m_causticsReady = false;
+    float m_causticsOrigin[2] = {};
+    float m_causticsInvSize = 0.0f;
+    float m_coarseCausticsOrigin[2] = {};
+    float m_coarseCausticsInvSize = 0.0f;
     // Writes m_translucentDepth into the game's depth buffer, for its format.
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_depthPipeline;
     DXGI_FORMAT m_depthPipelineFormat = DXGI_FORMAT_UNKNOWN;
@@ -603,11 +661,13 @@ private:
     double m_timestampPeriodMs = 0.0;
     std::array<double, static_cast<size_t>(GpuPass::Count)> m_passMsTotal = {};
     uint32_t m_gpuSamples = 0;
-    // GPU time of the 3D skybox's and viewmodel's runs since the last report.
+    // GPU time of the 3D skybox's and viewmodel's runs since the last report, and of the 3D skybox's alone.
     double m_otherViewsMsTotal = 0.0;
+    double m_skyboxMsTotal = 0.0;
     uint32_t m_timingReports = 0;
     uint32_t m_cameraFailures = 0;
     std::array<bool, kSlots> m_slotWasMain = {};
+    std::array<bool, kSlots> m_slotWasSkybox = {};
     uint64_t m_run = 0;
     bool m_loggedFormats = false;
     bool m_probeRequested = false;

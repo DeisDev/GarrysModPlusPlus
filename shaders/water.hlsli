@@ -3,11 +3,13 @@
 
 #include "reflection.hlsli"
 
-// Water surfaces (shaders/water_surface.hlsl wrote them into the G-buffer's targets where it holds no surface): Source's
-// refraction, already fogged by the water, under ray-traced reflections, a sun glint and the Fresnel term of water.
-// albedo: refraction (as the game would write it); normal: the normal map's tangent-space slope (xy), the reflect tint's
-// brightness and the angle of the tangent-space eye vector (kNoEyeAngle without one); flags: g 1, a the share of the
-// reflection the shore leaves.
+// Water surfaces (shaders/water_surface.hlsl wrote them into the G-buffer's targets where it holds no surface): the
+// surface's Fresnel split between a ray-traced reflection and a ray-traced refraction through the water below it
+// (ThroughWater), or from under the water into the air above, with a sun glint.
+// albedo: Source's refraction, fogged by the water, which water outside the map's bodies of water (brush entities)
+// keeps; normal: the normal map's tangent-space slope (xy), the reflect tint's brightness and the angle of the
+// tangent-space eye vector (kNoEyeAngle without one); flags: g 1, a the share of the reflection Source's shore fade
+// leaves.
 
 // The normal map's slopes are softened for the traced reflections' directions, which mirror the scene where Source
 // distorted a texture by a few texels. The Fresnel term keeps the full normal, as Source's does: flattened, the water
@@ -15,8 +17,8 @@
 static const float kWaveSlope = 0.35;
 // The sun's highlight: a GGX lobe of this roughness (alpha).
 static const float kGlintRoughness = 0.03;
-static const float kWaterIor = 1.333;
-static const float kWaterF0 = 0.02;
+// Rays through the water gather its light at this many points (ThroughWater).
+static const uint kWaterSteps = 2;
 
 bool IsWater(float4 flags) { return flags.r < 0.5 && flags.g > 0.5; }
 // A mirror's surface (translator::Variant::markMirror), which shows the game's reflection view.
@@ -40,7 +42,18 @@ float3 WaterNormal(float2 tangentSlope, float eyeAngle, float3 toEye, float slop
     return normalize(float3(slope, max(z, 0.2) * side));
 }
 
-float Schlick(float cosine) { return kWaterF0 + (1.0 - kWaterF0) * pow(1.0 - saturate(cosine), 5.0); }
+// The world normal of a drawn water pixel from the normal map's tangent-space slope the G-buffer holds: by its body's
+// texture axes where they are known (tangent x along s, y along t, as Water_vs20 takes them; also where the axes are
+// mirrored, which no rotation from the eye angle can match), else by the eye angle (WaterNormal).
+float3 DrawnWaterNormal(float2 tangentSlope, float eyeAngle, float3 toEye, float slopeScale, uint water)
+{
+    float2 s, t;
+    if (water == kNoWater || !WaterTextureAxes(water, LoadWaterBody(water), s, t))
+        return WaterNormal(tangentSlope, eyeAngle, toEye, slopeScale);
+    float z = sqrt(saturate(1.0 - dot(tangentSlope, tangentSlope)));
+    float2 slope = tangentSlope * slopeScale;
+    return normalize(float3(s * slope.x + t * slope.y, max(z, 0.2) * (toEye.z >= 0.0 ? 1.0 : -1.0)));
+}
 
 // The sun's specular highlight on the water, before the tonemap scale.
 float3 SunGlint(float3 position, float3 normal, float3 toEye)
@@ -56,7 +69,7 @@ float3 SunGlint(float3 position, float3 normal, float3 toEye)
     float d = a2 / (3.14159265 * pow(nh * nh * (a2 - 1.0) + 1.0, 2.0));
     float k = kGlintRoughness * 0.5;
     float g = (nl / (nl * (1.0 - k) + k)) * (nv / (nv * (1.0 - k) + k));
-    float f = Schlick(dot(halfway, toEye));
+    float f = Fresnel(dot(halfway, toEye), kWaterIor);
     float3 visibility = SunVisibility(position + normal * 2.0, g_frame.sunShadowMask);
     return ClampSample(g_frame.sunColor * (d * g * f / (4.0 * nv)) * visibility);
 }
@@ -68,58 +81,104 @@ struct WaterResult
     float hitDistance;
 };
 
-// The shaded water at a pixel, before the tonemap scale. Its reflection samples the glint's GGX lobe around the rippled
-// normal (a mirror without glossy reflections).
+// The shaded water at a pixel, before the tonemap scale. The rippled normal splits the light by Fresnel's equations
+// into a reflection, which samples the glint's GGX lobe (a mirror without glossy reflections), and a refraction bent
+// by Snell's law. From above, the refraction crosses the water to what lies under it (ThroughWater), and its radiance
+// spreads over the wider cone it leaves the water in (1 / n^2); from below, light from the air in Snell's window is
+// gathered into the narrower cone (n^2), beyond it the surface mirrors the water entirely, and the reflection crosses
+// the water too. Source's $refracttint tints what comes through. Water outside the map's bodies of water (brush
+// entities) keeps Source's refraction, fogged by Source, under the traced reflection.
+// The two rays share one call of ReflectedRadiance and the water one of ThroughWater: inlined more often, their code
+// slowed every pixel of the pass.
 WaterResult ShadeWater(int2 pixel, float3 position)
 {
-    Texture2D<float4> albedos = ResourceDescriptorHeap[g_frame.albedoView];
     Texture2D<float4> normals = ResourceDescriptorHeap[g_frame.gbufferNormalView];
     Texture2D<float4> flags = ResourceDescriptorHeap[g_frame.flagsView];
     float4 tangentNormal = normals.Load(int3(pixel, 0));
     float4 marks = flags.Load(int3(pixel, 0));
-    float tint = tangentNormal.z;
     float3 toEye = g_frame.eyePosition - position;
     float distance = length(toEye);
     toEye /= max(distance, 1e-4);
-    float3 normal = WaterNormal(tangentNormal.xy, tangentNormal.w, toEye, kWaveSlope);
-    float3 fresnelNormal = WaterNormal(tangentNormal.xy, tangentNormal.w, toEye, 1.0);
-    // The refraction holds the colour the game would have written, which is linear before its tonemap scale.
-    float3 refraction = albedos.Load(int3(pixel, 0)).rgb / max(g_frame.tonemapScale, 1e-3);
-
-    float cosine = saturate(dot(fresnelNormal, toEye));
-    float fresnel = Schlick(cosine) * marks.a;
-    // Below the surface, light from beyond the critical angle is reflected entirely (Snell's window). The shore fade is
-    // for the view from above, where the refraction's alpha holds the water's depth.
+    uint water = g_frame.traceMask != 0 ? WaterBodyAt(position - float3(0.0, 0.0, 1.0)) : kNoWater;
+    bool traced = water != kNoWater;
+    float tint = tangentNormal.z;
+    float3 normal = DrawnWaterNormal(tangentNormal.xy, tangentNormal.w, toEye, kWaveSlope, water);
+    float3 fresnelNormal = DrawnWaterNormal(tangentNormal.xy, tangentNormal.w, toEye, 1.0, water);
     bool below = toEye.z < 0.0;
-    if (below) {
-        float sine = sqrt(saturate(1.0 - cosine * cosine)) * kWaterIor;
-        fresnel = sine >= 1.0 ? 1.0 : Schlick(sqrt(saturate(1.0 - sine * sine)));
-    }
+    float side = below ? -1.0 : 1.0;
+    float ior = below ? 1.0 / kWaterIor : kWaterIor;
+    // Source's shore fade (the refraction's alpha) only for its own refraction.
+    float fresnel = Fresnel(dot(fresnelNormal, toEye), ior) * (traced || below ? 1.0 : marks.a);
+    uint seed = PixelSeed(pixel, 0x5Au);
+    float lobe = g_frame.glossyReflections != 0 ? LobeSpread(kGlintRoughness) : 0.0;
+    // Rays leave from the body's surface itself: the depth buffer puts far water units off it, and a reflected ray that
+    // started under the surface would meet its underside.
+    float3 surface = traced ? float3(position.xy, LoadWaterBody(water).surfaceZ) : position;
+
     WaterResult result;
-    result.hitDistance = kSkyHitDistance;
+    float weight;
+    float3 direction = ReflectionDirection(-toEye, normal, float3(0.0, 0.0, side), kGlintRoughness, float2(Random(seed), Random(seed)), weight);
+    // Ripples can tilt the direction into the surface; reflect it back off the plane.
+    if (direction.z * side < 0.02)
+        direction.z = side * max(abs(direction.z), 0.02);
+    direction = normalize(direction);
+    float3 refracted = refract(-toEye, fresnelNormal, 1.0 / ior);
+    bool refracts = traced && fresnel < 1.0 && dot(refracted, refracted) > 0.0;
+    if (refracts) {
+        if (refracted.z * side > -0.02)
+            refracted.z = -side * max(abs(refracted.z), 0.02);
+        refracted = normalize(refracted);
+    }
+
     float3 reflection = 0.0;
-    if (g_frame.traceMask != 0 && g_frame.reflectionScale > 0.0) {
-        uint seed = PixelSeed(pixel, 0x5Au);
-        float side = below ? -1.0 : 1.0;
-        float weight;
-        float3 direction = ReflectionDirection(-toEye, normal, float3(0.0, 0.0, side), kGlintRoughness, float2(Random(seed), Random(seed)), weight);
-        // Ripples can tilt the direction into the water; reflect it back off the plane.
-        if (direction.z * side < 0.02)
-            direction.z = side * max(abs(direction.z), 0.02);
-        direction = normalize(direction);
-        float lobe = g_frame.glossyReflections != 0 ? LobeSpread(kGlintRoughness) : 0.0;
-        reflection = ReflectedRadiance(position + float3(0.0, 0.0, side * 2.0), direction, PixelAngle() * distance, PixelAngle() + lobe, seed,
-            result.hitDistance);
-        reflection *= tint * g_frame.reflectionScale * weight;
-        // Seen from below, the reflected underwater scene lies behind more water.
+    float3 seen = 0.0;
+    float seenDistance = kSkyHitDistance;
+    result.hitDistance = kSkyHitDistance;
+    uint rays = g_frame.traceMask == 0 ? 0 : refracts ? 2 : 1;
+    for (uint r = 0; r < rays; ++r) {
+        bool reflected = r == 0;
+        float3 rayDirection = reflected ? direction : refracted;
+        float offset = reflected ? side * (traced ? kWaterSurfaceOffset : 2.0) : -side * kWaterSurfaceOffset;
+        float hitDistance;
+        float3 light = ReflectedRadiance(surface + float3(0.0, 0.0, offset), rayDirection, PixelAngle() * distance, PixelAngle() + lobe, seed, hitDistance,
+            reflected && traced && !below);
+        if (reflected) {
+            reflection = light * (tint * weight * g_frame.reflectionScale);
+            result.hitDistance = hitDistance;
+        } else {
+            seen = light;
+            seenDistance = hitDistance;
+        }
+    }
+
+    float3 transmitted;
+    if (traced) {
+        // From below the reflection crosses the water; from above what is seen through it does.
+        float3 inWater = below ? reflection : seenDistance < kSkyHitDistance ? seen : 0.0;
+        float3 crossedDirection = below ? direction : refracted;
+        float crossedDistance = below ? result.hitDistance : seenDistance;
+        float3 crossed = ThroughWater(inWater, surface, crossedDirection, crossedDistance, water, kWaterSteps, seed) +
+            WaterLampsAlong(surface, crossedDirection, crossedDistance, water, kWaterSteps, seed);
+        if (below) {
+            reflection = crossed;
+            transmitted = seen * (kWaterIor * kWaterIor);
+        } else {
+            transmitted = refracts ? crossed / (kWaterIor * kWaterIor) : 0.0;
+        }
+        transmitted *= LoadWaterBody(water).refractTint;
+    } else {
+        // Source's refraction holds the colour the game would have written, linear before its tonemap scale. Seen from
+        // below, the reflected underwater scene lies behind more of Source's water fog.
+        Texture2D<float4> albedos = ResourceDescriptorHeap[g_frame.albedoView];
+        transmitted = albedos.Load(int3(pixel, 0)).rgb / max(g_frame.tonemapScale, 1e-3);
         if (below && g_frame.fogEnabled != 0) {
             float fog = saturate(min(g_frame.fogParams.z, result.hitDistance * g_frame.fogParams.w - g_frame.fogParams.x));
             reflection = lerp(reflection, g_frame.fogColor / max(g_frame.tonemapScale, 1e-3), g_frame.fogParams.y > 0.0 ? fog : fog * fog);
         }
     }
-    result.color = lerp(refraction, reflection, fresnel);
+    result.color = fresnel * reflection + (1.0 - fresnel) * transmitted;
     if (!below)
-        result.color += SunGlint(position, normal, toEye) * (g_frame.reflectionScale * marks.a);
+        result.color += SunGlint(surface, normal, toEye) * (g_frame.reflectionScale * (traced ? 1.0 : marks.a));
     result.specularAlbedo = saturate(fresnel * tint);
     return result;
 }

@@ -67,6 +67,8 @@ struct BspLeaf {
     int32_t cluster;
     int32_t area;
     Float3 mins, maxs;
+    // Its WorldGeometry::waterBodies index (dleaf_t::leafWaterDataID), or -1 outside water.
+    int32_t water = -1;
 };
 
 // The world's BSP tree and potentially visible sets. VRAD only lights a sample from lights whose cluster sees
@@ -169,11 +171,36 @@ struct BakedLighting {
     std::vector<AmbientSample> ambientSamples;
 };
 
+// A body of water (dleafwaterdata_t): the leaves under one water surface, and that surface's material (texdata) and
+// texture axes (texinfo's texture vectors over the texdata's size, as FaceUv maps faces).
+struct WaterBody {
+    float surfaceZ;
+    float minZ;
+    uint32_t material = kNoMaterial;
+    float textureS[4] = {};
+    float textureT[4] = {};
+    // The bounds of its surface's faces across, and from minZ up to the surface.
+    Float3 mins = {};
+    Float3 maxs = {};
+};
+
 struct WorldGeometry {
     Mesh mesh;
+    // The world's water surfaces (horizontal SURF_WARP faces outside the 3D skybox) that top one of waterBodies; each
+    // triangle's triangleMaterials entry is its waterBodies index (Scene::SetWater's triangle bodies).
+    Mesh water;
+    std::vector<WaterBody> waterBodies;
     // Brush entity models ("*1", "*2", ...: doors, func_brush) indexed by model number, in their entity's space.
     // Entry 0 is the world, which is `mesh`, and stays empty.
     std::vector<Mesh> brushModels;
+    // Water in brush entity models (func_water_analog): the model's upward SURF_WARP faces and the body they top, in
+    // the entity's space; the body's material and texture axes come from the highest face.
+    struct BrushWater {
+        uint32_t model = 0;
+        Mesh surface;
+        WaterBody body;
+    };
+    std::vector<BrushWater> brushWater;
     // Material name of each texdata entry, as in "materials/<name>.vmt".
     std::vector<std::string> materials;
     // The texdata entries VRAD made emit_surface lights of (a texinfo with SURF_LIGHT uses them).

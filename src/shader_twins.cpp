@@ -58,6 +58,8 @@ struct Family {
     // The register of the source's light warp sampler, read when the static switch `lightWarpSwitch` is 1, or -1.
     int lightWarpSampler = -1;
     std::string_view lightWarpSwitch = "LIGHTWARPTEXTURE";
+    // Drawn only after the G-buffer (forward lighting): no G-buffer twin.
+    bool forwardOnly = false;
 };
 
 // Flashlight passes are skipped in real-time mode; GMod's lightmap switch is not in the twin yet; unlit combos keep
@@ -73,6 +75,11 @@ bool KeepSkin(const Values& values) { return ValueOf(values, "FLASHLIGHT") != 0;
 
 bool KeepNone(const Values&) { return false; }
 
+// Refract's masked frame buffer copy is an effect, not glass: it keeps the game's shader. Its blur (a 3x3 box of 1/512
+// of the screen) and its fade towards the plain copy at silhouettes, both on by default, give way to the traced
+// refraction and Fresnel's equations.
+bool KeepRefractEffects(const Values& values) { return ValueOf(values, "MASKED") != 0; }
+
 constexpr Family kFamilies[] = {
     { "vertexlit_and_unlit_generic_ps20b", "vertexlit_and_unlit_generic_ps2x.fxc", "ps20b", "ps_2_b", "SHADER_MODEL_PS_2_B", 377487360, 12, 0x6e13aa07,
         &KeepVertexLitGeneric, "" },
@@ -86,6 +93,9 @@ constexpr Family kFamilies[] = {
     // Eyes and teeth have no lighting preview combo; their twins are drawn in place of the game's lit shader.
     { "eyes_ps20b", "eyes_ps2x.fxc", "ps20b", "ps_2_b", "SHADER_MODEL_PS_2_B", 4, 4, 0x2dc0584a, &KeepNone, "WRITE_DEPTH_TO_DESTALPHA PIXELFOGTYPE" },
     { "teeth_ps20b", "teeth_ps2x.fxc", "ps20b", "ps_2_b", "SHADER_MODEL_PS_2_B", 8, 4, 0x08da8ae0, &KeepNone, "PIXELFOGTYPE WRITE_DEPTH_TO_DESTALPHA" },
+    // Refract glass traces its refraction (shaders/forward_twin.hlsli) instead of distorting the frame buffer.
+    { "refract_ps20b", "refract_ps2x.fxc", "ps20b", "ps_2_b", "SHADER_MODEL_PS_2_B", 2048, 4, 0xc47bc098, &KeepRefractEffects,
+        "PIXELFOGTYPE WRITE_DEPTH_TO_DESTALPHA", -1, "LIGHTWARPTEXTURE", true },
 };
 
 std::filesystem::path TwinDirectory() { return ModDirectory() / L"twins"; }
@@ -363,7 +373,7 @@ std::span<const DWORD> Twin(std::string_view file, const vcs::Header& header, in
             forward ? " (forward)" : "", error.substr(line, error.find('\n', line) - line));
     } else if (!code.empty() && !entry->loggedUse) {
         entry->loggedUse = true;
-        log::Info("Twins: {} draws its G-buffer twin", entry->family->gameFile);
+        log::Info("Twins: {} draws its {} twin", entry->family->gameFile, entry->family->forwardOnly ? "forward" : "G-buffer");
     }
     return compiled.try_emplace(key, std::move(code)).first->second;
 }
@@ -372,6 +382,8 @@ std::span<const DWORD> Twin(std::string_view file, const vcs::Header& header, in
 
 std::span<const DWORD> GBufferShader(std::string_view file, const vcs::Header& header, int staticIndex, int dynamicIndex)
 {
+    if (!HasTwin(file))
+        return {};
     return Twin(file, header, staticIndex, dynamicIndex, false);
 }
 
@@ -420,7 +432,7 @@ bool HasTwin(std::string_view file)
     std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     if (key.ends_with(".vcs"))
         key.resize(key.size() - 4);
-    return std::any_of(std::begin(kFamilies), std::end(kFamilies), [&](const Family& f) { return f.gameFile == key; });
+    return std::any_of(std::begin(kFamilies), std::end(kFamilies), [&](const Family& f) { return f.gameFile == key && !f.forwardOnly; });
 }
 
 }

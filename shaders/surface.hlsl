@@ -38,7 +38,27 @@ void main(uint3 id : SV_DispatchThreadID)
     if (coverage.r < 0.5 || depth >= 1.0) {
         float3 toWater = g_frame.eyePosition - WorldPositionFromDepth(pixel, depth);
         output[pixel] = IsWater(coverage) && depth < 1.0 ? float4(0.0, 0.0, toWater.z >= 0.0 ? 1.0 : -1.0, -length(toWater)) : 0.0;
+        // The developer probe on water: the normal map's tangent-space slope the game's draw sampled (and its eye angle)
+        // and the one shaders sample at the same point (WaterSurfaceSlope), which should agree (Lighting::RequestProbe).
+        if (g_frame.probeView != kNoView && IsWater(coverage) && depth < 1.0 && all(uint2(pixel) == uint2(g_frame.probePixel & 0xFFFF, g_frame.probePixel >> 16))) {
+            float3 position = WorldPositionFromDepth(pixel, depth);
+            uint water = WaterBodyAt(position - float3(0.0, 0.0, 1.0));
+            float4 stored = gbufferNormal.Load(int3(pixel, 0));
+            float3 drawn = float3(stored.xy, stored.w);
+            float3 rebuilt = water != kNoWater ? WaterSurfaceSlope(water, LoadWaterBody(water), position) : 0.0;
+            // The eye vector's angle in the tangent plane if tangent x runs along the texture's s axis and y along t.
+            float2 axisS, axisT;
+            if (water != kNoWater && WaterTextureAxes(water, LoadWaterBody(water), axisS, axisT))
+                rebuilt.z = atan2(dot(toWater.xy, axisT), dot(toWater.xy, axisS));
+            RWByteAddressBuffer probe = ResourceDescriptorHeap[g_frame.probeView];
+            probe.Store4(32, uint4(asuint(drawn), water));
+            probe.Store4(48, uint4(asuint(rebuilt), 1));
+        }
         return;
+    }
+    if (g_frame.probeView != kNoView && all(uint2(pixel) == uint2(g_frame.probePixel & 0xFFFF, g_frame.probePixel >> 16))) {
+        RWByteAddressBuffer probe = ResourceDescriptorHeap[g_frame.probeView];
+        probe.Store(60, 0);
     }
     float3 position = WorldPositionFromDepth(pixel, depth);
     float3 toEye = g_frame.eyePosition - position;

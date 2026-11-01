@@ -25,7 +25,7 @@ std::span<const DWORD> ForwardShader(std::string_view file, const vcs::Header& h
 
 // The sampler register of the light warp texture ($lightwarptexture) a twin's combo reads, or -1.
 int LightWarpSampler(std::string_view file, const vcs::Header& header, int staticIndex);
-// Whether a game shader file (.vcs name, any case) has a twin.
+// Whether a game shader file (.vcs name, any case) has a G-buffer twin.
 bool HasTwin(std::string_view file);
 
 }

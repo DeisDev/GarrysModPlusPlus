@@ -373,8 +373,9 @@ float4 main( PS_INPUT i ) : COLOR
 	twin.emissive = float4( max( twinEmissive, 0.0f ), -fSpecExp );
 	float twinSpecular = fSpecMask * g_SpecularBoost * dot( vSpecularTint, float3( 1.0f, 1.0f, 1.0f ) / 3.0f );
 #if FORWARD_TWIN
-	// shaders/forward_twin.hlsli lights the draw at its world position.
+	// shaders/forward_twin.hlsli lights the draw at its world position; skin reflects no traced cubemap (normal alpha 0).
 	twin.flags = float4( i.worldPos_atten3.xyz, twinAlpha );
+	twin.normal.a = 0.0f;
 #else
 	// Rim light: red holds the rim's mask, Fresnel and tint from 128/255 (shaders/common.hlsli RimScale), a step above
 	// coverage's 0.5 so an 8-bit target cannot round a zero rim below it, and the material bits its boost.

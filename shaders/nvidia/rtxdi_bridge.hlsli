@@ -338,7 +338,7 @@ bool RAB_SurfaceImportanceSampleBrdf(RAB_Surface surface, inout RTXDI_RandomSamp
     return true;
 }
 
-// The share of a sample's light that reaches the surface, as LightTransmittance traces it: from in front of the face
+// The share of a sample's light that reaches the surface, as LightTransmittance traces it (LightPath): from in front of the face
 // (behind a leaf for light through it), past lamp shells for sealed lights, and past the local player for its
 // attached lights.
 float3 SampleTransmittance(RAB_Surface surface, RAB_LightSample sample)
@@ -359,7 +359,12 @@ float3 SampleTransmittance(RAB_Surface surface, RAB_LightSample sample)
         mask = ShadowMask(true);
     }
     bool onModel = (surface.material & kRestirOnModel) != 0;
-    return Transmittance(origin, path / distance, ShadowRayLength(clearance, distance), mask, SelfShadowFlags(onModel, surface.faceNormal, sample.toLight));
+    // Under water the light follows its bent path through the surface (LightPath).
+    g_receiverNormal = surface.normal;
+    float3 toLight;
+    float3 visibility = LightPath(origin, sample.position, clearance, mask, SelfShadowFlags(onModel, surface.faceNormal, sample.toLight), toLight);
+    g_receiverNormal = 0.0;
+    return index < g_restir.mapLights && any(visibility > 0.0) ? visibility * BentSpotShare(index, origin, sample.position, toLight) : visibility;
 }
 
 bool RAB_GetConservativeVisibility(RAB_Surface surface, RAB_LightSample sample)

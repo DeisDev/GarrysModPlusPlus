@@ -1617,6 +1617,22 @@ int UserClipPlanes(float planes[6][4])
     }
     return count;
 }
+bool EyeBelowHeightClip()
+{
+    if (g_clip.enabled == 0)
+        return false;
+    Matrix eyeToWorld;
+    if (!Invert(Top(kMatrixView), eyeToWorld))
+        return false;
+    const float* eye = eyeToWorld.m[3];
+    for (int i = 0; i < kClipPlanes; ++i) {
+        const float* p = g_clip.planes[i];
+        if ((g_clip.enabled & (1u << i)) && p[2] > 0.99f && p[0] * eye[0] + p[1] * eye[1] + p[2] * eye[2] + p[3] < 0.0f)
+            return true;
+    }
+    return false;
+}
+
 void ResetDynamicState() { ResetRenderState(ShaderApi(), true); }
 void* BoundMaterial() { return g_api.material; }
 

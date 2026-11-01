@@ -30,6 +30,8 @@ constexpr UINT kSkyboxMask = 0x10;
 // Static props the map marks as casting no shadows (often foliage). VRAD let all light through them; they block
 // light by FoliageShadows (src/settings.h).
 constexpr UINT kShadowlessPropMask = 0x20;
+// Water surfaces (Scene::SetWater), which only rays that look for water meet: the water's own rays and reflections.
+constexpr UINT kWaterMask = 0x40;
 // Static props that enclose a map light (SealedLights in src/world.cpp). The lights they seal shine through them, as
 // through a diffuser; to every other ray they are static props.
 constexpr UINT kLampShellMask = 0x80;
@@ -46,6 +48,42 @@ constexpr uint32_t kInstanceModel = 0x04;
 constexpr uint32_t kInstanceEmitter = 0x10;
 // Set by Scene for instances of character models (Scene::MarkCharacter), whose $halflambert materials are skin.
 constexpr uint32_t kInstanceCharacter = 0x20;
+// The water surfaces' instance (kWaterMask).
+constexpr uint32_t kInstanceWater = 0x40;
+
+// A body of water for shaders (WaterBody in shaders/water_body.hlsli): the medium its water is, its surface's height,
+// tints and normal map (frames from `framesFirst` in Scene::Water's frame list, animated at `frameRate`; bumpS and bumpT
+// map (u, v, seconds, 1) to its coordinates), and its bounds.
+struct GpuWaterBody {
+    float extinction[3];
+    float surfaceZ;
+    float fogColor[3];
+    float reflectTint;
+    float refractTint[3];
+    uint32_t framesFirst;
+    float textureS[4];
+    float textureT[4];
+    float bumpS[4];
+    float bumpT[4];
+    float mins[3];
+    uint32_t frameCount;
+    float maxs[3];
+    float frameRate;
+};
+static_assert(sizeof(GpuWaterBody) == 144);
+
+// The map's water on the GPU (Scene::SetWater): raw views of the GpuWaterBody list, each BSP leaf's body (-1 for none),
+// each water surface triangle's body and the normal maps' frame descriptors; `top` is the highest surface. Bodies from
+// `brushFirst` on are brush entities' (Scene::PlaceBrushWater), found by their bounds alone.
+struct WaterViews {
+    UINT bodiesView = DescriptorHeap::kInvalid;
+    UINT bodyCount = 0;
+    UINT brushFirst = 0;
+    UINT leafWaterView = DescriptorHeap::kInvalid;
+    UINT trianglesView = DescriptorHeap::kInvalid;
+    UINT framesView = DescriptorHeap::kInvalid;
+    float top = -1e30f;
+};
 
 // A static self-illuminated triangle sampled as an area light (Emitter in shaders/scene.hlsli): its corners in world
 // space, its scene instance and triangle, and the share of all emitters' emission times area up to and with it. The
@@ -107,7 +145,11 @@ struct GpuMaterial {
     float envmapLightScale;
     float envmapLightMin;
     float envmapLightRange;
-    float padding[2];
+    // The base texture (DescriptorHeap::kInvalid for none) and the luminance of its average colour (vtex's
+    // reflectivity), from which reflected and refracted hits take their texture's detail (TexturedAlbedo in
+    // shaders/scene.hlsli).
+    uint32_t baseTexture;
+    float reflectivity;
 };
 
 struct SceneInstance {
@@ -118,6 +160,10 @@ struct SceneInstance {
     UINT mask = 0;
     // kInstanceIgnoreNormals.
     uint32_t flags = 0;
+    // Brush entity water's body of water (Scene::SetWater's bodies); the world's water surfaces find theirs per
+    // triangle.
+    static constexpr uint32_t kNoWaterBody = 0xFFFFFFFFu;
+    uint32_t waterBody = kNoWaterBody;
     float transform[3][4];
     // Where the instance was last frame, for motion vectors: its transform when `previousKnown`, and a skinned
     // model's vertex positions when the view is valid.
@@ -173,6 +219,16 @@ struct SceneFrame {
     UINT dynamicLightCount = 0;
     // The light style values of Scene::SetLightStyles, as floats.
     UINT lightStylesView = DescriptorHeap::kInvalid;
+    // The bodies of water with the brush entities' where Scene::PlaceBrushWater put them (kInvalid when the map has
+    // none), and the highest surface.
+    UINT waterBodiesView = DescriptorHeap::kInvalid;
+    float waterTop = -1e30f;
+};
+
+// Where a brush entity's body of water is this frame: its entity's offset from the model's space.
+struct BrushWaterPlacement {
+    uint32_t body = 0;
+    float offset[3] = {};
 };
 
 // Ray-tracing acceleration structures and the per-triangle data shaders need at a hit (positions, indices
@@ -216,6 +272,14 @@ public:
     // `tint` times the texture's colour (Refract glass).
     static constexpr uint32_t kTintFilter = 1;
     static constexpr uint32_t kTintRefract = 2;
+    // Added to either: the surface is a pane of glass, whose two faces reflect part of the light (GlassTransmission in
+    // shaders/scene.hlsli).
+    static constexpr uint32_t kTintGlass = 4;
+    // Set by AddModel on glass with another glass face of the model close behind it: one face of a thick pane, which
+    // reflects at that face alone.
+    static constexpr uint32_t kTintGlassFace = 8;
+    // How far behind a glass face the pane's other face may be (a window's glass is a few units thick).
+    static constexpr float kMaxGlassThickness = 16.0f;
     static uint32_t PackTint(const bsp::Float3& tint, uint32_t mode);
 
     static constexpr uint32_t kNoMaterial = 0xFFFFFFFF;
@@ -256,6 +320,19 @@ public:
         if (model >= 0 && static_cast<size_t>(model) < m_models.size())
             m_models[model].character = true;
     }
+    // The map's bodies of water, the descriptors of their normal maps' frames, each water surface triangle's body (in the
+    // water model's BLAS order) and each BSP leaf's body; false (logged) when the upload fails.
+    bool SetWater(std::span<const GpuWaterBody> bodies, std::span<const uint32_t> frameViews, std::span<const uint32_t> triangleBodies,
+        const bsp::Visibility& visibility, UINT brushFirst);
+    // Moves the brush entities' bodies of water (from WaterViews::brushFirst on, given in their model's space) to where
+    // their entities are this frame; bodies not placed hold no water.
+    void PlaceBrushWater(std::span<const BrushWaterPlacement> placements);
+    const WaterViews& Water() const { return m_water; }
+    std::span<const GpuWaterBody> WaterBodies() const { return m_waterBodies; }
+    // The body of water holding a point (WaterBodyAt in shaders/water_body.hlsli), or DescriptorHeap::kInvalid.
+    UINT WaterAt(const float (&point)[3]) const;
+    // Whether a body of water's surface lies over part of a square of the ground plane.
+    bool WaterWithin(float minX, float minY, float maxX, float maxY) const;
     UINT EmittersView() const { return m_emittersView; }
     UINT EmitterCount() const { return m_emitterCount; }
     float EmitterPower() const { return m_emitterPower; }
@@ -352,6 +429,10 @@ private:
         Microsoft::WRL::ComPtr<ID3D12Resource> lightStyles;
         float* mappedLightStyles = nullptr;
         UINT lightStylesView = DescriptorHeap::kInvalid;
+        Microsoft::WRL::ComPtr<ID3D12Resource> waterBodies;
+        GpuWaterBody* mappedWaterBodies = nullptr;
+        UINT waterBodiesView = DescriptorHeap::kInvalid;
+        size_t waterBodyCapacity = 0;
         Microsoft::WRL::ComPtr<ID3D12Resource> scratch;
         Microsoft::WRL::ComPtr<ID3D12Resource> tlas;
     };
@@ -366,6 +447,7 @@ private:
     bool EnsureFrameCapacity(FrameTlas& frame, UINT count);
     bool EnsureDynamicLights(FrameTlas& frame);
     bool EnsureLightStyles(FrameTlas& frame);
+    bool EnsureWaterBodies(FrameTlas& frame, size_t count);
     bool BuildLightLists(std::span<const bsp::Light> lights, const bsp::Visibility& visibility);
     // The light grid of LightLists over the world's triangles. A cell lists the lights with the largest bound there
     // (LightBound), lights its clusters' PVS leaves out weighed down but kept, and samples the rest; it samples the
@@ -438,6 +520,14 @@ private:
     Microsoft::WRL::ComPtr<ID3D12Resource> m_gridTail;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_bspNodes;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_leafClusters;
+    WaterViews m_water;
+    std::vector<GpuWaterBody> m_waterBodies;
+    // m_waterBodies with the brush entities' where PlaceBrushWater put them, and their highest surface.
+    std::vector<GpuWaterBody> m_placedWaterBodies;
+    float m_placedWaterTop = -1e30f;
+    // The BSP tree and leaves, for WaterAt.
+    bsp::Visibility m_waterVisibility;
+    std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> m_waterBuffers;
     BakedBuffers m_baked;
     std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> m_bakedInputs;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_bakedRaw;

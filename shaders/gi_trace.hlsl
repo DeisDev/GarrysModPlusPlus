@@ -38,9 +38,9 @@ float3 PreviousIrradiance(float3 position, float3 normal)
 }
 
 // Indirect light at an off-screen hit: more diffuse bounces, each seeing the sky, the light the radiance cache holds for
-// the surface it meets, or that surface lit by the sun and one local light. Below foliage_shadows' "All light", rays
-// after the first pass through shadowless props (g_frame.bounceMask): in grass they cross many alpha-tested blades for
-// light the denoiser blurs anyway.
+// the surface it meets, or that surface lit by the sun and one local light, through the water on the way
+// (TraceThroughWater). Below foliage_shadows' "All light", rays after the first pass through shadowless props
+// (g_frame.bounceMask): in grass they cross many alpha-tested blades for light the denoiser blurs anyway.
 float3 FurtherBounces(HitSurface hit, float3 origin, inout uint seed)
 {
     float3 irradiance = 0.0;
@@ -49,7 +49,12 @@ float3 FurtherBounces(HitSurface hit, float3 origin, inout uint seed)
         float3 direction = CosineSample(hit.normal, Random(seed), Random(seed));
         HitSurface next;
         HitInfo nextHit;
-        if (!TraceClosest(origin, direction, kMaxDistance, g_frame.bounceMask, next, nextHit, g_frame.indirectRayFlags))
+        float3 water;
+        float3 waterLight;
+        bool found = TraceThroughWater(origin, direction, kMaxDistance, g_frame.bounceMask, g_frame.indirectRayFlags, seed, next, nextHit, water, waterLight);
+        irradiance += throughput * waterLight;
+        throughput *= water;
+        if (!found)
             return irradiance + throughput * SkyLight(direction);
         float3 emission = BounceEmission(next, nextHit, false);
         float3 cached;
@@ -125,11 +130,14 @@ void main(uint3 id : SV_DispatchThreadID)
         float3 direction = AboveSurface(CosineSample(through ? -normal : normal, Random(seed), Random(seed)), side);
         HitSurface hit;
         HitInfo hitInfo;
-        if (TraceClosest(through ? position - geometricNormal * bias : origin, direction, kMaxDistance, g_frame.indirectMask, hit, hitInfo, g_frame.indirectRayFlags)) {
-            estimate += ClampSample(HitRadiance(hit, hitInfo, seed));
+        float3 water;
+        float3 waterLight;
+        if (TraceThroughWater(through ? position - geometricNormal * bias : origin, direction, kMaxDistance, g_frame.indirectMask, g_frame.indirectRayFlags, seed,
+                hit, hitInfo, water, waterLight)) {
+            estimate += ClampSample(HitRadiance(hit, hitInfo, seed) * water + waterLight);
             hitDistance += hitInfo.t;
         } else {
-            estimate += SkyLight(direction);
+            estimate += SkyLight(direction) * water + waterLight;
             hitDistance += kMaxDistance;
         }
     }

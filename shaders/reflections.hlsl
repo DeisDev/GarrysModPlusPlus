@@ -48,57 +48,69 @@ void main(uint3 id : SV_DispatchThreadID)
     float3 position = WorldPositionFromDepth(pixel, DepthAt(pixel));
     float3 view = normalize(position - g_frame.eyePosition);
     Texture2D<float4> flags = ResourceDescriptorHeap[g_frame.flagsView];
-    if (IsWaterSurface(MaterialBits(flags.Load(int3(pixel, 0))))) {
+    uint seed = PixelSeed(pixel, 0x8Fu);
+    // Textured water and env_cubemap materials share the one traced reflection (ReflectedRadiance): its code inlined twice
+    // slowed the whole pass.
+    bool waterSurface = IsWaterSurface(MaterialBits(flags.Load(int3(pixel, 0))));
+    Material material = (Material)0;
+    float2 uv = 0.0;
+    float footprint = 0.0;
+    float3 origin = 0.0;
+    float3 direction = 0.0;
+    float3 normal = surface.xyz;
+    float coneWidth = 0.0;
+    float lobe = 0.0;
+    float weight = 1.0;
+    float strength = 0.0;
+    float alpha = kGlintRoughness;
+    if (waterSurface) {
         // Textured water: a mirror under the water's Fresnel term, scaled by its reflect tint and the base texture's
         // alpha, from just above the plane (shaders/water.hlsli).
         Texture2D<float4> normals = ResourceDescriptorHeap[g_frame.gbufferNormalView];
         float4 water = normals.Load(int3(pixel, 0));
-        uint seed = PixelSeed(pixel, 0x8Fu);
-        float weight;
-        float3 direction = ReflectionDirection(view, WaterNormal(water.xy, water.w, -view, kWaveSlope), float3(0.0, 0.0, 1.0), kGlintRoughness,
+        direction = ReflectionDirection(view, WaterNormal(water.xy, water.w, -view, kWaveSlope), float3(0.0, 0.0, 1.0), kGlintRoughness,
             float2(Random(seed), Random(seed)), weight);
         direction.z = max(direction.z, 0.02);
-        float strength = Schlick(dot(surface.xyz, -view)) * water.z * g_frame.reflectionScale;
-        float hitDistance;
-        float lobe = g_frame.glossyReflections != 0 ? LobeSpread(kGlintRoughness) : 0.0;
-        float3 reflection = ReflectedRadiance(position + float3(0.0, 0.0, 2.0), normalize(direction), PixelAngle() * surface.w, PixelAngle() + lobe, seed,
-            hitDistance);
-        output[pixel] = float4(reflection * strength * weight, hitDistance);
-        WriteGuides(pixel, saturate(strength), GuideRoughness(kGlintRoughness), hitDistance);
-        return;
+        direction = normalize(direction);
+        strength = Fresnel(dot(surface.xyz, -view), kWaterIor) * water.z * g_frame.reflectionScale;
+        lobe = g_frame.glossyReflections != 0 ? LobeSpread(kGlintRoughness) : 0.0;
+        origin = position + float3(0.0, 0.0, 2.0);
+        coneWidth = PixelAngle() * surface.w;
+    } else {
+        HitInfo hit;
+        float uvPerUnit;
+        if (!VisibleHit(pixel, hit) || !HitMaterial(hit, material, uv, uvPerUnit))
+            return;
+        // The pixel's size on the surface, from the neighbours on the side that stays on the same surface.
+        float3 right = WorldPositionFromDepth(pixel + int2(1, 0), DepthAt(pixel + int2(1, 0))) - position;
+        float3 left = position - WorldPositionFromDepth(pixel - int2(1, 0), DepthAt(pixel - int2(1, 0)));
+        float3 down = WorldPositionFromDepth(pixel + int2(0, 1), DepthAt(pixel + int2(0, 1))) - position;
+        float3 up = position - WorldPositionFromDepth(pixel - int2(0, 1), DepthAt(pixel - int2(0, 1)));
+        float pixelWidth = max(min(length(right), length(left)), min(length(down), length(up)));
+        footprint = pixelWidth * uvPerUnit;
+        strength = MaskValue(material.envmapMask, uv, footprint) * g_frame.reflectionScale;
+        if (strength > 0.0) {
+            float3 geometricNormal = GeometricNormalAt(pixel);
+            origin = SurfaceRayOrigin(position, geometricNormal, surface.w);
+            alpha = PhongRoughness(pixel);
+            direction = ReflectionDirection(view, normal, geometricNormal, alpha, float2(Random(seed), Random(seed)), weight);
+            lobe = g_frame.glossyReflections != 0 && alpha >= kMirrorRoughness ? LobeSpread(alpha) : 0.0;
+            coneWidth = pixelWidth;
+        }
     }
-    HitInfo hit;
-    if (!VisibleHit(pixel, hit))
-        return;
-    Material material;
-    float2 uv;
-    float uvPerUnit;
-    if (!HitMaterial(hit, material, uv, uvPerUnit))
-        return;
-    // The pixel's size on the surface, from the neighbours on the side that stays on the same surface.
-    float3 right = WorldPositionFromDepth(pixel + int2(1, 0), DepthAt(pixel + int2(1, 0))) - position;
-    float3 left = position - WorldPositionFromDepth(pixel - int2(1, 0), DepthAt(pixel - int2(1, 0)));
-    float3 down = WorldPositionFromDepth(pixel + int2(0, 1), DepthAt(pixel + int2(0, 1))) - position;
-    float3 up = position - WorldPositionFromDepth(pixel - int2(0, 1), DepthAt(pixel - int2(0, 1)));
-    float pixelWidth = max(min(length(right), length(left)), min(length(down), length(up)));
-    float footprint = pixelWidth * uvPerUnit;
 
     float3 result = 0.0;
     float reflectionDistance = 0.0;
-    float mask = MaskValue(material.envmapMask, uv, footprint);
-    float reflectivity = mask * g_frame.reflectionScale;
-    if (reflectivity > 0.0) {
-        float3 normal = surface.xyz;
-        float3 geometricNormal = GeometricNormalAt(pixel);
-        float3 origin = SurfaceRayOrigin(position, geometricNormal, surface.w);
-        uint seed = PixelSeed(pixel, 0x8Fu);
+    if (strength > 0.0) {
         float hitDistance;
-        float alpha = PhongRoughness(pixel);
-        float weight;
-        float3 direction = ReflectionDirection(view, normal, geometricNormal, alpha, float2(Random(seed), Random(seed)), weight);
-        float lobe = g_frame.glossyReflections != 0 && alpha >= kMirrorRoughness ? LobeSpread(alpha) : 0.0;
+        float3 reflected = ReflectedRadiance(origin, direction, coneWidth, PixelAngle() + lobe, seed, hitDistance, (g_frame.traceMask & kSkyboxMask) == 0);
+        if (waterSurface) {
+            output[pixel] = float4(reflected * strength * weight, hitDistance);
+            WriteGuides(pixel, saturate(strength), GuideRoughness(kGlintRoughness), hitDistance);
+            return;
+        }
         // As LightmappedGeneric and VertexLitGeneric shape their cubemap term.
-        float3 specular = ReflectedRadiance(origin, direction, pixelWidth, PixelAngle() + lobe, seed, hitDistance) * material.envmapTint * (reflectivity * weight);
+        float3 specular = reflected * material.envmapTint * (strength * weight);
         specular = lerp(specular, specular * specular, material.envmapContrast);
         specular = lerp(dot(specular, float3(0.299, 0.587, 0.114)), specular, material.envmapSaturation);
         if (material.envmapLightScale > 0.0) {
@@ -116,7 +128,9 @@ void main(uint3 id : SV_DispatchThreadID)
         result += specular;
         reflectionDistance = hitDistance;
         float roughness = GuideRoughness(alpha);
-        WriteGuides(pixel, SpecularAlbedo(saturate(material.envmapTint * reflectivity), roughness * roughness, dot(normal, -view)), roughness, hitDistance);
+        WriteGuides(pixel, SpecularAlbedo(saturate(material.envmapTint * strength), roughness * roughness, dot(normal, -view)), roughness, hitDistance);
+    } else if (waterSurface) {
+        return;
     }
     float selfIllum = MaskValue(material.selfIllumMask, uv, footprint);
     if (selfIllum > 0.0) {

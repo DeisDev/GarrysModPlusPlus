@@ -67,6 +67,8 @@ struct Pass {
     // A forward twin, lit in the shader from these frame constants and scene (translator::Variant::forwardLighting).
     D3D12_GPU_VIRTUAL_ADDRESS forwardFrame = 0;
     D3D12_GPU_VIRTUAL_ADDRESS forwardScene = 0;
+    // A water surface the capture records (gbuffer::WaterSurfaceDraw); its texture mapping comes from its vertices.
+    bool waterSurface = false;
 };
 
 // The game's pixel shader combo a pass draws: its shader file's header and combo indices (shader_twins.h).
@@ -80,6 +82,8 @@ struct ComboId {
 // `pixelFile` (null without a pixel shader).
 Pass Prepare(std::span<const DWORD> vertexCode, std::span<const DWORD> pixelCode, const char* pixelFile, const ComboId& pixelCombo, bool depthTest,
     bool blend, int sourceBlend, int destinationBlend, bool srgbWrite, std::uint32_t srgbRead);
+// Takes a water surface pass's texture mapping from its first triangle's vertices (WaterSurfaceDraw::uvS, uvT).
+void RecordWaterMapping(const MeshDraw& mesh);
 // Binds the capture's targets for a pass routed to them.
 Targets BindTargets(const Pass& pass, bool srgb);
 // Adds the G-buffer's coverage target to a pass's targets as render target 1, for a pass with clearsCoverage.

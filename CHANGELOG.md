@@ -23,8 +23,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Ropes and cables, such as power lines, cast shadows.
 - Held weapons, including your own, cast shadows and show in reflections, placed in the hand that holds them.
 - Light switches, toggled lights and animated lights (flicker, pulse, scripted day and night) now work with real-time lighting.
-- Water has ray-traced reflections over the game's refraction, a sun glint and a physical Fresnel term.
-- Underwater, the surface shows the world above through Snell's window and mirrors the water below beyond it, and sunlight scatters in the water's colour.
+- Glass reflects its surroundings with ray tracing, more strongly at grazing angles, where its cubemap used to be.
+- Refract glass shows the scene behind it, bent by its ripples and tinted, with ray tracing instead of a distorted copy of the screen. Thick panes bend light at both faces, and frosted Refract glass stays blurred.
+- Reflections show water surfaces and what lies under them, and reflected and refracted surfaces keep their textures.
+- Water is fully ray traced: reflections, refraction that shows what lies under the water bent by its ripples, a sun glint, and Fresnel's equations between them.
+- Sunlight through water throws moving caustics on what lies below it, following the water's own ripples.
+- Lamps and flashlights shine into water along the path the surface bends their light to, dimmed by the water, and their beams glow in the water seen from above it too.
+- Water in moving brush entities (`func_water_analog`) is ray traced like other water.
+- Water dims and colours light by depth, as real water does, using each map's water colour and fog distances.
+- Underwater, the surface shows the world above through Snell's window and mirrors the water below beyond it, sunlight bends at the surface and shines through the water in shafts, and flashlights light up the water.
 - A `winmm.dll` loader in the game folder. With `-insecure -gmodpp_vanilla` it runs the game's own renderer through `gmodpp.dll`, as a reference for the coming native Direct3D 12 renderer.
 - In the native renderer, GMod's Advanced video options hide MSAA and Direct3D 9Ex, which do nothing there, and keep MSAA off.
 - In the native renderer, a "Display" setting in the menu moves the game window to another monitor.
@@ -57,7 +64,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Shadows of many lights are less noisy: the strongest lights are always traced, and the rest are denoised.
 - Reflections are steadier and sparkle less.
 - Skin materials support more detail texture blend modes.
-- Light through glass and other translucent surfaces takes their colour: stained glass throws coloured light, and Refract glass windows tint the light by their own tint instead of letting it all through.
+- Light through glass and other translucent surfaces takes their colour: stained glass throws coloured light, and Refract glass windows tint the light by their own tint instead of letting it all through. Glass also keeps back the light its surfaces reflect.
 - Map lights are no longer limited to the areas the map's visibility data says they can see, so light that comes through gaps it misses still arrives. Each spot evaluates at most 64 lights and samples the rest.
 - Map lights no longer stop at the maximum distance set in the map, which the map's own baked lighting ignored too, and faint lights no longer switch on and off as the exposure changes.
 - Map lights fall off with distance like real light, from a bulb-sized source with soft shadow edges. Each light keeps the brightness its mapper set at 100 units (or at its 50% distance), so most lights look the same there; lights set to fade linearly or not at all are brighter up close and dimmer far away.
@@ -99,6 +106,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Under water, the native renderer no longer runs at half the frame rate: Source's view of the air above the water was lit as a second scene.
+- Surfaces lit by the flashlight no longer look almost unlit in reflections.
+- Lamp and flashlight light in haze and fog now glows most when you look towards the light, not away from it.
 - In the native renderer, swaying grass and plants whose material sets no sway falloff (concrete_cool_house's grass) are no longer missing from the view and from shadows.
 - With DLSS Ray Reconstruction, map lights and the flashlight are no longer blotchy and noisy.
 - Map lights no longer show square blotches with "Importance sampled" or "Reused samples" light sampling.

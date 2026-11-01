@@ -228,6 +228,7 @@ void Streams(Mesh& mesh, MeshDraw& draw)
                 static_cast<UINT>(source.dynamicVertexBytes), static_cast<UINT>(stride) };
         }
     } else if (source.vertexBuffer.resource.resource != nullptr) {
+        draw.vertexData = source.vertices.empty() ? nullptr : source.vertices.data();
         source.vertexBuffer.Require(kBufferRead);
         draw.streams[0] = { source.vertexBuffer.resource.resource->GetGPUVirtualAddress(), static_cast<UINT>(source.vertexBuffer.size),
             static_cast<UINT>(stride) };
@@ -235,6 +236,12 @@ void Streams(Mesh& mesh, MeshDraw& draw)
     }
     draw.vertexFormat = source.format;
     draw.vertexCount = source.vertexCount;
+    if (draw.vertexData != nullptr && TexCoordSize(0, source.format) >= 2) {
+        VertexDesc desc = {};
+        std::uint8_t* base = const_cast<std::uint8_t*>(draw.vertexData);
+        FillVertexDesc(base, source.format, desc);
+        draw.texCoord0Offset = static_cast<int>(reinterpret_cast<std::uint8_t*>(desc.texCoord[0]) - base);
+    }
     if (mesh.colorMesh != nullptr && mesh.colorMesh->vertexBuffer.resource.resource != nullptr) {
         GpuBuffer& colors = mesh.colorMesh->vertexBuffer;
         colors.Require(kBufferRead);
@@ -252,10 +259,13 @@ void Indices(Mesh& mesh, MeshDraw& draw)
 {
     Mesh& source = mesh.indexOverride != nullptr ? *mesh.indexOverride : mesh;
     if (source.dynamic) {
-        if (source.dynamicIndices.buffer != nullptr && source.indexCount > 0)
+        if (source.dynamicIndices.buffer != nullptr && source.indexCount > 0) {
             draw.indices = { source.dynamicIndices.buffer->GetGPUVirtualAddress() + source.dynamicIndices.offset,
                 static_cast<UINT>(source.dynamicIndexBytes), DXGI_FORMAT_R16_UINT };
+            draw.indexData = reinterpret_cast<const std::uint16_t*>(source.dynamicIndices.data);
+        }
     } else if (source.indexBuffer.resource.resource != nullptr && source.indexCount > 0) {
+        draw.indexData = source.indices.empty() ? nullptr : reinterpret_cast<const std::uint16_t*>(source.indices.data());
         source.indexBuffer.Require(kBufferRead);
         draw.indices = { source.indexBuffer.resource.resource->GetGPUVirtualAddress(), static_cast<UINT>(source.indexBuffer.size), DXGI_FORMAT_R16_UINT };
     }

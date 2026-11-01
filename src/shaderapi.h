@@ -94,6 +94,10 @@ DynamicState& Dynamic();
 // The enabled user clip planes in clip space, as shaderapidx9.dll commits them for vertex shaders (0x180012ec0);
 // returns how many.
 int UserClipPlanes(float planes[6][4]);
+// Whether an enabled user clip plane keeps only what lies above a horizontal plane that the eye is below: the view from
+// under water into the air, which Source draws into the back buffer and copies to the refraction texture
+// (CUnderWaterView::CRefractionView, MATERIAL_HEIGHTCLIPMODE_RENDER_ABOVE_HEIGHT).
+bool EyeBelowHeightClip();
 DepthBias PassDepthBias(int polygonOffsetMode);
 // HDRType_t.
 constexpr int kHdrNone = 0;

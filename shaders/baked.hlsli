@@ -138,21 +138,6 @@ float3 BakedIrradiance(int2 pixel, float3 normal)
     return lerp(lerp(a, b, f.x), lerp(c, d, f.x), f.y);
 }
 
-// The BSP leaf holding a point (the engine's point-in-leaf walk), or -1 without visibility data or in solid space.
-int LeafAt(float3 position)
-{
-    if (g_frame.clusterCount == 0)
-        return -1;
-    ByteAddressBuffer nodes = ResourceDescriptorHeap[g_frame.bspNodesView];
-    int node = 0;
-    for (uint steps = 0; node >= 0 && steps < 512; ++steps) {
-        float4 plane = asfloat(nodes.Load4(node * 24));
-        int2 children = asint(nodes.Load2(node * 24 + 16));
-        node = dot(plane.xyz, position) - plane.w >= 0.0 ? children.x : children.y;
-    }
-    return node < 0 ? -node - 1 : -1;
-}
-
 // The leaf ambient cube at a point: its leaf's samples, weighted by inverse squared distance as the engine weights
 // them. False where the leaf has no samples.
 bool LeafAmbientCube(float3 position, out float3 cube[6])

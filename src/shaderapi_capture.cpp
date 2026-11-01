@@ -100,6 +100,14 @@ struct State {
     // Fog of the main view and of the 3D skybox, which has its own.
     std::array<gbuffer::Fog, 2> fog;
     std::optional<std::array<float, 3>> waterFogColor;
+    // The water surfaces the game drew (the last draw of each, by fog colour) and the texture handle of each one's
+    // normal map (Water's NormalSampler, s4).
+    std::vector<gbuffer::WaterSurfaceDraw> waterDraws;
+    std::vector<std::intptr_t> waterNormalHandles;
+    // The waterDraws entry of the water pass being drawn.
+    int lastWaterDraw = -1;
+    bool loggedWaterMapping = false;
+    std::vector<ID3D12Resource*> waterNormalMaps;
     gbuffer::SwayClock swayClock;
     std::vector<Projected> projected;
     std::vector<Projected> lastProjected;
@@ -458,6 +466,13 @@ bool End(ViewKind kind, ViewInputs& inputs)
     }
     inputs.projected = g_state.lights;
     inputs.cookies = g_state.cookies;
+    g_state.waterNormalMaps.clear();
+    for (const std::intptr_t handle : g_state.waterNormalHandles) {
+        Texture* texture = TextureFromHandle(handle);
+        g_state.waterNormalMaps.push_back(texture != nullptr && !texture->copies.empty() ? common(texture->Current().resource) : nullptr);
+    }
+    inputs.waterDraws = g_state.waterDraws;
+    inputs.waterNormalMaps = g_state.waterNormalMaps;
     inputs.lightWarps = g_state.lightWarps;
     if (kind == ViewKind::Main && g_state.probes[0].resource) {
         for (size_t i = 0; i < g_state.probes.size(); ++i)
@@ -531,6 +546,68 @@ int FixedLighting()
     return -1;
 }
 
+void RecordWaterMapping(const MeshDraw& mesh)
+{
+    const int entry = std::exchange(g_state.lastWaterDraw, -1);
+    if (entry < 0 || static_cast<size_t>(entry) >= g_state.waterDraws.size())
+        return;
+    if (mesh.vertexData == nullptr || mesh.indexData == nullptr || mesh.texCoord0Offset < 0 || mesh.primitives.empty() || mesh.primitives[0].second < 3) {
+        if (!std::exchange(g_state.loggedWaterMapping, true))
+            log::Info("G-buffer: a water surface's texture mapping cannot be read (vertices {}, indices {}, texture coordinate at {}, {} primitive lists)",
+                mesh.vertexData != nullptr, mesh.indexData != nullptr, mesh.texCoord0Offset, mesh.primitives.size());
+        return;
+    }
+    // Water surfaces are horizontal: their coordinates are an affine function of x and y, solved from one triangle.
+    const UINT stride = mesh.streams[0].StrideInBytes;
+    float x[3], y[3], u[3], v[3];
+    for (int k = 0; k < 3; ++k) {
+        const std::uint16_t index = mesh.indexData[mesh.primitives[0].first + k];
+        if (static_cast<int>(index) >= mesh.vertexCount)
+            return;
+        const std::uint8_t* vertex = mesh.vertexData + static_cast<size_t>(index) * stride;
+        const float* position = reinterpret_cast<const float*>(vertex);
+        const float* uv = reinterpret_cast<const float*>(vertex + mesh.texCoord0Offset);
+        x[k] = position[0];
+        y[k] = position[1];
+        u[k] = uv[0];
+        v[k] = uv[1];
+    }
+    const float ax = x[1] - x[0], ay = y[1] - y[0], bx = x[2] - x[0], by = y[2] - y[0];
+    const float det = ax * by - ay * bx;
+    if (std::fabs(det) < 1e-6f)
+        return;
+    const auto solve = [&](const float (&c)[3], std::array<float, 4>& row) {
+        const float da = c[1] - c[0], db = c[2] - c[0];
+        row[0] = (da * by - db * ay) / det;
+        row[1] = (db * ax - da * bx) / det;
+        row[2] = 0.0f;
+        row[3] = c[0] - row[0] * x[0] - row[1] * y[0];
+    };
+    gbuffer::WaterSurfaceDraw& draw = g_state.waterDraws[static_cast<size_t>(entry)];
+    solve(u, draw.uvS);
+    solve(v, draw.uvT);
+    if (!draw.mapped && !std::exchange(g_state.loggedWaterMapping, true))
+        log::Info("G-buffer: a water surface's texture coordinates are ({:.5f} {:.5f}) . xy + {:.3f}, ({:.5f} {:.5f}) . xy + {:.3f}", draw.uvS[0], draw.uvS[1],
+            draw.uvS[3], draw.uvT[0], draw.uvT[1], draw.uvT[3]);
+    draw.mapped = true;
+}
+
+namespace {
+
+bool ScreenSpaceDraw()
+{
+    for (UINT row = 0; row < 4; ++row) {
+        const float* v = VertexRegister(4 + row).v;
+        for (UINT column = 0; column < 4; ++column) {
+            if (v[column] != (row == column ? 1.0f : 0.0f))
+                return false;
+        }
+    }
+    return true;
+}
+
+} // namespace
+
 Pass Prepare(std::span<const DWORD> vertexCode, std::span<const DWORD> pixelCode, const char* pixelFile, const ComboId& pixelCombo, bool depthTest,
     bool blend, int sourceBlend, int destinationBlend, bool srgbWrite, std::uint32_t srgbRead)
 {
@@ -558,8 +635,17 @@ Pass Prepare(std::span<const DWORD> vertexCode, std::span<const DWORD> pixelCode
             pass.route = Pass::Route::Skip;
             return pass;
         }
+        // Screen overlays (the underwater view's Refract warp) are drawn in clip space, with an identity
+        // model-view-projection: they are no surface in the world to light.
+        if (ScreenSpaceDraw()) {
+            Count(pixelFile, Path::ForwardUnlit);
+            return pass;
+        }
         // Forward twins trace their own light; additive draws add light and are shown as drawn.
-        const std::span<const DWORD> twin = !additive && g_state.twinFrame != 0 && g_state.twinScene != 0 && pixelFile != nullptr && pixelCombo.header != nullptr
+        // Refract's twin needs the game shader's registers it was written for.
+        const bool refract = pixelFile != nullptr && std::string_view(pixelFile).starts_with("refract_");
+        const std::span<const DWORD> twin = !additive && g_state.twinFrame != 0 && g_state.twinScene != 0 && pixelFile != nullptr && pixelCombo.header != nullptr &&
+                (!refract || shaderClass.refractGlass)
             ? twins::ForwardShader(pixelFile, *pixelCombo.header, pixelCombo.staticIndex, pixelCombo.dynamicIndex)
             : std::span<const DWORD>();
         if (!twin.empty()) {
@@ -599,6 +685,29 @@ Pass Prepare(std::span<const DWORD> vertexCode, std::span<const DWORD> pixelCode
     if (water) {
         const float* waterFog = PixelRegister(gbuffer::kWaterFogColorRegister).v;
         g_state.waterFogColor = std::array<float, 3>{waterFog[0], waterFog[1], waterFog[2]};
+        if (vertex.bumpTransformRegister >= 0) {
+            gbuffer::WaterSurfaceDraw draw;
+            draw.fog = *g_state.waterFogColor;
+            for (UINT row = 0; row < 2; ++row)
+                std::copy_n(VertexRegister(static_cast<UINT>(vertex.bumpTransformRegister) + row).v, 4, draw.bumpRows[row].begin());
+            draw.time = gbuffer::WaterClock();
+            const std::intptr_t normalMap = Dynamic().textures[gbuffer::kWaterNormalSampler];
+            const auto same = std::find_if(g_state.waterDraws.begin(), g_state.waterDraws.end(), [&](const gbuffer::WaterSurfaceDraw& d) { return d.fog == draw.fog; });
+            if (same != g_state.waterDraws.end()) {
+                draw.uvS = same->uvS;
+                draw.uvT = same->uvT;
+                draw.mapped = same->mapped;
+                *same = draw;
+                g_state.waterNormalHandles[static_cast<size_t>(same - g_state.waterDraws.begin())] = normalMap;
+                g_state.lastWaterDraw = static_cast<int>(same - g_state.waterDraws.begin());
+                pass.waterSurface = true;
+            } else if (g_state.waterDraws.size() < gbuffer::kMaxWaterDraws) {
+                g_state.waterDraws.push_back(draw);
+                g_state.waterNormalHandles.push_back(normalMap);
+                g_state.lastWaterDraw = static_cast<int>(g_state.waterDraws.size()) - 1;
+                pass.waterSurface = true;
+            }
+        }
     }
     // Opaque shaders with a twin but no preview combo (eyes, teeth) are drawn into the G-buffer by their twin.
     const bool twinOnly = shaderClass.kind == ShaderKind::Other && !blend && pixelFile != nullptr && twins::HasTwin(pixelFile);

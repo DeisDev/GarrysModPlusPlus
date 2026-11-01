@@ -17,6 +17,7 @@
 #include "swaying_props.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <charconv>
 #include <chrono>
@@ -93,6 +94,9 @@ struct MaterialInfo {
     bool translucent = false;
     bool clear = false;
     bool refract = false;
+    // Glass: Refract materials, and translucent ones that reflect ($envmap). Light through it loses what its two faces
+    // reflect (Scene::kTintGlass).
+    bool glass = false;
     // $refracttint in linear light, as the Refract shader sets it (SetPixelShaderConstantGammaToLinear, c1; confirmed in
     // GMod's stdshader_dx9.dll at 0x180017210, called with the refract tint from 0x180044070, whose $REFRACTTINT
     // defaults to [1 1 1] in the parameter table at 0x1800be7c0), and its tint texture (sampler 5, read as sRGB).
@@ -185,6 +189,14 @@ struct State {
     // The local player's origin from the last main view's entities.
     std::optional<std::array<float, 3>> localPlayer;
     std::vector<bsp::Mesh> brushModels;
+    // Brush entity models with water (func_water_analog) by model number: their surfaces' scene model and body of water.
+    struct BrushWaterModel {
+        int sceneModel = -1;
+        uint32_t body = 0;
+    };
+    std::unordered_map<uint32_t, BrushWaterModel> brushWater;
+    std::vector<BrushWaterPlacement> brushWaterPlacements;
+    bool loggedTurnedWater = false;
     // The map's 3D skybox test (BSP tree, leaf areas and bounds), to keep its entities out of the main view's rays.
     bsp::WorldGeometry skyboxTest;
     // How far this frame's image is shifted, in render pixels (x right, y down).
@@ -235,6 +247,13 @@ std::vector<std::byte> ReadOptional(const std::string& path, size_t maxBytes = S
     return data;
 }
 
+UINT AddSceneTexture(const studio::TextureImage& image)
+{
+    constexpr DXGI_FORMAT kFormats[] = {DXGI_FORMAT_BC1_UNORM, DXGI_FORMAT_BC2_UNORM, DXGI_FORMAT_BC3_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM,
+        DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_B8G8R8X8_UNORM, DXGI_FORMAT_R8_UNORM};
+    return g_state.scene.AddTexture(kFormats[static_cast<int>(image.format)], image.width, image.height, image.mips);
+}
+
 const SceneTexture& TextureFor(const std::string& vtfPath)
 {
     auto cached = g_state.textures.find(vtfPath);
@@ -245,9 +264,7 @@ const SceneTexture& TextureFor(const std::string& vtfPath)
     std::string error;
     const std::optional<studio::TextureImage> image = studio::ReadTexture(file, kSceneTextureSize, error);
     if (image) {
-        constexpr DXGI_FORMAT kFormats[] = {DXGI_FORMAT_BC1_UNORM, DXGI_FORMAT_BC2_UNORM, DXGI_FORMAT_BC3_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM,
-            DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_B8G8R8X8_UNORM, DXGI_FORMAT_R8_UNORM};
-        texture.view = g_state.scene.AddTexture(kFormats[static_cast<int>(image->format)], image->width, image->height, image->mips);
+        texture.view = AddSceneTexture(*image);
         texture.alpha = image->alpha;
         if (texture.view == DescriptorHeap::kInvalid)
             error = "creating the texture failed";
@@ -405,7 +422,7 @@ std::vector<ModelEmitter> ModelEmitters(std::span<const bsp::Float3> positions, 
 
 // The scene material for a VMT's env_cubemap reflection and self-illumination (as LightmappedGeneric and
 // VertexLitGeneric compute their masks) and whether it is unlit, or Scene::kNoMaterial when it has none of them.
-uint32_t SceneMaterial(std::string_view vmt, std::string_view shader, const std::string& baseTexture, bool unlit)
+uint32_t SceneMaterial(std::string_view vmt, std::string_view shader, const std::string& baseTexture, const bsp::Float3& reflectivity, bool unlit)
 {
     auto enabled = [&](std::string_view key) {
         const std::optional<std::string> value = studio::MaterialValue(vmt, key);
@@ -414,7 +431,8 @@ uint32_t SceneMaterial(std::string_view vmt, std::string_view shader, const std:
     const std::optional<std::string> envmap = studio::MaterialValue(vmt, "$envmap");
     const bool reflective = envmap && !envmap->empty();
     const bool selfIllum = enabled("$selfillum");
-    if (!reflective && !selfIllum && !unlit)
+    const UINT baseView = baseTexture.empty() ? DescriptorHeap::kInvalid : TextureFor(baseTexture).view;
+    if (!reflective && !selfIllum && !unlit && baseView == DescriptorHeap::kInvalid)
         return Scene::kNoMaterial;
     auto mask = [](const std::string& texture, uint32_t channel, bool invert) {
         const UINT view = texture.empty() ? DescriptorHeap::kInvalid : TextureFor(texture).view;
@@ -422,6 +440,8 @@ uint32_t SceneMaterial(std::string_view vmt, std::string_view shader, const std:
     };
     GpuMaterial material = {};
     material.flags = unlit ? Scene::kMaterialUnlit : 0u;
+    material.baseTexture = baseView;
+    material.reflectivity = 0.2126f * reflectivity.x + 0.7152f * reflectivity.y + 0.0722f * reflectivity.z;
     material.envmapMask = Scene::kMaskOff;
     if (reflective) {
         const std::string envmapMask = studio::MaterialTexture(vmt, "$envmapmask");
@@ -457,23 +477,20 @@ uint32_t SceneMaterial(std::string_view vmt, std::string_view shader, const std:
         material.selfIllumTint[1] = tint.y;
         material.selfIllumTint[2] = tint.z;
     }
-    if (material.envmapMask == Scene::kMaskOff && material.selfIllumMask == Scene::kMaskOff && !unlit)
+    if (material.envmapMask == Scene::kMaskOff && material.selfIllumMask == Scene::kMaskOff && !unlit && baseView == DescriptorHeap::kInvalid)
         return Scene::kNoMaterial;
     return AddSceneMaterial(material);
 }
 
-// The first of a texture's candidate VMTs that exists, with what the scene needs from it.
-const std::optional<MaterialInfo>& MaterialFor(const std::string& vmtPath)
+// A VMT's text, with the material a "patch" material includes appended, and its shader's name in lower case; nothing when
+// the file is missing.
+std::optional<std::string> MaterialText(const std::string& vmtPath, std::string& shader)
 {
-    auto cached = g_state.materials.find(vmtPath);
-    if (cached != g_state.materials.end())
-        return cached->second;
-    std::optional<MaterialInfo>& entry = g_state.materials[vmtPath];
     std::vector<std::byte> vmt = ReadOptional(vmtPath);
     if (vmt.empty())
-        return entry;
+        return std::nullopt;
     std::string text(reinterpret_cast<const char*>(vmt.data()), vmt.size());
-    std::string shader = ShaderName(text);
+    shader = ShaderName(text);
     // Maps ship cubemap-patched copies of their materials ("patch" shader) that include the original.
     if (std::optional<std::string> include = studio::MaterialValue(text, "include")) {
         std::string path = *include;
@@ -485,6 +502,25 @@ const std::optional<MaterialInfo>& MaterialFor(const std::string& vmtPath)
             shader = ShaderName(includedText);
         text.append("\n").append(includedText);
     }
+    return text;
+}
+
+// Source's GammaToLinear for colour constants up to 1 (src/mathlib/color_conversion.cpp): 1 from 0.95 up.
+float GammaToLinear(float c) { return c > 1.0f ? c : c >= 0.95f ? 1.0f : std::pow(std::max(c, 0.0f), 2.2f); }
+bsp::Float3 GammaToLinear(const bsp::Float3& c) { return {GammaToLinear(c.x), GammaToLinear(c.y), GammaToLinear(c.z)}; }
+
+// The first of a texture's candidate VMTs that exists, with what the scene needs from it.
+const std::optional<MaterialInfo>& MaterialFor(const std::string& vmtPath)
+{
+    auto cached = g_state.materials.find(vmtPath);
+    if (cached != g_state.materials.end())
+        return cached->second;
+    std::optional<MaterialInfo>& entry = g_state.materials[vmtPath];
+    std::string shader;
+    const std::optional<std::string> materialText = MaterialText(vmtPath, shader);
+    if (!materialText)
+        return entry;
+    const std::string& text = *materialText;
     auto enabled = [&](std::string_view key) {
         const std::optional<std::string> value = studio::MaterialValue(text, key);
         return value && !value->empty() && value->front() != '0';
@@ -499,12 +535,10 @@ const std::optional<MaterialInfo>& MaterialFor(const std::string& vmtPath)
     entry->clear = enabled("$additive");
     if (shader == "refract") {
         entry->refract = true;
-        const bsp::Float3 tint = MaterialColor(text, "$refracttint", {1.0f, 1.0f, 1.0f});
-        // Source's GammaToLinear for colour constants up to 1 (src/mathlib/color_conversion.cpp): 1 from 0.95 up.
-        const auto linear = [](float c) { return c > 1.0f ? c : c >= 0.95f ? 1.0f : std::pow(std::max(c, 0.0f), 2.2f); };
-        entry->refractTint = {linear(tint.x), linear(tint.y), linear(tint.z)};
+        entry->refractTint = GammaToLinear(MaterialColor(text, "$refracttint", {1.0f, 1.0f, 1.0f}));
         entry->refractTintTexture = studio::MaterialTexture(text, "$refracttinttexture");
     }
+    entry->glass = entry->refract || (entry->translucent && !entry->clear && studio::MaterialValue(text, "$envmap").has_value());
     entry->alphaTest = enabled("$alphatest");
     if (std::optional<std::string> reference = studio::MaterialValue(text, "$alphatestreference")) {
         float value = 0.0f;
@@ -517,7 +551,7 @@ const std::optional<MaterialInfo>& MaterialFor(const std::string& vmtPath)
         if (std::optional<bsp::Float3> reflectivity = studio::TextureReflectivity(header))
             entry->reflectivity = *reflectivity;
     }
-    entry->sceneMaterial = SceneMaterial(text, shader, entry->baseTexture, IsUnlitShader(shader));
+    entry->sceneMaterial = SceneMaterial(text, shader, entry->baseTexture, entry->reflectivity, IsUnlitShader(shader));
     if (const std::optional<SwayMaterial> sway = MaterialSway(text)) {
         entry->swayMaterial = static_cast<uint32_t>(g_state.swayMaterials.size());
         g_state.swayMaterials.push_back(*sway);
@@ -560,7 +594,8 @@ uint32_t TriangleAlphaFor(const MaterialInfo& material)
 // surfaces by their texture's colour.
 uint32_t TriangleTintFor(const MaterialInfo& material)
 {
-    return material.refract ? Scene::PackTint(material.refractTint, Scene::kTintRefract) : Scene::PackTint({1.0f, 1.0f, 1.0f}, Scene::kTintFilter);
+    const uint32_t glass = material.glass ? Scene::kTintGlass : 0;
+    return material.refract ? Scene::PackTint(material.refractTint, Scene::kTintRefract | glass) : Scene::PackTint({1.0f, 1.0f, 1.0f}, Scene::kTintFilter | glass);
 }
 
 // Moves the triangles whose `triangleAlpha` is not kOpaqueTriangle behind the others and removes those marked
@@ -608,6 +643,217 @@ const std::optional<MaterialInfo>* MapMaterial(uint32_t texdata)
     std::replace(path.begin(), path.end(), '\\', '/');
     std::transform(path.begin(), path.end(), path.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     return &MaterialFor(path);
+}
+
+// A VMT texture transform ("center .5 .5 scale 1 1 rotate 0 translate 0 0") as the rows of its 2x3 matrix over
+// (u, v, 1): scaled and rotated about the centre, then translated, as the SDK's TextureTransform proxy composes the same
+// parts (src/game/client/matrixproxy.cpp).
+std::array<float, 6> TextureTransform(std::string_view text)
+{
+    float center[2] = {0.5f, 0.5f};
+    float scale[2] = {1.0f, 1.0f};
+    float rotate = 0.0f;
+    float translate[2] = {0.0f, 0.0f};
+    std::vector<std::string_view> words;
+    for (size_t i = 0; i < text.size();) {
+        while (i < text.size() && std::isspace(static_cast<unsigned char>(text[i])))
+            ++i;
+        const size_t start = i;
+        while (i < text.size() && !std::isspace(static_cast<unsigned char>(text[i])))
+            ++i;
+        if (i > start)
+            words.push_back(text.substr(start, i - start));
+    }
+    const auto number = [&](size_t index, float& value) {
+        if (index < words.size())
+            std::from_chars(words[index].data(), words[index].data() + words[index].size(), value);
+    };
+    for (size_t w = 0; w < words.size(); ++w) {
+        if (words[w] == "center") {
+            number(w + 1, center[0]);
+            number(w + 2, center[1]);
+        } else if (words[w] == "scale") {
+            number(w + 1, scale[0]);
+            number(w + 2, scale[1]);
+        } else if (words[w] == "rotate") {
+            number(w + 1, rotate);
+        } else if (words[w] == "translate") {
+            number(w + 1, translate[0]);
+            number(w + 2, translate[1]);
+        }
+    }
+    const float radians = rotate * 3.14159265358979f / 180.0f;
+    const float c = std::cos(radians);
+    const float s = std::sin(radians);
+    const float a[2][2] = {{c * scale[0], -s * scale[1]}, {s * scale[0], c * scale[1]}};
+    return {a[0][0], a[0][1], center[0] + translate[0] - a[0][0] * center[0] - a[0][1] * center[1],
+        a[1][0], a[1][1], center[1] + translate[1] - a[1][0] * center[0] - a[1][1] * center[1]};
+}
+
+// The keys and values of each block named `proxy` in a VMT's Proxies, in lower case.
+std::vector<std::unordered_map<std::string, std::string>> MaterialProxies(std::string_view vmt, std::string_view proxy)
+{
+    std::vector<std::string> tokens;
+    for (size_t i = 0; i < vmt.size();) {
+        const char c = vmt[i];
+        if (c == '/' && i + 1 < vmt.size() && vmt[i + 1] == '/') {
+            i = vmt.find('\n', i);
+            if (i == std::string_view::npos)
+                break;
+        } else if (c == '"') {
+            const size_t end = vmt.find('"', i + 1);
+            if (end == std::string_view::npos)
+                break;
+            tokens.emplace_back(vmt.substr(i + 1, end - i - 1));
+            i = end + 1;
+        } else if (c == '{' || c == '}') {
+            tokens.emplace_back(1, c);
+            ++i;
+        } else if (std::isspace(static_cast<unsigned char>(c))) {
+            ++i;
+        } else {
+            size_t end = i;
+            while (end < vmt.size() && !std::isspace(static_cast<unsigned char>(vmt[end])) && vmt[end] != '"' && vmt[end] != '{' && vmt[end] != '}')
+                ++end;
+            tokens.emplace_back(vmt.substr(i, end - i));
+            i = end;
+        }
+    }
+    for (std::string& token : tokens)
+        std::transform(token.begin(), token.end(), token.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    std::vector<std::unordered_map<std::string, std::string>> blocks;
+    for (size_t t = 0; t + 1 < tokens.size(); ++t) {
+        if (tokens[t] != proxy || tokens[t + 1] != "{")
+            continue;
+        std::unordered_map<std::string, std::string>& block = blocks.emplace_back();
+        for (t += 2; t + 1 < tokens.size() && tokens[t] != "}"; t += 2)
+            block[tokens[t]] = tokens[t + 1];
+    }
+    return blocks;
+}
+
+float ProxyFloat(const std::unordered_map<std::string, std::string>& block, const std::string& key, float fallback)
+{
+    const auto value = block.find(key);
+    float result = fallback;
+    if (value == block.end() || std::from_chars(value->second.data(), value->second.data() + value->second.size(), result).ec != std::errc())
+        return fallback;
+    return result;
+}
+
+// The most frames of a water normal map that are loaded.
+constexpr uint32_t kMaxWaterFrames = 64;
+
+// A body of water for the scene, from its surface material (the Water shader's parameters, water.cpp in the SDK) and
+// its normal map's frames, which go to `frameViews`. `normalMaps` caches the frames of each material.
+GpuWaterBody WaterBodyFor(const bsp::WaterBody& body, std::vector<uint32_t>& frameViews, std::unordered_map<std::string, std::pair<uint32_t, uint32_t>>& normalMaps)
+{
+    GpuWaterBody gpu = {};
+    gpu.surfaceZ = body.surfaceZ;
+    std::copy_n(body.textureS, 4, gpu.textureS);
+    std::copy_n(body.textureT, 4, gpu.textureT);
+    gpu.mins[0] = body.mins.x - 1.0f;
+    gpu.mins[1] = body.mins.y - 1.0f;
+    gpu.mins[2] = body.minZ;
+    gpu.maxs[0] = body.maxs.x + 1.0f;
+    gpu.maxs[1] = body.maxs.y + 1.0f;
+    gpu.maxs[2] = body.surfaceZ;
+    std::string text;
+    if (body.material < g_state.mapMaterials.size()) {
+        std::string path = "materials/" + g_state.mapMaterials[body.material] + ".vmt";
+        std::replace(path.begin(), path.end(), '\\', '/');
+        std::transform(path.begin(), path.end(), path.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        std::string shader;
+        text = MaterialText(path, shader).value_or(std::string());
+    }
+    // Water_DX9's defaults: a red fog colour, fog from 0 to 0 units, white tints, dev/water_normal.
+    const bsp::Float3 fog = GammaToLinear(MaterialColor(text, "$fogcolor", {1.0f, 0.0f, 0.0f}));
+    const float fogStart = MaterialFloat(text, "$fogstart", 0.0f);
+    const float fogEnd = MaterialFloat(text, "$fogend", 0.0f);
+    // The water's mean free path matches the mean visibility of Source's linear fog: as far as the surface beyond stays
+    // visible on average, (start + end) / 2. Light that crosses it keeps the fog colour's balance: colours the fog
+    // lacks are absorbed faster, by the log of how much it lacks them (at most e^-4 more), scaled so that the extinction
+    // averaged by luminance is 1 / that path.
+    const float meanFreePath = std::max(0.5f * (fogStart + fogEnd), 8.0f);
+    const float fogColor[3] = {fog.x, fog.y, fog.z};
+    const float brightest = std::max({fog.x, fog.y, fog.z, 1e-4f});
+    constexpr float kLuminance[3] = {0.2126f, 0.7152f, 0.0722f};
+    float k[3];
+    float average = 0.0f;
+    for (int c = 0; c < 3; ++c) {
+        k[c] = 1.0f + std::min(std::log(brightest / std::max(fogColor[c], 1e-4f)), 4.0f);
+        average += kLuminance[c] * k[c];
+    }
+    for (int c = 0; c < 3; ++c) {
+        gpu.extinction[c] = k[c] / (average * meanFreePath);
+        gpu.fogColor[c] = fogColor[c];
+    }
+    const bsp::Float3 reflectTint = GammaToLinear(MaterialColor(text, "$reflecttint", {1.0f, 1.0f, 1.0f}));
+    gpu.reflectTint = (reflectTint.x + reflectTint.y + reflectTint.z) / 3.0f;
+    const bsp::Float3 refractTint = GammaToLinear(MaterialColor(text, "$refracttint", {1.0f, 1.0f, 1.0f}));
+    gpu.refractTint[0] = refractTint.x;
+    gpu.refractTint[1] = refractTint.y;
+    gpu.refractTint[2] = refractTint.z;
+    const std::optional<std::string> bumpTransform = studio::MaterialValue(text, "$bumptransform");
+    const std::array<float, 6> bump = TextureTransform(bumpTransform.value_or(std::string()));
+    gpu.bumpS[0] = bump[0];
+    gpu.bumpS[1] = bump[1];
+    gpu.bumpS[3] = bump[2];
+    gpu.bumpT[0] = bump[3];
+    gpu.bumpT[1] = bump[4];
+    gpu.bumpT[3] = bump[5];
+    // A TextureScroll proxy on $bumptransform replaces it with its scale and an offset that moves at its rate along its
+    // angle (texturescrollmaterialproxy.cpp in the SDK); the offset per second goes in the rows' z.
+    for (const auto& scroll : MaterialProxies(text, "texturescroll")) {
+        const auto var = scroll.find("texturescrollvar");
+        if (var == scroll.end() || var->second != "$bumptransform")
+            continue;
+        const float rate = ProxyFloat(scroll, "texturescrollrate", 1.0f);
+        const float angle = ProxyFloat(scroll, "texturescrollangle", 0.0f) * 3.14159265358979f / 180.0f;
+        const float scale = ProxyFloat(scroll, "texturescale", 1.0f);
+        const float rows[2][4] = {{scale, 0.0f, rate * std::cos(angle), 0.0f}, {0.0f, scale, rate * std::sin(angle), 0.0f}};
+        std::copy_n(rows[0], 4, gpu.bumpS);
+        std::copy_n(rows[1], 4, gpu.bumpT);
+    }
+
+    std::string normalMap = studio::MaterialTexture(text, "$normalmap");
+    if (normalMap.empty())
+        normalMap = "materials/dev/water_normal.vtf";
+    // The AnimatedTexture proxy steps $bumpframe through the normal map's frames (baseanimatedtextureproxy.cpp in the
+    // SDK: 15 frames a second by default); without it the material's $bumpframe stays.
+    bool animated = false;
+    for (const auto& proxy : MaterialProxies(text, "animatedtexture")) {
+        const auto var = proxy.find("animatedtexturevar");
+        if (var != proxy.end() && var->second == "$normalmap") {
+            animated = true;
+            gpu.frameRate = ProxyFloat(proxy, "animatedtextureframerate", 15.0f);
+        }
+    }
+    const uint32_t fixedFrame = static_cast<uint32_t>(std::max(MaterialFloat(text, "$bumpframe", 0.0f), 0.0f));
+    const std::string key = animated ? normalMap : std::format("{}#{}", normalMap, fixedFrame);
+    auto cached = normalMaps.find(key);
+    if (cached == normalMaps.end()) {
+        const std::vector<std::byte> file = ReadOptional(normalMap);
+        std::string error;
+        std::optional<studio::TextureImage> first = studio::ReadTexture(file, kSceneTextureSize, error);
+        const uint32_t frames = !first ? 0 : animated ? std::min(first->frames, kMaxWaterFrames) : 1;
+        const uint32_t firstView = static_cast<uint32_t>(frameViews.size());
+        for (uint32_t f = 0; f < frames; ++f) {
+            const std::optional<studio::TextureImage> image = studio::ReadTexture(file, kSceneTextureSize, error, animated ? f : std::min(fixedFrame, first->frames - 1));
+            const UINT view = image ? AddSceneTexture(*image) : DescriptorHeap::kInvalid;
+            if (view == DescriptorHeap::kInvalid) {
+                frameViews.resize(firstView);
+                break;
+            }
+            frameViews.push_back(view);
+        }
+        if (frameViews.size() == firstView)
+            log::Info("Scene: water normal map '{}' unusable ({}); its caustics and reflected ripples are flat", normalMap, file.empty() ? "file not found" : error);
+        cached = normalMaps.emplace(key, std::pair{firstView, static_cast<uint32_t>(frameViews.size()) - firstView}).first;
+    }
+    gpu.framesFirst = cached->second.first;
+    gpu.frameCount = cached->second.second;
+    return gpu;
 }
 
 // Partitions a BSP mesh by its materials' alpha tests and describes it for Scene::AddModel.
@@ -1061,6 +1307,8 @@ void ClearScene()
     light_queries::Clear();
     g_state.models.clear();
     g_state.brushModels.clear();
+    g_state.brushWater.clear();
+    g_state.brushWaterPlacements.clear();
     g_state.skyboxTest = {};
     g_state.mapMaterials.clear();
     g_state.textures.clear();
@@ -1167,6 +1415,50 @@ void LoadScene(const std::string& level, const std::function<void(float)>& repor
             ModelEmitters(world.mesh.positions, world.mesh.indices, world.mesh.triangleAlbedo, worldTriangles.materials), instances, worldEmits, emitterPower);
         if (g_state.scene.LoadMap(level, world, lightShapes, worldGeometry, emitters, worldEmits, emitterPower)) {
             report(0.75f);
+            if (!world.water.indices.empty() || !world.brushWater.empty()) {
+                std::vector<GpuWaterBody> bodies;
+                std::vector<uint32_t> frameViews;
+                std::unordered_map<std::string, std::pair<uint32_t, uint32_t>> normalMaps;
+                for (const bsp::WaterBody& body : world.waterBodies)
+                    bodies.push_back(WaterBodyFor(body, frameViews, normalMaps));
+                const UINT brushFirst = static_cast<UINT>(bodies.size());
+                const auto surfaceGeometry = [](const bsp::Mesh& mesh, std::vector<uint32_t>& albedo) {
+                    albedo.assign(mesh.indices.size() / 3, PackAlbedo({1.0f, 1.0f, 1.0f}));
+                    return ModelGeometry{mesh.positions, mesh.indices, albedo, static_cast<UINT>(albedo.size()), {}, {}, {}, {}};
+                };
+                for (const bsp::WorldGeometry::BrushWater& water : world.brushWater) {
+                    std::vector<uint32_t> albedo;
+                    const int model = g_state.scene.AddModel(surfaceGeometry(water.surface, albedo));
+                    if (model < 0)
+                        continue;
+                    g_state.brushWater[water.model] = {model, static_cast<uint32_t>(bodies.size())};
+                    bodies.push_back(WaterBodyFor(water.body, frameViews, normalMaps));
+                }
+                std::vector<uint32_t> albedo;
+                SceneInstance water;
+                water.model = world.water.indices.empty() ? -1 : g_state.scene.AddModel(surfaceGeometry(world.water, albedo));
+                water.mask = kWaterMask;
+                water.flags = kInstanceWater;
+                const float identity[3][4] = {{1.0f, 0.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 1.0f, 0.0f}};
+                std::memcpy(water.transform, identity, sizeof(water.transform));
+                const std::vector<uint32_t> triangleBodies = world.water.triangleMaterials.empty() ? std::vector<uint32_t>{SceneInstance::kNoWaterBody}
+                                                                                                   : world.water.triangleMaterials;
+                if (g_state.scene.SetWater(bodies, frameViews, triangleBodies, world.visibility, brushFirst)) {
+                    if (water.model >= 0)
+                        instances.push_back(water);
+                    log::Info("Scene: {} bodies of water ({} in brush entities), {} surface triangles, {} normal map frames", bodies.size(),
+                        bodies.size() - brushFirst, albedo.size(), frameViews.size());
+                    for (size_t b = 0; b < bodies.size() && b < 16; ++b) {
+                        const GpuWaterBody& body = bodies[b];
+                        if (body.mins[0] <= body.maxs[0])
+                            log::Info("Scene: water {} at z {:.0f} over ({:.0f} {:.0f})-({:.0f} {:.0f}), fog ({:.3f} {:.3f} {:.3f}), extinction ({:.5f} {:.5f} {:.5f}), {} frames at {:.0f}/s, "
+                                      "texture axes ({:.5f} {:.5f} {:.5f} {:.3f}) ({:.5f} {:.5f} {:.5f} {:.3f})",
+                                b, body.surfaceZ, body.mins[0], body.mins[1], body.maxs[0], body.maxs[1], body.fogColor[0], body.fogColor[1], body.fogColor[2],
+                                body.extinction[0], body.extinction[1], body.extinction[2], body.frameCount, body.frameRate, body.textureS[0], body.textureS[1],
+                                body.textureS[2], body.textureS[3], body.textureT[0], body.textureT[1], body.textureT[2], body.textureT[3]);
+                    }
+                }
+            }
             g_state.brushModels = std::move(world.brushModels);
             g_state.skyboxTest.visibility.nodes = std::move(world.visibility.nodes);
             g_state.skyboxTest.visibility.leaves = std::move(world.visibility.leaves);
@@ -1327,11 +1619,38 @@ void AddHeldWeapon(const entities::ModelEntity& weapon, const studio::Matrix3x4&
     TrackMotion(instance, weapon.index);
 }
 
+// A brush entity's water surface (func_water_analog) where its entity is: an instance carrying its body of water, which
+// Scene::PlaceBrushWater moves with it. Water surfaces are level, so only entities that are moved, not turned, carry it.
+void AddBrushWater(const entities::ModelEntity& entity)
+{
+    if (!entity.model.starts_with('*'))
+        return;
+    uint32_t number = 0;
+    const auto [end, ec] = std::from_chars(entity.model.data() + 1, entity.model.data() + entity.model.size(), number);
+    const auto found = ec == std::errc() ? g_state.brushWater.find(number) : g_state.brushWater.end();
+    if (found == g_state.brushWater.end())
+        return;
+    const auto& t = entity.transform;
+    if (std::fabs(t[0][0] - 1.0f) > 1e-3f || std::fabs(t[1][1] - 1.0f) > 1e-3f || std::fabs(t[2][2] - 1.0f) > 1e-3f) {
+        if (!std::exchange(g_state.loggedTurnedWater, true))
+            log::Info("Scene: brush entity water '{}' is turned; it is left out", entity.model);
+        return;
+    }
+    SceneInstance& instance = g_state.dynamicInstances.emplace_back();
+    instance.model = found->second.sceneModel;
+    instance.mask = kWaterMask;
+    instance.flags = kInstanceWater;
+    instance.waterBody = found->second.body;
+    std::memcpy(instance.transform, entity.transform, sizeof(instance.transform));
+    g_state.brushWaterPlacements.push_back({found->second.body, {t[0][3], t[1][3], t[2][3]}});
+}
+
 void CollectEntities()
 {
     g_state.dynamicInstances.clear();
     g_state.skinnedEntities.clear();
     g_state.currentTransforms.clear();
+    g_state.brushWaterPlacements.clear();
     entities::Collect(g_state.entities);
     const int localPlayer = engine::LocalPlayerIndex();
     const auto player = std::find_if(g_state.entities.begin(), g_state.entities.end(), [&](const entities::ModelEntity& e) { return e.index == localPlayer; });
@@ -1355,6 +1674,7 @@ void CollectEntities()
                 AddHeldWeapon(entity, *playerHand);
             continue;
         }
+        AddBrushWater(entity);
         const ModelEntry& model = ModelFor(entity.model, entity.skin);
         if (model.sceneModel < 0)
             continue;
@@ -1382,6 +1702,7 @@ void CollectEntities()
         TrackMotion(instance, entity.index);
     }
     CollectRopes();
+    g_state.scene.PlaceBrushWater(g_state.brushWaterPlacements);
     std::swap(g_state.previousTransforms, g_state.currentTransforms);
 }
 
@@ -1563,6 +1884,10 @@ void LightView(ViewInputs& inputs)
         log::Info("Probe: sun visibility {:.2f} at ({:.1f} {:.1f} {:.1f}); blocked by instance {} (model {} '{}', mask {:#x}), triangle {}, {:.1f} units away",
             probe->sunVisibility, probe->origin[0], probe->origin[1], probe->origin[2], static_cast<int>(probe->instance), probe->model, model, probe->mask,
             probe->triangle, probe->distance);
+        if (probe->water)
+            log::Info("Probe: water slope drawn ({:.3f} {:.3f}, eye angle {:.3f}), sampled by shaders ({:.3f} {:.3f}, eye angle by the texture axes {:.3f})", probe->drawnWaterNormal[0],
+                probe->drawnWaterNormal[1], probe->drawnWaterNormal[2], probe->rebuiltWaterNormal[0], probe->rebuiltWaterNormal[1],
+                probe->rebuiltWaterNormal[2]);
     }
 }
 

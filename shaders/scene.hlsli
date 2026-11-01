@@ -2,6 +2,7 @@
 #define GMODPP_SCENE_HLSLI
 
 #include "common.hlsli"
+#include "water_body.hlsli"
 
 // Ray queries of the Shader Model 6.9 variants (OPACITY_MICROMAPS) let traversal use opacity micromaps, which
 // settle alpha-tested candidates in their known opaque and transparent regions without the shader.
@@ -32,7 +33,9 @@ struct InstanceRecord
     // For instances with emitters: each triangle's emitter index (Scene::EmittersView) plus one, 0 for none; kNoView
     // for instances without.
     uint emitterLights;
-    uint2 padding;
+    // Brush entity water's body of water (WaterBodyOfTriangle), kNoView for other instances.
+    uint waterBody;
+    uint padding;
 };
 
 // kInstanceIgnoreNormals, kInstanceSelfIllum and kInstanceModel in src/scene.h.
@@ -41,6 +44,8 @@ static const uint kInstanceSelfIllum = 0x02;
 static const uint kInstanceModel = 0x04;
 static const uint kInstanceEmitter = 0x10;
 static const uint kInstanceCharacter = 0x20;
+// kInstanceWater in src/scene.h: the water surfaces (kWaterMask).
+static const uint kInstanceWater = 0x40;
 
 // EmissiveLighting in src/settings.h.
 static const uint kEmissiveOff = 0;
@@ -152,16 +157,57 @@ struct AlphaTriangle
     uint tint;
 };
 
-// Scene::kTintFilter and Scene::kTintRefract.
+// Scene::kTintFilter and Scene::kTintRefract, and Scene::kTintGlass added to either.
 static const uint kTintFilter = 1;
 static const uint kTintRefract = 2;
+static const uint kTintGlass = 4;
+// Scene::kTintGlassFace: one face of a thick pane (its other face lies within Scene::kMaxGlassThickness behind it).
+static const uint kTintGlassFace = 8;
+static const float kMaxGlassThickness = 16.0;
+
+// Glass's index of refraction (soda-lime glass, about 1.52).
+static const float kGlassIor = 1.52;
+
+// The share of light glass lets through at `cosine` to its normal. A face of a thick pane (`face`) lets through what it
+// does not reflect, 1 - F, the pane's other face taking its own share where the ray crosses it; a thin pane, both of whose
+// faces the one triangle stands for, lets through (1 - F) / (1 + F), light reflected back and forth between its faces
+// included (absorption is the tint's).
+float GlassTransmission(float cosine, bool face = false)
+{
+    float fresnel = Fresnel(abs(cosine), kGlassIor);
+    return face ? 1.0 - fresnel : (1.0 - fresnel) / (1.0 + fresnel);
+}
+
+// The object-space face normal of a model's alpha triangle (Source's front: the negated edge cross product), unnormalised.
+float3 AlphaTriangleNormal(uint instance, uint alphaPrimitive)
+{
+    InstanceRecord record = LoadInstance(instance);
+    ByteAddressBuffer positions = ResourceDescriptorHeap[NonUniformResourceIndex(record.positions)];
+    ByteAddressBuffer indices = ResourceDescriptorHeap[NonUniformResourceIndex(record.indices)];
+    uint3 index = indices.Load3((record.opaqueTriangles + alphaPrimitive) * 12);
+    float3 p0 = positions.Load<float3>(index.x * 12);
+    return -cross(positions.Load<float3>(index.y * 12) - p0, positions.Load<float3>(index.z * 12) - p0);
+}
+
+// The cosine between a ray (in the instance's object space) and a translucent candidate's face.
+float CandidateCosine(uint instance, uint alphaPrimitive, float3 objectDirection)
+{
+    return dot(normalize(AlphaTriangleNormal(instance, alphaPrimitive)), normalize(objectDirection));
+}
+
+// Scene::PackTint's mode bits of a model's alpha triangle.
+uint AlphaTriangleTintMode(uint instance, uint alphaPrimitive)
+{
+    ByteAddressBuffer alpha = ResourceDescriptorHeap[NonUniformResourceIndex(LoadInstance(instance).alpha)];
+    return alpha.Load(alphaPrimitive * 32 + 28) >> 24;
+}
 
 // The light that gets through where a ray crosses a candidate in a model's non-opaque geometry: 0 or 1 for alpha-tested
 // triangles; for translucent ones (`translucent`), with opacity the texture's alpha times $alpha, (1 - opacity) as it
 // is and the covered part filtered by the texture's colour; for Refract glass its tint times its tint texture's colour.
 // The alpha is filtered as the game's alpha tests filter it; unfiltered, the low-resolution alpha's texels showed as
 // square blocks in leaf shadows. Textures are read as sRGB, as the game reads base and tint textures.
-float3 CandidateTransmission(uint instance, uint alphaPrimitive, float2 barycentrics, out bool translucent)
+float3 CandidateTransmission(uint instance, uint alphaPrimitive, float2 barycentrics, out bool translucent, float3 objectDirection = 0.0)
 {
     ByteAddressBuffer alpha = ResourceDescriptorHeap[NonUniformResourceIndex(LoadInstance(instance).alpha)];
     AlphaTriangle entry = alpha.Load<AlphaTriangle>(alphaPrimitive * 32);
@@ -177,10 +223,43 @@ float3 CandidateTransmission(uint instance, uint alphaPrimitive, float2 barycent
     if (!translucent)
         return texel.a >= value ? 0.0 : 1.0;
     float3 colour = UnpackAlbedo(entry.tint) * SrgbToLinear(saturate(texel.rgb));
-    if ((entry.tint >> 24) == kTintRefract)
-        return colour;
+    uint mode = entry.tint >> 24;
+    float glass = (mode & kTintGlass) != 0 && any(objectDirection != 0.0)
+        ? GlassTransmission(CandidateCosine(instance, alphaPrimitive, objectDirection), (mode & kTintGlassFace) != 0)
+        : 1.0;
+    if ((mode & 3u) == kTintRefract)
+        return colour * glass;
     float opacity = saturate(texel.a * value);
-    return (1.0 - opacity) + opacity * colour;
+    return ((1.0 - opacity) + opacity * colour) * glass;
+}
+
+// The other face of a thick pane of glass, along a ray inside it from `origin`: the first glass candidate within
+// kMaxGlassThickness, its distance and world-space face normal (facing back along the ray). False for a thin pane, or
+// when something else comes first.
+bool GlassExit(float3 origin, float3 direction, out float distance, out float3 normal)
+{
+    distance = 0.0;
+    normal = 0.0;
+    if (g_frame.traceMask == 0)
+        return false;
+    SCENE_RAY_QUERY(RAY_FLAG_NONE) query;
+    RayDesc ray;
+    ray.Origin = origin;
+    ray.Direction = direction;
+    ray.TMin = 0.01;
+    ray.TMax = kMaxGlassThickness;
+    query.TraceRayInline(g_scene, RAY_FLAG_NONE, g_frame.traceMask & ~kWaterMask, ray);
+    while (query.Proceed()) {
+        if ((AlphaTriangleTintMode(query.CandidateInstanceID(), query.CandidatePrimitiveIndex()) & kTintGlass) != 0)
+            query.CommitNonOpaqueTriangleHit();
+    }
+    if (query.CommittedStatus() != COMMITTED_TRIANGLE_HIT || query.CommittedGeometryIndex() == 0)
+        return false;
+    distance = query.CommittedRayT();
+    normal = normalize(mul((float3x3)query.CommittedObjectToWorld3x4(), AlphaTriangleNormal(query.CommittedInstanceID(), query.CommittedPrimitiveIndex())));
+    if (dot(normal, direction) > 0.0)
+        normal = -normal;
+    return true;
 }
 
 // Rays other than shadow rays stop at candidates at least this opaque (1 - the luminance of what gets through).
@@ -341,7 +420,8 @@ struct Material
     float envmapLightScale;
     float envmapLightMin;
     float envmapLightRange;
-    float2 padding;
+    uint baseTexture;
+    float reflectivity;
 };
 
 static const uint kNoMaterial = 0xFFFFFFFFu;
@@ -412,6 +492,25 @@ bool HitMaterial(HitInfo hit, out Material material, out float2 uv, out float uv
 }
 
 // A Scene::PackMask value at a texture coordinate; `footprint` is how many texture coordinates a pixel spans.
+// A hit's colour with its base texture's detail, where its material has one: the texture's linear colour at the hit,
+// scaled by how the triangle's albedo (its texture's average, with the material's and lighting's tints) compares with
+// the texture's average. `coneWidth` is the ray's width there, for the mip. Reflections and refractions show the scene's
+// textures; light gathered from the hit (indirect bounces) keeps the triangle's average.
+float3 TexturedAlbedo(HitInfo hit, float3 albedo, float coneWidth)
+{
+    Material material;
+    float2 uv;
+    float uvPerUnit;
+    if (!HitMaterial(hit, material, uv, uvPerUnit) || material.baseTexture == kNoView || uvPerUnit <= 0.0 || material.reflectivity <= 0.0)
+        return albedo;
+    Texture2D<float4> texture = ResourceDescriptorHeap[NonUniformResourceIndex(material.baseTexture)];
+    uint width, height, levels;
+    texture.GetDimensions(0, width, height, levels);
+    float lod = log2(max(coneWidth * uvPerUnit * max(width, height), 1e-6));
+    float3 texel = SrgbToLinear(saturate(texture.SampleLevel(g_linearWrap, uv, lod).rgb));
+    return saturate(texel * (Luminance(albedo) / material.reflectivity));
+}
+
 float MaskValue(uint mask, float2 uv, float footprint)
 {
     if (mask == kMaskOff)
@@ -618,7 +717,8 @@ float3 Transmittance(float3 origin, float3 direction, float tMax, uint mask, uin
     float3 transmittance = 1.0;
     while (query.Proceed()) {
         bool translucent;
-        float3 through = CandidateTransmission(query.CandidateInstanceID(), query.CandidatePrimitiveIndex(), query.CandidateTriangleBarycentrics(), translucent);
+        float3 through = CandidateTransmission(query.CandidateInstanceID(), query.CandidatePrimitiveIndex(), query.CandidateTriangleBarycentrics(), translucent,
+            query.CandidateObjectRayDirection());
         if (translucent)
             transmittance *= through;
         if ((!translucent && through.x < 1.0) || all(transmittance < 0.01))
@@ -640,9 +740,62 @@ float3 SunVisibilityAlong(float3 origin, float3 direction, uint mask, uint rayFl
     return visibility;
 }
 
+// Rays leave a water surface this far to its side.
+static const float kWaterSurfaceOffset = 0.05;
+
+// SunVisibilityAlong for a point in `water` (kNoWater for air). Under water sunlight from `airDirection` (towards a point
+// of the sun's disc) bends at the flat surface (RefractedSunDirection), crosses the water, which takes its share, and is
+// focused by the ripples (CausticsAt); above the surface it is SunVisibilityAlong's. One call of each ray query: inlined
+// more often, their code slowed every pass that lights.
+float3 SunVisibilityFrom(float3 origin, uint water, float3 airDirection, uint mask, uint rayFlags = RAY_FLAG_NONE)
+{
+    float3 share = 1.0;
+    float3 start = origin;
+    if (water != kNoWater) {
+        if (airDirection.z <= 0.0)
+            return 0.0;
+        WaterBody body = LoadWaterBody(water);
+        float3 up = RefractedSunDirection(airDirection);
+        float length = max(body.surfaceZ - origin.z, 0.0) / up.z;
+        share = Transmittance(origin, up, length, mask & ~kWaterMask, rayFlags);
+        if (all(share <= 0.0))
+            return 0.0;
+        float3 surface = origin + up * length;
+        share *= (SunIntoWater(airDirection) * CausticsAt(surface)) * exp(-body.extinction * length);
+        start = surface + float3(0.0, 0.0, kWaterSurfaceOffset);
+    }
+    return share * SunVisibilityAlong(start, airDirection, mask & ~kWaterMask, rayFlags);
+}
+
+float3 UnderwaterSunVisibility(float3 origin, uint water, float3 airDirection, uint mask, uint rayFlags)
+{
+    return SunVisibilityFrom(origin, water, airDirection, mask, rayFlags);
+}
+
+// The direction sunlight from `airDirection` arrives from at a point in `water` (kNoWater for air).
+float3 SunArrival(uint water, float3 airDirection)
+{
+    return water == kNoWater ? airDirection : RefractedSunDirection(airDirection);
+}
+
 float3 SunVisibility(float3 origin, uint mask, uint rayFlags = RAY_FLAG_NONE)
 {
-    return SunVisibilityAlong(origin, g_frame.sunDirection, mask, rayFlags);
+    return SunVisibilityFrom(origin, WaterBodyAt(origin), g_frame.sunDirection, mask, rayFlags);
+}
+
+// SunVisibilityFrom for the sunlight on secondary hits (indirect rays, reflections, probes): under water the water's sun
+// map (WaterSunAt) stands in for the bent shadow rays where it covers the point. Hits on the lake floor traced both
+// legs for every indirect sample, which made the viewmodel's run over water several ms slower.
+float3 HitSunVisibility(float3 origin, uint water, uint mask)
+{
+    if (water != kNoWater && g_frame.sunDirection.z > 0.0) {
+        float3 up = RefractedSunDirection(g_frame.sunDirection);
+        float length = max(LoadWaterBody(water).surfaceZ - origin.z, 0.0) / up.z;
+        float3 light;
+        if (WaterSunMapAt(origin, light))
+            return light * CausticsAt(origin) * SunIntoWater(g_frame.sunDirection) * exp(-LoadWaterBody(water).extinction * length);
+    }
+    return SunVisibilityFrom(origin, water, g_frame.sunDirection, mask);
 }
 
 // The real sun's angular radius (its disc is about 0.53 degrees across), and 1 - its cosine.
@@ -685,7 +838,8 @@ float3 TransmittanceToNearest(float3 origin, float3 direction, float tMax, uint 
     float3 transmittance = 1.0;
     while (query.Proceed()) {
         bool translucent;
-        float3 through = CandidateTransmission(query.CandidateInstanceID(), query.CandidatePrimitiveIndex(), query.CandidateTriangleBarycentrics(), translucent);
+        float3 through = CandidateTransmission(query.CandidateInstanceID(), query.CandidatePrimitiveIndex(), query.CandidateTriangleBarycentrics(), translucent,
+            query.CandidateObjectRayDirection());
         if (translucent) {
             transmittance *= through;
             occluder = min(occluder, query.CandidateTriangleRayT());
@@ -704,6 +858,15 @@ float3 TransmittanceToNearest(float3 origin, float3 direction, float tMax, uint 
 // the 3D skybox are as far as their scaled distance.
 float3 SunVisibilityToNearest(float3 origin, float3 direction, uint mask, uint rayFlags, out float occluder)
 {
+    uint water = WaterBodyAt(origin);
+    if (water != kNoWater) {
+        // Under water the occluder that matters for the penumbra lies along the bent ray; the rest is UnderwaterSunVisibility's.
+        float3 up = RefractedSunDirection(direction);
+        float length = max(LoadWaterBody(water).surfaceZ - origin.z, 0.0) / up.z;
+        float3 under = TransmittanceToNearest(origin, up, length, mask & ~kWaterMask, rayFlags, occluder);
+        occluder = occluder < length ? occluder : 65536.0;
+        return any(under > 0.0) ? UnderwaterSunVisibility(origin, water, direction, mask, rayFlags) : 0.0;
+    }
     float3 visibility = TransmittanceToNearest(origin, direction, 65536.0, mask, rayFlags, occluder);
     if (any(visibility > 0.0) && g_frame.worldToSky > 0.0 && (mask & kSkyboxMask) == 0) {
         float3 camera = float3(g_frame.skyCameraX, g_frame.skyCameraY, g_frame.skyCameraZ);
@@ -721,13 +884,14 @@ float3 SunIrradiance(HitSurface hit, float3 origin, uint mask)
 {
     if (g_frame.sunEnabled == 0.0)
         return 0.0;
-    float cosine = dot(hit.normal, g_frame.sunDirection);
+    uint water = WaterBodyAt(origin);
+    float cosine = dot(hit.normal, SunArrival(water, g_frame.sunDirection));
     bool leaf = (hit.flags & kInstanceIgnoreNormals) != 0;
     if (leaf && cosine < 0.0)
         return g_frame.sunColor * (kLeafTransmission * -cosine) * SunVisibility(2.0 * hit.position - origin, mask);
     if (cosine <= 0.0)
         return 0.0;
-    return g_frame.sunColor * (cosine * (leaf ? 1.0 - kLeafTransmission : 1.0)) * SunVisibility(origin, mask);
+    return g_frame.sunColor * (cosine * (leaf ? 1.0 - kLeafTransmission : 1.0)) * HitSunVisibility(origin, water, mask);
 }
 
 // Map lights that can reach a position (Scene::LightLists): the (offset, count) range of the light indices its light
@@ -751,17 +915,11 @@ uint ClusterAt(float3 position)
 {
     if (g_frame.clusterCount == 0)
         return 0;
-    ByteAddressBuffer nodes = ResourceDescriptorHeap[g_frame.bspNodesView];
-    int node = 0;
-    for (uint steps = 0; node >= 0 && steps < 512; ++steps) {
-        float4 plane = asfloat(nodes.Load4(node * 24));
-        int2 children = asint(nodes.Load2(node * 24 + 16));
-        node = dot(plane.xyz, position) - plane.w >= 0.0 ? children.x : children.y;
-    }
-    if (node >= 0)
+    int leaf = LeafAt(position);
+    if (leaf < 0)
         return g_frame.clusterCount;
     ByteAddressBuffer leafClusters = ResourceDescriptorHeap[g_frame.leafClustersView];
-    int cluster = asint(leafClusters.Load((-node - 1) * 4));
+    int cluster = asint(leafClusters.Load(leaf * 4));
     return cluster >= 0 ? uint(cluster) : g_frame.clusterCount;
 }
 
@@ -849,6 +1007,161 @@ float3 LitFog(float3 position, uint3 volume)
             ambient = saturate(Luminance(indirect) / max(skyLight, 1e-6));
     }
     return g_frame.fogColor / max(g_frame.tonemapScale, 1e-3) * (sunShare * sun + (1.0 - sunShare) * ambient);
+}
+
+// LitFog's shares of the light in open air: the sun's and, in its units, the irradiance averaged over all directions.
+float SunShareOfAirLight(out float airLight)
+{
+    float sunLight = g_frame.sunEnabled != 0.0 ? 0.25 * Luminance(g_frame.sunColor) : 0.0;
+    airLight = sunLight + 0.5 * Luminance(g_frame.skyColor);
+    return sunLight / max(airLight, 1e-6);
+}
+
+// Water scatters half its light evenly and half strongly forward (Henyey-Greenstein, g = 0.9), as particles in water
+// do, so sunlight shows as shafts and a glow towards the sun. Times 4 pi: 1 averaged over all directions.
+static const float kWaterForwardShare = 0.5;
+static const float kWaterPhaseG = 0.9;
+
+float WaterPhase(float cosine)
+{
+    float g2 = kWaterPhaseG * kWaterPhaseG;
+    return (1.0 - kWaterForwardShare) + kWaterForwardShare * (1.0 - g2) / pow(max(1.0 + g2 - 2.0 * kWaterPhaseG * cosine, 1e-4), 1.5);
+}
+
+// The light the water of `body` scatters towards a ray along `direction` at a point, before the tonemap scale. In open
+// water just under the surface, lit by the full sun and sky, it averages the water's fog colour, as LitFog keeps the
+// map fog's: the sun's share follows the sunlight that reaches the point (the surface, the water's sun map: shadows
+// above and in the water, caustics; and the water above) and the phase function, the sky's share the light that
+// reaches its depth.
+float3 LitWater(float3 position, WaterBody body, float3 direction)
+{
+    float airLight;
+    float sunShare = SunShareOfAirLight(airLight);
+    float3 sun = 0.0;
+    if (sunShare > 0.0 && g_frame.sunDirection.z > 0.0) {
+        float3 up = RefractedSunDirection(g_frame.sunDirection);
+        float length = max(body.surfaceZ - position.z, 0.0) / up.z;
+        float3 arriving = SunIntoWater(g_frame.sunDirection) * WaterSunAt(position) * exp(-body.extinction * length);
+        sun = arriving * WaterPhase(dot(direction, up));
+    }
+    float3 sky = exp(-body.extinction * max(body.surfaceZ - position.z, 0.0));
+    return body.fogColor * (sunShare * sun + (1.0 - sunShare) * sky);
+}
+
+// The water's scattering albedo by colour: the share of the light reaching it that it scatters, from the light it shows
+// in open water (LitWater), at most 1.
+float3 WaterAlbedo(WaterBody body)
+{
+    float airLight;
+    SunShareOfAirLight(airLight);
+    return saturate(body.fogColor / max(airLight, 1e-6));
+}
+
+// Light along a ray through the water of `water` from `origin` along `direction` for `length` units: `radiance` from its
+// end, attenuated by the water, plus the water's own light (LitWater) gathered at `steps` points jittered by `seed`
+// over the stretch that still shows (four mean free paths), each standing for the light its part of the ray adds.
+float3 ThroughWater(float3 radiance, float3 origin, float3 direction, float length, uint water, uint steps, inout uint seed)
+{
+    WaterBody body = LoadWaterBody(water);
+    float3 far = exp(-body.extinction * length);
+    float span = min(length, 4.0 / max(min(body.extinction.r, min(body.extinction.g, body.extinction.b)), 1e-6));
+    float3 light = 0.0;
+    float3 before = 1.0;
+    for (uint s = 0; s < steps; ++s) {
+        float3 after = s + 1 == steps ? far : exp(-body.extinction * (span * (s + 1) / steps));
+        float t = span * (s + Random(seed)) / steps;
+        light += LitWater(origin + direction * t, body, direction) * max(before - after, 0.0);
+        before = after;
+    }
+    return radiance * far + light;
+}
+
+// The most water surfaces a ray of TraceThroughWater crosses or is mirrored by.
+static const uint kWaterInterfaces = 3;
+
+// The closest surface along a ray that water may bend, for paths that pick one of Fresnel's branches at random (indirect
+// light, the radiance cache, the probe volume). Through water, `light` gathers the water's own light (ThroughWater, one
+// point a stretch) and `throughput` what the water lets through. At a water surface the ray is mirrored with Fresnel's
+// probability, else refracted, whose radiance changes by the square of the ratio of the indices of refraction (into
+// water n^2, out of it 1 / n^2). `direction` ends as the last stretch's direction (the sky's, on a miss). False when
+// the ray meets nothing; with a zero throughput, nothing more can reach its origin.
+bool TraceThroughWater(float3 origin, inout float3 direction, float tMax, uint mask, uint rayFlags, inout uint seed, out HitSurface surface,
+    out HitInfo hit, out float3 throughput, out float3 light)
+{
+    throughput = 1.0;
+    light = 0.0;
+    surface = (HitSurface)0;
+    hit = (HitInfo)0;
+    uint water = g_frame.waterBodyCount != 0 ? WaterBodyAt(origin) : kNoWater;
+    // One trace a stretch: in water up to its surface, in air up to the first surface including water's.
+    // Bodies are loaded field by field where they are needed: a whole WaterBody kept across the trace made every pass
+    // that traces these rays slower.
+    for (uint crossing = 0; crossing <= kWaterInterfaces; ++crossing) {
+        float length = tMax;
+        uint stretchMask = mask & ~kWaterMask;
+        if (water != kNoWater) {
+            if (direction.z > 0.0)
+                length = min(length, max(LoadWaterBody(water).surfaceZ - origin.z, 0.0) / direction.z);
+        } else if (crossing < kWaterInterfaces && g_frame.waterBodyCount != 0) {
+            stretchMask |= kWaterMask;
+        }
+        bool found = TraceClosest(origin, direction, length, stretchMask, surface, hit, rayFlags);
+        if (water != kNoWater) {
+            length = found ? hit.t : length;
+            light += throughput * ThroughWater(0.0, origin, direction, found || direction.z > 0.0 ? length : 1e9, water, 1, seed);
+            throughput *= exp(-LoadWaterBody(water).extinction * length);
+            if (found)
+                return true;
+            if (direction.z <= 0.0 || crossing == kWaterInterfaces) {
+                throughput = 0.0;
+                return false;
+            }
+            // At the surface from below: mirrored with Fresnel's probability, else out into the air.
+            float3 surfacePoint = origin + direction * length;
+            float3 down = -WaterSurfaceNormal(water, LoadWaterBody(water), surfacePoint);
+            float fresnel = Fresnel(-dot(direction, down), 1.0 / kWaterIor);
+            float3 refracted = refract(direction, down, kWaterIor);
+            if (Random(seed) < fresnel || dot(refracted, refracted) <= 0.0 || refracted.z <= 0.0) {
+                direction = reflect(direction, down);
+                direction.z = min(direction.z, -0.02);
+                direction = normalize(direction);
+                origin = surfacePoint - float3(0.0, 0.0, kWaterSurfaceOffset);
+            } else {
+                direction = normalize(refracted);
+                throughput *= kWaterIor * kWaterIor;
+                origin = surfacePoint + float3(0.0, 0.0, kWaterSurfaceOffset);
+                water = kNoWater;
+            }
+            continue;
+        }
+        if (!found)
+            return false;
+        if ((surface.flags & kInstanceWater) == 0)
+            return true;
+        // A water surface from above: mirrored with Fresnel's probability, else into the water.
+        float3 surfacePoint = surface.position;
+        uint below = WaterBodyOfTriangle(hit.instance, hit.primitive);
+        if (below == kNoWater || direction.z >= 0.0) {
+            origin = surfacePoint + direction * kWaterSurfaceOffset;
+            continue;
+        }
+        float3 up = WaterSurfaceNormal(below, LoadWaterBody(below), surfacePoint);
+        float fresnel = Fresnel(-dot(direction, up), kWaterIor);
+        float3 refracted = refract(direction, up, 1.0 / kWaterIor);
+        if (Random(seed) < fresnel || dot(refracted, refracted) <= 0.0 || refracted.z >= 0.0) {
+            direction = reflect(direction, up);
+            direction.z = max(direction.z, 0.02);
+            direction = normalize(direction);
+            origin = surfacePoint + float3(0.0, 0.0, kWaterSurfaceOffset);
+        } else {
+            direction = normalize(refracted);
+            throughput /= kWaterIor * kWaterIor;
+            origin = surfacePoint - float3(0.0, 0.0, kWaterSurfaceOffset);
+            water = below;
+        }
+    }
+    throughput = 0.0;
+    return false;
 }
 
 float VisibleIrradiance() { return (1.0 / 1024.0) / max(g_frame.tonemapScale, 1e-3); }
@@ -1026,12 +1339,157 @@ float ProjectorClearance(Projector projector)
     return (projector.flags & kProjectorLocalFlashlight) != 0 ? kLightClearance : kAttachedLightClearance;
 }
 
-// The share of a projected light that reaches `origin`, on the straight path from there to the projector.
+// The normal of the surface a pass lights, when it has one, for LightPath's Lambert term under water (0 for none).
+static float3 g_receiverNormal = 0.0;
+
+// The share of a light's light that reaches `origin` from `lightPosition`, its shadow ray stopping `clearance` short of
+// the light, relative to what the straight, unshadowed path would bring. Outside water it is that straight shadow ray.
+// From under water, light from a lamp in the same water crosses it on the straight path (Beer-Lambert); light from above
+// the surface bends where it crosses it (Snell's law; the point found by bisection along the horizontal line between
+// them), and its shadow is traced along both legs of that path. It loses what the surface reflects (Fresnel) and what
+// the water takes on its underwater leg, and its beam spreads differently than the straight inverse square: for a point
+// source at height h_a above the surface and a point h_w below, the irradiance across the beam is
+// I sin(a) / (x dx/da cos(w)) with x = h_a tan(a) + h_w tan(w), sin(a) = n sin(w) (the Jacobian of the bent rays),
+// against I / d^2. With g_receiverNormal set, the Lambert term follows the bent direction too. `toLight` is the direction
+// the light leaves towards the origin, reversed: along its last leg.
+float3 LightPath(float3 origin, float3 lightPosition, float clearance, uint mask, uint rayFlags, out float3 toLight)
+{
+    float3 path = lightPosition - origin;
+    float distance = max(length(path), 1e-3);
+    uint water = origin.z < g_frame.waterTop ? WaterBodyAt(origin) : kNoWater;
+    WaterBody body = (WaterBody)0;
+    if (water != kNoWater)
+        body = LoadWaterBody(water);
+    // The shadow ray's legs (one, or two through the surface) share one ray query, which keeps the passes that trace
+    // them small.
+    float3 share = 1.0;
+    float3 start = origin;
+    float3 direction = path / distance;
+    float stretch = ShadowRayLength(clearance, distance);
+    float3 nextStart = origin;
+    float3 nextDirection = direction;
+    float nextLength = 0.0;
+    uint legs = 1;
+    toLight = direction;
+    if (water != kNoWater && lightPosition.z <= body.surfaceZ) {
+        share = exp(-body.extinction * distance);
+    } else if (water != kNoWater) {
+        float underDepth = max(body.surfaceZ - origin.z, 1e-3);
+        float aboveHeight = max(lightPosition.z - body.surfaceZ, 1e-3);
+        float2 across = lightPosition.xy - origin.xy;
+        float reach = length(across);
+        float2 heading = reach > 1e-4 ? across / reach : float2(1.0, 0.0);
+        float low = 0.0;
+        float high = reach;
+        for (uint step = 0; step < 20; ++step) {
+            float r = 0.5 * (low + high);
+            float sineWater = r / sqrt(r * r + underDepth * underDepth);
+            float sineAir = (reach - r) / sqrt((reach - r) * (reach - r) + aboveHeight * aboveHeight);
+            if (kWaterIor * sineWater > sineAir)
+                high = r;
+            else
+                low = r;
+        }
+        float3 crossing = float3(origin.xy + heading * (0.5 * (low + high)), body.surfaceZ);
+        float3 under = crossing - origin;
+        float underLength = max(length(under), 1e-3);
+        float3 over = lightPosition - crossing;
+        float overLength = max(length(over), 1e-3);
+        direction = under / underLength;
+        stretch = underLength;
+        nextStart = crossing + float3(0.0, 0.0, kWaterSurfaceOffset);
+        nextDirection = over / overLength;
+        toLight = nextDirection;
+        nextLength = ShadowRayLength(clearance, overLength);
+        legs = 2;
+        float cosineAir = aboveHeight / overLength;
+        float cosineWater = underDepth / underLength;
+        float sineAir = sqrt(saturate(1.0 - cosineAir * cosineAir));
+        float spread;
+        if (reach < 1e-2) {
+            float apparent = aboveHeight + underDepth / kWaterIor;
+            spread = distance * distance / (apparent * apparent);
+        } else {
+            float dx = aboveHeight / (cosineAir * cosineAir) + underDepth / (cosineWater * cosineWater) * cosineAir / (kWaterIor * cosineWater);
+            spread = distance * distance * sineAir / (reach * dx * cosineWater);
+        }
+        float lambert = 1.0;
+        if (any(g_receiverNormal != 0.0)) {
+            float straight = dot(g_receiverNormal, path / distance);
+            lambert = straight > 1e-3 ? saturate(dot(g_receiverNormal, direction)) / straight : 0.0;
+        }
+        share = ((1.0 - Fresnel(cosineAir, kWaterIor)) * spread * lambert) * exp(-body.extinction * underLength);
+        mask &= ~kWaterMask;
+    }
+    for (uint leg = 0; leg < legs && any(share > 0.0); ++leg) {
+        share *= Transmittance(start, direction, stretch, mask, rayFlags);
+        start = nextStart;
+        direction = nextDirection;
+        stretch = nextLength;
+    }
+    return share;
+}
+
+float3 LightPath(float3 origin, float3 lightPosition, float clearance, uint mask, uint rayFlags)
+{
+    float3 toLight;
+    return LightPath(origin, lightPosition, clearance, mask, rayFlags, toLight);
+}
+
+// A map spot light's cone along the path its light takes to `origin` (LightPath's toLight) over its weight along the
+// straight line from `lightPosition`, which its irradiance was weighed on: 1 where the path is straight.
+float BentSpotShare(uint mapLight, float3 origin, float3 lightPosition, float3 toLight)
+{
+    float3 straight = lightPosition - origin;
+    float distance = max(length(straight), 1e-3);
+    straight /= distance;
+    if (dot(toLight, straight) >= 0.99999)
+        return 1.0;
+    Light light = LoadLight(mapLight);
+    float weighed = SpotFactor(light, straight, distance);
+    return weighed > 0.0 ? SpotFactor(light, toLight, distance) / weighed : 0.0;
+}
+
+// A projector's cookie towards a point, 0 outside its frustum.
+float3 ProjectorPattern(Projector projector, float3 position)
+{
+    float4 world = float4(position, 1.0);
+    float4 projected = float4(dot(projector.worldToTexture[0], world), dot(projector.worldToTexture[1], world),
+        dot(projector.worldToTexture[2], world), dot(projector.worldToTexture[3], world));
+    if (projected.w <= 0.0)
+        return 0.0;
+    // The depth range is left out: the local flashlight's apex was moved forward, past where its near plane began.
+    float2 coords = projected.xy / projected.w;
+    if (any(coords < 0.0) || any(coords > 1.0))
+        return 0.0;
+    if (projector.cookieView != kNoCookie) {
+        Texture2D<float4> texture = ResourceDescriptorHeap[NonUniformResourceIndex(projector.cookieView)];
+        return texture.SampleLevel(g_linearClamp, coords, 0.0).rgb;
+    }
+    return smoothstep(0.5, 0.35, length(coords - 0.5));
+}
+
+// A projector's pattern (ProjectorPattern) along the path its light takes to `origin` (LightPath's toLight), bent at a
+// water surface, over the pattern along the straight line ProjectorIrradiance weighed it on: 1 where the path is
+// straight.
+float3 BentPatternShare(Projector projector, float3 origin, float3 toLight)
+{
+    float3 straight = projector.origin - origin;
+    float distance = length(straight);
+    if (dot(toLight, straight) >= 0.99999 * distance)
+        return 1.0;
+    float3 weighed = ProjectorPattern(projector, origin);
+    float3 bent = ProjectorPattern(projector, projector.origin - toLight * distance);
+    return select(weighed > 0.0, bent / max(weighed, 1e-6), 0.0);
+}
+
+// The share of a projected light that reaches `origin` from the projector (LightPath), its pattern weighed along that
+// path (BentPatternShare).
 float3 ProjectorTransmittance(Projector projector, float3 origin)
 {
-    float3 path = projector.origin - origin;
-    float distance = max(length(path), 1e-3);
-    return Transmittance(origin, path / distance, ShadowRayLength(ProjectorClearance(projector), distance), ShadowMask(true));
+    float3 toLight;
+    float3 share = LightPath(origin, projector.origin, ProjectorClearance(projector), ShadowMask(true), RAY_FLAG_NONE, toLight);
+    return all(share <= 0.0) ? share : share * BentPatternShare(projector, origin, toLight);
 }
 
 // Below this distance from its lamp the local flashlight brightens more slowly than the inverse square: a
@@ -1044,28 +1502,15 @@ static const float kFlashlightNearField = 16.0;
 // except for the local flashlight, whose lamp keeps brightening (kFlashlightNearField).
 float3 ProjectorIrradiance(Projector projector, float3 position, float3 normal, out float3 toLight, out float distance)
 {
-    float4 world = float4(position, 1.0);
-    float4 projected = float4(dot(projector.worldToTexture[0], world), dot(projector.worldToTexture[1], world),
-        dot(projector.worldToTexture[2], world), dot(projector.worldToTexture[3], world));
     float3 delta = projector.origin - position;
     distance = max(length(delta), 1e-3);
     toLight = delta / distance;
-    if (projected.w <= 0.0)
-        return 0.0;
-    // The depth range is left out: the local flashlight's apex was moved forward, past where its near plane began.
-    float2 coords = projected.xy / projected.w;
-    if (any(coords < 0.0) || any(coords > 1.0))
-        return 0.0;
     float lambert = Lambert(normal, toLight);
     if (lambert <= 0.0)
         return 0.0;
-    float3 cookie;
-    if (projector.cookieView != kNoCookie) {
-        Texture2D<float4> texture = ResourceDescriptorHeap[NonUniformResourceIndex(projector.cookieView)];
-        cookie = texture.SampleLevel(g_linearClamp, coords, 0.0).rgb;
-    } else {
-        cookie = smoothstep(0.5, 0.35, length(coords - 0.5));
-    }
+    float3 cookie = ProjectorPattern(projector, position);
+    if (all(cookie <= 0.0))
+        return 0.0;
     float attenuation = saturate(dot(projector.attenuation, float3(1.0, 1.0 / distance, 1.0 / (distance * distance))));
     float fullSquared = projector.fullDistance * projector.fullDistance;
     if ((projector.flags & kProjectorLocalFlashlight) != 0 && projector.fullDistance > 0.0)
@@ -1115,7 +1560,9 @@ float3 SetLightIrradiance(LightSet set, uint i, float3 position, float3 normal, 
 // from the origin itself: origins sit off the surface by a bias that grows with the distance to the eye, and rays
 // parallel to the surface's own path ended beside the light, inside or outside its lamp as the camera moved. Map lights
 // are spheres (Light::size): `jitter`, two numbers in [0, 1), picks the point of the disc they show the origin that the
-// ray aims at, for soft shadows; kLightCentre aims at the centre.
+// ray aims at, for soft shadows; kLightCentre aims at the centre. A spot light's cone and a projector's pattern weigh
+// the light along the path it takes (bent at a water surface) in place of the straight one its irradiance was weighed
+// along.
 float3 LightTransmittance(LightSet set, uint i, float3 origin, float3 lightPosition, float2 jitter, uint rayFlags = RAY_FLAG_NONE)
 {
     bool attached = IsAttachedLight(set, i);
@@ -1127,9 +1574,13 @@ float3 LightTransmittance(LightSet set, uint i, float3 origin, float3 lightPosit
         if (jitter.x >= 0.0)
             lightPosition = DiscPoint(lightPosition, asfloat(shape.y), origin, jitter);
     }
-    float3 path = lightPosition - origin;
-    float distance = max(length(path), 1e-3);
-    return Transmittance(origin, path / distance, ShadowRayLength(clearance, distance), ShadowMask(attached, sealed), rayFlags);
+    float3 toLight;
+    float3 share = LightPath(origin, lightPosition, clearance, ShadowMask(attached, sealed), rayFlags, toLight);
+    if (all(share <= 0.0))
+        return share;
+    if (!attached)
+        return share * BentSpotShare(SetMapLight(set, i), origin, lightPosition, toLight);
+    return i >= set.pointLights ? share * BentPatternShare(LoadProjector(i - set.pointLights), origin, toLight) : share;
 }
 
 // On a dynamic model, a shadow ray towards a light its triangle faces away from (where the smoothed normal still faces
@@ -1198,19 +1649,93 @@ bool SampleLight(LightSet set, float3 position, float3 normal, inout uint seed, 
     return true;
 }
 
-// Direct light at a hit off screen: the sun, with its shadow ray under `sunMask`, and one local light picked by
-// SampleLight, both from `origin` off the hit's surface.
+// Direct light at a hit off screen: the sun, with its shadow ray under `sunMask`, and the local lights, all from
+// `origin` off the hit's surface.
 float3 HitDirectIrradiance(HitSurface hit, float3 origin, uint sunMask, inout uint seed)
 {
     float3 irradiance = SunIrradiance(hit, origin, sunMask);
-    float3 light;
-    float3 toLight;
-    float distance;
-    uint picked;
     LightSet set = LightSetAt(hit.position);
-    if (SampleLight(set, hit.position, hit.normal, seed, light, toLight, distance, picked))
-        irradiance += light * LightTransmittance(set, picked, origin, hit.position + toLight * distance, float2(Random(seed), Random(seed)));
+    // Projected lights (the flashlight) are few and bright, and each is traced: picked as one light among a cell's many,
+    // their rare, heavily weighted samples were clamped (ClampSample), and the flashlight barely lit the floor under
+    // water or what mirrors show. The others are sampled. One shadow ray call serves both.
+    uint projectors = set.count - set.pointLights;
+    LightSet sampled = set;
+    sampled.count = set.pointLights;
+    for (uint k = 0; k <= projectors; ++k) {
+        float3 light;
+        float3 toLight;
+        float distance;
+        uint index;
+        bool projector = k < projectors;
+        if (projector) {
+            index = set.pointLights + k;
+            light = SetLightIrradiance(set, index, hit.position, hit.normal, toLight, distance);
+        } else if (!SampleLight(sampled, hit.position, hit.normal, seed, light, toLight, distance, index)) {
+            break;
+        }
+        if (all(light <= 0.0))
+            continue;
+        LightSet lit = sampled;
+        if (projector)
+            lit = set;
+        g_receiverNormal = hit.normal;
+        irradiance += light * LightTransmittance(lit, index, origin, hit.position + toLight * distance,
+            projector ? kLightCentre : float2(Random(seed), Random(seed)));
+        g_receiverNormal = 0.0;
+    }
     return irradiance;
+}
+
+// The light lamps and projected lights scatter in the water of `body` towards a ray along `direction` (away from the
+// eye) at a point, before the tonemap scale: each projected light and one sampled lamp (as HitDirectIrradiance lights a
+// hit), their shadow rays along their bent paths (LightTransmittance), times the water's albedo (WaterAlbedo) and phase
+// function (WaterPhase; light travelling along -toLight scatters towards the eye by the angle whose cosine is
+// dot(direction, toLight)), in the units LitWater gives the sun's.
+float3 WaterLampLight(float3 position, WaterBody body, float3 direction, inout uint seed)
+{
+    LightSet set = LightSetAt(position);
+    uint projectors = set.count - set.pointLights;
+    LightSet sampled = set;
+    sampled.count = set.pointLights;
+    float3 scattered = 0.0;
+    for (uint k = 0; k <= projectors; ++k) {
+        float3 light;
+        float3 toLight;
+        float distance;
+        uint index;
+        bool projector = k < projectors;
+        if (projector) {
+            index = set.pointLights + k;
+            light = SetLightIrradiance(set, index, position, 0.0, toLight, distance);
+        } else if (!SampleLight(sampled, position, 0.0, seed, light, toLight, distance, index)) {
+            break;
+        }
+        if (all(light <= 0.0))
+            continue;
+        LightSet lit = sampled;
+        if (projector)
+            lit = set;
+        scattered += light * WaterPhase(dot(direction, toLight)) *
+            LightTransmittance(lit, index, position, position + toLight * distance, projector ? kLightCentre : float2(Random(seed), Random(seed)));
+    }
+    return scattered * WaterAlbedo(body);
+}
+
+// WaterLampLight along a ray through the water of `water` from `origin` along `direction` for `length` units, at `steps`
+// points jittered by `seed`, each standing for its stretch of what still shows (as ThroughWater gathers the water's own
+// light).
+float3 WaterLampsAlong(float3 origin, float3 direction, float length, uint water, uint steps, inout uint seed)
+{
+    WaterBody body = LoadWaterBody(water);
+    float span = min(length, 4.0 / max(min(body.extinction.r, min(body.extinction.g, body.extinction.b)), 1e-6));
+    float3 light = 0.0;
+    float3 before = 1.0;
+    for (uint s = 0; s < steps; ++s) {
+        float3 after = exp(-body.extinction * (span * (s + 1) / steps));
+        light += WaterLampLight(origin + direction * (span * (s + Random(seed)) / steps), body, direction, seed) * max(before - after, 0.0);
+        before = after;
+    }
+    return light;
 }
 
 #endif

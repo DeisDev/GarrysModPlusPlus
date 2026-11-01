@@ -59,8 +59,11 @@ struct MeshDraw {
     std::span<const std::pair<int, int>> primitives;
     int vertexCount = 0;
     ID3D12Resource* buffers[3] = {};
-    // The vertices' CPU copy when there is one (developer diagnostics).
+    // The vertices' and 16-bit indices' CPU copies when there are some (developer diagnostics, water surfaces' texture
+    // mapping), and where in a vertex its first texture coordinate is (-1 for none).
     const std::uint8_t* vertexData = nullptr;
+    const std::uint16_t* indexData = nullptr;
+    int texCoord0Offset = -1;
 };
 
 // IShaderDevice and IShaderAPI's mesh methods.

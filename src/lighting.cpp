@@ -8,6 +8,7 @@
 
 #include <g_aoCS.h>
 #include <g_bakedBounceCS.h>
+#include <g_causticsCS.h>
 #include <g_aoOmmCS.h>
 #include <g_compositeCoveredPS.h>
 #include <g_compositeDepthPS.h>
@@ -68,6 +69,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <fstream>
@@ -80,19 +82,29 @@ namespace gmodpp {
 
 namespace {
 
-constexpr UINT kConstantsStride = 4 * D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT;
+constexpr UINT kConstantsStride = 5 * D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT;
 static_assert(sizeof(FrameConstants) <= kConstantsStride);
 static_assert(offsetof(FrameConstants, lightWarpViews) % 16 == 0);
 static_assert(offsetof(FrameConstants, skyboxFogParams) % 16 == 0);
+static_assert(offsetof(FrameConstants, causticsOrigin) % 16 == 0);
 // Each slot has the view's constants and a copy for the passes Ray Reconstruction runs at render resolution.
 constexpr UINT kConstantsPerSlot = 2;
 // Per slot: colour copy, depth, G-buffer normal, flags, light, albedo and self-illumination views, then projector cookies.
 constexpr UINT kInputViews = 7;
 constexpr UINT kMaxProjectors = 8;
-constexpr UINT kViewsPerSlot = kInputViews + kMaxProjectors;
+constexpr UINT kViewsPerSlot = kInputViews + kMaxProjectors + static_cast<UINT>(gbuffer::kMaxWaterDraws);
+// Bodies of water whose drawn surface the shaders can follow (WaterDraw in shaders/water_body.hlsli, 80 bytes each).
+constexpr UINT kMaxDrawnWaterBodies = 256;
+constexpr UINT kWaterDrawStride = 80;
 constexpr UINT kInvalidView = ~0u;
 // Texels on a side of each face of the sky light (kSize in shaders/sky.hlsl).
 constexpr UINT kSkyLightSize = 8;
+// Caustics (shaders/caustics.hlsl, kCausticsCells there) cover this many units square around the main view's eye.
+constexpr UINT kCausticsCells = 1024;
+constexpr float kCausticsRange = 2048.0f;
+// The coarse sun map (kCoarseCells there) covers the largest map Source allows.
+constexpr UINT kCoarseCausticsCells = 512;
+constexpr float kCoarseCausticsRange = 32768.0f;
 // Per slot: SamplingConstants, then RestirConstants from kRestirConstantsOffset.
 constexpr UINT kSamplingStride = 4096;
 constexpr UINT kRestirConstantsOffset = 256;
@@ -201,7 +213,7 @@ constexpr UINT kPassCount = static_cast<UINT>(GpuPass::Count);
 // A timestamp before the first pass and after each one.
 constexpr UINT kMarkers = kPassCount + 1;
 constexpr uint32_t kTimingSamples = 120;
-constexpr UINT kProbeBytes = 32;
+constexpr UINT kProbeBytes = 64;
 // Luxels the bounce light bake traces per main view or loading screen update, which keeps each part well below the
 // GPU timeout.
 constexpr UINT kBakeLuxelsPerView = 1 << 14;
@@ -449,6 +461,16 @@ bool Lighting::Initialize(ID3D12Device5* device, ID3D12CommandQueue* queue, Desc
         m_projectors = CreateBuffer(m_device, D3D12_HEAP_TYPE_UPLOAD, sizeof(GpuProjector) * kMaxProjectors * kSlots, D3D12_RESOURCE_STATE_GENERIC_READ);
         hr = m_projectors ? m_projectors->Map(0, nullptr, reinterpret_cast<void**>(&m_projectorsMapped)) : E_OUTOFMEMORY;
     }
+    if (SUCCEEDED(hr)) {
+        m_waterDraws = CreateBuffer(m_device, D3D12_HEAP_TYPE_UPLOAD, kWaterDrawStride * kMaxDrawnWaterBodies * kSlots, D3D12_RESOURCE_STATE_GENERIC_READ);
+        hr = m_waterDraws ? m_waterDraws->Map(0, nullptr, reinterpret_cast<void**>(&m_waterDrawsMapped)) : E_OUTOFMEMORY;
+    }
+    for (UINT slot = 0; slot < kSlots && SUCCEEDED(hr); ++slot) {
+        m_waterDrawViews[slot] = m_descriptors->CreateRawView(m_waterDraws.Get(), static_cast<UINT64>(slot) * kWaterDrawStride * kMaxDrawnWaterBodies,
+            static_cast<UINT64>(kWaterDrawStride) * kMaxDrawnWaterBodies);
+        if (m_waterDrawViews[slot] == DescriptorHeap::kInvalid)
+            hr = E_OUTOFMEMORY;
+    }
     for (UINT slot = 0; slot < kSlots && SUCCEEDED(hr); ++slot) {
         m_projectorViews[slot] = m_descriptors->Allocate();
         if (m_projectorViews[slot] == DescriptorHeap::kInvalid) {
@@ -515,7 +537,7 @@ bool Lighting::Initialize(ID3D12Device5* device, ID3D12CommandQueue* queue, Desc
         cache ? std::span<const BYTE>(g_reflectionsCacheCS) : g_reflectionsCS, g_reflectionTemporalCS, g_dlssInputsCS, g_dlssResolveCS, g_directWideCS,
         g_swayCS, g_translucentDepthCS, g_viewRectCS, g_bakedBounceCS, g_skyCS, cache ? std::span<const BYTE>(g_sharcUpdateCS) : none,
         cache ? std::span<const BYTE>(g_sharcResolveCS) : none, g_directSunCS, g_restirPdfCS, g_restirPresampleCS, g_restirRegirCS, g_restirInitialCS,
-        g_restirTemporalCS, g_restirSpatialCS, g_restirShadeCS, g_nrdInputsCS, g_nrdResolveCS, g_sunShadowCS};
+        g_restirTemporalCS, g_restirSpatialCS, g_restirShadeCS, g_nrdInputsCS, g_nrdResolveCS, g_sunShadowCS, g_causticsCS};
     static_assert(std::size(shaders) == static_cast<size_t>(Pass::Count));
     for (size_t i = 0; i < m_pipelines.size() && SUCCEEDED(hr); ++i) {
         if (shaders[i].empty())
@@ -628,6 +650,16 @@ bool Lighting::Initialize(ID3D12Device5* device, ID3D12CommandQueue* queue, Desc
     }
     if (!CreateSkyLight())
         log::Info("Lighting: creating the sky light failed; indirect light takes the map's flat sky light");
+    if (!CreateTarget(m_causticCounts, 2 * kCausticsCells, kCausticsCells, DXGI_FORMAT_R32_UINT) ||
+        !CreateTarget(m_caustics, kCausticsCells, kCausticsCells, DXGI_FORMAT_R16_FLOAT) ||
+        !CreateTarget(m_waterSun, kCausticsCells, kCausticsCells, DXGI_FORMAT_R32G32B32A32_FLOAT) ||
+        !CreateTarget(m_coarseWaterSun, kCoarseCausticsCells, kCoarseCausticsCells, DXGI_FORMAT_R32G32B32A32_FLOAT)) {
+        m_causticCounts = {};
+        m_caustics = {};
+        m_waterSun = {};
+        m_coarseWaterSun = {};
+        log::Info("Lighting: creating the caustics' targets failed; water throws no caustics and its light is unshadowed");
+    }
     m_fenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     m_rtvIncrement = m_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     m_skinned.Initialize(m_device, *m_descriptors);
@@ -679,6 +711,128 @@ bool Lighting::CreateTarget(Texture& texture, UINT width, UINT height, DXGI_FORM
     uav.Texture3D.WSize = depth != 0 ? depth : 0;
     m_device->CreateUnorderedAccessView(texture.resource.Get(), nullptr, &uav, m_descriptors->Cpu(texture.uav));
     return true;
+}
+
+void Lighting::WriteWaterDraws(UINT slot, const ViewInputs& inputs, const Scene& scene, UINT firstView, FrameConstants& constants)
+{
+    const std::span<const GpuWaterBody> bodies = scene.WaterBodies();
+    if (bodies.empty() || inputs.waterDraws.empty() || constants.waterBodyCount == 0)
+        return;
+    struct WaterDraw {
+        float bumpS[4];
+        float bumpT[4];
+        float uvS[4];
+        float uvT[4];
+        uint32_t normalMap;
+        float time;
+        uint32_t mapped;
+        uint32_t padding;
+    };
+    static_assert(sizeof(WaterDraw) == kWaterDrawStride);
+    WaterDraw* entries = reinterpret_cast<WaterDraw*>(m_waterDrawsMapped + static_cast<size_t>(slot) * kWaterDrawStride * kMaxDrawnWaterBodies);
+    const size_t count = std::min<size_t>(bodies.size(), kMaxDrawnWaterBodies);
+    for (size_t b = 0; b < count; ++b)
+        entries[b] = {{}, {}, {}, {}, kInvalidView, 0.0f, 0, 0};
+    for (size_t d = 0; d < inputs.waterDraws.size() && d < gbuffer::kMaxWaterDraws; ++d) {
+        ID3D12Resource* normalMap = d < inputs.waterNormalMaps.size() ? inputs.waterNormalMaps[d] : nullptr;
+        if (normalMap == nullptr)
+            continue;
+        const gbuffer::WaterSurfaceDraw& draw = inputs.waterDraws[d];
+        const D3D12_RESOURCE_DESC desc = normalMap->GetDesc();
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+        srv.Format = ColorViewFormat(desc.Format);
+        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.Texture2D.MipLevels = desc.MipLevels;
+        const UINT view = firstView + static_cast<UINT>(d);
+        m_device->CreateShaderResourceView(normalMap, &srv, m_descriptors->Cpu(view));
+        // The draw's pixel c6 is its material's linear $fogcolor, the same value WaterBodyFor reads for its body.
+        for (size_t b = 0; b < count; ++b) {
+            bool same = true;
+            for (int c = 0; c < 3; ++c)
+                same = same && std::fabs(bodies[b].fogColor[c] - draw.fog[c]) < 1e-4f;
+            if (same) {
+                if (!m_loggedWaterDraw) {
+                    m_loggedWaterDraw = true;
+                    log::Info("Lighting: water body {} follows its drawn surface (bump rows ({:.3f} {:.3f} {:.3f} {:.3f}) ({:.3f} {:.3f} {:.3f} {:.3f}), "
+                              "texture mapping ({:.5f} {:.5f} {:.3f}) ({:.5f} {:.5f} {:.3f}){})", b,
+                        draw.bumpRows[0][0], draw.bumpRows[0][1], draw.bumpRows[0][2], draw.bumpRows[0][3], draw.bumpRows[1][0], draw.bumpRows[1][1],
+                        draw.bumpRows[1][2], draw.bumpRows[1][3], draw.uvS[0], draw.uvS[1], draw.uvS[3], draw.uvT[0], draw.uvT[1], draw.uvT[3],
+                        draw.mapped ? "" : ", not read yet");
+                }
+                std::copy_n(draw.bumpRows[0].begin(), 4, entries[b].bumpS);
+                std::copy_n(draw.bumpRows[1].begin(), 4, entries[b].bumpT);
+                std::copy_n(draw.uvS.begin(), 4, entries[b].uvS);
+                std::copy_n(draw.uvT.begin(), 4, entries[b].uvT);
+                entries[b].mapped = draw.mapped ? 1u : 0u;
+                entries[b].normalMap = view;
+                entries[b].time = draw.time;
+            }
+        }
+    }
+    constants.waterDrawsView = m_waterDrawViews[slot];
+}
+
+void Lighting::SetCausticsConstants(FrameConstants& constants) const
+{
+    constants.causticsView = m_caustics.srv;
+    std::copy_n(m_causticsOrigin, 2, constants.causticsOrigin);
+    constants.causticsInvSize = m_causticsInvSize;
+    constants.waterSunView = m_waterSun.srv;
+    constants.coarseWaterSunView = m_coarseWaterSun.srv;
+    std::copy_n(m_coarseCausticsOrigin, 2, constants.coarseCausticsOrigin);
+    constants.coarseCausticsInvSize = m_coarseCausticsInvSize;
+}
+
+void Lighting::RecordCaustics(FrameConstants& constants, const Scene& scene)
+{
+    m_causticsReady = false;
+    const float cell = kCausticsRange / static_cast<float>(kCausticsCells);
+    const float originX = std::floor(constants.eyePosition[0] / cell) * cell - 0.5f * kCausticsRange;
+    const float originY = std::floor(constants.eyePosition[1] / cell) * cell - 0.5f * kCausticsRange;
+    const bool sun = constants.sunEnabled != 0.0f && constants.sunDirection[2] > 0.0f &&
+        constants.sunColor[0] + constants.sunColor[1] + constants.sunColor[2] > 0.0f;
+    if (!m_caustics.resource || constants.traceMask == 0 || !sun || constants.waterBodyCount == 0)
+        return;
+    // Without water near the eye the fine square is only cleared: no caustics, and the coarse map's shadows.
+    const bool waterNear = scene.WaterWithin(originX, originY, originX + kCausticsRange, originY + kCausticsRange);
+    m_causticsOrigin[0] = originX;
+    m_causticsOrigin[1] = originY;
+    m_causticsInvSize = 1.0f / kCausticsRange;
+    const float coarseCell = kCoarseCausticsRange / static_cast<float>(kCoarseCausticsCells);
+    m_coarseCausticsOrigin[0] = std::floor(constants.eyePosition[0] / coarseCell) * coarseCell - 0.5f * kCoarseCausticsRange;
+    m_coarseCausticsOrigin[1] = std::floor(constants.eyePosition[1] / coarseCell) * coarseCell - 0.5f * kCoarseCausticsRange;
+    m_coarseCausticsInvSize = 1.0f / kCoarseCausticsRange;
+    // Fine: clear, photons, resolve; coarse (step bit 2): clear, photons (sun map only).
+    const D3D12_RESOURCE_BARRIER counted = {D3D12_RESOURCE_BARRIER_TYPE_UAV, D3D12_RESOURCE_BARRIER_FLAG_NONE, {.UAV = {m_causticCounts.resource.Get()}}};
+    Use(m_causticCounts, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    Use(m_caustics, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    Use(m_waterSun, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    Use(m_coarseWaterSun, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    const PassArgs fine = {.input1 = std::bit_cast<UINT>(originX), .input2 = std::bit_cast<UINT>(originY), .input3 = std::bit_cast<UINT>(m_causticsInvSize),
+        .output0 = m_causticCounts.uav, .output1 = m_caustics.uav, .output2 = m_waterSun.uav};
+    const PassArgs coarse = {.input1 = std::bit_cast<UINT>(m_coarseCausticsOrigin[0]), .input2 = std::bit_cast<UINT>(m_coarseCausticsOrigin[1]),
+        .input3 = std::bit_cast<UINT>(m_coarseCausticsInvSize), .output0 = m_causticCounts.uav, .output2 = m_coarseWaterSun.uav};
+    const auto run = [&](PassArgs args, UINT step, UINT cells) {
+        args.step = step;
+        DispatchGroups(Pass::Caustics, args, cells / 8, cells / 8, 1);
+        m_list->ResourceBarrier(1, &counted);
+    };
+    run(fine, 0, kCausticsCells);
+    if (waterNear)
+        run(fine, 1, kCausticsCells);
+    Use(m_causticCounts, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    PassArgs resolve = fine;
+    resolve.input0 = m_causticCounts.srv;
+    run(resolve, 2, kCausticsCells);
+    Use(m_causticCounts, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    run(coarse, 4, kCoarseCausticsCells);
+    run(coarse, 5, kCoarseCausticsCells);
+    Use(m_caustics, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    Use(m_waterSun, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    Use(m_coarseWaterSun, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    SetCausticsConstants(constants);
+    m_causticsReady = true;
 }
 
 bool Lighting::CreateSkyLight()
@@ -1231,6 +1385,20 @@ void Lighting::FillSceneConstants(FrameConstants& constants, const Scene& scene)
     constants.gridIndicesView = lists.gridIndicesView;
     constants.gridTailView = lists.gridTailView;
     constants.emittersView = scene.EmittersView();
+    const WaterViews& water = scene.Water();
+    constants.waterBodiesView = water.bodiesView;
+    constants.waterBodyCount = water.bodyCount;
+    constants.brushWaterFirst = water.brushFirst;
+    constants.leafWaterView = water.leafWaterView;
+    constants.waterFramesView = water.framesView;
+    constants.waterTrianglesView = water.trianglesView;
+    constants.waterTop = water.top;
+    constants.eyeWater = kInvalidView;
+    constants.waterTime = gbuffer::WaterClock();
+    constants.causticsView = kInvalidView;
+    constants.waterDrawsView = kInvalidView;
+    constants.waterSunView = kInvalidView;
+    constants.coarseWaterSunView = kInvalidView;
 }
 
 bool Lighting::FillConstants(FrameConstants& constants, const Scene& scene, const ViewInputs& inputs)
@@ -1255,6 +1423,11 @@ bool Lighting::FillConstants(FrameConstants& constants, const Scene& scene, cons
     for (int i = 0; i < 3; ++i)
         constants.eyePosition[i] = inv[i][2] / inv[3][2];
     FillSceneConstants(constants, scene);
+    // The 3D skybox's scaled-down scene has no water of its own.
+    if (inputs.kind == gbuffer::ViewKind::Skybox)
+        constants.waterBodyCount = 0;
+    else
+        constants.eyeWater = scene.WaterAt(constants.eyePosition);
     const bsp::SunLight& sun = scene.Sun();
     const Settings& settings = GetSettings();
     const float sunStyle = scene.LightStyle(sun.style);
@@ -1314,6 +1487,8 @@ bool Lighting::FillConstants(FrameConstants& constants, const Scene& scene, cons
     constants.skyLightView = m_skyLightReady ? m_skyLight.srv : kInvalidView;
     // The 3D skybox is a scaled-down scene elsewhere in the map: the map's lights do not belong to it.
     const bool skybox = inputs.kind == gbuffer::ViewKind::Skybox;
+    if (m_causticsReady && !skybox)
+        SetCausticsConstants(constants);
     constants.lightCount = settings.mapLights && !skybox ? scene.LightCount() : 0u;
     constants.lightWarpCount = static_cast<uint32_t>(std::min(inputs.lightWarps.size(), std::size(constants.lightWarpViews)));
     std::copy_n(inputs.lightWarps.begin(), constants.lightWarpCount, constants.lightWarpViews);
@@ -1549,8 +1724,12 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     // Timings of the view that last used this slot: the main view's per pass, the others' whole runs.
     if (m_slotFenceValues[slot] != 0 && !m_slotWasMain[slot]) {
         const uint64_t* markers = m_timestampValues + slot * kMarkers;
-        if (markers[kPassCount] > markers[0])
-            m_otherViewsMsTotal += static_cast<double>(markers[kPassCount] - markers[0]) * m_timestampPeriodMs;
+        if (markers[kPassCount] > markers[0]) {
+            const double ms = static_cast<double>(markers[kPassCount] - markers[0]) * m_timestampPeriodMs;
+            m_otherViewsMsTotal += ms;
+            if (m_slotWasSkybox[slot])
+                m_skyboxMsTotal += ms;
+        }
     }
     if (m_slotFenceValues[slot] != 0 && m_slotWasMain[slot]) {
         const uint64_t* markers = m_timestampValues + slot * kMarkers;
@@ -1566,7 +1745,9 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
                 }
                 statistics.otherViewsMs = m_otherViewsMsTotal / m_gpuSamples;
                 statistics.lightingMs += statistics.otherViewsMs;
+                const double skyboxMs = m_skyboxMsTotal / m_gpuSamples;
                 m_otherViewsMsTotal = 0.0;
+                m_skyboxMsTotal = 0.0;
                 m_passMsTotal = {};
                 m_gpuSamples = 0;
                 if (++m_timingReports % (GetOptions().devMode ? 1 : 10) == 0) {
@@ -1578,14 +1759,15 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
                     const auto& p = statistics.passMs;
                     log::Info("Lighting: {:.3f} ms GPU per frame ({}x{} traced at {}x{}; scene {:.2f}, surface {:.2f}, radiance cache {:.2f}, volume {:.2f}, "
                               "direct {:.2f}, light sampling {:.2f}, ao {:.2f}, indirect {:.2f}, reflections {:.2f}, accumulation {:.2f}, denoiser {:.2f}, "
-                              "lighting {:.2f}, resolve {:.2f}; 3D skybox and viewmodel {:.2f}); frame time {:.2f} ms, tonemap scale {:.3f}",
+                              "lighting {:.2f}, resolve {:.2f}; 3D skybox and viewmodel {:.2f}, of which 3D skybox {:.2f}); frame time {:.2f} ms, tonemap scale {:.3f}",
                         statistics.lightingMs, m_width, m_height, statistics.renderWidth, statistics.renderHeight, p[0], p[1], p[2], p[3], p[4],
-                        p[5], p[6], p[7], p[8], p[9], p[10], p[11], p[12], statistics.otherViewsMs, frames ? frameMs / frames : 0.0, inputs.tonemapScale);
+                        p[5], p[6], p[7], p[8], p[9], p[10], p[11], p[12], statistics.otherViewsMs, skyboxMs, frames ? frameMs / frames : 0.0, inputs.tonemapScale);
                 }
             }
         }
     }
     m_slotWasMain[slot] = inputs.kind == gbuffer::ViewKind::Main;
+    m_slotWasSkybox[slot] = inputs.kind == gbuffer::ViewKind::Skybox;
     const bool main = inputs.kind == gbuffer::ViewKind::Main;
     UINT renderWidth = m_width;
     UINT renderHeight = m_height;
@@ -1712,6 +1894,12 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     }
     if (inputs.skyCube != nullptr)
         resources.push_back(inputs.skyCube);
+    // The water surfaces' normal maps as the game drew them (WriteWaterDraws).
+    for (size_t i = 0; i < inputs.waterNormalMaps.size() && i < gbuffer::kMaxWaterDraws; ++i) {
+        ID3D12Resource* normalMap = inputs.waterNormalMaps[i];
+        if (normalMap != nullptr && std::find(resources.begin() + kInputViews, resources.end(), normalMap) == resources.end())
+            resources.push_back(normalMap);
+    }
     // The game's probe volume textures, filled by copies at the end of the irradiance volume passes.
     const std::array<ID3D12Resource*, 3>& probeTargets = inputs.probes;
     const bool copyVolume = volume && GetSettings().translucentLighting && probeTargets[0] != nullptr && probeTargets[1] != nullptr &&
@@ -1760,6 +1948,7 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
         constants.projectorCount = WriteProjectors(slot, inputs.projected, cookies, views + kInputViews, constants, inputs.localPlayer);
         constants.projectorsView = m_projectorViews[slot];
     }
+    WriteWaterDraws(slot, inputs, scene, views + kInputViews + kMaxProjectors, constants);
     // The 3D skybox is drawn before the main view of the same frame, so it may use the surface the main
     // view is about to overwrite; the previous frame's main-view data stays intact.
     const UINT current = static_cast<UINT>(m_mainRuns % 2);
@@ -1821,6 +2010,9 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     constants.instancesView = frame.instancesView;
     constants.dynamicLightsView = frame.dynamicLightsView;
     constants.lightStylesView = frame.lightStylesView;
+    if (frame.waterBodiesView != kInvalidView)
+        constants.waterBodiesView = frame.waterBodiesView;
+    constants.waterTop = frame.waterTop;
     constants.dynamicLightCount = GetSettings().dynamicLights && inputs.kind != gbuffer::ViewKind::Skybox ? frame.dynamicLightCount : 0u;
     Statistics& statistics = GetStatistics();
     if (main) {
@@ -1848,6 +2040,8 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
         constants.indirectMask = constants.traceMask & (kDynamicMask | kLocalPlayerMask);
 
     BindCompute(slotConstantsGpu, frame.tlas, slot);
+    if (main)
+        RecordCaustics(constants, scene);
     if (bakedIndirect && main && constants.traceMask != 0 && !scene.Baked().Ready())
         BakeStep(scene, frame, slotConstantsGpu);
     if (main && inputs.skyCube != nullptr && m_skyLight.resource) {
@@ -2432,6 +2626,13 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
             m_probeReadback->Unmap(0, &written);
             ProbeResult result = {data[0], data[1], std::bit_cast<float>(data[2]), std::bit_cast<float>(data[3]),
                 {std::bit_cast<float>(data[4]), std::bit_cast<float>(data[5]), std::bit_cast<float>(data[6])}, -1, 0};
+            if (data[15] == 1) {
+                result.water = true;
+                for (int i = 0; i < 3; ++i) {
+                    result.drawnWaterNormal[i] = std::bit_cast<float>(data[8 + i]);
+                    result.rebuiltWaterNormal[i] = std::bit_cast<float>(data[12 + i]);
+                }
+            }
             std::tie(result.model, result.mask) = scene.InstanceInfo(result.instance);
             m_probe = result;
         }

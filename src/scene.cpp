@@ -29,7 +29,8 @@ struct Scene::InstanceRecord {
     float previousTransform[3][4];
     uint32_t flags;
     uint32_t emitterLights;
-    uint32_t padding[2];
+    uint32_t waterBody;
+    uint32_t padding;
 };
 static_assert(sizeof(GpuMaterial) == 64);
 
@@ -411,6 +412,53 @@ UINT Scene::AddTexture(DXGI_FORMAT format, UINT width, UINT height, std::span<co
     return m_textures.back().view;
 }
 
+// Marks the glass among a model's alpha records whose pane has another glass face close behind (kTintGlassFace).
+static void MarkGlassFaces(const ModelGeometry& geometry, UINT opaqueTriangles, std::span<AlphaTriangle> records)
+{
+    const auto corner = [&](UINT t, int c) { return geometry.positions[geometry.indices[static_cast<size_t>(opaqueTriangles + t) * 3 + c]]; };
+    const auto sub = [](bsp::Float3 a, bsp::Float3 b) { return bsp::Float3{a.x - b.x, a.y - b.y, a.z - b.z}; };
+    const auto cross = [](bsp::Float3 a, bsp::Float3 b) { return bsp::Float3{a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x}; };
+    const auto dot = [](bsp::Float3 a, bsp::Float3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; };
+    std::vector<UINT> glass;
+    for (UINT t = 0; t < records.size(); ++t) {
+        if (((records[t].tint >> 24) & Scene::kTintGlass) != 0)
+            glass.push_back(t);
+    }
+    for (const UINT t : glass) {
+        const bsp::Float3 p0 = corner(t, 0);
+        const bsp::Float3 back = cross(sub(corner(t, 1), p0), sub(corner(t, 2), p0));
+        const float length = std::sqrt(dot(back, back));
+        if (length <= 1e-8f)
+            continue;
+        // Source's triangles are clockwise from the front: cross(p1 - p0, p2 - p0) points into the pane.
+        const bsp::Float3 inward = {back.x / length, back.y / length, back.z / length};
+        const bsp::Float3 p1 = corner(t, 1);
+        const bsp::Float3 p2 = corner(t, 2);
+        const bsp::Float3 centre = {(p0.x + p1.x + p2.x) / 3.0f, (p0.y + p1.y + p2.y) / 3.0f, (p0.z + p1.z + p2.z) / 3.0f};
+        for (const UINT other : glass) {
+            if (other == t)
+                continue;
+            // Moller-Trumbore from the centre along the inward normal.
+            const bsp::Float3 a = corner(other, 0);
+            const bsp::Float3 e1 = sub(corner(other, 1), a);
+            const bsp::Float3 e2 = sub(corner(other, 2), a);
+            const bsp::Float3 h = cross(inward, e2);
+            const float det = dot(e1, h);
+            if (std::fabs(det) < 1e-8f)
+                continue;
+            const bsp::Float3 s = sub(centre, a);
+            const float u = dot(s, h) / det;
+            const bsp::Float3 q = cross(s, e1);
+            const float v = dot(inward, q) / det;
+            const float distance = dot(e2, q) / det;
+            if (u >= 0.0f && v >= 0.0f && u + v <= 1.0f && distance > 0.01f && distance <= Scene::kMaxGlassThickness) {
+                records[t].tint |= Scene::kTintGlassFace << 24;
+                break;
+            }
+        }
+    }
+}
+
 int Scene::AddModel(const ModelGeometry& geometry)
 {
     const UINT triangles = static_cast<UINT>(geometry.indices.size() / 3);
@@ -438,6 +486,7 @@ int Scene::AddModel(const ModelGeometry& geometry)
             records[t] = {geometry.alphaTriangles[t], {geometry.uvs[triangle[0]], geometry.uvs[triangle[1]], geometry.uvs[triangle[2]]},
                 t < geometry.alphaTints.size() ? geometry.alphaTints[t] : 0u};
         }
+        MarkGlassFaces(geometry, model.opaqueTriangles, records);
         model.alpha = UploadToDefault(records.data(), records.size() * sizeof(AlphaTriangle), staging);
     }
     if (materials) {
@@ -511,9 +560,11 @@ bool Scene::AddMicromaps(Model& model, const ModelGeometry& geometry, D3D12_RAYT
     std::vector<omm::AlphaTriangle> alpha(geometry.alphaTriangles.size());
     for (size_t t = 0; t < alpha.size(); ++t) {
         const uint32_t* triangle = geometry.indices.data() + (model.opaqueTriangles + t) * 3;
-        // A Refract tint texture's alpha is no opacity: the shader decides everywhere, and fast alpha tests let rays pass.
-        const bool refract = t < geometry.alphaTints.size() && geometry.alphaTints[t] >> 24 == kTintRefract;
-        alpha[t] = {refract ? PackTranslucent(DescriptorHeap::kInvalid, 0.25f) : geometry.alphaTriangles[t],
+        // A Refract tint texture's alpha is no opacity, and glass dims even the light through its clear parts: the shader
+        // decides everywhere, and fast alpha tests let rays pass.
+        const uint32_t tint = t < geometry.alphaTints.size() ? geometry.alphaTints[t] >> 24 : 0;
+        const bool shaderDecides = (tint & 3u) == kTintRefract || (tint & kTintGlass) != 0;
+        alpha[t] = {shaderDecides ? PackTranslucent(DescriptorHeap::kInvalid, 0.25f) : geometry.alphaTriangles[t],
             {geometry.uvs[triangle[0]], geometry.uvs[triangle[1]], geometry.uvs[triangle[2]]}};
     }
     const omm::Micromaps baked = omm::Bake(alpha, m_alphaImages);
@@ -733,6 +784,112 @@ void Scene::Clear()
     m_gridTail.Reset();
     m_bspNodes.Reset();
     m_leafClusters.Reset();
+    for (UINT view : {m_water.bodiesView, m_water.leafWaterView, m_water.trianglesView, m_water.framesView})
+        m_descriptors->Free(view);
+    m_water = {};
+    m_waterBuffers.clear();
+    m_waterBodies.clear();
+    m_placedWaterBodies.clear();
+    m_placedWaterTop = -1e30f;
+    m_waterVisibility = {};
+}
+
+bool Scene::WaterWithin(float minX, float minY, float maxX, float maxY) const
+{
+    return std::any_of(m_placedWaterBodies.begin(), m_placedWaterBodies.end(), [&](const GpuWaterBody& body) {
+        return body.mins[0] <= maxX && body.maxs[0] >= minX && body.mins[1] <= maxY && body.maxs[1] >= minY;
+    });
+}
+
+UINT Scene::WaterAt(const float (&point)[3]) const
+{
+    if (point[2] >= m_placedWaterTop)
+        return DescriptorHeap::kInvalid;
+    const auto inside = [&](const GpuWaterBody& body) {
+        return point[0] >= body.mins[0] && point[1] >= body.mins[1] && point[0] <= body.maxs[0] && point[1] <= body.maxs[1] && point[2] < body.surfaceZ &&
+            point[2] > body.mins[2] - 1.0f;
+    };
+    for (size_t b = m_water.brushFirst; b < m_placedWaterBodies.size(); ++b) {
+        if (inside(m_placedWaterBodies[b]))
+            return static_cast<UINT>(b);
+    }
+    for (size_t b = 0; b < m_water.brushFirst && b < m_placedWaterBodies.size(); ++b) {
+        if (!inside(m_placedWaterBodies[b]))
+            continue;
+        if (m_water.leafWaterView == DescriptorHeap::kInvalid)
+            return static_cast<UINT>(b);
+        const int32_t leaf = m_waterVisibility.LeafAt({point[0], point[1], point[2]});
+        const int32_t water = leaf >= 0 ? m_waterVisibility.leaves[leaf].water : -1;
+        return water >= 0 && static_cast<UINT>(water) < m_water.brushFirst ? static_cast<UINT>(water) : DescriptorHeap::kInvalid;
+    }
+    return DescriptorHeap::kInvalid;
+}
+
+void Scene::PlaceBrushWater(std::span<const BrushWaterPlacement> placements)
+{
+    m_placedWaterBodies = m_waterBodies;
+    m_placedWaterTop = m_water.top;
+    for (size_t b = m_water.brushFirst; b < m_placedWaterBodies.size(); ++b) {
+        GpuWaterBody& body = m_placedWaterBodies[b];
+        body.surfaceZ = -1e30f;
+        std::fill_n(body.mins, 3, 1e30f);
+        std::fill_n(body.maxs, 3, -1e30f);
+    }
+    for (const BrushWaterPlacement& placement : placements) {
+        if (placement.body < m_water.brushFirst || placement.body >= m_placedWaterBodies.size())
+            continue;
+        const GpuWaterBody& model = m_waterBodies[placement.body];
+        GpuWaterBody& body = m_placedWaterBodies[placement.body];
+        body = model;
+        body.surfaceZ += placement.offset[2];
+        for (int i = 0; i < 3; ++i) {
+            body.mins[i] += placement.offset[i];
+            body.maxs[i] += placement.offset[i];
+            // Its texture moves with it: the coordinates at p are the model's at p - offset.
+            body.textureS[3] -= model.textureS[i] * placement.offset[i];
+            body.textureT[3] -= model.textureT[i] * placement.offset[i];
+        }
+        m_placedWaterTop = std::max(m_placedWaterTop, body.surfaceZ);
+    }
+}
+
+bool Scene::SetWater(std::span<const GpuWaterBody> bodies, std::span<const uint32_t> frameViews, std::span<const uint32_t> triangleBodies,
+    const bsp::Visibility& visibility, UINT brushFirst)
+{
+    if (bodies.empty())
+        return true;
+    std::vector<int32_t> leafWater;
+    for (const bsp::BspLeaf& leaf : visibility.leaves)
+        leafWater.push_back(leaf.water);
+    const std::vector<uint32_t> frames = frameViews.empty() ? std::vector<uint32_t>{0} : std::vector<uint32_t>(frameViews.begin(), frameViews.end());
+    m_allocator->Reset();
+    m_list->Reset(m_allocator.Get(), nullptr);
+    std::vector<ComPtr<ID3D12Resource>> staging;
+    ComPtr<ID3D12Resource> bodyBuffer = UploadToDefault(bodies.data(), bodies.size_bytes(), staging);
+    ComPtr<ID3D12Resource> frameBuffer = UploadToDefault(frames.data(), frames.size() * sizeof(uint32_t), staging);
+    ComPtr<ID3D12Resource> leafBuffer = leafWater.empty() ? nullptr : UploadToDefault(leafWater.data(), leafWater.size() * sizeof(int32_t), staging);
+    ComPtr<ID3D12Resource> triangleBuffer = UploadToDefault(triangleBodies.data(), triangleBodies.size_bytes(), staging);
+    if (!bodyBuffer || !frameBuffer || (!leafWater.empty() && !leafBuffer) || !triangleBuffer || !Submit()) {
+        log::Info("Scene: uploading the map's {} bodies of water failed", bodies.size());
+        return false;
+    }
+    WaterViews water;
+    water.bodiesView = m_descriptors->CreateRawView(bodyBuffer.Get());
+    water.bodyCount = static_cast<UINT>(bodies.size());
+    water.brushFirst = brushFirst;
+    water.framesView = m_descriptors->CreateRawView(frameBuffer.Get());
+    water.trianglesView = m_descriptors->CreateRawView(triangleBuffer.Get());
+    // The BSP walk needs the tree, which comes with visibility data (BuildLightLists).
+    water.leafWaterView = leafBuffer && m_lightLists.nodesView != DescriptorHeap::kInvalid ? m_descriptors->CreateRawView(leafBuffer.Get()) : DescriptorHeap::kInvalid;
+    for (size_t b = 0; b < brushFirst && b < bodies.size(); ++b)
+        water.top = std::max(water.top, bodies[b].surfaceZ);
+    m_water = water;
+    m_waterBuffers = {bodyBuffer, frameBuffer, leafBuffer, triangleBuffer};
+    m_waterBodies.assign(bodies.begin(), bodies.end());
+    PlaceBrushWater({});
+    m_waterVisibility.nodes = visibility.nodes;
+    m_waterVisibility.leaves = visibility.leaves;
+    return water.bodiesView != DescriptorHeap::kInvalid && water.framesView != DescriptorHeap::kInvalid && water.trianglesView != DescriptorHeap::kInvalid;
 }
 
 bool Scene::LoadMap(const std::string& name, const bsp::WorldGeometry& world, std::span<const MapLightShape> lightShapes, const ModelGeometry& worldGeometry,
@@ -1063,6 +1220,22 @@ bool Scene::EnsureLightStyles(FrameTlas& frame)
     return frame.lightStylesView != DescriptorHeap::kInvalid;
 }
 
+bool Scene::EnsureWaterBodies(FrameTlas& frame, size_t count)
+{
+    if (frame.waterBodies && frame.waterBodyCapacity >= count)
+        return true;
+    m_descriptors->Free(std::exchange(frame.waterBodiesView, DescriptorHeap::kInvalid));
+    frame.waterBodyCapacity = 0;
+    frame.waterBodies = CreateBuffer(count * sizeof(GpuWaterBody), D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+    if (!frame.waterBodies || FAILED(frame.waterBodies->Map(0, nullptr, reinterpret_cast<void**>(&frame.mappedWaterBodies)))) {
+        frame.waterBodies.Reset();
+        return false;
+    }
+    frame.waterBodiesView = m_descriptors->CreateRawView(frame.waterBodies.Get());
+    frame.waterBodyCapacity = count;
+    return frame.waterBodiesView != DescriptorHeap::kInvalid;
+}
+
 bool Scene::EnsureFrameCapacity(FrameTlas& frame, UINT count)
 {
     if (frame.tlas && frame.capacity >= count)
@@ -1197,7 +1370,7 @@ SceneFrame Scene::RecordFrame(ID3D12GraphicsCommandList4* list, UINT slot, std::
         record = {source.positionsView != DescriptorHeap::kInvalid ? source.positionsView : model.positionsView, model.indicesView, model.albedoView,
             model.uvsView, model.alphaView, model.opaqueTriangles, model.materialsView, source.previousPositionsView, {},
             source.flags | (model.selfIllum ? kInstanceSelfIllum : 0u) | (dynamicModel ? kInstanceModel : 0u) | (model.character ? kInstanceCharacter : 0u),
-            staticIndex && *staticIndex < m_emitterLightViews.size() ? m_emitterLightViews[*staticIndex] : DescriptorHeap::kInvalid, {}};
+            staticIndex && *staticIndex < m_emitterLightViews.size() ? m_emitterLightViews[*staticIndex] : DescriptorHeap::kInvalid, source.waterBody, 0};
         std::memcpy(record.previousTransform, source.previousKnown ? source.previousTransform : instance.Transform, sizeof(record.previousTransform));
         m_recorded.emplace_back(source.model, mask);
         ++written;
@@ -1235,6 +1408,11 @@ SceneFrame Scene::RecordFrame(ID3D12GraphicsCommandList4* list, UINT slot, std::
     if (EnsureLightStyles(frame)) {
         std::memcpy(frame.mappedLightStyles, m_lightStyles.data(), sizeof(m_lightStyles));
         result.lightStylesView = frame.lightStylesView;
+    }
+    result.waterTop = m_placedWaterTop;
+    if (m_water.brushFirst < m_placedWaterBodies.size() && EnsureWaterBodies(frame, m_placedWaterBodies.size())) {
+        std::memcpy(frame.mappedWaterBodies, m_placedWaterBodies.data(), m_placedWaterBodies.size() * sizeof(GpuWaterBody));
+        result.waterBodiesView = frame.waterBodiesView;
     }
     return result;
 }

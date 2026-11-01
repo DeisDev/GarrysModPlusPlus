@@ -36,6 +36,7 @@ struct State {
     bool initialized = false;
     bool available = false;
     bool loggedThread = false;
+    bool loggedRefractionView = false;
     bool viewmodelCapture = false;
     float viewmodelDepth[2] = {};
     // Why the last main view was not captured, for the menu.
@@ -65,6 +66,12 @@ bool CanCapture()
     const bool mainTarget = dynamic.colorTargets[0] == kDefaultTarget && dynamic.depthTarget == kDefaultTarget;
     if (mainTarget)
         g_state.block = RealtimeBlock::None;
+    // Water surfaces seen from below trace the air themselves; lighting this view as well doubled the frame's lighting.
+    if (mainTarget && EyeBelowHeightClip()) {
+        if (GetOptions().devMode && !std::exchange(g_state.loggedRefractionView, true))
+            log::Info("Real-time lighting: the view from under water into the air keeps the game's light");
+        return false;
+    }
     return mainTarget;
 }
 

@@ -529,8 +529,10 @@ HALF4 main( PS_INPUT i ) : COLOR
 	twin.normal = float4( mul( vNormal.xyz, i.tangentSpaceTranspose ), alpha );
 	twin.emissive = float4( twinEmissive, twinPhongExponent );
 #if FORWARD_TWIN
-	// shaders/forward_twin.hlsli lights the draw at its world position.
+	// shaders/forward_twin.hlsli lights the draw at its world position, and where the material has a cubemap traces
+	// the reflection it stood for (normal alpha: the cubemap's mask).
 	twin.flags = float4( i.worldPos_projPosZ.xyz, alpha );
+	twin.normal.a = ( CUBEMAP && bCubemap && any( g_EnvmapTint.rgb > 0.0f ) ) ? saturate( dot( specularFactor, float3( 1.0f, 1.0f, 1.0f ) / 3.0f ) ) : 0.0f;
 #else
 	// Green: 1 less the material bits over 255 (shaders/common.hlsli kMaterialLightWarp, kMaterialWarpTotal); with the
 	// light warp the translator puts its texture's slot in alpha.

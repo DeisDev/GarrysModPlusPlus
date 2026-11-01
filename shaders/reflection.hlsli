@@ -40,28 +40,118 @@ float3 HitIndirectIrradiance(HitSurface hit, float3 origin, inout uint seed)
         float3 direction = CosineSample(hit.normal, Random(seed), Random(seed));
         HitSurface next;
         HitInfo nextHit;
-        if (!TraceClosest(origin, direction, kMaxDistance, g_frame.bounceMask, next, nextHit, g_frame.indirectRayFlags))
-            return SkyLight(direction);
+        float3 water;
+        float3 waterLight;
+        if (!TraceThroughWater(origin, direction, kMaxDistance, g_frame.bounceMask, g_frame.indirectRayFlags, seed, next, nextHit, water, waterLight))
+            return SkyLight(direction) * water + waterLight;
         float3 cached;
         if (CachedRadiance(next, BounceEmission(next, nextHit, false), nextHit.t, nextHit.t, cached))
-            return cached;
+            return cached * water + waterLight;
     }
     float3 volume = VolumeIrradiance(hit.position, hit.normal);
     return volume.x >= 0.0 ? volume : SkyLight(hit.normal);
 }
 
-// The light along a reflected ray. Its cone is `coneWidth` across at the origin and widens by `coneSpread` per unit of
-// length: where it is wide enough for the radiance cache's voxels the cache gives the hit's light; elsewhere the hit is
-// lit where it is by the sun and one local light, with HitIndirectIrradiance as its indirect light.
-float3 ReflectedRadiance(float3 origin, float3 direction, float coneWidth, float coneSpread, inout uint seed, out float hitDistance)
+// The angle one pixel of the view spans.
+float PixelAngle()
+{
+    return 2.0 / (float(g_frame.size.y) * length(g_frame.viewProj[1].xyz));
+}
+
+// The light along one ray from a water surface, for SeenWater: its first hit, textured and lit by the radiance cache
+// where the ray's cone is wide enough for it, else by the sun, one local light and the indirect light volume (or the
+// sky's light), or the sky and 3D skybox (BeyondMap). `seed` is fixed by the
+// caller, so the same point always takes the same light. `distance` is the hit's distance, kSkyHitDistance for none.
+float3 WaterRayRadiance(float3 origin, float3 direction, float coneWidth, uint seed, out float distance)
 {
     HitSurface hit;
     HitInfo hitInfo;
-    if (!TraceClosest(origin, direction, kMaxDistance, g_frame.traceMask, hit, hitInfo)) {
+    if (!TraceClosest(origin, direction, kMaxDistance, g_frame.traceMask & ~kWaterMask, hit, hitInfo)) {
+        distance = kSkyHitDistance;
+        return BeyondMap(origin, direction);
+    }
+    distance = hitInfo.t;
+    hit.albedo = TexturedAlbedo(hitInfo, hit.albedo, coneWidth);
+    float3 emission = HitEmission(hit, hitInfo, distance);
+    // Where the cone has grown as wide as the radiance cache's voxels, the cache's light, as for other reflected hits.
+    float3 cached;
+    if (CachedRadiance(hit, emission, distance, coneWidth + PixelAngle() * distance, cached))
+        return ClampSample(cached);
+    float3 indirect = VolumeIrradiance(hit.position, hit.normal, true);
+    if (indirect.x < 0.0)
+        indirect = SkyLight(hit.normal);
+    float3 shadowOrigin = hit.position + hit.normal;
+    return ClampSample(hit.albedo * (HitDirectIrradiance(hit, shadowOrigin, g_frame.sunShadowMask, seed) + indirect * g_frame.indirectScale) + emission);
+}
+
+// What a ray sees where it meets a water surface (kWaterMask) on its way: at the rippled surface (WaterSurfaceNormal),
+// Fresnel's equations split it into a reflected and a refracted ray, each traced once (WaterRayRadiance). Light from
+// under the water crosses it (ThroughWater) and spreads over the wider cone it leaves the water in (1 / n^2); seen from
+// below, light from the air is gathered into Snell's window (n^2) and the reflection crosses the water. Every choice is
+// fixed, so forward-lit glass and other undenoised rays do not sparkle. `coneWidth` is the arriving ray's width.
+float3 SeenWater(float3 position, float3 direction, uint instance, uint primitive, float coneWidth = 1.0)
+{
+    bool below = direction.z > 0.0;
+    float side = below ? -1.0 : 1.0;
+    uint water = WaterBodyOfTriangle(instance, primitive);
+    bool traced = water != kNoWater;
+    float3 normal = traced ? WaterSurfaceNormal(water, LoadWaterBody(water), position) * side : float3(0.0, 0.0, side);
+    float fresnel = traced ? Fresnel(-dot(direction, normal), below ? 1.0 / kWaterIor : kWaterIor) : 1.0;
+    float3 mirrored = reflect(direction, normal);
+    mirrored.z = side * max(mirrored.z * side, 0.02);
+    mirrored = normalize(mirrored);
+    float3 refracted = refract(direction, normal, below ? kWaterIor : 1.0 / kWaterIor);
+    bool refracts = traced && fresnel < 1.0 && dot(refracted, refracted) > 0.0;
+    // One call of WaterRayRadiance for both rays keeps the code small where it is inlined.
+    float3 reflected = 0.0;
+    float3 transmitted = 0.0;
+    float reflectedDistance = kSkyHitDistance;
+    float transmittedDistance = kSkyHitDistance;
+    for (uint r = 0; r < (refracts ? 2u : 1u); ++r) {
+        bool mirror = r == 0;
+        float distance;
+        float3 light = WaterRayRadiance(position + float3(0.0, 0.0, (mirror ? side : -side) * kWaterSurfaceOffset), mirror ? mirrored : normalize(refracted),
+            coneWidth, 0x9Eu, distance);
+        if (mirror) {
+            reflected = light;
+            reflectedDistance = distance;
+        } else {
+            transmitted = light;
+            transmittedDistance = distance;
+        }
+    }
+    if (!traced)
+        return reflected;
+    // From below the reflection crosses the water; from above what is seen through it does.
+    uint seed = 0x9Eu;
+    float3 inWater = below ? reflected : transmittedDistance < kSkyHitDistance ? transmitted : 0.0;
+    float3 crossed = ThroughWater(inWater, position, below ? mirrored : normalize(refracted), below ? reflectedDistance : transmittedDistance, water, 1, seed);
+    if (below) {
+        reflected = crossed;
+        transmitted *= kWaterIor * kWaterIor;
+    } else {
+        reflected *= LoadWaterBody(water).reflectTint;
+        transmitted = refracts ? crossed / (kWaterIor * kWaterIor) : 0.0;
+    }
+    return fresnel * reflected + (1.0 - fresnel) * transmitted * LoadWaterBody(water).refractTint;
+}
+
+// The light along a reflected ray. Its cone is `coneWidth` across at the origin and widens by `coneSpread` per unit of
+// length: where it is wide enough for the radiance cache's voxels the cache gives the hit's light; elsewhere the hit is
+// lit where it is by the sun and one local light, with HitIndirectIrradiance as its indirect light. With `seeWater`
+// the ray meets water surfaces (SeenWater).
+float3 ReflectedRadiance(float3 origin, float3 direction, float coneWidth, float coneSpread, inout uint seed, out float hitDistance, bool seeWater = false)
+{
+    HitSurface hit;
+    HitInfo hitInfo;
+    if (!TraceClosest(origin, direction, kMaxDistance, g_frame.traceMask | (seeWater ? kWaterMask : 0u), hit, hitInfo)) {
         hitDistance = kSkyHitDistance;
         return BeyondMap(origin, direction);
     }
     hitDistance = hitInfo.t;
+    if ((hit.flags & kInstanceWater) != 0)
+        return ClampSample(SeenWater(hit.position, direction, hitInfo.instance, hitInfo.primitive, coneWidth + coneSpread * hitDistance));
+    hit.albedo = TexturedAlbedo(hitInfo, hit.albedo, coneWidth + coneSpread * hitDistance);
     float3 emission = HitEmission(hit, hitInfo, hitDistance);
     float3 cached;
     if (CachedRadiance(hit, emission, hitDistance, coneWidth + coneSpread * hitDistance, cached))
@@ -71,11 +161,6 @@ float3 ReflectedRadiance(float3 origin, float3 direction, float coneWidth, float
     return ClampSample(hit.albedo * irradiance + emission);
 }
 
-// The angle one pixel of the view spans.
-float PixelAngle()
-{
-    return 2.0 / (float(g_frame.size.y) * length(g_frame.viewProj[1].xyz));
-}
 
 // How fast a GGX lobe of roughness `alpha` widens per unit of length (SHaRC's effective cone spread of a glossy lobe).
 float LobeSpread(float alpha)

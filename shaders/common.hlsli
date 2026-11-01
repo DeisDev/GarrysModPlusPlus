@@ -131,7 +131,8 @@ struct FrameConstants
     float worldToSky;
     // Phong highlights (shaders/direct.hlsl), added unlit by shaders/deferred_lighting.hlsl.
     uint specularView;
-    uint padding2;
+    // Each water surface triangle's body of water (WaterBodyOfHit in shaders/water_body.hlsli), or kNoView.
+    uint waterTrianglesView;
     // The light warp textures the G-buffer's flags refer to (LightWarpView).
     uint lightWarpCount;
     // The 2D sky as the game draws it and its blurred light for indirect rays (SkyRadiance, SkyLight), or kNoView.
@@ -163,6 +164,30 @@ struct FrameConstants
     // Shadow rays over the sun's disc for the viewmodel's pixels (shaders/direct.hlsl).
     uint viewmodelShadowRays;
     uint padding;
+    // The map's bodies of water (shaders/water_body.hlsli), each BSP leaf's body, their normal maps' frames and the
+    // highest surface; the body holding the eye (kNoView in air), the clock their normal maps animate by, and the main
+    // view's caustics (shaders/caustics.hlsl) over the square from causticsOrigin, 1 / causticsInvSize across.
+    uint waterBodiesView;
+    uint waterBodyCount;
+    uint leafWaterView;
+    uint waterFramesView;
+    float waterTop;
+    uint eyeWater;
+    float waterTime;
+    uint causticsView;
+    float2 causticsOrigin;
+    float causticsInvSize;
+    // Each body of water's surface as the game last drew it (WaterDraw in shaders/water_body.hlsli), or kNoView.
+    uint waterDrawsView;
+    // The water's sun maps (shaders/caustics.hlsl): the fine one over the caustics' square, and the coarse one over the
+    // square from coarseCausticsOrigin, 1 / coarseCausticsInvSize across; kNoView without sunlight on water.
+    uint waterSunView;
+    uint coarseWaterSunView;
+    float coarseCausticsInvSize;
+    // The first brush entity body of water (Scene::PlaceBrushWater), found by its bounds alone.
+    uint brushWaterFirst;
+    float2 coarseCausticsOrigin;
+    uint2 padding5;
     uint4 lightWarpViews[16];
 };
 

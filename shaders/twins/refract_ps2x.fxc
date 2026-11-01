@@ -1,0 +1,129 @@
+// GarrysMod++ forward twin of GMod's refract_ps20b (shaders/twins).
+// Source: Source SDK 2013 mp/src/materialsystem/stdshaders/refract_ps2x.fxc at 7309a5f (Source 1 SDK License), whose
+// combos GMod's file has (2048 combos, 4 dynamic). Change: instead of distorting the frame buffer copy it writes what
+// shaders/forward_twin.hlsli needs to trace the refraction through the glass: oC0 the refract tint (with its tint
+// texture and colour modulation), oC1 the bumped world normal and in alpha -1 less the cubemap's mask, oC2 the face's
+// world normal and in alpha 1 for the BLUR combos, oC3 the world position. Only the forward output is used: Refract draws
+// come after the G-buffer.
+// The normal map's slopes are scaled so the traced refraction bends the view as far as Source's distortion moved it:
+// Source shifts the copy by slope * alpha * $refractamount of the screen, about twice that in radians at a 90 degree
+// view, and a thin pane whose face is that steep bends light by (n - 1) * slope.
+//====== Copyright 1996-2007, Valve Corporation, All rights reserved. =======
+//
+//=============================================================================
+
+// STATIC: "CONVERT_TO_SRGB"				"0..1"	[ps20b][= g_pHardwareConfig->NeedsShaderSRGBConversion()] [PC]
+// STATIC: "CONVERT_TO_SRGB"				"0..0"	[= 0] [XBOX]
+// STATIC: "BLUR"							"0..1"
+// STATIC: "FADEOUTONSILHOUETTE"			"0..1"
+// STATIC: "CUBEMAP"						"0..1"
+// STATIC: "REFRACTTINTTEXTURE"				"0..1"
+// STATIC: "MASKED"							"0..1"
+// STATIC: "COLORMODULATE"					"0..1"
+// STATIC: "SECONDARY_NORMAL"				"0..1"
+// STATIC: "NORMAL_DECODE_MODE"				"0..0"	[XBOX]
+// STATIC: "NORMAL_DECODE_MODE"				"0..0"	[PC]
+// STATIC: "SHADER_SRGB_READ"				"0..1"	[ps20b]
+
+// DYNAMIC: "PIXELFOGTYPE"					"0..1"
+// DYNAMIC: "WRITE_DEPTH_TO_DESTALPHA"		"0..1"	[ps20b] [PC]
+// DYNAMIC: "WRITE_DEPTH_TO_DESTALPHA"		"0..0"	[ps20b] [XBOX]
+
+// SKIP: $MASKED && $BLUR
+
+#if defined( SHADER_MODEL_PS_2_0 )
+#	define WRITE_DEPTH_TO_DESTALPHA 0
+#endif
+
+#include "common_ps_fxc.h"
+#include "shader_constant_register_map.h"
+
+sampler NormalSampler2				: register( s1 );
+sampler RefractSampler				: register( s2 );
+sampler NormalSampler				: register( s3 );
+#if CUBEMAP
+sampler EnvmapSampler				: register( s4 );
+#endif
+#if REFRACTTINTTEXTURE
+sampler RefractTintSampler			: register( s5 );
+#endif
+
+#if NORMAL_DECODE_MODE == NORM_DECODE_ATI2N_ALPHA
+sampler AlphaMapSampler				: register( s6 );	// alpha
+sampler AlphaMapSampler2			: register( s7 );
+#else
+#define AlphaMapSampler2			NormalSampler
+#define AlphaMapSampler				NormalSampler2
+#endif
+
+const float3 g_EnvmapTint			: register( c0 );
+const float3 g_RefractTint			: register( c1 );
+const float3 g_EnvmapContrast		: register( c2 );
+const float3 g_EnvmapSaturation		: register( c3 );
+const float4  g_c5					: register( c5 );
+#define g_RefractScale g_c5.x
+#define g_flTime g_c5.w
+
+const float4 g_FogParams				: register( PSREG_FOG_PARAMS );
+const float4 g_EyePos_SpecExponent		: register( PSREG_EYEPOS_SPEC_EXPONENT );
+
+struct PS_INPUT
+{
+	float4 vBumpTexCoord			: TEXCOORD0;			// NormalMap1 in xy, NormalMap2 in wz
+	float3 vTangentVertToEyeVector	: TEXCOORD1;
+	float3 vWorldNormal				: TEXCOORD2;
+	float3 vWorldTangent			: TEXCOORD3;
+	float3 vWorldBinormal			: TEXCOORD4;
+	float3 vRefractXYW				: TEXCOORD5;
+	float3 vWorldViewVector			: TEXCOORD6;
+#if COLORMODULATE
+	float4 ColorModulate            : COLOR0;
+#endif
+
+	float4 worldPos_projPosZ		: TEXCOORD7;		// Necessary for pixel fog
+	float4 fogFactorW				: COLOR1;
+};
+
+struct GBufferTwinOutput
+{
+	float4 albedo	: COLOR0;
+	float4 normal	: COLOR1;
+	float4 emissive	: COLOR2;
+	float4 flags	: COLOR3;
+};
+
+GBufferTwinOutput main( PS_INPUT i )
+{
+	// Decompress normal
+	float4 vNormal = DecompressNormal( NormalSampler, i.vBumpTexCoord.xy, NORMAL_DECODE_MODE, AlphaMapSampler );
+
+#if SECONDARY_NORMAL
+	float3 vNormal2 = DecompressNormal( NormalSampler2, i.vBumpTexCoord.wz, NORMAL_DECODE_MODE, AlphaMapSampler2 );
+	vNormal.xyz = normalize( vNormal.xyz + vNormal2.xyz );
+#endif
+
+#if REFRACTTINTTEXTURE
+	float3 refractTintColor = 2.0 * g_RefractTint * tex2D( RefractTintSampler, i.vBumpTexCoord.xy );
+#else
+	float3 refractTintColor = g_RefractTint;
+#endif
+
+#if COLORMODULATE
+	refractTintColor *= i.ColorModulate.rgb;
+#endif
+
+	vNormal.xy *= saturate( 2.0f * g_RefractScale * vNormal.a / ( 1.52f - 1.0f ) );
+	float3 worldSpaceNormal = Vec3TangentToWorld( normalize( vNormal.xyz ), i.vWorldNormal, i.vWorldTangent, i.vWorldBinormal );
+#if CUBEMAP
+	float reflectivity = any( g_EnvmapTint > 0.0f ) ? saturate( vNormal.a ) : 0.0f;
+#else
+	float reflectivity = 0.0f;
+#endif
+
+	GBufferTwinOutput twin;
+	twin.albedo = float4( refractTintColor, 1.0f );
+	twin.normal = float4( normalize( worldSpaceNormal ), -1.0f - reflectivity );
+	twin.emissive = float4( normalize( i.vWorldNormal ), BLUR ? 1.0f : 0.0f );
+	twin.flags = float4( i.worldPos_projPosZ.xyz, 1.0f );
+	return twin;
+}

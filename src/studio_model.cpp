@@ -502,7 +502,7 @@ uint32_t MipBytes(const VtfFormat& format, uint32_t width, uint32_t height)
 
 }
 
-std::optional<TextureImage> ReadTexture(std::span<const std::byte> bytes, uint32_t maxSize, std::string& error)
+std::optional<TextureImage> ReadTexture(std::span<const std::byte> bytes, uint32_t maxSize, std::string& error, uint32_t frame)
 {
     Reader vtf(bytes);
     auto minor = vtf.At<uint32_t>(8);
@@ -527,6 +527,10 @@ std::optional<TextureImage> ReadTexture(std::span<const std::byte> bytes, uint32
     const uint16_t depth = *minor >= 2 ? vtf.At<uint16_t>(63).value_or(1) : 1;
     if (info == nullptr || (*flags & kVtfEnvmapFlag) != 0 || depth > 1) {
         error = std::format("image format {} (flags {:#x}, depth {}) is not supported", *format, *flags, depth);
+        return std::nullopt;
+    }
+    if (frame >= std::max<uint32_t>(*frames, 1)) {
+        error = std::format("it has no frame {}", frame);
         return std::nullopt;
     }
 
@@ -568,15 +572,15 @@ std::optional<TextureImage> ReadTexture(std::span<const std::byte> bytes, uint32
         return std::nullopt;
     }
     TextureImage image{info->format, std::max(1u, static_cast<uint32_t>(*width) >> chosen), std::max(1u, static_cast<uint32_t>(*height) >> chosen),
-        info->alpha, {}};
+        info->alpha, std::max<uint32_t>(*frames, 1), {}};
     image.mips.resize(*mips - chosen);
     for (int m = *mips - 1; m >= chosen; --m) {
         const size_t size = MipBytes(*info, std::max(1u, static_cast<uint32_t>(*width) >> m), std::max(1u, static_cast<uint32_t>(*height) >> m));
-        if (offset > bytes.size() || bytes.size() - offset < size) {
+        if (offset > bytes.size() || bytes.size() - offset < size * (frame + 1)) {
             error = "the image data is truncated";
             return std::nullopt;
         }
-        image.mips[m - chosen] = bytes.subspan(offset, size);
+        image.mips[m - chosen] = bytes.subspan(offset + size * frame, size);
         offset += size * *frames;
     }
     if (info->converted) {

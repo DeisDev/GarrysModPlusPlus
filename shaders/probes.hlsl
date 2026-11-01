@@ -98,23 +98,27 @@ void Trace(uint3 id, uint thread)
     for (uint r = thread; r < g_frame.volumeRays; r += kProbeThreads) {
         uint seed = Hash(probeSeed + r);
         float3 direction = UniformSphere((r + Random(seed)) / g_frame.volumeRays, Random(seed));
-        float3 radiance = SkyLight(direction);
+        // The ray may cross water, which bends, dims and lights it (TraceThroughWater); `last` is its final stretch.
+        float3 last = direction;
+        float3 radiance;
         HitInfo hit;
-        if (TraceHit(position, direction, kMaxDistance, g_frame.indirectMask, hit)) {
-            if (HitBackFace(hit, direction)) {
-                ++backFaces;
-                radiance = 0.0;
-            } else {
-                HitSurface surface = SurfaceOf(hit, position, direction);
-                float3 emission = BounceEmission(surface, hit, false);
-                if (!CachedRadiance(surface, emission, hit.t, hit.t, radiance)) {
-                    float3 origin = surface.position + surface.normal;
-                    float3 irradiance = HitDirectIrradiance(surface, origin, g_frame.bounceMask, seed) +
-                        LastVolumeIrradiance(surface.position, surface.normal) * g_frame.indirectScale;
-                    radiance = surface.albedo * irradiance + emission;
-                }
-                radiance = ClampSample(radiance);
+        HitSurface surface;
+        float3 water;
+        float3 waterLight;
+        if (!TraceThroughWater(position, last, kMaxDistance, g_frame.indirectMask, RAY_FLAG_NONE, seed, surface, hit, water, waterLight)) {
+            radiance = SkyLight(last) * water + waterLight;
+        } else if (HitBackFace(hit, last)) {
+            ++backFaces;
+            radiance = 0.0;
+        } else {
+            float3 emission = BounceEmission(surface, hit, false);
+            if (!CachedRadiance(surface, emission, hit.t, hit.t, radiance)) {
+                float3 origin = surface.position + surface.normal;
+                float3 irradiance = HitDirectIrradiance(surface, origin, g_frame.bounceMask, seed) +
+                    LastVolumeIrradiance(surface.position, surface.normal) * g_frame.indirectScale;
+                radiance = surface.albedo * irradiance + emission;
             }
+            radiance = ClampSample(radiance) * water + waterLight;
         }
         a += radiance;
         b[0] += radiance.r * direction;
@@ -157,8 +161,11 @@ void AddDirection(float3 irradiance, float3 direction, inout float4 value[3])
 
 void AddDirectLight(float3 position, inout float4 value[3])
 {
-    if (g_frame.sunEnabled != 0.0)
-        AddDirection(g_frame.sunColor * SunVisibility(position, g_frame.sunShadowMask), g_frame.sunDirection, value);
+    if (g_frame.sunEnabled != 0.0) {
+        uint water = WaterBodyAt(position);
+        AddDirection(g_frame.sunColor * SunVisibilityFrom(position, water, g_frame.sunDirection, g_frame.sunShadowMask), SunArrival(water, g_frame.sunDirection),
+            value);
+    }
     LightSet set = LightSetAt(position);
     uint top[kProbeLights];
     float topWeight[kProbeLights];

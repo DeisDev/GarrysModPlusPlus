@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cfloat>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -33,6 +34,7 @@ constexpr int kLumpModels = 14;
 constexpr int kLumpWorldLights = 15;
 constexpr int kLumpDispInfo = 26;
 constexpr int kLumpGameLump = 35;
+constexpr int kLumpLeafWaterData = 36;
 constexpr int kLumpDispVerts = 33;
 constexpr int kLumpTexdataStringData = 43;
 constexpr int kLumpTexdataStringTable = 44;
@@ -219,6 +221,13 @@ struct LzmaHeader {
     uint8_t properties[LZMA_PROPS_SIZE];
 };
 #pragma pack(pop)
+
+struct LeafWaterData {
+    float surfaceZ;
+    float minZ;
+    int16_t surfaceTexInfoId;
+};
+static_assert(sizeof(LeafWaterData) == 12);
 
 static_assert(sizeof(Header) == 1036);
 static_assert(sizeof(Plane) == 20);
@@ -906,7 +915,7 @@ void ReadVisibility(std::span<const std::byte> file, const Header& header, Visib
         std::memcpy(&leaf, file.data() + leafLump.offset + offset, sizeof(leaf));
         leaves.push_back({leaf.cluster < clusterCount ? leaf.cluster : -1, leaf.areaFlags & 0x1FF,
             {static_cast<float>(leaf.mins[0]), static_cast<float>(leaf.mins[1]), static_cast<float>(leaf.mins[2])},
-            {static_cast<float>(leaf.maxs[0]), static_cast<float>(leaf.maxs[1]), static_cast<float>(leaf.maxs[2])}});
+            {static_cast<float>(leaf.maxs[0]), static_cast<float>(leaf.maxs[1]), static_cast<float>(leaf.maxs[2])}, leaf.leafWaterDataId});
     }
     std::vector<BspNode> tree;
     tree.reserve(nodes->size());
@@ -1354,11 +1363,62 @@ bool LoadWorld(std::span<const std::byte> file, WorldGeometry& world, std::strin
     const auto inSkybox = [&](Float3 point) { return skyArea >= 0 && (InBounds(point, world.skyMins, world.skyMaxs) || areas->AreaAt(point) == skyArea); };
     auto planes = LumpArray<Plane>(file, header, kLumpPlanes);
     const Model& worldModel = (*models)[0];
+    std::vector<int16_t> waterTexinfos;
+    if (auto waterData = LumpArray<LeafWaterData>(file, header, kLumpLeafWaterData)) {
+        for (const LeafWaterData& data : *waterData) {
+            WaterBody& body = world.waterBodies.emplace_back(WaterBody{data.surfaceZ, data.minZ});
+            body.mins = {FLT_MAX, FLT_MAX, data.minZ};
+            body.maxs = {-FLT_MAX, -FLT_MAX, data.surfaceZ};
+            waterTexinfos.push_back(data.surfaceTexInfoId);
+            if (data.surfaceTexInfoId < 0 || static_cast<size_t>(data.surfaceTexInfoId) >= lumps.texinfos.size())
+                continue;
+            const Texinfo& texinfo = lumps.texinfos[data.surfaceTexInfoId];
+            if (texinfo.texdata < 0 || static_cast<size_t>(texinfo.texdata) >= lumps.texdatas.size())
+                continue;
+            const Texdata& texdata = lumps.texdatas[texinfo.texdata];
+            body.material = static_cast<uint32_t>(texinfo.texdata);
+            for (int i = 0; i < 4; ++i) {
+                body.textureS[i] = texinfo.textureVecs[0][i] / static_cast<float>(std::max(texdata.width, 1));
+                body.textureT[i] = texinfo.textureVecs[1][i] / static_cast<float>(std::max(texdata.height, 1));
+            }
+        }
+    }
+    // The water body a horizontal water face at height `z` tops: the one whose surface uses its texinfo, or else its
+    // material, at that height.
+    const auto waterBodyOf = [&](const Face& face, float z) {
+        int32_t best = -1;
+        for (size_t b = 0; b < world.waterBodies.size(); ++b) {
+            const WaterBody& body = world.waterBodies[b];
+            if (std::fabs(body.surfaceZ - z) > 1.0f)
+                continue;
+            if (waterTexinfos[b] == face.texinfo)
+                return static_cast<int32_t>(b);
+            if (best < 0 && body.material == FaceMaterial(lumps, face))
+                best = static_cast<int32_t>(b);
+        }
+        return best;
+    };
     std::vector<Float3> polygon;
     for (int32_t f = worldModel.firstFace; f < worldModel.firstFace + worldModel.numFaces; ++f) {
         if (f < 0 || static_cast<size_t>(f) >= lumps.faces.size())
             break;
         const Face& face = lumps.faces[f];
+        const int32_t surfaceFlags = face.texinfo >= 0 && static_cast<size_t>(face.texinfo) < lumps.texinfos.size() ? lumps.texinfos[face.texinfo].flags : 0;
+        if ((surfaceFlags & kSurfWarp) != 0 && (surfaceFlags & (kSurfSky | kSurfSky2D | kSurfNoDraw)) == 0 && planes && face.planeNum < planes->size() &&
+            std::fabs((*planes)[face.planeNum].normal.z) > 0.99f && FacePolygon(lumps, face, polygon) && !inSkybox(polygon[0])) {
+            const int32_t body = waterBodyOf(face, polygon[0].z);
+            if (body >= 0) {
+                const size_t first = world.water.triangleMaterials.size();
+                AddPolygon(world.water, lumps, face, polygon);
+                std::fill(world.water.triangleMaterials.begin() + first, world.water.triangleMaterials.end(), static_cast<uint32_t>(body));
+                WaterBody& water = world.waterBodies[body];
+                for (const Float3& p : polygon) {
+                    water.mins = {std::min(water.mins.x, p.x), std::min(water.mins.y, p.y), water.mins.z};
+                    water.maxs = {std::max(water.maxs.x, p.x), std::max(water.maxs.y, p.y), water.maxs.z};
+                }
+            }
+            continue;
+        }
         if (IsSkipped(lumps, face) || !FacePolygon(lumps, face, polygon))
             continue;
         if (skyArea >= 0 && planes && face.planeNum < planes->size()) {
@@ -1397,12 +1457,47 @@ bool LoadWorld(std::span<const std::byte> file, WorldGeometry& world, std::strin
     world.brushModels.resize(models->size());
     for (size_t m = 1; m < models->size(); ++m) {
         const Model& model = (*models)[m];
+        WorldGeometry::BrushWater water;
+        water.model = static_cast<uint32_t>(m);
+        water.body.surfaceZ = -FLT_MAX;
+        water.body.minZ = FLT_MAX;
+        water.body.mins = {FLT_MAX, FLT_MAX, 0.0f};
+        water.body.maxs = {-FLT_MAX, -FLT_MAX, 0.0f};
         for (int32_t f = model.firstFace; f < model.firstFace + model.numFaces; ++f) {
             if (f < 0 || static_cast<size_t>(f) >= lumps.faces.size())
                 break;
             const Face& face = lumps.faces[f];
-            if (!IsSkipped(lumps, face) && FacePolygon(lumps, face, polygon))
+            if (!FacePolygon(lumps, face, polygon))
+                continue;
+            for (const Float3& p : polygon)
+                water.body.minZ = std::min(water.body.minZ, p.z);
+            const int32_t surfaceFlags = face.texinfo >= 0 && static_cast<size_t>(face.texinfo) < lumps.texinfos.size() ? lumps.texinfos[face.texinfo].flags : 0;
+            const float up = planes && face.planeNum < planes->size() ? (*planes)[face.planeNum].normal.z * (face.side != 0 ? -1.0f : 1.0f) : 0.0f;
+            if ((surfaceFlags & kSurfWarp) != 0 && (surfaceFlags & (kSurfSky | kSurfSky2D | kSurfNoDraw)) == 0 && up > 0.99f) {
+                AddPolygon(water.surface, lumps, face, polygon);
+                for (const Float3& p : polygon) {
+                    water.body.mins = {std::min(water.body.mins.x, p.x), std::min(water.body.mins.y, p.y), 0.0f};
+                    water.body.maxs = {std::max(water.body.maxs.x, p.x), std::max(water.body.maxs.y, p.y), 0.0f};
+                }
+                if (polygon[0].z > water.body.surfaceZ) {
+                    water.body.surfaceZ = polygon[0].z;
+                    water.body.material = FaceMaterial(lumps, face);
+                    const Texinfo& texinfo = lumps.texinfos[face.texinfo];
+                    const Texdata* texdata = water.body.material != kNoMaterial ? &lumps.texdatas[water.body.material] : nullptr;
+                    for (int i = 0; i < 4; ++i) {
+                        water.body.textureS[i] = texinfo.textureVecs[0][i] / static_cast<float>(texdata ? std::max(texdata->width, 1) : 1);
+                        water.body.textureT[i] = texinfo.textureVecs[1][i] / static_cast<float>(texdata ? std::max(texdata->height, 1) : 1);
+                    }
+                }
+                continue;
+            }
+            if (!IsSkipped(lumps, face))
                 AddPolygon(world.brushModels[m], lumps, face, polygon);
+        }
+        if (!water.surface.indices.empty() && water.body.minZ < water.body.surfaceZ) {
+            water.body.mins.z = water.body.minZ;
+            water.body.maxs.z = water.body.surfaceZ;
+            world.brushWater.push_back(std::move(water));
         }
     }
 

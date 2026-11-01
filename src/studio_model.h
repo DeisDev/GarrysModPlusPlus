@@ -67,7 +67,7 @@ std::optional<bsp::Float3> TextureReflectivity(std::span<const std::byte> vtfHea
 
 enum class TextureFormat { Bc1, Bc2, Bc3, Bgra8, Rgba8, Bgrx8, R8 };
 
-// A VTF's first frame from its largest mip no bigger than a limit down to 1x1, each mip in its stored layout
+// One frame of a VTF from its largest mip no bigger than a limit down to 1x1, each mip in its stored layout
 // (rows of 4x4 blocks for the BC formats).
 struct TextureImage {
     TextureFormat format;
@@ -75,13 +75,15 @@ struct TextureImage {
     uint32_t height;
     // False when the format stores no alpha (it then reads as 1).
     bool alpha;
+    // The VTF's frames (animated textures have several).
+    uint32_t frames;
     // Largest first.
     std::vector<std::span<const std::byte>> mips;
     // Mips converted from a format textures do not take, which `mips` then views.
     std::vector<std::vector<std::byte>> converted;
 };
 
-// A 2D VTF's mips no bigger than `maxSize` texels on a side, or nothing with a reason.
-std::optional<TextureImage> ReadTexture(std::span<const std::byte> vtf, uint32_t maxSize, std::string& error);
+// A 2D VTF's mips no bigger than `maxSize` texels on a side, of its frame `frame`, or nothing with a reason.
+std::optional<TextureImage> ReadTexture(std::span<const std::byte> vtf, uint32_t maxSize, std::string& error, uint32_t frame = 0);
 
 }

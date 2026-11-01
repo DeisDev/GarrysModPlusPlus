@@ -43,13 +43,15 @@ void main(uint3 id : SV_DispatchThreadID)
     float3 behind = g_twoSided ? position - faceNormal * SurfaceBias(surface.w) : origin;
     uint seed = PixelSeed(pixel, 0x5Bu);
     float3 direction = SunDiscDirection(seed);
+    // Under water the disc's light arrives bent by the surface (SunVisibilityToNearest follows it).
+    float3 arrival = SunArrival(WaterBodyAt(origin), direction);
 
     // SIGMA's encoding: no distance where the surface faces away from the light, NRD_FP16_MAX where nothing blocks it.
     float occluder = 0.0;
     float3 light = 0.0;
-    if (g_frame.sunEnabled != 0.0 && Lambert(lightNormal, direction) > 0.0) {
-        light = SunVisibilityToNearest(ShadowOrigin(origin, behind, faceNormal, direction), direction, g_frame.sunShadowMask,
-            SelfShadowFlags(onModel, faceNormal, direction), occluder);
+    if (g_frame.sunEnabled != 0.0 && Lambert(lightNormal, arrival) > 0.0) {
+        light = SunVisibilityToNearest(ShadowOrigin(origin, behind, faceNormal, arrival), direction, g_frame.sunShadowMask,
+            SelfShadowFlags(onModel, faceNormal, arrival), occluder);
         if (occluder >= 65536.0)
             occluder = NRD_FP16_MAX;
     }

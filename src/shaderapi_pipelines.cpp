@@ -1058,6 +1058,8 @@ void DrawPass(const ShadowState& shadow, const MeshDraw& mesh)
             shadow.depthTest != 0, blendEnabled, source, destination, shadow.srgbWrite != 0, static_cast<std::uint32_t>(shadow.srgbRead));
     if (pass.route == capture::Pass::Route::Skip)
         return;
+    if (pass.waterSurface)
+        capture::RecordWaterMapping(mesh);
     const std::span<const DWORD> drawnPixelCode = pass.pixelCode.empty() ? pixelCode : pass.pixelCode;
     const char* pixelName = !pass.pixelCode.empty() ? pass.pixelName : depthOnly ? "none" : shadow.pixelShader->name.c_str();
 

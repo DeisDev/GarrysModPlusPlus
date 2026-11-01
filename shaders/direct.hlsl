@@ -98,15 +98,15 @@ float2 SpiralPoint(uint k, uint count, float2 turn)
     return float2((float(k) + turn.x) / float(count), frac(float(k) * 0.618034 + turn.y));
 }
 
-float3 ViewmodelSunVisibility(float3 from, uint rayFlags, inout uint seed)
+float3 ViewmodelSunVisibility(float3 from, uint water, uint rayFlags, inout uint seed)
 {
     uint rays = max(g_frame.viewmodelShadowRays, 1u);
     if (rays == 1u)
-        return SunVisibility(from, g_frame.sunShadowMask, rayFlags);
+        return SunVisibilityFrom(from, water, g_frame.sunDirection, g_frame.sunShadowMask, rayFlags);
     float2 turn = float2(Random(seed), Random(seed));
     float3 sum = 0.0;
     for (uint k = 0; k < rays; ++k)
-        sum += SunVisibilityAlong(from, SunDiscDirectionAt(SpiralPoint(k, rays, turn)), g_frame.sunShadowMask, rayFlags);
+        sum += SunVisibilityFrom(from, water, SunDiscDirectionAt(SpiralPoint(k, rays, turn)), g_frame.sunShadowMask, rayFlags);
     return sum / float(rays);
 }
 
@@ -154,6 +154,7 @@ void main(uint3 id : SV_DispatchThreadID)
     g_twoSided = lit && (pixelFlags.Load(int3(pixel, 0)) & kPixelIgnoreNormals) != 0;
     g_toEye = lit ? normalize(g_frame.eyePosition - position) : 0.0;
     float3 lightNormal = g_twoSided && dot(normal, faceNormal) < 0.0 ? -normal : normal;
+    g_receiverNormal = lit ? lightNormal : 0.0;
     float3 behind = g_twoSided ? position - faceNormal * SurfaceBias(surface.w) : origin;
     bool onModel = false;
     if (lit) {
@@ -171,19 +172,22 @@ void main(uint3 id : SV_DispatchThreadID)
     float3 rim = 0.0;
     Phong phong = PhongAt(pixel, lit && inside, position, normal);
     float3 sunVisibility = 0.0;
-    float lambert = Lambert(lightNormal, g_frame.sunDirection);
+    // Under water the sun shines from the direction the surface bends its light to.
+    uint sunWater = lit ? WaterBodyAt(origin) : kNoWater;
+    float3 sunDirection = SunArrival(sunWater, g_frame.sunDirection);
+    float lambert = Lambert(lightNormal, sunDirection);
     if (lit && g_frame.sunEnabled != 0.0 && lambert > 0.0) {
-        float3 sunFrom = ShadowOrigin(origin, behind, faceNormal, g_frame.sunDirection);
-        uint sunFlags = SelfShadowFlags(onModel, faceNormal, g_frame.sunDirection);
+        float3 sunFrom = ShadowOrigin(origin, behind, faceNormal, sunDirection);
+        uint sunFlags = SelfShadowFlags(onModel, faceNormal, sunDirection);
         if (g_pass.input0 != kNoView)
             sunVisibility = SunShadowAt(pixel);
         else if (g_frame.viewmodel != 0)
-            sunVisibility = ViewmodelSunVisibility(sunFrom, sunFlags, seed);
+            sunVisibility = ViewmodelSunVisibility(sunFrom, sunWater, sunFlags, seed);
         else
-            sunVisibility = SunVisibility(sunFrom, g_frame.sunShadowMask, sunFlags);
-        exact += g_frame.sunColor * lambert * sunVisibility * LightWarp(lightNormal, g_frame.sunDirection);
+            sunVisibility = SunVisibilityFrom(sunFrom, sunWater, g_frame.sunDirection, g_frame.sunShadowMask, sunFlags);
+        exact += g_frame.sunColor * lambert * sunVisibility * LightWarp(lightNormal, sunDirection);
         specular += SunHighlight(phong, g_frame.sunColor * (lambert * sunVisibility));
-        rim += ModelRim(phong, g_frame.sunColor * (lambert * sunVisibility), g_frame.sunDirection);
+        rim += ModelRim(phong, g_frame.sunColor * (lambert * sunVisibility), sunDirection);
     }
 
     float3 sampled = 0.0;

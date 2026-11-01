@@ -44,7 +44,7 @@ float3 ProjectorScatter(float3 position, float3 direction)
         Projector projector = LoadProjector(p);
         float3 irradiance = ProjectorIrradiance(projector, position, 0.0, toLight, distance);
         if (Luminance(irradiance) > 0.0)
-            scattered += irradiance * Phase(dot(direction, -toLight)) * ProjectorTransmittance(projector, position);
+            scattered += irradiance * Phase(dot(direction, toLight)) * ProjectorTransmittance(projector, position);
     }
     return scattered;
 }
@@ -61,7 +61,7 @@ float3 LampScatter(float3 position, float3 direction, inout uint seed)
     uint picked;
     if (!SampleLight(set, position, 0.0, seed, irradiance, toLight, distance, picked))
         return 0.0;
-    return irradiance * Phase(dot(direction, -toLight)) *
+    return irradiance * Phase(dot(direction, toLight)) *
         LightTransmittance(set, picked, position, position + toLight * distance, float2(Random(seed), Random(seed)));
 }
 
@@ -94,6 +94,18 @@ float4 MarchFog(float3 direction, float distance, float depthPerUnit, uint seed)
         light += gained * (LitFog(position, volume) + 3.14159265 * scattered);
     }
     return float4(ClampSample(light), end);
+}
+
+// The water the eye is in (g_frame.eyeWater) as far as the surface: its own light (ThroughWater: sunlight bent and
+// focused by the surface, shafts where the water's shadows break it, the sky's light by depth), and the light lamps and
+// projected lights scatter in it (WaterLampsAlong). Their shadow rays follow the light through the water (LightPath),
+// which costs too much at every step: lamps are sampled at a quarter as many points, and the history averages the noise.
+float4 MarchWater(float3 direction, float rayLength, uint seed)
+{
+    uint water = g_frame.eyeWater;
+    float3 light = ThroughWater(0.0, g_frame.eyePosition, direction, rayLength, water, g_frame.volumetricSteps, seed) +
+        WaterLampsAlong(g_frame.eyePosition, direction, rayLength, water, max(g_frame.volumetricSteps / 4, 1u), seed);
+    return float4(ClampSample(light), rayLength);
 }
 
 float4 MarchHaze(float3 direction, float rayLength, uint seed)
@@ -129,6 +141,8 @@ float4 March(int2 pixel)
     float targetDistance = max(sqrt(dot(toTarget, toTarget)), 1e-3);
     float3 direction = toTarget / targetDistance;
     uint seed = PixelSeed(full, 0xB1u);
+    if (g_frame.eyeWater != kNoView)
+        return MarchWater(direction, surface.w != 0.0 ? min(abs(surface.w), kMaxDistance) : kMaxDistance, seed);
     if (g_frame.volumetricFog != 0) {
         // Source leaves the sky unfogged.
         if (surface.w == 0.0)
