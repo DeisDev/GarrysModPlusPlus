@@ -350,6 +350,8 @@ std::uint64_t Key(std::span<const DWORD> code, const translator::Variant& varian
         key = Fnv("mirror", 6, key);
     if (variant.lightWarpSlot != 0)
         key = Fnv("lightwarp", 9, key);
+    if (variant.opacityMicromaps != 0)
+        key = Fnv("micromaps", 9, key);
     return Fnv(&kTranslatorVersion, sizeof(kTranslatorVersion), key);
 }
 

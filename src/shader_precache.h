@@ -38,6 +38,8 @@ struct Request {
     // the forward twin that translucent ones draw.
     bool gbufferTwin = false;
     bool forwardTwin = false;
+    // The device has opacity micromaps (translator::Variant::opacityMicromaps).
+    bool opacityMicromaps = false;
 };
 
 // Queues compiling every dynamic combo of the request's static combo on worker threads, in the variants its draws

@@ -83,8 +83,7 @@ bool Compile(std::span<const DWORD> code, const translator::Variant& variant, co
         return false;
     }
     const ShaderCompiler* compiler = Compiler(error);
-    const wchar_t* profile = info.stage == translator::Stage::Vertex ? L"vs_6_6" : L"ps_6_6";
-    if (compiler == nullptr || !compiler->Compile(info.hlsl, profile, dxil, error)) {
+    if (compiler == nullptr || !compiler->Compile(info.hlsl, translator::Profile(info.stage, variant), dxil, error)) {
         if (FirstFailureOf(name)) {
             log::Info("Shaders: compiling a combo of {} failed (later failures of the file are not logged): {}", name,
                 std::string_view(error).substr(0, error.find('\n')));
@@ -179,6 +178,7 @@ void Run(const Request& request)
             translator::Variant variant;
             variant.alphaTest = request.alphaTest;
             variant.forwardLighting = forward ? 1 : 0;
+            variant.opacityMicromaps = forward && request.opacityMicromaps ? 1 : 0;
             variant.lightWarpSlot = !forward && lightWarp ? 1 : 0;
             Ensure(twin, variant, request.name);
         }
@@ -195,7 +195,7 @@ public:
         {
             std::scoped_lock lock(m_mutex);
             const auto id = std::tuple(static_cast<const void*>(request.file.data()), request.staticIndex, request.alphaTest, request.gbufferTwin,
-                request.forwardTwin);
+                request.forwardTwin, request.opacityMicromaps);
             if (!m_seen.insert(id).second)
                 return;
             m_queue.push_back({ request, counted });
@@ -244,7 +244,7 @@ private:
     std::mutex m_mutex;
     std::condition_variable m_ready;
     std::deque<Queued> m_queue;
-    std::set<std::tuple<const void*, std::int32_t, std::uint8_t, bool, bool>> m_seen;
+    std::set<std::tuple<const void*, std::int32_t, std::uint8_t, bool, bool, bool>> m_seen;
     std::size_t m_total = 0;
     std::size_t m_done = 0;
     bool m_started = false;

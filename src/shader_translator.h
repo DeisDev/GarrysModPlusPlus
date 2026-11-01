@@ -36,7 +36,13 @@ struct Variant {
     // G-buffer twins of light-warped materials: the flags target's alpha (oC3.a) takes gmodpp_alpha.y, the warp
     // texture's slot in the view's table (shaderapi_capture.h, LightWarpSlot).
     std::uint8_t lightWarpSlot : 1 = 0;
+    // With forwardLighting, on devices with opacity micromaps: compiled for shader model 6.9 with OPACITY_MICROMAPS, so
+    // the lighting's ray queries may meet the micromaps of the scene they trace (shaders/scene.hlsli, SCENE_RAY_QUERY).
+    std::uint8_t opacityMicromaps : 1 = 0;
 };
+
+// The target a translation compiles for.
+const wchar_t* Profile(Stage stage, const Variant& variant);
 
 struct VertexInput {
     BYTE usage;

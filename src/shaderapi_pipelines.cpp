@@ -835,6 +835,7 @@ void PrecacheShaders(const ShadowState& state)
             request.alphaTest = state.alphaTest ? static_cast<std::uint8_t>(state.alphaFunc + 1) : 0;
             request.gbufferTwin = twins && state.depthTest;
             request.forwardTwin = twins && (state.blend || GetSettings().renderTargetLighting);
+            request.opacityMicromaps = GetStatistics().opacityMicromapsAvailable;
         }
         shader_precache::Enqueue(request);
     }
@@ -1100,6 +1101,7 @@ void DrawPass(const ShadowState& shadow, const MeshDraw& mesh)
     if (shadow.alphaTest)
         pixelVariant.alphaTest = static_cast<std::uint8_t>(shadow.alphaFunc + 1);
     pixelVariant.forwardLighting = pass.forwardFrame != 0 ? 1 : 0;
+    pixelVariant.opacityMicromaps = pass.forwardFrame != 0 && GetStatistics().opacityMicromapsAvailable ? 1 : 0;
     pixelVariant.clearCoverage = clearCoverage ? 1 : 0;
     pixelVariant.markMirror = clearCoverage && pass.marksMirror ? 1 : 0;
     if (pass.route == capture::Pass::Route::GBuffer && pass.lightWarpSampler >= 0 && pass.lightWarpSampler < kSamplers) {

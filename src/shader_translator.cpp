@@ -851,8 +851,12 @@ std::string Interpolants(const std::set<std::string>& centroid)
 std::string Translator::Assemble()
 {
     std::string text = "// Translated by GarrysMod++ from D3D9 shader bytecode.\n";
-    if (m_stage == Stage::Pixel && m_variant.forwardLighting != 0)
-        text += "#define GMODPP_GAME_DRAW 1\n#include \"forward_twin.hlsli\"\n";
+    if (m_stage == Stage::Pixel && m_variant.forwardLighting != 0) {
+        text += "#define GMODPP_GAME_DRAW 1\n";
+        if (m_variant.opacityMicromaps != 0)
+            text += "#define OPACITY_MICROMAPS 1\n";
+        text += "#include \"forward_twin.hlsli\"\n";
+    }
     const UINT first = m_floatMin == UINT_MAX ? 0 : m_floatMin;
     m_out.firstFloatConstant = first;
     m_out.floatConstantCount = m_floatMin == UINT_MAX ? 0 : m_floatMax - m_floatMin + 1;
@@ -1071,6 +1075,13 @@ bool Translator::Run()
     return true;
 }
 
+}
+
+const wchar_t* Profile(Stage stage, const Variant& variant)
+{
+    if (stage == Stage::Vertex)
+        return L"vs_6_6";
+    return variant.forwardLighting != 0 && variant.opacityMicromaps != 0 ? L"ps_6_9" : L"ps_6_6";
 }
 
 bool Translate(std::span<const DWORD> code, const Variant& variant, Translation& out, std::string& error)
