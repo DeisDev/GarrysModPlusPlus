@@ -52,7 +52,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
-- Faster frames: with DLSS Ray Reconstruction, the sun's shadow rays stop at the first thing that blocks them, since only their light is used; every ray query skips the procedural primitives the scene never has; draws no longer look up the bound render targets again for each texture they sample; and constants set again to the values they already hold are no longer uploaded again.
+- Faster frames: the view of the weapon in your hands traces the main view's ray tracing scene instead of building its own every frame; with DLSS Ray Reconstruction, the sun's shadow rays stop at the first thing that blocks them, since only their light is used; every ray query skips the procedural primitives the scene never has; draws no longer look up the bound render targets again for each texture they sample; and constants set again to the values they already hold are no longer uploaded again.
 - Shaders are compiled for the materials a map uses, in the background while the map loads, instead of for every shader the game ships before the game starts. The loading screen shows "Compiling shaders..." while it waits for them; shaders compiled once are kept for later launches.
 - Compiled shaders are kept in one file, `gmodplusplus\cache\shaders.bin`, instead of one file per shader, so reading them is faster. The old `gmodplusplus\cache\shaders` folder is deleted in the background.
 - The Low preset picks how map lights are sampled automatically, like the other presets.

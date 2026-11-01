@@ -647,9 +647,10 @@ private:
     float m_swayTime = 0.0f;
     float m_swayWind[2] = {};
     std::vector<SceneInstance> m_frameInstances;
-    // The skinned characters' instances the main view of frame m_skinnedFrame traced, which the viewmodel reuses.
-    std::vector<SceneInstance> m_skinnedInstances;
-    uint64_t m_skinnedFrame = ~0ull;
+    // The scene the main view of frame m_mainSceneFrame traced, from slot m_mainSceneSlot, which the viewmodel reuses.
+    SceneFrame m_mainScene = {};
+    uint64_t m_mainSceneFrame = ~0ull;
+    UINT m_mainSceneSlot = 0;
     float m_prevViewProj[4][4] = {};
     float m_prevEye[3] = {};
     bool m_historyValid = false;

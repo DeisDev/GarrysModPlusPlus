@@ -2014,19 +2014,20 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     }
 
     m_frameInstances.assign(dynamic.begin(), dynamic.end());
-    // The viewmodel traces the main view's characters (kViewmodelTraceMask) as the main view skinned them this frame;
-    // they are not skinned a second time.
-    if (inputs.kind == gbuffer::ViewKind::Viewmodel && m_skinnedFrame == inputs.frame)
-        m_frameInstances.insert(m_frameInstances.end(), m_skinnedInstances.begin(), m_skinnedInstances.end());
     m_skinned.Record(m_list.Get(), scene, skinned, m_frameInstances);
-    if (main) {
-        m_skinnedInstances.assign(m_frameInstances.begin() + static_cast<std::ptrdiff_t>(dynamic.size()), m_frameInstances.end());
-        m_skinnedFrame = inputs.frame;
-    }
     if (main)
         UpdateSway(scene, slot, inputs.sway, constants.eyePosition, slotConstantsGpu);
     m_sway.Append(m_frameInstances);
-    const SceneFrame frame = scene.RecordFrame(m_list.Get(), slot, m_frameInstances, m_useMicromaps);
+    // The viewmodel, drawn after the main view of its frame, traces the same scene with its own mask
+    // (kViewmodelTraceMask): it reuses the main view's acceleration structure and records, characters included, and
+    // keeps the main view's slot from being rebuilt until it is done (m_slotFenceValues below).
+    const bool reuseScene = inputs.kind == gbuffer::ViewKind::Viewmodel && m_mainScene.tlas != 0 && m_mainSceneFrame == inputs.frame;
+    const SceneFrame frame = reuseScene ? m_mainScene : scene.RecordFrame(m_list.Get(), slot, m_frameInstances, m_useMicromaps);
+    if (main) {
+        m_mainScene = frame;
+        m_mainSceneFrame = inputs.frame;
+        m_mainSceneSlot = slot;
+    }
     constants.instancesView = frame.instancesView;
     constants.dynamicLightsView = frame.dynamicLightsView;
     constants.lightStylesView = frame.lightStylesView;
@@ -2632,6 +2633,8 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     }
     queue->Signal(m_fence.Get(), ++m_fenceValue);
     m_slotFenceValues[slot] = m_fenceValue;
+    if (reuseScene)
+        m_slotFenceValues[m_mainSceneSlot] = m_fenceValue;
     if (std::exchange(m_bakeLogPending, false))
         FinishBake(scene);
     if (probe) {
