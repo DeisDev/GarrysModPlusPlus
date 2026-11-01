@@ -214,9 +214,13 @@ bool Scene::Initialize(ID3D12Device5* device, ID3D12CommandQueue* queue, Descrip
     m_opacityMicromaps = opacityMicromaps;
     m_queue = queue;
     m_descriptors = &descriptors;
-    HRESULT hr = device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&m_allocator));
+    HRESULT hr = S_OK;
+    for (UploadSlot& slot : m_uploads) {
+        if (SUCCEEDED(hr))
+            hr = device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&slot.allocator));
+    }
     if (SUCCEEDED(hr))
-        hr = device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, m_allocator.Get(), nullptr, IID_PPV_ARGS(&m_list));
+        hr = device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, m_uploads[0].allocator.Get(), nullptr, IID_PPV_ARGS(&m_list));
     if (SUCCEEDED(hr))
         hr = m_list->Close();
     if (SUCCEEDED(hr))
@@ -286,7 +290,25 @@ ComPtr<ID3D12Resource> Scene::UploadToDefault(const void* data, UINT64 size, std
     return buffer;
 }
 
-bool Scene::Submit()
+void Scene::WaitFor(uint64_t value)
+{
+    if (m_fence->GetCompletedValue() >= value)
+        return;
+    m_fence->SetEventOnCompletion(value, m_fenceEvent);
+    WaitForSingleObject(m_fenceEvent, INFINITE);
+}
+
+void Scene::BeginCommands()
+{
+    m_upload = (m_upload + 1) % kUploadSlots;
+    UploadSlot& slot = m_uploads[m_upload];
+    WaitFor(slot.fence);
+    slot.keepAlive.clear();
+    slot.allocator->Reset();
+    m_list->Reset(slot.allocator.Get(), nullptr);
+}
+
+bool Scene::Execute()
 {
     HRESULT hr = m_list->Close();
     if (FAILED(hr)) {
@@ -296,8 +318,23 @@ bool Scene::Submit()
     ID3D12CommandList* lists[] = {m_list.Get()};
     m_queue->ExecuteCommandLists(1, lists);
     m_queue->Signal(m_fence.Get(), ++m_fenceValue);
-    m_fence->SetEventOnCompletion(m_fenceValue, m_fenceEvent);
-    WaitForSingleObject(m_fenceEvent, INFINITE);
+    m_uploads[m_upload].fence = m_fenceValue;
+    return true;
+}
+
+bool Scene::Submit()
+{
+    if (!Execute())
+        return false;
+    WaitFor(m_fenceValue);
+    return true;
+}
+
+bool Scene::SubmitAsync(std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> keepAlive)
+{
+    if (!Execute())
+        return false;
+    m_uploads[m_upload].keepAlive = std::move(keepAlive);
     return true;
 }
 
@@ -381,20 +418,6 @@ UINT Scene::AddTexture(DXGI_FORMAT format, UINT width, UINT height, std::span<co
     }
     upload->Unmap(0, nullptr);
 
-    m_allocator->Reset();
-    m_list->Reset(m_allocator.Get(), nullptr);
-    for (UINT mip = 0; mip < mipCount; ++mip) {
-        D3D12_TEXTURE_COPY_LOCATION destination = {texture.resource.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
-        destination.SubresourceIndex = mip;
-        D3D12_TEXTURE_COPY_LOCATION source = {upload.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
-        source.PlacedFootprint = footprints[mip];
-        m_list->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
-    }
-    D3D12_RESOURCE_BARRIER barrier = Transition(texture.resource.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
-    m_list->ResourceBarrier(1, &barrier);
-    if (!Submit())
-        return DescriptorHeap::kInvalid;
-
     texture.view = m_descriptors->Allocate();
     if (texture.view == DescriptorHeap::kInvalid)
         return DescriptorHeap::kInvalid;
@@ -404,6 +427,23 @@ UINT Scene::AddTexture(DXGI_FORMAT format, UINT width, UINT height, std::span<co
     srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     srv.Texture2D.MipLevels = mipCount;
     m_device->CreateShaderResourceView(texture.resource.Get(), &srv, m_descriptors->Cpu(texture.view));
+
+    // Copied without waiting for the GPU (Scene::SubmitAsync), like models: nothing after this can fail and drop the
+    // texture while the copy runs.
+    BeginCommands();
+    for (UINT mip = 0; mip < mipCount; ++mip) {
+        D3D12_TEXTURE_COPY_LOCATION destination = {texture.resource.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+        destination.SubresourceIndex = mip;
+        D3D12_TEXTURE_COPY_LOCATION source = {upload.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+        source.PlacedFootprint = footprints[mip];
+        m_list->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+    }
+    D3D12_RESOURCE_BARRIER barrier = Transition(texture.resource.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
+    m_list->ResourceBarrier(1, &barrier);
+    if (!SubmitAsync({upload})) {
+        m_descriptors->Free(texture.view);
+        return DescriptorHeap::kInvalid;
+    }
     if (m_opacityMicromaps) {
         if (std::optional<omm::AlphaImage> alpha = omm::DecodeAlpha(format, width, height, mips[0]))
             m_alphaImages[texture.view] = std::move(*alpha);
@@ -467,8 +507,7 @@ int Scene::AddModel(const ModelGeometry& geometry)
     const bool materials = geometry.triangleMaterials.size() == triangles;
     if (triangles == 0 || geometry.triangleAlbedo.size() != triangles || geometry.alphaTriangles.size() != alphaTriangles || (alphaTriangles != 0 && !uvs))
         return -1;
-    m_allocator->Reset();
-    m_list->Reset(m_allocator.Get(), nullptr);
+    BeginCommands();
     std::vector<ComPtr<ID3D12Resource>> staging;
     Model model;
     model.vertexCount = static_cast<UINT>(geometry.positions.size());
@@ -532,9 +571,8 @@ int Scene::AddModel(const ModelGeometry& geometry)
     desc.DestAccelerationStructureData = model.blas->GetGPUVirtualAddress();
     desc.ScratchAccelerationStructureData = scratch->GetGPUVirtualAddress();
     m_list->BuildRaytracingAccelerationStructure(&desc, 0, nullptr);
-    if (!Submit())
-        return -1;
 
+    // The views need no GPU work, so a failure here leaves nothing running that reads the model.
     model.positionsView = m_descriptors->CreateRawView(model.positions.Get());
     model.indicesView = m_descriptors->CreateRawView(model.indices.Get());
     model.albedoView = m_descriptors->CreateRawView(model.albedo.Get());
@@ -547,6 +585,14 @@ int Scene::AddModel(const ModelGeometry& geometry)
     if (model.positionsView == DescriptorHeap::kInvalid || model.indicesView == DescriptorHeap::kInvalid || model.albedoView == DescriptorHeap::kInvalid ||
         (uvs && model.uvsView == DescriptorHeap::kInvalid) || (alphaTriangles != 0 && model.alphaView == DescriptorHeap::kInvalid) ||
         (materials && model.materialsView == DescriptorHeap::kInvalid)) {
+        m_list->Close();
+        ReleaseModel(model);
+        return -1;
+    }
+    // Models seen for the first time mid-game are built without waiting for the GPU, which would drain every frame in
+    // flight: the frames recorded after this use the model only after the queue has built it.
+    staging.push_back(std::move(scratch));
+    if (!SubmitAsync(std::move(staging))) {
         ReleaseModel(model);
         return -1;
     }
@@ -652,8 +698,7 @@ bool Scene::LoadBaked(const bsp::BakedLighting& baked, std::span<const BakedTria
         log::Info("Scene: the map has no lightmaps; indirect_lighting 1 traces indirect light instead");
         return false;
     }
-    m_allocator->Reset();
-    m_list->Reset(m_allocator.Get(), nullptr);
+    BeginCommands();
     std::vector<ComPtr<ID3D12Resource>> staging;
     auto upload = [&](const void* data, size_t bytes) {
         // Empty inputs (maps without leaf ambient samples) still get a buffer, so every view is valid.
@@ -728,6 +773,10 @@ bool Scene::LoadBaked(const bsp::BakedLighting& baked, std::span<const BakedTria
 
 void Scene::Clear()
 {
+    // Uploads still running (SubmitAsync) read what is released here.
+    WaitFor(m_fenceValue);
+    for (UploadSlot& slot : m_uploads)
+        slot.keepAlive.clear();
     for (UINT* view : {&m_baked.facesView, &m_baked.trianglesView, &m_baked.luxelsView, &m_baked.leafAmbientView, &m_baked.ambientSamplesView,
              &m_baked.ambientSamplesUav, &m_baked.rawView, &m_baked.rawUav, &m_baked.filteredView, &m_baked.filteredUav}) {
         if (*view != DescriptorHeap::kInvalid)
@@ -862,8 +911,7 @@ bool Scene::SetWater(std::span<const GpuWaterBody> bodies, std::span<const uint3
     for (const bsp::BspLeaf& leaf : visibility.leaves)
         leafWater.push_back(leaf.water);
     const std::vector<uint32_t> frames = frameViews.empty() ? std::vector<uint32_t>{0} : std::vector<uint32_t>(frameViews.begin(), frameViews.end());
-    m_allocator->Reset();
-    m_list->Reset(m_allocator.Get(), nullptr);
+    BeginCommands();
     std::vector<ComPtr<ID3D12Resource>> staging;
     ComPtr<ID3D12Resource> bodyBuffer = UploadToDefault(bodies.data(), bodies.size_bytes(), staging);
     ComPtr<ID3D12Resource> frameBuffer = UploadToDefault(frames.data(), frames.size() * sizeof(uint32_t), staging);
@@ -920,8 +968,7 @@ bool Scene::LoadMap(const std::string& name, const bsp::WorldGeometry& world, st
     else if (!emitters.empty())
         log::Info("Scene: {} self-illuminated triangles light the scene", emitters.size());
     if (!lights.empty()) {
-        m_allocator->Reset();
-        m_list->Reset(m_allocator.Get(), nullptr);
+        BeginCommands();
         std::vector<ComPtr<ID3D12Resource>> staging;
         m_lights = UploadToDefault(lights.data(), lights.size() * sizeof(GpuLight), staging);
         if (!m_lights || !Submit())
@@ -985,8 +1032,7 @@ bool Scene::BuildLightLists(std::span<const bsp::Light> lights, const bsp::Visib
         leafClusters.assign(1, -1);
     }
 
-    m_allocator->Reset();
-    m_list->Reset(m_allocator.Get(), nullptr);
+    BeginCommands();
     std::vector<ComPtr<ID3D12Resource>> staging;
     m_lightRanges = UploadToDefault(ranges.data(), ranges.size() * sizeof(uint32_t), staging);
     m_lightIndices = UploadToDefault(indices.data(), indices.size() * sizeof(uint32_t), staging);
@@ -1170,8 +1216,7 @@ bool Scene::BuildLightGrid(std::span<const GpuLight> lights, std::span<const bsp
     if (tail.empty())
         tail.insert(tail.end(), {0u, 0u});
 
-    m_allocator->Reset();
-    m_list->Reset(m_allocator.Get(), nullptr);
+    BeginCommands();
     std::vector<ComPtr<ID3D12Resource>> staging;
     m_gridCells = UploadToDefault(cellRanges.data(), cellRanges.size() * sizeof(uint32_t), staging);
     m_gridIndices = UploadToDefault(indices.data(), indices.size() * sizeof(uint32_t), staging);
@@ -1298,8 +1343,7 @@ bool Scene::UploadEmitters(std::span<const GpuEmitter> emitters, bool worldEmits
     m_worldFlags = worldEmits ? kInstanceEmitter : 0u;
     if (emitters.empty())
         return true;
-    m_allocator->Reset();
-    m_list->Reset(m_allocator.Get(), nullptr);
+    BeginCommands();
     std::vector<ComPtr<ID3D12Resource>> staging;
     m_emitters = UploadToDefault(emitters.data(), emitters.size_bytes(), staging);
     if (!m_emitters || !Submit())
@@ -1319,8 +1363,7 @@ bool Scene::UploadEmitters(std::span<const GpuEmitter> emitters, bool worldEmits
             table.resize(emitter.primitive + 1, 0u);
         table[emitter.primitive] = e + 1;
     }
-    m_allocator->Reset();
-    m_list->Reset(m_allocator.Get(), nullptr);
+    BeginCommands();
     std::vector<ComPtr<ID3D12Resource>> tableStaging;
     m_emitterLights.assign(tables.size(), nullptr);
     m_emitterLightViews.assign(tables.size(), DescriptorHeap::kInvalid);

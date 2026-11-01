@@ -440,7 +440,18 @@ private:
     Microsoft::WRL::ComPtr<ID3D12Resource> CreateBuffer(UINT64 size, D3D12_HEAP_TYPE heap, D3D12_RESOURCE_FLAGS flags, D3D12_RESOURCE_STATES state);
     // Records a copy of `data` into a new default-heap buffer; `staging` must outlive the command list.
     Microsoft::WRL::ComPtr<ID3D12Resource> UploadToDefault(const void* data, UINT64 size, std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>>& staging);
+    // Waits until the GPU passes `value` of m_fence.
+    void WaitFor(uint64_t value);
+    // Opens m_list on the next upload slot once the GPU is done with that slot's last commands, which have long finished
+    // unless several uploads came in a row.
+    void BeginCommands();
+    // Closes m_list and runs it; the slot's fence value marks its end.
+    bool Execute();
+    // Runs the commands and waits for them.
     bool Submit();
+    // Runs the commands without waiting: the queue runs them before any frame recorded later, and `keepAlive`, what they
+    // read, is kept with their slot until they are done.
+    bool SubmitAsync(std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> keepAlive);
     void ReleaseModel(Model& model);
     static void Link(const Model& model, D3D12_RAYTRACING_GEOMETRY_DESC& alphaGeometry, D3D12_RAYTRACING_GEOMETRY_TRIANGLES_DESC& triangles,
         D3D12_RAYTRACING_GEOMETRY_OMM_LINKAGE_DESC& linkage);
@@ -465,7 +476,15 @@ private:
     ID3D12Device5* m_device = nullptr;
     ID3D12CommandQueue* m_queue = nullptr;
     DescriptorHeap* m_descriptors = nullptr;
-    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> m_allocator;
+    struct UploadSlot {
+        Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
+        uint64_t fence = 0;
+        std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> keepAlive;
+    };
+    static constexpr size_t kUploadSlots = 4;
+    // Uploads record into m_list with these allocators in turn (BeginCommands); m_upload is the one recording.
+    std::array<UploadSlot, kUploadSlots> m_uploads;
+    size_t m_upload = 0;
     Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList4> m_list;
     Microsoft::WRL::ComPtr<ID3D12Fence> m_fence;
     HANDLE m_fenceEvent = nullptr;
