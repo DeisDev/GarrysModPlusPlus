@@ -15,6 +15,9 @@ inline constexpr std::uint32_t kTranslatorVersion = 5;
 // gmodplusplus\cache\shaders.
 std::filesystem::path Directory();
 
+// The lighting headers forward-lit translations include (gmodplusplus\hlsl).
+std::uint64_t LightingHeadersHash();
+
 // A translation's key: the bytecode, the variant and the translator version.
 std::uint64_t Key(std::span<const DWORD> code, const translator::Variant& variant);
 

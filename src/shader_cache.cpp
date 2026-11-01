@@ -24,7 +24,13 @@ std::uint64_t Fnv(const void* data, size_t size, std::uint64_t hash = 1469598103
     return hash;
 }
 
-// The lighting headers forward twins include (gmodplusplus\hlsl), which their translations depend on too.
+std::filesystem::path FilePath(const std::filesystem::path& directory, std::uint64_t key)
+{
+    return directory / std::format("{:016x}.bin", key);
+}
+
+}
+
 std::uint64_t LightingHeadersHash()
 {
     static const std::uint64_t hash = [] {
@@ -44,13 +50,6 @@ std::uint64_t LightingHeadersHash()
         return result;
     }();
     return hash;
-}
-
-std::filesystem::path FilePath(const std::filesystem::path& directory, std::uint64_t key)
-{
-    return directory / std::format("{:016x}.bin", key);
-}
-
 }
 
 std::filesystem::path Directory()

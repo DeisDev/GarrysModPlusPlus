@@ -48,7 +48,8 @@ std::filesystem::path MarkerPath()
     return shader_cache::Directory() / L"prewarm.txt";
 }
 
-// The translator version and the shader VPK's size and time, which a game update changes.
+// The translator version, the shader VPK's size and time, which a game update changes, and the sources of the twins and
+// of the lighting that forward-lit translations include, which a mod update changes.
 std::optional<std::string> MarkerText(const std::filesystem::path& gameDirectory)
 {
     std::error_code error;
@@ -59,7 +60,8 @@ std::optional<std::string> MarkerText(const std::filesystem::path& gameDirectory
     const auto time = std::filesystem::last_write_time(vpk, error);
     if (error)
         return std::nullopt;
-    return std::format("{} {} {} {:016x}", shader_cache::kTranslatorVersion, size, time.time_since_epoch().count(), twins::SourceHash());
+    return std::format("{} {} {} {:016x} {:016x}", shader_cache::kTranslatorVersion, size, time.time_since_epoch().count(), twins::SourceHash(),
+        shader_cache::LightingHeadersHash());
 }
 
 struct FileResult {
