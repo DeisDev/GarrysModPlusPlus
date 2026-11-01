@@ -336,7 +336,13 @@ void SetVertexFloats(int first, const float* values, int count)
 {
     if (first < 0 || first + count > kVertexFloatConstants)
         return;
-    std::memcpy(&g_dynamic.vertexFloats[static_cast<size_t>(first)], values, static_cast<size_t>(count) * sizeof(Float4));
+    // Rewriting the same values (the flex scale every mesh, the fog colour every pass) keeps the version, so the last
+    // upload of the registers is reused.
+    Float4* registers = &g_dynamic.vertexFloats[static_cast<size_t>(first)];
+    const size_t bytes = static_cast<size_t>(count) * sizeof(Float4);
+    if (std::memcmp(registers, values, bytes) == 0)
+        return;
+    std::memcpy(registers, values, bytes);
     ++g_dynamic.vertexFloatsVersion;
 }
 
@@ -344,7 +350,13 @@ void SetPixelFloats(int first, const float* values, int count)
 {
     if (first < 0 || first + count > kPixelFloatConstants)
         return;
-    std::memcpy(&g_dynamic.pixelFloats[static_cast<size_t>(first)], values, static_cast<size_t>(count) * sizeof(Float4));
+    // Rewriting the same values (the flex scale every mesh, the fog colour every pass) keeps the version, so the last
+    // upload of the registers is reused.
+    Float4* registers = &g_dynamic.pixelFloats[static_cast<size_t>(first)];
+    const size_t bytes = static_cast<size_t>(count) * sizeof(Float4);
+    if (std::memcmp(registers, values, bytes) == 0)
+        return;
+    std::memcpy(registers, values, bytes);
     ++g_dynamic.pixelFloatsVersion;
 }
 

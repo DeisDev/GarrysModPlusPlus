@@ -813,21 +813,24 @@ void Lighting::RecordCaustics(FrameConstants& constants, const Scene& scene)
         .output0 = m_causticCounts.uav, .output1 = m_caustics.uav, .output2 = m_waterSun.uav};
     const PassArgs coarse = {.input1 = std::bit_cast<UINT>(m_coarseCausticsOrigin[0]), .input2 = std::bit_cast<UINT>(m_coarseCausticsOrigin[1]),
         .input3 = std::bit_cast<UINT>(m_coarseCausticsInvSize), .output0 = m_causticCounts.uav, .output2 = m_coarseWaterSun.uav};
-    const auto run = [&](PassArgs args, UINT step, UINT cells) {
+    // The clear and the photons both write the counts and the sun map, so each dispatch waits for the last one's writes
+    // to both.
+    const auto run = [&](PassArgs args, UINT step, UINT cells, ID3D12Resource* sunMap) {
         args.step = step;
         DispatchGroups(Pass::Caustics, args, cells / 8, cells / 8, 1);
-        m_list->ResourceBarrier(1, &counted);
+        const D3D12_RESOURCE_BARRIER barriers[] = {counted, {D3D12_RESOURCE_BARRIER_TYPE_UAV, D3D12_RESOURCE_BARRIER_FLAG_NONE, {.UAV = {sunMap}}}};
+        m_list->ResourceBarrier(static_cast<UINT>(std::size(barriers)), barriers);
     };
-    run(fine, 0, kCausticsCells);
+    run(fine, 0, kCausticsCells, m_waterSun.resource.Get());
     if (waterNear)
-        run(fine, 1, kCausticsCells);
+        run(fine, 1, kCausticsCells, m_waterSun.resource.Get());
     Use(m_causticCounts, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     PassArgs resolve = fine;
     resolve.input0 = m_causticCounts.srv;
-    run(resolve, 2, kCausticsCells);
+    run(resolve, 2, kCausticsCells, m_waterSun.resource.Get());
     Use(m_causticCounts, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    run(coarse, 4, kCoarseCausticsCells);
-    run(coarse, 5, kCoarseCausticsCells);
+    run(coarse, 4, kCoarseCausticsCells, m_coarseWaterSun.resource.Get());
+    run(coarse, 5, kCoarseCausticsCells, m_coarseWaterSun.resource.Get());
     Use(m_caustics, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     Use(m_waterSun, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     Use(m_coarseWaterSun, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -1099,7 +1102,9 @@ std::pair<UINT, UINT> Lighting::RecordSunShadow(const FrameConstants& constants,
     Texture* written[] = {&m_sunPenumbra, &m_sunTranslucency, &m_nrdViewZ, &m_nrdNormalRoughness};
     for (Texture* texture : written)
         Use(*texture, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    Dispatch(Pass::SunShadow, {.output0 = m_sunPenumbra.uav, .output1 = m_sunTranslucency.uav, .output2 = m_nrdViewZ.uav, .output3 = m_nrdNormalRoughness.uav});
+    // Step 1: SIGMA denoises the shadows and needs each ray's nearest occluder; without it only the light is read.
+    Dispatch(Pass::SunShadow, {.output0 = m_sunPenumbra.uav, .output1 = m_sunTranslucency.uav, .output2 = m_nrdViewZ.uav, .output3 = m_nrdNormalRoughness.uav,
+        .step = denoise ? 1u : 0u});
     for (Texture* texture : written)
         Use(*texture, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     if (!denoise) {
@@ -2002,7 +2007,15 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     }
 
     m_frameInstances.assign(dynamic.begin(), dynamic.end());
+    // The viewmodel traces the main view's characters (kViewmodelTraceMask) as the main view skinned them this frame;
+    // they are not skinned a second time.
+    if (inputs.kind == gbuffer::ViewKind::Viewmodel && m_skinnedFrame == inputs.frame)
+        m_frameInstances.insert(m_frameInstances.end(), m_skinnedInstances.begin(), m_skinnedInstances.end());
     m_skinned.Record(m_list.Get(), scene, skinned, m_frameInstances);
+    if (main) {
+        m_skinnedInstances.assign(m_frameInstances.begin() + static_cast<std::ptrdiff_t>(dynamic.size()), m_frameInstances.end());
+        m_skinnedFrame = inputs.frame;
+    }
     if (main)
         UpdateSway(scene, slot, inputs.sway, constants.eyePosition, slotConstantsGpu);
     m_sway.Append(m_frameInstances);

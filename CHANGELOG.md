@@ -52,6 +52,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Faster frames: with DLSS Ray Reconstruction, the sun's shadow rays stop at the first thing that blocks them, since only their light is used; every ray query skips the procedural primitives the scene never has; draws no longer look up the bound render targets again for each texture they sample; and constants set again to the values they already hold are no longer uploaded again.
 - Shaders are compiled for the materials a map uses, in the background while the map loads, instead of for every shader the game ships before the game starts. The loading screen shows "Compiling shaders..." while it waits for them; shaders compiled once are kept for later launches.
 - Compiled shaders are kept in one file, `gmodplusplus\cache\shaders.bin`, instead of one file per shader, so reading them is faster. The old `gmodplusplus\cache\shaders` folder is deleted in the background.
 - The Low preset picks how map lights are sampled automatically, like the other presets.
@@ -109,6 +110,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Fixed the weapon in your hands getting no shadows, occlusion or reflections from characters, NPCs and other players: its view traced a scene without them.
+- Fixed a missing GPU synchronisation in water caustics, where clearing and tracing the sun map could overlap on some GPUs.
 - Glass and other translucent surfaces no longer freeze the game for many seconds the first time they appear: their shaders compile about 9 times faster.
 - After a mod update changes the lighting shaders, the shaders of glass and translucent surfaces are compiled again while the next map loads, not while you play.
 - Under water, the native renderer no longer runs at half the frame rate: Source's view of the air above the water was lit as a second scene.

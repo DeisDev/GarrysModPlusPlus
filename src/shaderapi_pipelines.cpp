@@ -558,16 +558,15 @@ struct StateBuffer {
 };
 static_assert(sizeof(StateBuffer) == kStateBufferBytes);
 
+// A texture's handle is its address (TextureFromHandle), so a live texture is bound as a target exactly when a target
+// handle equals it; comparing handles spares a locked lookup per target for every sampler of every draw.
 bool IsTarget(const Texture* texture)
 {
     if (texture == nullptr)
         return false;
+    const auto handle = reinterpret_cast<std::intptr_t>(texture);
     const DynamicState& state = Dynamic();
-    for (std::intptr_t handle : state.colorTargets) {
-        if (TextureFromHandle(handle) == texture)
-            return true;
-    }
-    return TextureFromHandle(state.depthTarget) == texture;
+    return std::ranges::find(state.colorTargets, handle) != state.colorTargets.end() || state.depthTarget == handle;
 }
 
 // The slot of a G-buffer twin's light warp texture (capture::LightWarpSlot), or 0 without one. The twin itself does not

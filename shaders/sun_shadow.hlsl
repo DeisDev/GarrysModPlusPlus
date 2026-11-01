@@ -5,7 +5,9 @@
 // SIGMA_SHADOW_TRANSLUCENCY (or Ray Reconstruction, which takes them noisy). Pixels are set up as in shaders/direct.hlsl,
 // which reads the result in place of its own ray to the sun's centre. output0: SIGMA's penumbra; output1: its
 // translucency (gba: the light that gets through, per colour); output2, output3: its view depth and normal guides,
-// NRD's shared inputs, which shaders/nrd.hlsl writes again later in the frame.
+// NRD's shared inputs, which shaders/nrd.hlsl writes again later in the frame. Step 1: SIGMA denoises the result, so each
+// ray finds its nearest occluder for the penumbra; step 0 (Ray Reconstruction) reads the light alone, so the ray ends
+// at the first opaque hit and the occluder distance is left at 0.
 
 [RootSignature(ROOT_SIGNATURE)]
 [numthreads(8, 8, 1)]
@@ -50,10 +52,15 @@ void main(uint3 id : SV_DispatchThreadID)
     float occluder = 0.0;
     float3 light = 0.0;
     if (g_frame.sunEnabled != 0.0 && Lambert(lightNormal, arrival) > 0.0) {
-        light = SunVisibilityToNearest(ShadowOrigin(origin, behind, faceNormal, arrival), direction, g_frame.sunShadowMask,
-            SelfShadowFlags(onModel, faceNormal, arrival), occluder);
-        if (occluder >= 65536.0)
-            occluder = NRD_FP16_MAX;
+        float3 shadowOrigin = ShadowOrigin(origin, behind, faceNormal, arrival);
+        uint rayFlags = SelfShadowFlags(onModel, faceNormal, arrival);
+        if (g_pass.step == 1) {
+            light = SunVisibilityToNearest(shadowOrigin, direction, g_frame.sunShadowMask, rayFlags, occluder);
+            if (occluder >= 65536.0)
+                occluder = NRD_FP16_MAX;
+        } else {
+            light = SunVisibilityFrom(shadowOrigin, WaterBodyAt(shadowOrigin), direction, g_frame.sunShadowMask, rayFlags);
+        }
     }
     penumbra[pixel] = SIGMA_FrontEnd_PackPenumbra(occluder, kSunAngularRadius);
     translucency[pixel] = SIGMA_FrontEnd_PackTranslucency(occluder, light);

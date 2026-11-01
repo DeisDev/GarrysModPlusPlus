@@ -5,11 +5,12 @@
 #include "water_body.hlsli"
 
 // Ray queries of the Shader Model 6.9 variants (OPACITY_MICROMAPS) let traversal use opacity micromaps, which
-// settle alpha-tested candidates in their known opaque and transparent regions without the shader.
+// settle alpha-tested candidates in their known opaque and transparent regions without the shader. The scene holds
+// triangles alone, so every query skips procedural primitives, which compiles their traversal out.
 #if OPACITY_MICROMAPS
-#define SCENE_RAY_QUERY(flags) RayQuery<flags, RAYQUERY_FLAG_ALLOW_OPACITY_MICROMAPS>
+#define SCENE_RAY_QUERY(flags) RayQuery<(flags) | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES, RAYQUERY_FLAG_ALLOW_OPACITY_MICROMAPS>
 #else
-#define SCENE_RAY_QUERY(flags) RayQuery<flags>
+#define SCENE_RAY_QUERY(flags) RayQuery<(flags) | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES>
 #endif
 
 // Mirrors Scene::InstanceRecord in src/scene.cpp: descriptor indices of raw buffers. A model's alpha-tested and
