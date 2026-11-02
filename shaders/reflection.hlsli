@@ -31,25 +31,43 @@ float3 BeyondMap(float3 origin, float3 direction)
     return lerp(radiance, g_frame.skyboxFogColor / g_frame.tonemapScale, g_frame.skyboxFogParams.y > 0.0 ? fog : fog * fog);
 }
 
-// The indirect light reaching a reflected hit: one cosine-weighted bounce that ends in the radiance cache, or else the
-// main view's indirect light volume there, or else the sky's light. Never the reflecting pixel's own light, which lit
-// far rooms seen in mirrors with the light of the mirror's room.
-float3 HitIndirectIrradiance(HitSurface hit, float3 origin, inout uint seed)
+// The light leaving a reflected hit lit where it is: its albedo times the sun and one local light, and its indirect
+// light from one cosine-weighted bounce that ends in the radiance cache, or, where the bounce is too short for the
+// cache's voxel, at the surface it meets lit by its own sun and local light. Without the cache the main view's indirect
+// light volume (else the sky's light) stands in for the bounce. Never the reflecting pixel's own light, which lit far
+// rooms seen in mirrors with the light of the mirror's room; and not the volume where the bounce was traced, whose
+// probes in the open air around enclosed spaces (under gm_construct's deck) lit them in reflections.
+float3 LiveHitRadiance(HitSurface hit, float3 emission, inout uint seed)
 {
-    if (RadianceCacheEnabled()) {
+    float3 radiance = 0.0;
+    float3 throughput = 1.0;
+    [loop]
+    for (uint vertex = 0; vertex < 2; ++vertex) {
+        float3 origin = hit.position + hit.normal;
+        radiance += throughput * (hit.albedo * HitDirectIrradiance(hit, origin, vertex == 0 ? g_frame.sunShadowMask : g_frame.bounceMask, seed) + emission);
+        if (vertex == 1)
+            break;
+        throughput = hit.albedo * g_frame.indirectScale;
+        if (!RadianceCacheEnabled()) {
+            float3 volume = VolumeIrradiance(hit.position, hit.normal);
+            return radiance + throughput * (volume.x >= 0.0 ? volume : SkyLight(hit.normal));
+        }
         float3 direction = CosineSample(hit.normal, Random(seed), Random(seed));
         HitSurface next;
         HitInfo nextHit;
         float3 water;
         float3 waterLight;
         if (!TraceThroughWater(origin, direction, kMaxDistance, g_frame.bounceMask, g_frame.indirectRayFlags, seed, next, nextHit, water, waterLight))
-            return SkyLight(direction) * water + waterLight;
+            return radiance + throughput * (SkyLight(direction) * water + waterLight);
+        emission = BounceEmission(next, nextHit, false);
         float3 cached;
-        if (CachedRadiance(next, BounceEmission(next, nextHit, false), nextHit.t, nextHit.t, cached))
-            return cached * water + waterLight;
+        if (CachedRadiance(next, emission, nextHit.t, nextHit.t, cached))
+            return radiance + throughput * (cached * water + waterLight);
+        radiance += throughput * waterLight;
+        throughput *= water;
+        hit = next;
     }
-    float3 volume = VolumeIrradiance(hit.position, hit.normal);
-    return volume.x >= 0.0 ? volume : SkyLight(hit.normal);
+    return radiance;
 }
 
 // The angle one pixel of the view spans.
@@ -138,9 +156,8 @@ float3 SeenWater(float3 position, float3 direction, uint instance, uint primitiv
 
 // The light along a reflected ray. Its cone is `coneWidth` across at the origin and widens by `coneSpread` per unit of
 // length: where it is wide enough for the radiance cache's voxels the cache gives the hit's light; elsewhere the hit is
-// lit where it is by the sun and one local light, with HitIndirectIrradiance as its indirect light. With `seeWater`
-// the ray meets water surfaces (SeenWater). `hitAlbedo` is the textured albedo of the surface it meets (0 for the sky
-// and water).
+// lit where it is (LiveHitRadiance). With `seeWater` the ray meets water surfaces (SeenWater). `hitAlbedo` is the
+// textured albedo of the surface it meets (0 for the sky and water).
 float3 ReflectedRadiance(float3 origin, float3 direction, float coneWidth, float coneSpread, inout uint seed, out float hitDistance, out float3 hitAlbedo,
     bool seeWater = false)
 {
@@ -160,9 +177,7 @@ float3 ReflectedRadiance(float3 origin, float3 direction, float coneWidth, float
     float3 cached;
     if (CachedRadiance(hit, emission, hitDistance, coneWidth + coneSpread * hitDistance, cached))
         return ClampSample(cached);
-    float3 shadowOrigin = hit.position + hit.normal;
-    float3 irradiance = HitDirectIrradiance(hit, shadowOrigin, g_frame.sunShadowMask, seed) + HitIndirectIrradiance(hit, shadowOrigin, seed) * g_frame.indirectScale;
-    return ClampSample(hit.albedo * irradiance + emission);
+    return ClampSample(LiveHitRadiance(hit, emission, seed));
 }
 
 
