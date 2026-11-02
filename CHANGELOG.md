@@ -113,6 +113,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Ground seen through water and in reflections uses full-resolution textures and shows blended terrain (WorldVertexTransition) as the game draws it, such as sand under gm_construct's lake instead of blurry grass.
+- Shadows on the ground seen through water are sharp instead of blocky.
+- Your own feet no longer float under the water when you look down into it; you still show in reflections.
+- Water fades out towards the shore, so sand meets the water without a hard, dark line.
+- Trees in the 3D skybox no longer turn white in reflections.
 - Water seen from above no longer looks smeared: its reflections are sharp mirrors broken up by its ripples, and with DLSS Ray Reconstruction what lies under it keeps its detail.
 - Fixed water reflections being four times too bright, which washed water near the far shore out to white.
 - Underwater caustics fade out towards the edge of the area they cover instead of stopping at a sharp line.

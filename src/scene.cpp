@@ -30,9 +30,9 @@ struct Scene::InstanceRecord {
     uint32_t flags;
     uint32_t emitterLights;
     uint32_t waterBody;
-    uint32_t padding;
+    uint32_t blends;
 };
-static_assert(sizeof(GpuMaterial) == 64);
+static_assert(sizeof(GpuMaterial) == 80);
 
 // Mirrors AlphaTriangle in shaders/scene.hlsli: an alpha-tested or translucent triangle's ModelGeometry::alphaTriangles
 // entry with its texture coordinates, so a candidate's alpha test reads one record.
@@ -516,6 +516,7 @@ int Scene::AddModel(const ModelGeometry& geometry)
     const UINT triangles = static_cast<UINT>(geometry.indices.size() / 3);
     const UINT alphaTriangles = triangles - std::min(geometry.opaqueTriangles, triangles);
     const bool uvs = geometry.uvs.size() == geometry.positions.size();
+    const bool blends = uvs && geometry.blends.size() == geometry.positions.size();
     const bool materials = geometry.triangleMaterials.size() == triangles;
     if (triangles == 0 || geometry.triangleAlbedo.size() != triangles || geometry.alphaTriangles.size() != alphaTriangles || (alphaTriangles != 0 && !uvs))
         return -1;
@@ -530,6 +531,8 @@ int Scene::AddModel(const ModelGeometry& geometry)
     model.albedo = UploadToDefault(geometry.triangleAlbedo.data(), geometry.triangleAlbedo.size_bytes(), staging);
     if (uvs)
         model.uvs = UploadToDefault(geometry.uvs.data(), geometry.uvs.size_bytes(), staging);
+    if (blends)
+        model.blends = UploadToDefault(geometry.blends.data(), geometry.blends.size_bytes(), staging);
     if (alphaTriangles != 0) {
         std::vector<AlphaTriangle> records(alphaTriangles);
         for (UINT t = 0; t < alphaTriangles; ++t) {
@@ -545,7 +548,7 @@ int Scene::AddModel(const ModelGeometry& geometry)
         model.selfIllum = std::any_of(geometry.triangleMaterials.begin(), geometry.triangleMaterials.end(),
             [&](uint32_t material) { return material < m_selfIllumMaterials.size() && m_selfIllumMaterials[material]; });
     }
-    if (!model.positions || !model.indices || !model.albedo || (uvs && !model.uvs) || (alphaTriangles != 0 && !model.alpha) ||
+    if (!model.positions || !model.indices || !model.albedo || (uvs && !model.uvs) || (blends && !model.blends) || (alphaTriangles != 0 && !model.alpha) ||
         (materials && !model.materials)) {
         Abandon();
         return -1;
@@ -590,12 +593,15 @@ int Scene::AddModel(const ModelGeometry& geometry)
     model.albedoView = m_descriptors->CreateRawView(model.albedo.Get());
     if (uvs)
         model.uvsView = m_descriptors->CreateRawView(model.uvs.Get());
+    if (blends)
+        model.blendsView = m_descriptors->CreateRawView(model.blends.Get());
     if (alphaTriangles != 0)
         model.alphaView = m_descriptors->CreateRawView(model.alpha.Get());
     if (materials)
         model.materialsView = m_descriptors->CreateRawView(model.materials.Get());
     if (model.positionsView == DescriptorHeap::kInvalid || model.indicesView == DescriptorHeap::kInvalid || model.albedoView == DescriptorHeap::kInvalid ||
-        (uvs && model.uvsView == DescriptorHeap::kInvalid) || (alphaTriangles != 0 && model.alphaView == DescriptorHeap::kInvalid) ||
+        (uvs && model.uvsView == DescriptorHeap::kInvalid) || (blends && model.blendsView == DescriptorHeap::kInvalid) ||
+        (alphaTriangles != 0 && model.alphaView == DescriptorHeap::kInvalid) ||
         (materials && model.materialsView == DescriptorHeap::kInvalid)) {
         Abandon();
         ReleaseModel(model);
@@ -699,6 +705,7 @@ void Scene::ReleaseModel(Model& model)
     m_descriptors->Free(model.indicesView);
     m_descriptors->Free(model.albedoView);
     m_descriptors->Free(model.uvsView);
+    m_descriptors->Free(model.blendsView);
     m_descriptors->Free(model.alphaView);
     m_descriptors->Free(model.materialsView);
     model = {};
@@ -1426,7 +1433,8 @@ SceneFrame Scene::RecordFrame(ID3D12GraphicsCommandList4* list, UINT slot, std::
         record = {source.positionsView != DescriptorHeap::kInvalid ? source.positionsView : model.positionsView, model.indicesView, model.albedoView,
             model.uvsView, model.alphaView, model.opaqueTriangles, model.materialsView, source.previousPositionsView, {},
             source.flags | (model.selfIllum ? kInstanceSelfIllum : 0u) | (dynamicModel ? kInstanceModel : 0u) | (model.character ? kInstanceCharacter : 0u),
-            staticIndex && *staticIndex < m_emitterLightViews.size() ? m_emitterLightViews[*staticIndex] : DescriptorHeap::kInvalid, source.waterBody, 0};
+            staticIndex && *staticIndex < m_emitterLightViews.size() ? m_emitterLightViews[*staticIndex] : DescriptorHeap::kInvalid, source.waterBody,
+            model.blendsView};
         std::memcpy(record.previousTransform, source.previousKnown ? source.previousTransform : instance.Transform, sizeof(record.previousTransform));
         m_recorded.emplace_back(source.model, mask);
         ++written;

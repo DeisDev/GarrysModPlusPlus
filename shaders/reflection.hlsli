@@ -10,9 +10,9 @@ static const float kMaxDistance = 16384.0;
 static const float kSkyHitDistance = 65504.0;
 
 // What a ray that leaves the map sees: as the game draws the 3D skybox behind the map, the ray goes on from the matching
-// point of the skybox (as SunVisibility's do), lit by the sun and the sky and in the skybox's fog, and past it the 2D
-// sky.
-float3 BeyondMap(float3 origin, float3 direction)
+// point of the skybox (as SunVisibility's do), textured, lit by the sun and the sky and in the skybox's fog, and past it
+// the 2D sky. The ray's cone is `coneWidth` across at `origin` and widens by `coneSpread` per unit of length.
+float3 BeyondMap(float3 origin, float3 direction, float coneWidth, float coneSpread)
 {
     if (g_frame.worldToSky <= 0.0 || (g_frame.traceMask & kSkyboxMask) != 0)
         return SkyRadiance(direction);
@@ -22,6 +22,8 @@ float3 BeyondMap(float3 origin, float3 direction)
     if (!TraceClosest(skyOrigin, direction, kMaxDistance, kSkyboxMask, hit, hitInfo))
         return SkyRadiance(direction);
     float distance = length(hit.position - skyOrigin);
+    // Untextured, alpha-tested tree cards took their texture's average, grey from its clear texels, and shone white.
+    hit.albedo = TexturedAlbedo(hitInfo, hit.albedo, coneWidth * g_frame.worldToSky + coneSpread * distance);
     float3 irradiance = SunIrradiance(hit, hit.position + hit.normal * 0.25, kSkyboxMask) + SkyLight(hit.normal) * g_frame.indirectScale;
     float3 radiance = ClampSample(hit.albedo * irradiance + HitEmission(hit, hitInfo, distance));
     if (g_frame.skyboxFogEnabled == 0)
@@ -36,15 +38,17 @@ float3 BeyondMap(float3 origin, float3 direction)
 // cache's voxel, at the surface it meets lit by its own sun and local light. Without the cache the main view's indirect
 // light volume (else the sky's light) stands in for the bounce. Never the reflecting pixel's own light, which lit far
 // rooms seen in mirrors with the light of the mirror's room; and not the volume where the bounce was traced, whose
-// probes in the open air around enclosed spaces (under gm_construct's deck) lit them in reflections.
-float3 LiveHitRadiance(HitSurface hit, float3 emission, inout uint seed)
+// probes in the open air around enclosed spaces (under gm_construct's deck) lit them in reflections. `tracedSun` traces
+// the hit's own sunlight under water (HitSunVisibility).
+float3 LiveHitRadiance(HitSurface hit, float3 emission, inout uint seed, bool tracedSun)
 {
     float3 radiance = 0.0;
     float3 throughput = 1.0;
     [loop]
     for (uint vertex = 0; vertex < 2; ++vertex) {
         float3 origin = hit.position + hit.normal;
-        radiance += throughput * (hit.albedo * HitDirectIrradiance(hit, origin, vertex == 0 ? g_frame.sunShadowMask : g_frame.bounceMask, seed) + emission);
+        radiance += throughput * (hit.albedo * HitDirectIrradiance(hit, origin, vertex == 0 ? g_frame.sunShadowMask : g_frame.bounceMask, seed,
+            tracedSun && vertex == 0) + emission);
         if (vertex == 1)
             break;
         throughput = hit.albedo * g_frame.indirectScale;
@@ -86,7 +90,7 @@ float3 WaterRayRadiance(float3 origin, float3 direction, float coneWidth, uint s
     HitInfo hitInfo;
     if (!TraceClosest(origin, direction, kMaxDistance, g_frame.traceMask & ~kWaterMask, hit, hitInfo)) {
         distance = kSkyHitDistance;
-        return BeyondMap(origin, direction);
+        return BeyondMap(origin, direction, coneWidth, PixelAngle());
     }
     distance = hitInfo.t;
     hit.albedo = TexturedAlbedo(hitInfo, hit.albedo, coneWidth);
@@ -156,17 +160,17 @@ float3 SeenWater(float3 position, float3 direction, uint instance, uint primitiv
 
 // The light along a reflected ray. Its cone is `coneWidth` across at the origin and widens by `coneSpread` per unit of
 // length: where it is wide enough for the radiance cache's voxels the cache gives the hit's light; elsewhere the hit is
-// lit where it is (LiveHitRadiance). With `seeWater` the ray meets water surfaces (SeenWater). `hitAlbedo` is the
-// textured albedo of the surface it meets (0 for the sky and water).
-float3 ReflectedRadiance(float3 origin, float3 direction, float coneWidth, float coneSpread, inout uint seed, out float hitDistance, out float3 hitAlbedo,
-    bool seeWater = false)
+// lit where it is (LiveHitRadiance). `mask` is what the ray meets; with kWaterMask, water surfaces (SeenWater).
+// `hitAlbedo` is the textured albedo of the surface it meets (0 for the sky and water). `tracedSun` as LiveHitRadiance's.
+float3 ReflectedRadiance(float3 origin, float3 direction, float coneWidth, float coneSpread, uint mask, inout uint seed, out float hitDistance,
+    out float3 hitAlbedo, bool tracedSun = false)
 {
     HitSurface hit;
     HitInfo hitInfo;
     hitAlbedo = 0.0;
-    if (!TraceClosest(origin, direction, kMaxDistance, g_frame.traceMask | (seeWater ? kWaterMask : 0u), hit, hitInfo)) {
+    if (!TraceClosest(origin, direction, kMaxDistance, mask, hit, hitInfo)) {
         hitDistance = kSkyHitDistance;
-        return BeyondMap(origin, direction);
+        return BeyondMap(origin, direction, coneWidth, coneSpread);
     }
     hitDistance = hitInfo.t;
     if ((hit.flags & kInstanceWater) != 0)
@@ -177,7 +181,7 @@ float3 ReflectedRadiance(float3 origin, float3 direction, float coneWidth, float
     float3 cached;
     if (CachedRadiance(hit, emission, hitDistance, coneWidth + coneSpread * hitDistance, cached))
         return ClampSample(cached);
-    return ClampSample(LiveHitRadiance(hit, emission, seed));
+    return ClampSample(LiveHitRadiance(hit, emission, seed, tracedSun));
 }
 
 

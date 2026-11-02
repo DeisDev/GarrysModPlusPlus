@@ -107,6 +107,9 @@ struct Mesh {
     std::vector<Float3> positions;
     // Texture coordinates of each vertex.
     std::vector<Float2> uvs;
+    // Each vertex's blend towards a WorldVertexTransition material's $basetexture2: a displacement vertex's alpha / 255,
+    // as the engine gives it to the shader's vertex colour; 0 on other faces.
+    std::vector<float> blends;
     std::vector<uint32_t> indices;
     // Linear reflectivity of each triangle's texture as packed RGBA8.
     std::vector<uint32_t> triangleAlbedo;

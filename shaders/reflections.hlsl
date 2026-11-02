@@ -77,7 +77,8 @@ void main(uint3 id : SV_DispatchThreadID)
     } else {
         HitInfo hit;
         float uvPerUnit;
-        if (!VisibleHit(pixel, hit) || !HitMaterial(hit, material, uv, uvPerUnit))
+        float blend;
+        if (!VisibleHit(pixel, hit) || !HitMaterial(hit, material, uv, uvPerUnit, blend))
             return;
         // The pixel's size on the surface, from the neighbours on the side that stays on the same surface.
         float3 right = WorldPositionFromDepth(pixel + int2(1, 0), DepthAt(pixel + int2(1, 0))) - position;
@@ -102,7 +103,8 @@ void main(uint3 id : SV_DispatchThreadID)
     if (strength > 0.0) {
         float hitDistance;
         float3 hitAlbedo;
-        float3 reflected = ReflectedRadiance(origin, direction, coneWidth, PixelAngle() + lobe, seed, hitDistance, hitAlbedo, (g_frame.traceMask & kSkyboxMask) == 0);
+        uint mask = g_frame.traceMask | ((g_frame.traceMask & kSkyboxMask) == 0 ? kWaterMask : 0u);
+        float3 reflected = ReflectedRadiance(origin, direction, coneWidth, PixelAngle() + lobe, mask, seed, hitDistance, hitAlbedo);
         if (waterSurface) {
             output[pixel] = float4(reflected * strength * weight, hitDistance);
             WriteGuides(pixel, saturate(strength), 0.0, hitDistance);

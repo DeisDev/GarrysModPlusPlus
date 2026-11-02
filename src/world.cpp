@@ -52,6 +52,9 @@ constexpr bsp::Float3 kDefaultReflectivity = {0.5f, 0.5f, 0.5f};
 constexpr float kDefaultAlphaReference = 0.5f;
 // Alpha and mask textures are read from a mip no larger than this; shadows and reflections need no more detail.
 constexpr uint32_t kSceneTextureSize = 256;
+// Base textures and blend masks, which reflected and refracted hits show (TexturedAlbedo in shaders/scene.hlsli), are
+// read whole: through water up close, the 256-texel mip showed as blur and blocks beside the game's own texture.
+constexpr uint32_t kFullTextureSize = D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION;
 // Never PackAlpha values (they always have a texture view below 0xFFFFFF) nor PackTranslucent ones (bit 31 set).
 // 0xFFFFFFFF is PackTranslucent's untextured glass at full opacity (Refract without a tint texture).
 constexpr uint32_t kOpaqueTriangle = 0x00FFFFFF;
@@ -164,6 +167,8 @@ struct State {
     std::vector<SwayMaterial> swayMaterials;
     // Textures uploaded for alpha tests and material masks, by VTF path.
     std::unordered_map<std::string, SceneTexture> textures;
+    // Textures at full size (kFullTextureSize), by path.
+    std::unordered_map<std::string, UINT> fullTextures;
     std::vector<std::string> mapMaterials;
     // bsp::WorldGeometry::lightMaterials of the map.
     std::vector<bool> lightMaterials;
@@ -254,15 +259,12 @@ UINT AddSceneTexture(const studio::TextureImage& image)
     return g_state.scene.AddTexture(kFormats[static_cast<int>(image.format)], image.width, image.height, image.mips);
 }
 
-const SceneTexture& TextureFor(const std::string& vtfPath)
+SceneTexture LoadSceneTexture(const std::string& vtfPath, uint32_t maxSize)
 {
-    auto cached = g_state.textures.find(vtfPath);
-    if (cached != g_state.textures.end())
-        return cached->second;
-    SceneTexture& texture = g_state.textures[vtfPath];
+    SceneTexture texture;
     const std::vector<std::byte> file = ReadOptional(vtfPath);
     std::string error;
-    const std::optional<studio::TextureImage> image = studio::ReadTexture(file, kSceneTextureSize, error);
+    const std::optional<studio::TextureImage> image = studio::ReadTexture(file, maxSize, error);
     if (image) {
         texture.view = AddSceneTexture(*image);
         texture.alpha = image->alpha;
@@ -270,8 +272,25 @@ const SceneTexture& TextureFor(const std::string& vtfPath)
             error = "creating the texture failed";
     }
     if (texture.view == DescriptorHeap::kInvalid && ++g_state.modelErrors <= 10)
-        log::Info("Scene: texture '{}' unusable ({}); alpha tests and masks that need it are skipped", vtfPath, file.empty() ? "file not found" : error);
+        log::Info("Scene: texture '{}' unusable ({}); alpha tests, masks and reflected detail that need it are skipped", vtfPath,
+            file.empty() ? "file not found" : error);
     return texture;
+}
+
+const SceneTexture& TextureFor(const std::string& vtfPath)
+{
+    const auto [entry, added] = g_state.textures.try_emplace(vtfPath);
+    if (added)
+        entry->second = LoadSceneTexture(vtfPath, kSceneTextureSize);
+    return entry->second;
+}
+
+UINT FullTextureFor(const std::string& vtfPath)
+{
+    const auto [entry, added] = g_state.fullTextures.try_emplace(vtfPath, DescriptorHeap::kInvalid);
+    if (added)
+        entry->second = LoadSceneTexture(vtfPath, kFullTextureSize).view;
+    return entry->second;
 }
 
 // A VMT colour: "[r g b]" in 0-1 or "{r g b}" in 0-255; one number sets all three.
@@ -431,7 +450,7 @@ uint32_t SceneMaterial(std::string_view vmt, std::string_view shader, const std:
     const std::optional<std::string> envmap = studio::MaterialValue(vmt, "$envmap");
     const bool reflective = envmap && !envmap->empty();
     const bool selfIllum = enabled("$selfillum");
-    const UINT baseView = baseTexture.empty() ? DescriptorHeap::kInvalid : TextureFor(baseTexture).view;
+    const UINT baseView = baseTexture.empty() ? DescriptorHeap::kInvalid : FullTextureFor(baseTexture);
     if (!reflective && !selfIllum && !unlit && baseView == DescriptorHeap::kInvalid)
         return Scene::kNoMaterial;
     auto mask = [](const std::string& texture, uint32_t channel, bool invert) {
@@ -442,6 +461,14 @@ uint32_t SceneMaterial(std::string_view vmt, std::string_view shader, const std:
     material.flags = unlit ? Scene::kMaterialUnlit : 0u;
     material.baseTexture = baseView;
     material.reflectivity = 0.2126f * reflectivity.x + 0.7152f * reflectivity.y + 0.0722f * reflectivity.z;
+    material.baseTexture2 = DescriptorHeap::kInvalid;
+    material.blendModulate = DescriptorHeap::kInvalid;
+    if (shader == "worldvertextransition" && baseView != DescriptorHeap::kInvalid) {
+        const std::string baseTexture2 = studio::MaterialTexture(vmt, "$basetexture2");
+        const std::string blendModulate = studio::MaterialTexture(vmt, "$blendmodulatetexture");
+        material.baseTexture2 = baseTexture2.empty() ? DescriptorHeap::kInvalid : FullTextureFor(baseTexture2);
+        material.blendModulate = blendModulate.empty() ? DescriptorHeap::kInvalid : FullTextureFor(blendModulate);
+    }
     material.envmapMask = Scene::kMaskOff;
     if (reflective) {
         const std::string envmapMask = studio::MaterialTexture(vmt, "$envmapmask");
@@ -879,7 +906,7 @@ ModelGeometry PrepareMesh(bsp::Mesh& mesh, TriangleData& triangles)
         }
     }
     return {mesh.positions, mesh.indices, mesh.triangleAlbedo, triangles.opaqueTriangles, mesh.uvs, triangles.alphaTriangles, triangles.alphaTints,
-        triangles.materials};
+        triangles.materials, mesh.blends};
 }
 
 uint32_t PackAlbedo(const bsp::Float3& c)
@@ -1312,6 +1339,7 @@ void ClearScene()
     g_state.skyboxTest = {};
     g_state.mapMaterials.clear();
     g_state.textures.clear();
+    g_state.fullTextures.clear();
     // Scene material indices and texture views are reset with the scene.
     g_state.materials.clear();
     g_state.sceneMaterials.clear();

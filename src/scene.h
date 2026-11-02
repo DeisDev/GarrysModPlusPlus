@@ -126,6 +126,8 @@ struct ModelGeometry {
     std::span<const uint32_t> alphaTints;
     // Each triangle's Scene::AddMaterial index, or Scene::kNoMaterial; empty when the model has none.
     std::span<const uint32_t> triangleMaterials;
+    // Each vertex's blend towards its material's second base texture (bsp::Mesh::blends); empty when the model has none.
+    std::span<const float> blends;
 };
 
 // What shaders need of a surface's material beyond its albedo (Material in shaders/scene.hlsli). A mask is
@@ -150,6 +152,11 @@ struct GpuMaterial {
     // shaders/scene.hlsli).
     uint32_t baseTexture;
     float reflectivity;
+    // WorldVertexTransition's $basetexture2 and $blendmodulatetexture (DescriptorHeap::kInvalid for none), which
+    // TexturedAlbedo blends by the vertices' blends as the game does.
+    uint32_t baseTexture2;
+    uint32_t blendModulate;
+    uint32_t padding[2];
 };
 
 struct SceneInstance {
@@ -394,6 +401,7 @@ private:
         Microsoft::WRL::ComPtr<ID3D12Resource> indices;
         Microsoft::WRL::ComPtr<ID3D12Resource> albedo;
         Microsoft::WRL::ComPtr<ID3D12Resource> uvs;
+        Microsoft::WRL::ComPtr<ID3D12Resource> blends;
         Microsoft::WRL::ComPtr<ID3D12Resource> alpha;
         Microsoft::WRL::ComPtr<ID3D12Resource> materials;
         Microsoft::WRL::ComPtr<ID3D12Resource> micromaps;
@@ -405,6 +413,7 @@ private:
         UINT indicesView = DescriptorHeap::kInvalid;
         UINT albedoView = DescriptorHeap::kInvalid;
         UINT uvsView = DescriptorHeap::kInvalid;
+        UINT blendsView = DescriptorHeap::kInvalid;
         UINT alphaView = DescriptorHeap::kInvalid;
         UINT materialsView = DescriptorHeap::kInvalid;
         UINT vertexCount = 0;

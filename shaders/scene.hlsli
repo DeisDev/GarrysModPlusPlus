@@ -36,7 +36,8 @@ struct InstanceRecord
     uint emitterLights;
     // Brush entity water's body of water (WaterBodyOfTriangle), kNoView for other instances.
     uint waterBody;
-    uint padding;
+    // Each vertex's blend towards its material's second base texture (ModelGeometry::blends), or kNoView.
+    uint blends;
 };
 
 // kInstanceIgnoreNormals, kInstanceSelfIllum and kInstanceModel in src/scene.h.
@@ -423,7 +424,11 @@ struct Material
     float envmapLightRange;
     uint baseTexture;
     float reflectivity;
+    uint baseTexture2;
+    uint blendModulate;
+    uint2 padding;
 };
+static const uint kMaterialStride = 80;
 
 static const uint kNoMaterial = 0xFFFFFFFFu;
 // Material flags (Scene::kMaterialUnlit): the surface shows its albedo as it is. Scene::kMaterialLightTexture: a face
@@ -442,7 +447,7 @@ uint MaterialFlags(HitInfo hit)
     if (index == kNoMaterial)
         return 0;
     ByteAddressBuffer table = ResourceDescriptorHeap[g_frame.materialsView];
-    return table.Load(index * 64 + 40);
+    return table.Load(index * kMaterialStride + 40);
 }
 
 // The triangle a G-buffer pixel shows, from shaders/primary.hlsl; false where none matches.
@@ -461,12 +466,13 @@ bool VisibleHit(int2 pixel, out HitInfo hit)
 static const uint kMaskOff = 0xFFFFFFFFu;
 
 // A hit triangle's material, or false when its model has none. `uvPerUnit` is how far its texture coordinates
-// move per world unit, for choosing mip levels.
-bool HitMaterial(HitInfo hit, out Material material, out float2 uv, out float uvPerUnit)
+// move per world unit, for choosing mip levels; `blend` its vertices' blend towards a second base texture there.
+bool HitMaterial(HitInfo hit, out Material material, out float2 uv, out float uvPerUnit, out float blend)
 {
     material = (Material)0;
     uv = 0.0;
     uvPerUnit = 0.0;
+    blend = 0.0;
     InstanceRecord record = LoadInstance(hit.instance);
     if (record.materials == kNoView)
         return false;
@@ -475,7 +481,7 @@ bool HitMaterial(HitInfo hit, out Material material, out float2 uv, out float uv
     if (index == kNoMaterial)
         return false;
     ByteAddressBuffer table = ResourceDescriptorHeap[g_frame.materialsView];
-    material = table.Load<Material>(index * 64);
+    material = table.Load<Material>(index * kMaterialStride);
     if (record.uvs != kNoView) {
         ByteAddressBuffer indices = ResourceDescriptorHeap[NonUniformResourceIndex(record.indices)];
         ByteAddressBuffer uvs = ResourceDescriptorHeap[NonUniformResourceIndex(record.uvs)];
@@ -488,30 +494,51 @@ bool HitMaterial(HitInfo hit, out Material material, out float2 uv, out float uv
         float3 p0 = positions.Load<float3>(vertex.x * 12);
         float worldArea = length(cross(positions.Load<float3>(vertex.y * 12) - p0, positions.Load<float3>(vertex.z * 12) - p0));
         uvPerUnit = sqrt(abs(uv1.x * uv2.y - uv1.y * uv2.x) / max(worldArea, 1e-6));
+        if (record.blends != kNoView && material.baseTexture2 != kNoView) {
+            ByteAddressBuffer blends = ResourceDescriptorHeap[NonUniformResourceIndex(record.blends)];
+            float3 corners = float3(asfloat(blends.Load(vertex.x * 4)), asfloat(blends.Load(vertex.y * 4)), asfloat(blends.Load(vertex.z * 4)));
+            blend = dot(corners, float3(1.0 - hit.barycentrics.x - hit.barycentrics.y, hit.barycentrics));
+        }
     }
     return true;
 }
 
-// A Scene::PackMask value at a texture coordinate; `footprint` is how many texture coordinates a pixel spans.
+// A texture's texel at a texture coordinate, from the mip where a texel spans `footprint` texture coordinates.
+float4 SampleFootprint(uint view, float2 uv, float footprint)
+{
+    Texture2D<float4> texture = ResourceDescriptorHeap[NonUniformResourceIndex(view)];
+    uint width, height, levels;
+    texture.GetDimensions(0, width, height, levels);
+    return texture.SampleLevel(g_linearWrap, uv, log2(max(footprint * max(width, height), 1e-6)));
+}
+
 // A hit's colour with its base texture's detail, where its material has one: the texture's linear colour at the hit,
 // scaled by how the triangle's albedo (its texture's average, with the material's and lighting's tints) compares with
 // the texture's average. `coneWidth` is the ray's width there, for the mip. Reflections and refractions show the scene's
-// textures; light gathered from the hit (indirect bounces) keeps the triangle's average.
+// textures; light gathered from the hit (indirect bounces) keeps the triangle's average. WorldVertexTransition blends
+// towards $basetexture2 as the game does (lightmappedgeneric_ps2_3_x.h): by the vertices' blend, which
+// $blendmodulatetexture narrows to a smoothstep around its green channel, its red channel wide.
 float3 TexturedAlbedo(HitInfo hit, float3 albedo, float coneWidth)
 {
     Material material;
     float2 uv;
     float uvPerUnit;
-    if (!HitMaterial(hit, material, uv, uvPerUnit) || material.baseTexture == kNoView || uvPerUnit <= 0.0 || material.reflectivity <= 0.0)
+    float blend;
+    if (!HitMaterial(hit, material, uv, uvPerUnit, blend) || material.baseTexture == kNoView || uvPerUnit <= 0.0 || material.reflectivity <= 0.0)
         return albedo;
-    Texture2D<float4> texture = ResourceDescriptorHeap[NonUniformResourceIndex(material.baseTexture)];
-    uint width, height, levels;
-    texture.GetDimensions(0, width, height, levels);
-    float lod = log2(max(coneWidth * uvPerUnit * max(width, height), 1e-6));
-    float3 texel = SrgbToLinear(saturate(texture.SampleLevel(g_linearWrap, uv, lod).rgb));
+    float footprint = coneWidth * uvPerUnit;
+    float3 texel = SrgbToLinear(saturate(SampleFootprint(material.baseTexture, uv, footprint).rgb));
+    if (material.baseTexture2 != kNoView) {
+        if (material.blendModulate != kNoView) {
+            float2 modulate = SampleFootprint(material.blendModulate, uv, footprint).rg;
+            blend = smoothstep(saturate(modulate.g - modulate.r), saturate(modulate.g + modulate.r), blend);
+        }
+        texel = lerp(texel, SrgbToLinear(saturate(SampleFootprint(material.baseTexture2, uv, footprint).rgb)), blend);
+    }
     return saturate(texel * (Luminance(albedo) / material.reflectivity));
 }
 
+// A Scene::PackMask value at a texture coordinate; `footprint` is how many texture coordinates a pixel spans.
 float MaskValue(uint mask, float2 uv, float footprint)
 {
     if (mask == kMaskOff)
@@ -519,11 +546,7 @@ float MaskValue(uint mask, float2 uv, float footprint)
     uint view = mask & 0xFFFFFF;
     if (view == 0xFFFFFF)
         return 1.0;
-    Texture2D<float4> texture = ResourceDescriptorHeap[NonUniformResourceIndex(view)];
-    uint width, height, levels;
-    texture.GetDimensions(0, width, height, levels);
-    float lod = log2(max(footprint * max(width, height), 1e-6));
-    float value = texture.SampleLevel(g_linearWrap, uv, lod)[(mask >> 24) & 3];
+    float value = SampleFootprint(view, uv, footprint)[(mask >> 24) & 3];
     return (mask & (1u << 26)) != 0 ? 1.0 - value : value;
 }
 
@@ -541,7 +564,8 @@ float3 HitEmission(HitSurface surface, HitInfo hit, float distance, bool lightin
     Material material;
     float2 uv;
     float uvPerUnit;
-    if (!HitMaterial(hit, material, uv, uvPerUnit) || material.selfIllumMask == kMaskOff || (lighting && (material.flags & kMaterialLightTexture) != 0))
+    float blend;
+    if (!HitMaterial(hit, material, uv, uvPerUnit, blend) || material.selfIllumMask == kMaskOff || (lighting && (material.flags & kMaterialLightTexture) != 0))
         return 0.0;
     return material.selfIllumTint * surface.albedo * MaskValue(material.selfIllumMask, uv, uvPerUnit * max(distance, 1.0) * kHitMaskFootprint);
 }
@@ -786,10 +810,11 @@ float3 SunVisibility(float3 origin, uint mask, uint rayFlags = RAY_FLAG_NONE)
 
 // SunVisibilityFrom for the sunlight on secondary hits (indirect rays, reflections, probes): under water the water's sun
 // map (WaterSunAt) stands in for the bent shadow rays where it covers the point. Hits on the lake floor traced both
-// legs for every indirect sample, which made the viewmodel's run over water several ms slower.
-float3 HitSunVisibility(float3 origin, uint water, uint mask)
+// legs for every indirect sample, which made the viewmodel's run over water several ms slower. Hits the eye sees through
+// a water surface (`traced`) trace them: the sun map's 2-unit cells showed as steps in their shadows.
+float3 HitSunVisibility(float3 origin, uint water, uint mask, bool traced)
 {
-    if (water != kNoWater && g_frame.sunDirection.z > 0.0) {
+    if (!traced && water != kNoWater && g_frame.sunDirection.z > 0.0) {
         float3 up = RefractedSunDirection(g_frame.sunDirection);
         float length = max(LoadWaterBody(water).surfaceZ - origin.z, 0.0) / up.z;
         float3 light;
@@ -880,8 +905,9 @@ float3 SunVisibilityToNearest(float3 origin, float3 direction, uint mask, uint r
 }
 
 // Sunlight reaching a hit surface, with its shadow ray starting at `origin`, off the side the ray came from. Leaves
-// (kInstanceIgnoreNormals) also take the sunlight that comes through from their other side, evenly scattered.
-float3 SunIrradiance(HitSurface hit, float3 origin, uint mask)
+// (kInstanceIgnoreNormals) also take the sunlight that comes through from their other side, evenly scattered. `traced`
+// as for HitSunVisibility.
+float3 SunIrradiance(HitSurface hit, float3 origin, uint mask, bool traced = false)
 {
     if (g_frame.sunEnabled == 0.0)
         return 0.0;
@@ -892,7 +918,7 @@ float3 SunIrradiance(HitSurface hit, float3 origin, uint mask)
         return g_frame.sunColor * (kLeafTransmission * -cosine) * SunVisibility(2.0 * hit.position - origin, mask);
     if (cosine <= 0.0)
         return 0.0;
-    return g_frame.sunColor * (cosine * (leaf ? 1.0 - kLeafTransmission : 1.0)) * HitSunVisibility(origin, water, mask);
+    return g_frame.sunColor * (cosine * (leaf ? 1.0 - kLeafTransmission : 1.0)) * HitSunVisibility(origin, water, mask, traced);
 }
 
 // Map lights that can reach a position (Scene::LightLists): the (offset, count) range of the light indices its light
@@ -1651,10 +1677,10 @@ bool SampleLight(LightSet set, float3 position, float3 normal, inout uint seed, 
 }
 
 // Direct light at a hit off screen: the sun, with its shadow ray under `sunMask`, and the local lights, all from
-// `origin` off the hit's surface.
-float3 HitDirectIrradiance(HitSurface hit, float3 origin, uint sunMask, inout uint seed)
+// `origin` off the hit's surface. `tracedSun` as SunIrradiance's `traced`.
+float3 HitDirectIrradiance(HitSurface hit, float3 origin, uint sunMask, inout uint seed, bool tracedSun = false)
 {
-    float3 irradiance = SunIrradiance(hit, origin, sunMask);
+    float3 irradiance = SunIrradiance(hit, origin, sunMask, tracedSun);
     LightSet set = LightSetAt(hit.position);
     // Projected lights (the flashlight) are few and bright, and each is traced: picked as one light among a cell's many,
     // their rare, heavily weighted samples were clamped (ClampSample), and the flashlight barely lit the floor under
