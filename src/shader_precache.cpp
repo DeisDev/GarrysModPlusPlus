@@ -11,19 +11,27 @@
 #include <d3d9types.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <cctype>
 #include <condition_variable>
 #include <deque>
 #include <format>
 #include <fstream>
+#include <functional>
+#include <iterator>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <set>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <tuple>
+#include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 namespace gmodpp::shader_precache {
 
@@ -154,15 +162,18 @@ void Run(const Request& request)
             translator::Variant variant;
             const bool vertex = !combo.bytecode.empty() && (combo.bytecode[0] & 0xFFFF0000u) == 0xFFFE0000u;
             if (vertex) {
+                variant.clipPlanes = request.clipPlanes & 7u;
                 Ensure(combo.bytecode, variant, request.name);
                 // The compressed variant depends on the inputs the translation lists; translating without compiling is
                 // cheap.
                 translator::Translation base;
                 if (translator::Translate(combo.bytecode, variant, base, error)) {
-                    if (const std::optional<translator::Variant> compressed = CompressedVariant(base))
+                    if (std::optional<translator::Variant> compressed = CompressedVariant(base)) {
+                        compressed->clipPlanes = variant.clipPlanes;
                         Ensure(combo.bytecode, *compressed, request.name);
+                    }
                 }
-            } else {
+            } else if (request.clipPlanes == 0) {
                 variant.alphaTest = request.alphaTest;
                 Ensure(combo.bytecode, variant, request.name);
                 // DrawPass clears the coverage only with a single colour output, which the translation lists.
@@ -175,7 +186,7 @@ void Run(const Request& request)
             }
         }
         for (const bool forward : { false, true }) {
-            if (!(forward ? request.forwardTwin : request.gbufferTwin))
+            if (!(forward ? request.forwardTwin : request.gbufferTwin) || request.clipPlanes != 0)
                 continue;
             const int dynamicIndex = static_cast<int>(combo.dynamicCombo);
             const std::span<const DWORD> twin = forward ? twins::ForwardShader(request.name, header, request.staticIndex, dynamicIndex)
@@ -192,25 +203,43 @@ void Run(const Request& request)
     }
 }
 
+// A request's identity: the same pass of the same file is compiled once, whichever buffer holds the file (a map's
+// materials read it through the game's filesystem, StartReplay from the VPK).
+using RequestId = std::tuple<std::string, std::int32_t, std::uint8_t, std::uint8_t, bool, bool, bool, bool>;
+
+RequestId IdOf(const Request& request)
+{
+    std::string name = request.name;
+    std::ranges::transform(name, name.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return { std::move(name), request.staticIndex, request.clipPlanes, request.alphaTest, request.gbufferTwin, request.forwardTwin, request.clearCoverage,
+        request.opacityMicromaps };
+}
+
 // Requests run on worker threads below normal priority, one fewer than the logical cores so the game's main thread keeps
-// one. The pool lives as long as the process; its threads are detached, as the process ends them at exit.
+// one, taking the most urgent priority first. The pool lives as long as the process; its threads are detached, as the
+// process ends them at exit.
 class Pool {
 public:
-    // `counted` requests are waited for by the loading screen (Status).
-    void Enqueue(const Request& request, bool counted)
+    void Enqueue(const Request& request, Priority priority)
     {
         {
             std::scoped_lock lock(m_mutex);
-            const auto id = std::tuple(static_cast<const void*>(request.file.data()), request.staticIndex, request.alphaTest, request.gbufferTwin,
-                request.forwardTwin, request.clearCoverage, request.opacityMicromaps);
-            if (!m_seen.insert(id).second)
+            RequestId id = IdOf(request);
+            if (m_started.contains(id))
                 return;
-            m_queue.push_back({ request, counted });
-            m_total += counted ? 1 : 0;
-            if (!m_started) {
-                m_started = true;
+            // A request still waiting at a lower priority is queued again at this one; the first copy taken runs.
+            const auto queued = m_queuedAt.find(id);
+            if (queued != m_queuedAt.end() && queued->second <= priority)
+                return;
+            m_queuedAt[id] = priority;
+            const size_t p = static_cast<size_t>(priority);
+            m_queues[p].push_back({ request, std::move(id) });
+            ++m_total[p];
+            if (!m_running) {
+                m_running = true;
                 PinThisModule();
                 const unsigned threads = std::max(2u, std::thread::hardware_concurrency()) - 1;
+                m_backgroundLimit = std::max(1u, threads / 2);
                 for (unsigned i = 0; i < threads; ++i)
                     std::thread([this] { Work(); }).detach();
                 log::Info("Shaders: compiling the shaders of materials on {} threads", threads);
@@ -219,42 +248,93 @@ public:
         m_ready.notify_one();
     }
 
-    Progress Status()
+    Progress Status(Priority priority)
     {
         std::scoped_lock lock(m_mutex);
-        return { m_done, m_total };
+        const size_t p = static_cast<size_t>(priority);
+        return { m_done[p], m_total[p] };
+    }
+
+    // Calls `callback` on a worker once every Background request queued so far has finished; returns true instead when
+    // they all have already.
+    bool OnBackgroundDone(std::function<void()> callback)
+    {
+        std::scoped_lock lock(m_mutex);
+        const size_t p = static_cast<size_t>(Priority::Background);
+        if (m_done[p] == m_total[p])
+            return true;
+        m_backgroundDone = std::move(callback);
+        return false;
     }
 
 private:
+    struct Queued {
+        Request request;
+        RequestId id;
+    };
+
     void Work()
     {
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
         for (;;) {
             Queued queued;
+            size_t p = 0;
+            bool run = false;
             {
                 std::unique_lock lock(m_mutex);
-                m_ready.wait(lock, [&] { return !m_queue.empty(); });
-                queued = m_queue.front();
-                m_queue.pop_front();
+                m_ready.wait(lock, [&] { return Takeable() < m_queues.size(); });
+                p = Takeable();
+                if (p == static_cast<size_t>(Priority::Background))
+                    ++m_backgroundRunning;
+                queued = std::move(m_queues[p].front());
+                m_queues[p].pop_front();
+                // A copy queued again at a more urgent priority may have run already.
+                run = m_started.insert(queued.id).second;
+                if (run)
+                    m_queuedAt.erase(queued.id);
             }
-            Run(queued.request);
-            std::scoped_lock lock(m_mutex);
-            m_done += queued.counted ? 1 : 0;
+            const bool background = p == static_cast<size_t>(Priority::Background);
+            // Background requests keep the workers' priority: a draw may wait in Build for a shader one compiles.
+            if (run)
+                Run(queued.request);
+            std::function<void()> callback;
+            {
+                std::scoped_lock lock(m_mutex);
+                ++m_done[p];
+                if (background) {
+                    --m_backgroundRunning;
+                    m_ready.notify_one();
+                }
+                if (background && m_done[p] == m_total[p])
+                    callback = std::exchange(m_backgroundDone, nullptr);
+            }
+            if (callback)
+                callback();
         }
     }
 
-    struct Queued {
-        Request request;
-        bool counted = true;
-    };
-
     std::mutex m_mutex;
     std::condition_variable m_ready;
-    std::deque<Queued> m_queue;
-    std::set<std::tuple<const void*, std::int32_t, std::uint8_t, bool, bool, bool, bool>> m_seen;
-    std::size_t m_total = 0;
-    std::size_t m_done = 0;
-    bool m_started = false;
+    std::array<std::deque<Queued>, static_cast<size_t>(Priority::Count)> m_queues;
+    std::map<RequestId, Priority> m_queuedAt;
+    std::set<RequestId> m_started;
+    std::array<std::size_t, static_cast<size_t>(Priority::Count)> m_total = {};
+    std::array<std::size_t, static_cast<size_t>(Priority::Count)> m_done = {};
+    std::function<void()> m_backgroundDone;
+    // Background requests run on at most half the workers, so a map's requests and the game keep the rest.
+    unsigned m_backgroundLimit = 1;
+    unsigned m_backgroundRunning = 0;
+    bool m_running = false;
+
+    // The most urgent queue a worker may take from, or the queue count when none. Under m_mutex.
+    size_t Takeable() const
+    {
+        for (size_t p = 0; p < m_queues.size(); ++p) {
+            if (!m_queues[p].empty() && (p != static_cast<size_t>(Priority::Background) || m_backgroundRunning < m_backgroundLimit))
+                return p;
+        }
+        return m_queues.size();
+    }
 };
 
 Pool& ThePool()
@@ -304,31 +384,303 @@ bool Build(std::span<const DWORD> code, const translator::Variant& variant, cons
 
 namespace {
 
-void EnqueueRequest(const Request& request, bool counted)
+std::uint64_t Fnv(const void* data, size_t size, std::uint64_t hash = 14695981039346656037ull)
 {
-    if (request.name == nullptr || request.directory == nullptr || request.file.empty() || request.staticIndex < 0)
-        return;
+    const auto* bytes = static_cast<const std::uint8_t*>(data);
+    for (size_t i = 0; i < size; ++i) {
+        hash ^= bytes[i];
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
+
+template <class T>
+std::uint64_t FnvValue(const T& value, std::uint64_t hash)
+{
+    return Fnv(&value, sizeof(value), hash);
+}
+
+constexpr std::string_view kRememberedHeader = "gmodpp-precache 1";
+
+// A remembered request's flags (RememberedRequests).
+std::uint32_t FlagsOf(const Request& request)
+{
+    return request.alphaTest | (request.vertex ? 1u << 8 : 0u) | (static_cast<std::uint32_t>(request.clipPlanes & 7u) << 9)
+        | (request.gbufferTwin ? 1u << 12 : 0u) | (request.forwardTwin ? 1u << 13 : 0u) | (request.clearCoverage ? 1u << 14 : 0u)
+        | (request.opacityMicromaps ? 1u << 15 : 0u);
+}
+
+void ApplyFlags(std::uint32_t flags, Request& request)
+{
+    request.alphaTest = static_cast<std::uint8_t>(flags & 0xffu);
+    request.vertex = (flags & 1u << 8) != 0;
+    request.clipPlanes = static_cast<std::uint8_t>(flags >> 9 & 7u);
+    request.gbufferTwin = (flags & 1u << 12) != 0;
+    request.forwardTwin = (flags & 1u << 13) != 0;
+    request.clearCoverage = (flags & 1u << 14) != 0;
+    request.opacityMicromaps = (flags & 1u << 15) != 0;
+}
+
+// The requests of every session so far, in gmodplusplus\cache\precache.txt: a header line with the generation
+// (ReplayGeneration) they were last all compiled for, then a line per request with its file, static index and flags.
+// Thread-safe.
+class RememberedRequests {
+public:
+    struct Line {
+        std::string name;
+        std::int32_t staticIndex = 0;
+        std::uint32_t flags = 0;
+    };
+
+    void Add(const Request& request)
+    {
+        std::string name = std::get<0>(IdOf(request));
+        std::string line = std::format("{} {} {:x}", name, request.staticIndex, FlagsOf(request));
+        std::scoped_lock lock(m_mutex);
+        Load();
+        if (!m_known.insert(line).second)
+            return;
+        m_lines.push_back({ std::move(name), request.staticIndex, FlagsOf(request) });
+        if (!m_append.is_open())
+            Rewrite();
+        else if (m_append << line << '\n'; ++m_unflushed >= 256)
+            FlushLocked();
+    }
+
+    // Writes out the lines added since the last flush.
+    void Flush()
+    {
+        std::scoped_lock lock(m_mutex);
+        FlushLocked();
+    }
+
+    std::vector<Line> Lines(std::uint64_t& generation)
+    {
+        std::scoped_lock lock(m_mutex);
+        Load();
+        generation = m_generation;
+        return m_lines;
+    }
+
+    void MarkCompiled(std::uint64_t generation)
+    {
+        std::scoped_lock lock(m_mutex);
+        Load();
+        if (m_generation == generation && m_append.is_open())
+            return;
+        m_generation = generation;
+        Rewrite();
+    }
+
+private:
+    static std::filesystem::path Path() { return ModDirectory() / L"cache" / L"precache.txt"; }
+
+    // Under m_mutex.
+    void FlushLocked()
+    {
+        if (m_append.is_open())
+            m_append.flush();
+        m_unflushed = 0;
+    }
+
+    // Under m_mutex.
+    void Load()
+    {
+        if (std::exchange(m_loaded, true))
+            return;
+        std::ifstream read(Path(), std::ios::binary);
+        const std::string contents((std::istreambuf_iterator<char>(read)), std::istreambuf_iterator<char>());
+        std::istringstream file(contents);
+        std::string header;
+        if (!std::getline(file, header) || !header.starts_with(kRememberedHeader))
+            return;
+        std::istringstream(header.substr(kRememberedHeader.size())) >> std::hex >> m_generation;
+        for (std::string text; std::getline(file, text);) {
+            Line line;
+            std::istringstream fields(text);
+            if (!(fields >> line.name >> std::dec >> line.staticIndex >> std::hex >> line.flags) || line.staticIndex < 0 || !m_known.insert(text).second)
+                continue;
+            m_lines.push_back(std::move(line));
+        }
+        // A file cut off in a line is written again whole by the next Add, rather than appended to.
+        if (contents.ends_with('\n'))
+            m_append.open(Path(), std::ios::app);
+    }
+
+    // Writes the file again (beside it, renamed into place) and opens it for appending. Under m_mutex.
+    void Rewrite()
+    {
+        m_append.close();
+        std::error_code error;
+        std::filesystem::create_directories(Path().parent_path(), error);
+        std::filesystem::path temporary = Path();
+        temporary += L".tmp";
+        {
+            std::ofstream file(temporary, std::ios::trunc);
+            file << kRememberedHeader << ' ' << std::format("{:016x}", m_generation) << '\n';
+            for (const Line& line : m_lines)
+                file << std::format("{} {} {:x}", line.name, line.staticIndex, line.flags) << '\n';
+            if (!file) {
+                log::Info("Shaders: writing {} failed", temporary.string());
+                return;
+            }
+        }
+        std::filesystem::rename(temporary, Path(), error);
+        if (error) {
+            log::Info("Shaders: replacing {} failed: {}", Path().string(), error.message());
+            std::filesystem::remove(temporary, error);
+            return;
+        }
+        m_append.open(Path(), std::ios::app);
+    }
+
+    std::mutex m_mutex;
+    bool m_loaded = false;
+    std::uint64_t m_generation = 0;
+    std::vector<Line> m_lines;
+    std::unordered_set<std::string> m_known;
+    std::ofstream m_append;
+    size_t m_unflushed = 0;
+};
+
+RememberedRequests& Remembered()
+{
+    static RememberedRequests* remembered = new RememberedRequests;
+    return *remembered;
+}
+
+// What the remembered requests compile to: a new shader cache (its stamp), translator, lighting headers, twins or
+// game shaders (the VPK holding them) each change it.
+std::uint64_t ReplayGeneration(const std::filesystem::path& vpk)
+{
+    std::uint64_t hash = FnvValue(shader_cache::kTranslatorVersion, 14695981039346656037ull);
+    hash = FnvValue(shader_cache::Stamp(), hash);
+    hash = FnvValue(shader_cache::LightingHeadersHash(), hash);
+    hash = FnvValue(twins::SourceHash(), hash);
+    std::error_code error;
+    const auto written = std::filesystem::last_write_time(vpk, error);
+    hash = FnvValue(error ? 0 : written.time_since_epoch().count(), hash);
+    hash = FnvValue(error ? 0 : std::filesystem::file_size(vpk, error), hash);
+    return hash;
+}
+
+bool Writable()
+{
     // Without a cache file what workers compile would be lost, and draws would compile it again.
     static const bool writable = shader_cache::Writable();
-    if (!writable)
+    return writable;
+}
+
+void EnqueueRequest(const Request& request, Priority priority)
+{
+    if (request.name == nullptr || request.directory == nullptr || request.file.empty() || request.staticIndex < 0 || !Writable())
         return;
-    ThePool().Enqueue(request, counted);
+    ThePool().Enqueue(request, priority);
 }
+
+// A shader file read by StartReplay or EnqueueEveryShader. Requests point into these for the life of the process.
+struct LoadedFile {
+    std::string name;
+    std::vector<std::uint8_t> bytes;
+    vcs::Directory directory;
+};
 
 }
 
-void Enqueue(const Request& request) { EnqueueRequest(request, true); }
+void Enqueue(const Request& request)
+{
+    if (request.name == nullptr || request.directory == nullptr || request.file.empty() || request.staticIndex < 0 || !Writable())
+        return;
+    EnqueueRequest(request, Priority::Map);
+    Remembered().Add(request);
+    if (request.vertex && request.clipPlanes == 0) {
+        // The game clips the views of water's reflection and refraction with one user clip plane (UseFastClipping is
+        // false), and every vertex shader drawn in them takes that variant.
+        Request clipped = request;
+        clipped.clipPlanes = 1;
+        EnqueueRequest(clipped, Priority::Water);
+        Remembered().Add(clipped);
+    }
+}
+
+void StartReplay(const std::filesystem::path& gameDirectory)
+{
+    static std::once_flag once;
+    std::call_once(once, [&] {
+        PinThisModule();
+        std::thread([gameDirectory] {
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+            if (!Writable())
+                return;
+            const std::filesystem::path vpkPath = gameDirectory / L"garrysmod" / L"garrysmod_dir.vpk";
+            const std::uint64_t generation = ReplayGeneration(vpkPath);
+            std::uint64_t compiled = 0;
+            const std::vector<RememberedRequests::Line> lines = Remembered().Lines(compiled);
+            if (compiled == generation)
+                return;
+            if (lines.empty()) {
+                Remembered().MarkCompiled(generation);
+                return;
+            }
+            constexpr std::string_view kShaderDirectory = "shaders/fxc/";
+            Vpk vpk;
+            std::string error;
+            if (!vpk.Open(vpkPath, error))
+                log::Info("Shaders: {}; earlier sessions' shaders are read from the shaders folder alone", error);
+            std::unordered_map<std::string, const Vpk::Entry*> entries;
+            for (const Vpk::Entry& entry : vpk.Entries()) {
+                if (entry.path.starts_with(kShaderDirectory) && entry.path.ends_with(".vcs"))
+                    entries.emplace(entry.path.substr(kShaderDirectory.size(), entry.path.size() - kShaderDirectory.size() - 4), &entry);
+            }
+            static std::deque<LoadedFile> files;
+            std::unordered_map<std::string, const LoadedFile*> loaded;
+            auto file = [&](const std::string& name) -> const LoadedFile* {
+                const auto found = loaded.find(name);
+                if (found != loaded.end())
+                    return found->second;
+                LoadedFile read{ name, {}, {} };
+                // A loose file in the game's shaders folder, else the VPK's.
+                std::ifstream loose(gameDirectory / L"garrysmod" / L"shaders" / L"fxc" / (name + ".vcs"), std::ios::binary);
+                if (loose)
+                    read.bytes.assign(std::istreambuf_iterator<char>(loose), std::istreambuf_iterator<char>());
+                else if (const auto entry = entries.find(name); entry != entries.end())
+                    read.bytes = vpk.Read(*entry->second, error).value_or(std::vector<std::uint8_t>());
+                const LoadedFile* result = nullptr;
+                if (!read.bytes.empty() && vcs::ReadDirectory(read.bytes, read.directory, error))
+                    result = &files.emplace_back(std::move(read));
+                loaded.emplace(name, result);
+                return result;
+            };
+            size_t queued = 0;
+            for (const RememberedRequests::Line& line : lines) {
+                const LoadedFile* shader = file(line.name);
+                if (shader == nullptr)
+                    continue;
+                Request request;
+                request.name = shader->name.c_str();
+                request.file = shader->bytes;
+                request.directory = &shader->directory;
+                request.staticIndex = line.staticIndex;
+                ApplyFlags(line.flags, request);
+                EnqueueRequest(request, Priority::Background);
+                ++queued;
+            }
+            log::Info("Shaders: compiling {} passes of {} shader files from earlier sessions in the background", queued, files.size());
+            auto finished = [generation] {
+                Remembered().MarkCompiled(generation);
+                log::Info("Shaders: the shaders of earlier sessions are compiled");
+            };
+            if (ThePool().OnBackgroundDone(finished))
+                finished();
+        }).detach();
+    });
+}
 
 void EnqueueEveryShader(const std::filesystem::path& gameDirectory)
 {
-    struct File {
-        std::string name;
-        std::vector<std::uint8_t> bytes;
-        vcs::Directory directory;
-    };
     // Requests point into these for the life of the process.
     static std::mutex mutex;
-    static std::deque<File> files;
+    static std::deque<LoadedFile> files;
     std::scoped_lock lock(mutex);
     if (!files.empty())
         return;
@@ -344,12 +696,12 @@ void EnqueueEveryShader(const std::filesystem::path& gameDirectory)
         if (!entry.path.starts_with(kShaderDirectory) || !entry.path.ends_with(".vcs"))
             continue;
         std::optional<std::vector<std::uint8_t>> bytes = vpk.Read(entry, error);
-        File file{ entry.path.substr(kShaderDirectory.size()), bytes ? std::move(*bytes) : std::vector<std::uint8_t>(), {} };
+        LoadedFile file{ entry.path.substr(kShaderDirectory.size()), bytes ? std::move(*bytes) : std::vector<std::uint8_t>(), {} };
         if (!bytes || !vcs::ReadDirectory(file.bytes, file.directory, error)) {
             log::Info("Shaders: {}: {}", entry.path, error);
             continue;
         }
-        File& stored = files.emplace_back(std::move(file));
+        LoadedFile& stored = files.emplace_back(std::move(file));
         const std::int32_t dynamicCombos = std::max(stored.directory.header.dynamicCombos, 1);
         for (const vcs::Directory::Record& record : stored.directory.records) {
             if (record.staticCombo == 0xffffffff || record.staticCombo > static_cast<std::uint32_t>(INT32_MAX / dynamicCombos))
@@ -362,13 +714,15 @@ void EnqueueEveryShader(const std::filesystem::path& gameDirectory)
             // Files without twins (vertex shaders among them) have none to compile.
             request.gbufferTwin = true;
             request.forwardTwin = true;
-            EnqueueRequest(request, false);
+            EnqueueRequest(request, Priority::Background);
             ++requests;
         }
     }
     log::Info("Shaders: queued all {} static combos of the game's {} shader files", requests, files.size());
 }
 
-Progress Status() { return ThePool().Status(); }
+Progress Status(Priority priority) { return ThePool().Status(priority); }
+
+void SaveRemembered() { Remembered().Flush(); }
 
 }

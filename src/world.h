@@ -21,6 +21,8 @@ bool Initialize(ID3D12Device5* device, ID3D12CommandQueue* queue, DescriptorHeap
 void Shutdown();
 // Whether views can be lit: the lighting exists and the map's scene is loaded.
 bool Ready();
+// Whether the loaded map has water, as far as its scene tells (false without one).
+bool LevelHasWater();
 void WaitForGpu();
 
 // Once per presented frame, with the size of the main view: installs the engine hooks, follows the settings file,

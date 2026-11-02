@@ -1782,6 +1782,8 @@ void Shutdown()
 
 bool Ready() { return g_state.lighting && g_state.scene.Ready(); }
 
+bool LevelHasWater() { return Ready() && !g_state.scene.WaterBodies().empty(); }
+
 void WaitForGpu()
 {
     if (g_state.lighting)

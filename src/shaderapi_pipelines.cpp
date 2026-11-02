@@ -916,6 +916,7 @@ void PrecacheShaders(const ShadowState& state)
         request.file = file->bytes;
         request.directory = &file->directory;
         request.staticIndex = file == state.vertexShader ? state.vertexStaticIndex : state.pixelStaticIndex;
+        request.vertex = file == state.vertexShader;
         if (file == state.pixelShader) {
             // As DrawPass and capture::Prepare choose them: captured passes with a depth test draw G-buffer twins,
             // translucent passes after the capture draw forward twins, and so does every pass of a view drawn into a

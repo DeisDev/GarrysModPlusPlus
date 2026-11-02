@@ -15,6 +15,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <vector>
 
 namespace gmodpp::loading {
 
@@ -57,24 +58,38 @@ void ShowProgress(void* self, float done, world::LoadStage stage)
 }
 
 // The map's materials queued their shaders as they took their state snapshots (shader_precache.h); they are compiled
-// before the loading screen closes, so the first frames don't wait for them.
+// before the loading screen closes, so the first frames don't wait for them. On maps with water, so are the vertex
+// shaders of its reflection and refraction views.
 void WaitForShaders(void* self)
 {
-    shader_precache::Progress progress = shader_precache::Status();
-    if (progress.done >= progress.total)
-        return;
-    const std::size_t first = progress.done;
-    const std::size_t requests = progress.total - first;
-    ui::UpdateLanguage();
-    const std::wstring text = Wide(ui::Visual(ui::Text("loading.shaders")));
-    const auto start = std::chrono::steady_clock::now();
-    while (progress.done < progress.total) {
-        g_updateCustomProgressBar(self, static_cast<float>(progress.done - first) / static_cast<float>(progress.total - first), text.c_str());
-        std::this_thread::sleep_for(std::chrono::milliseconds(15));
-        progress = shader_precache::Status();
+    std::vector<shader_precache::Priority> priorities = { shader_precache::Priority::Map };
+    if (world::LevelHasWater())
+        priorities.push_back(shader_precache::Priority::Water);
+    auto status = [&] {
+        shader_precache::Progress sum;
+        for (const shader_precache::Priority priority : priorities) {
+            const shader_precache::Progress progress = shader_precache::Status(priority);
+            sum.done += progress.done;
+            sum.total += progress.total;
+        }
+        return sum;
+    };
+    shader_precache::Progress progress = status();
+    if (progress.done < progress.total) {
+        const std::size_t first = progress.done;
+        const std::size_t requests = progress.total - first;
+        ui::UpdateLanguage();
+        const std::wstring text = Wide(ui::Visual(ui::Text("loading.shaders")));
+        const auto start = std::chrono::steady_clock::now();
+        while (progress.done < progress.total) {
+            g_updateCustomProgressBar(self, static_cast<float>(progress.done - first) / static_cast<float>(progress.total - first), text.c_str());
+            std::this_thread::sleep_for(std::chrono::milliseconds(15));
+            progress = status();
+        }
+        log::Info("Loading screen: waited {:.0f} ms for the shaders of {} material passes",
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count(), requests);
     }
-    log::Info("Loading screen: waited {:.0f} ms for the shaders of {} material passes",
-        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count(), requests);
+    shader_precache::SaveRemembered();
 }
 
 void __fastcall HookUpdateProgressBar(void* self, int progress)

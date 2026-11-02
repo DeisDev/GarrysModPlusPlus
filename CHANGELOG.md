@@ -65,6 +65,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Faster frames: the view of the weapon in your hands traces the main view's ray tracing scene instead of building its own every frame; with DLSS Ray Reconstruction, the sun's shadow rays stop at the first thing that blocks them, since only their light is used; every ray query skips the procedural primitives the scene never has; draws no longer look up the bound render targets again for each texture they sample; and constants set again to the values they already hold are no longer uploaded again.
 - Shaders are compiled for the materials a map uses, in the background while the map loads, instead of for every shader the game ships before the game starts. The loading screen shows "Compiling shaders..." while it waits for them; shaders compiled once are kept for later launches.
 - Compiled shaders are kept in one file, `gmodplusplus\cache\shaders.bin`, instead of one file per shader, so reading them is faster. The old `gmodplusplus\cache\shaders` folder is deleted in the background.
+- Shaders compiled for maps you have played are remembered (`gmodplusplus\cache\precache.txt`). When an update to the mod or the game makes the shader cache stale, they are compiled again in the background a few seconds after the game starts, on at most half the CPU cores, so maps you played before don't compile shaders while they load or while you play. A map you load meanwhile goes first.
 - `gmodplusplus\cache\shaders.idx` lists the shaders in `shaders.bin`, so starting the game reads one small file instead of a piece of the whole cache, and the cache is opened in the background while the game starts.
 - The Low preset picks how map lights are sampled automatically, like the other presets.
 - The settings menu has a new look: the game's own fonts, a page list on the left, switches and grouped sections.
@@ -126,6 +127,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Maps with water no longer stutter the first time you look at water: the vertex shaders the water's reflection and refraction views draw with (with a clip plane) are compiled while the map loads.
 - The game no longer hitches every 30 seconds while new pipeline states are being made: the pipeline library (`gmodplusplus\cache\pipelines.bin`) is saved on another thread, and read in the background while the game starts.
 - Smooth gradients, such as the sky and fog, no longer break into bands of colour.
 - Some maps, such as gm_blackbrook_asylum, no longer crash the game as they finish loading.

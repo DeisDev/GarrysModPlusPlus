@@ -199,6 +199,13 @@ public:
         return m_writable;
     }
 
+    std::uint32_t Stamp()
+    {
+        std::scoped_lock lock(m_mutex);
+        Open();
+        return m_stamp;
+    }
+
     bool Find(std::uint64_t key, std::vector<unsigned char>& payload)
     {
         std::scoped_lock lock(m_mutex);
@@ -510,6 +517,8 @@ void Store(std::uint64_t key, const translator::Translation& info, std::span<con
 bool Contains(std::uint64_t key) { return Pack().Contains(key); }
 
 bool Writable() { return Pack().Writable(); }
+
+std::uint32_t Stamp() { return Pack().Stamp(); }
 
 void OpenInBackground()
 {

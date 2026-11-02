@@ -4,14 +4,17 @@
 #include "d3d12_device.h"
 #include "log.h"
 #include "native_lighting.h"
+#include "options.h"
 #include "overlay.h"
 #include "settings.h"
 #include "shader_cache.h"
+#include "shader_precache.h"
 #include "shaderapi.h"
 #include "shaderapi_meshes.h"
 #include "shaderapi_pipelines.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <fstream>
 #include <optional>
@@ -36,6 +39,8 @@ constexpr UINT kDescriptorCapacity = 1000000;
 constexpr UINT64 kUploadPageSize = 16 << 20;
 // How often the developer request files are checked, as the shim does.
 constexpr unsigned kDevFilePollPresents = 10;
+// How long after the first frame earlier sessions' shaders start compiling again (shader_precache::StartReplay).
+constexpr auto kReplayDelay = std::chrono::seconds(5);
 constexpr UINT64 kStagingPageSize = 32 << 20;
 // Staging memory one frame may hold before Flush reclaims it, so loading a map does not keep every upload alive.
 constexpr UINT64 kStagingFlushBytes = 256 << 20;
@@ -132,7 +137,11 @@ void Disconnect(DeviceManagerObject*)
 }
 void* QueryInterface(DeviceManagerObject*, const char* name) { return CreateInterface(name, nullptr); }
 InitReturnVal Init(DeviceManagerObject*) { return kInitOk; }
-void Shutdown(DeviceManagerObject*) { SavePipelineLibrary(true); }
+void Shutdown(DeviceManagerObject*)
+{
+    SavePipelineLibrary(true);
+    shader_precache::SaveRemembered();
+}
 int GetAdapterCount(DeviceManagerObject*) { return static_cast<int>(DisplayAdapters().size()); }
 
 void GetAdapterInfo(DeviceManagerObject*, int adapterIndex, MaterialAdapterInfo& info)
@@ -580,6 +589,11 @@ void Backend::Present()
         return;
     RunPending();
     SavePipelineLibrary(false);
+    // Once the game has been drawing for a few seconds (its menu is up), shaders of earlier sessions that an update
+    // made stale are compiled again in the background.
+    static const auto firstPresent = std::chrono::steady_clock::now();
+    if (std::chrono::steady_clock::now() - firstPresent > kReplayDelay)
+        shader_precache::StartReplay(GetOptions().gameDirectory);
     static const bool developer = HasArgument(L"-gmodpp_dev");
     if (developer) {
         static int limit = -1;
