@@ -1,5 +1,6 @@
 #include "shaderapi_pipelines.h"
 
+#include "busy_window.h"
 #include "command_line.h"
 #include "log.h"
 #include "settings.h"
@@ -465,6 +466,7 @@ const CompiledShader* CompiledByHash(std::span<const DWORD> code, const translat
     auto shader = std::make_unique<CompiledShader>();
     // Usually a read of what precaching compiled; otherwise the draw waits for the compile.
     const auto start = std::chrono::steady_clock::now();
+    const busy::Scope busy(busy::Reason::Shaders);
     shader->failed = !shader_precache::Build(code, variant, fileName, shader->info, shader->dxil);
     g_cache.buildSeconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     if (++g_cache.built % 1000 == 0)
@@ -569,6 +571,8 @@ ID3D12PipelineState* Pipeline(PipelineKey& key)
     const std::wstring name = g_cache.library != nullptr ? PipelineName(key) : std::wstring();
     HRESULT hr = g_cache.library != nullptr ? g_cache.library->LoadGraphicsPipeline(name.c_str(), &desc, IID_PPV_ARGS(&pipeline)) : E_FAIL;
     if (FAILED(hr)) {
+        // The driver compiles the shaders for the GPU.
+        const busy::Scope busy(busy::Reason::Shaders);
         hr = GetBackend().Device()->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pipeline));
         if (FAILED(hr))
             log::Info("Native: creating a pipeline state failed: {:#010x}", static_cast<unsigned>(hr));

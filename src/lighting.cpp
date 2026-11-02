@@ -1,5 +1,6 @@
 #include "lighting.h"
 
+#include "busy_window.h"
 #include "command_line.h"
 #include "light_queries.h"
 #include "log.h"
@@ -517,8 +518,10 @@ bool Lighting::WaitForPipelines()
     m_pipelinesChecked = true;
     const auto start = std::chrono::steady_clock::now();
     const bool waited = PreparingPipelines();
-    if (m_pipelineBuilder.joinable())
+    if (m_pipelineBuilder.joinable()) {
+        const busy::Scope busy(busy::Reason::Pipelines);
         m_pipelineBuilder.join();
+    }
     if (waited)
         log::Info("Lighting: waited {:.0f} ms for the pipeline states", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
     if (FAILED(m_pipelinesResult)) {

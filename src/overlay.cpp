@@ -4,10 +4,13 @@
 #include "log.h"
 #include "options.h"
 #include "overlay_widgets.h"
+#include "loading_screen.h"
 #include "settings.h"
+#include "shader_precache.h"
 #include "shaderapi_device.h"
 #include "text_layout.h"
 #include "ui_text.h"
+#include "world.h"
 
 #include <MinHook.h>
 #include <backends/imgui_impl_dx12.h>
@@ -17,6 +20,8 @@
 #include <intrin.h>
 
 #include <algorithm>
+#include <chrono>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -30,6 +35,8 @@ namespace {
 using ui::Text;
 
 constexpr UINT kToggleKey = VK_INSERT;
+// Work shorter than this shows no notice, so models and effects that compile a few shaders in play don't flash it.
+constexpr auto kNoticeDelay = std::chrono::milliseconds(1500);
 
 enum class Page { General, Lighting, Quality, Image, Performance, Count };
 
@@ -53,6 +60,9 @@ struct State {
     GetRawInputBufferFn getRawInputBuffer = nullptr;
     // Where the game last put the cursor for mouse look; while the menu is open it keeps reading this point.
     POINT gameCursor = {};
+    // The notice's text this frame, and since when there has been one.
+    std::string notice;
+    std::optional<std::chrono::steady_clock::time_point> noticeSince;
 };
 
 State g_state;
@@ -686,6 +696,49 @@ constexpr PageInfo kPages[] = {
 };
 static_assert(std::size(kPages) == static_cast<size_t>(Page::Count));
 
+// What is running in the background that the player may notice, or nothing. The loading screen shows its own progress.
+std::string NoticeText()
+{
+    if (loading::Active())
+        return {};
+    if (const std::optional<std::pair<size_t, size_t>> pipelines = world::LightingPipelineProgress())
+        return ui::Format("notice.pipelines", {{"done", ui::Number(static_cast<double>(pipelines->first), 0)},
+                                                  {"total", ui::Number(static_cast<double>(pipelines->second), 0)}});
+    size_t left = 0;
+    for (const shader_precache::Priority priority : {shader_precache::Priority::Map, shader_precache::Priority::Water}) {
+        const shader_precache::Progress progress = shader_precache::Status(priority);
+        left += progress.total - progress.done;
+    }
+    if (left > 0)
+        return ui::Format("notice.shaders", {{"left", ui::Number(static_cast<double>(left), 0)}});
+    const shader_precache::Progress background = shader_precache::Status(shader_precache::Priority::Background);
+    if (background.done < background.total)
+        return ui::Format("notice.shaders_background", {{"done", ui::Number(static_cast<double>(background.done), 0)},
+                                                           {"total", ui::Number(static_cast<double>(background.total), 0)}});
+    return {};
+}
+
+// A small box in the bottom corner (bottom left for right-to-left languages), which takes no input.
+void DrawNotice(const std::string& text)
+{
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    const float margin = ImGui::GetFontSize();
+    const bool rightToLeft = widgets::RightToLeft();
+    ImGui::SetNextWindowPos(ImVec2(rightToLeft ? viewport->WorkPos.x + margin : viewport->WorkPos.x + viewport->WorkSize.x - margin,
+                                viewport->WorkPos.y + viewport->WorkSize.y - margin),
+        ImGuiCond_Always, ImVec2(rightToLeft ? 0.0f : 1.0f, 1.0f));
+    ImGui::SetNextWindowBgAlpha(0.85f);
+    constexpr ImGuiWindowFlags kFlags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_AlwaysAutoResize |
+        ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav;
+    if (ImGui::Begin("###gmodpp_notice", nullptr, kFlags)) {
+        ImGui::PushFont(widgets::GetFonts().strong);
+        ImGui::TextUnformatted(ui::Visual(Text("notice.title")).c_str());
+        ImGui::PopFont();
+        ImGui::TextUnformatted(ui::Visual(text).c_str());
+    }
+    ImGui::End();
+}
+
 // Returns false when the close button was clicked.
 bool DrawMenu()
 {
@@ -829,6 +882,19 @@ bool Initialize(HWND window, ID3D12Device* device, ID3D12CommandQueue* queue, De
 
 bool Open() { return g_state.initialized && g_state.open; }
 
+bool Visible()
+{
+    if (!g_state.initialized)
+        return false;
+    g_state.notice = NoticeText();
+    const auto now = std::chrono::steady_clock::now();
+    if (g_state.notice.empty())
+        g_state.noticeSince.reset();
+    else if (!g_state.noticeSince)
+        g_state.noticeSince = now;
+    return g_state.open || (g_state.noticeSince && now - *g_state.noticeSince >= kNoticeDelay);
+}
+
 void EnsureWindowHook()
 {
     if (!g_state.initialized)
@@ -844,10 +910,19 @@ void EnsureWindowHook()
 void Render(ID3D12GraphicsCommandList* list, D3D12_CPU_DESCRIPTOR_HANDLE rtv)
 {
     ui::UpdateLanguage();
+    // With the menu closed the game owns the cursor: Dear ImGui neither draws one nor changes the system's.
+    ImGuiIO& io = ImGui::GetIO();
+    io.MouseDrawCursor = g_state.open;
+    if (g_state.open)
+        io.ConfigFlags &= ~ImGuiConfigFlags_NoMouseCursorChange;
+    else
+        io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
     ImGui_ImplDX12_NewFrame();
     ImGui_ImplWin32_NewFrame();
     ImGui::NewFrame();
-    if (!DrawMenu()) {
+    if (!g_state.notice.empty() && g_state.noticeSince && std::chrono::steady_clock::now() - *g_state.noticeSince >= kNoticeDelay)
+        DrawNotice(g_state.notice);
+    if (g_state.open && !DrawMenu()) {
         g_state.open = false;
         log::Info("Overlay: menu closed");
     }

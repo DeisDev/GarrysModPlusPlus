@@ -402,6 +402,7 @@ add_library(gmodpp SHARED
     src/shaderapi_shim.cpp
     src/shaderapi_slots.cpp
     src/shaderapi_thunks.asm
+    src/busy_window.cpp
     src/capture.cpp
     src/command_line.cpp
     src/log.cpp

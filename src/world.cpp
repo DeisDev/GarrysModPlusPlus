@@ -1782,6 +1782,13 @@ void Shutdown()
 
 bool Ready() { return g_state.lighting && g_state.scene.Ready(); }
 
+std::optional<std::pair<size_t, size_t>> LightingPipelineProgress()
+{
+    if (!g_state.lighting || !g_state.lighting->PreparingPipelines())
+        return std::nullopt;
+    return g_state.lighting->PipelineProgress();
+}
+
 bool LevelHasWater() { return Ready() && !g_state.scene.WaterBodies().empty(); }
 
 void WaitForGpu()

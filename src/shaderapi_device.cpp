@@ -1,5 +1,6 @@
 #include "shaderapi_device.h"
 
+#include "busy_window.h"
 #include "command_line.h"
 #include "d3d12_device.h"
 #include "log.h"
@@ -588,6 +589,7 @@ void Backend::Present()
     if (!m_recording)
         return;
     RunPending();
+    busy::NotePresent();
     SavePipelineLibrary(false);
     // Once the game has been drawing for a few seconds (its menu is up), shaders of earlier sessions that an update
     // made stale are compiled again in the background.
@@ -612,7 +614,7 @@ void Backend::Present()
         LimitDraws(limit);
     }
     TrackedResource& presented = SwapChainBuffer();
-    if (overlay::Open()) {
+    if (overlay::Visible()) {
         Transition(presented, D3D12_RESOURCE_STATE_RENDER_TARGET);
         overlay::Render(m_commandList.Get(), m_backBufferViews[m_swapChain->GetCurrentBackBufferIndex() * 2]);
     }

@@ -21,6 +21,8 @@ bool Initialize(ID3D12Device5* device, ID3D12CommandQueue* queue, DescriptorHeap
 void Shutdown();
 // Whether views can be lit: the lighting exists and the map's scene is loaded.
 bool Ready();
+// While the lighting's pipeline states are being created in the background: how many are done, of how many.
+std::optional<std::pair<size_t, size_t>> LightingPipelineProgress();
 // Whether the loaded map has water, as far as its scene tells (false without one).
 bool LevelHasWater();
 void WaitForGpu();

@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- A window says why the game has stopped responding when it waits more than a second for shaders it needs right away (most often the first launch after an update) or for ray tracing to be prepared, and goes away by itself when the game continues. It replaces the "Preparing shaders" window, without holding up the launch.
+- A notice in the bottom corner of the screen shows shaders being compiled and ray tracing being prepared in the background, with their progress, when the work takes longer than a moment.
 - With real-time lighting, sunlight and shadows follow the map's `env_sun`, so turning it in game (for example with the Sun Editor) moves the shadows. A sun turned below the horizon lights nothing. Turn off "Sun follows env_sun" to use the map's `light_environment` instead.
 - With real-time lighting, a physically based sky replaces the map's 2D skybox, in the skybox's colours, and lights reflections and indirect light ("Physical sky" in the menu, on by default). It follows `env_sun` and GMod's painted sky (`env_skypaint`), so addons that move the sun move it too. Clouds and stars painted on the skybox are not shown.
 - With real-time lighting, a sharp sun disc coloured by the atmosphere replaces `env_sun`'s sprite ("Sun disc" in the menu, on by default). It is as big as the map's `env_sun` sprite looked, and "Sun size" scales it.
@@ -121,7 +123,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Removed
 
-- The "Preparing shaders" window at the first launch and after game updates. It compiled every shader combination the game ships, most of which no map uses.
+- The "Preparing shaders" window at the first launch and after game updates, which held up the launch while it compiled every shader combination the game ships, most of which no map uses. Shaders are compiled for the maps you load and, after an update, again in the background for the maps you played before.
 - The Direct3D 9 build (`bin/win64/d3d9.dll` with D3D9On12). `-insecure` now starts the native Direct3D 12 renderer through the `winmm.dll` loader; deploying removes the old `d3d9.dll`.
 - The "Game" flashlight option. It made props see-through and left them unlit by the flashlight.
 
