@@ -193,6 +193,8 @@ struct State {
     std::vector<engine::DynamicLight> dynamicLights;
     // The local player's origin from the last main view's entities.
     std::optional<std::array<float, 3>> localPlayer;
+    // env_sun as the last 3D skybox or main view found it, for every view's sunlight.
+    std::optional<gbuffer::EnvSun> envSun;
     std::vector<bsp::Mesh> brushModels;
     // Brush entity models with water (func_water_analog) by model number: their surfaces' scene model and body of water.
     struct BrushWaterModel {
@@ -1883,12 +1885,13 @@ void LightView(ViewInputs& inputs)
         CollectEntities();
         engine::ActiveDynamicLights(g_state.dynamicLights);
         inputs.localPlayer = g_state.localPlayer;
-        inputs.envSun = entities::FindSun();
+        g_state.envSun = entities::FindSun();
         break;
     case gbuffer::ViewKind::Skybox:
         g_state.dynamicInstances.clear();
         g_state.skinnedEntities.clear();
         g_state.dynamicLights.clear();
+        g_state.envSun = entities::FindSun();
         break;
     case gbuffer::ViewKind::Viewmodel:
         // Same scene as the main view; characters are not skinned a second time.
@@ -1897,6 +1900,7 @@ void LightView(ViewInputs& inputs)
     g_state.scene.SetDynamicLights(g_state.dynamicLights);
     if (std::array<float, engine::kLightStyles> styles; engine::LightStyleValues(styles))
         g_state.scene.SetLightStyles(styles);
+    inputs.envSun = g_state.envSun;
     inputs.frame = g_state.frame;
     inputs.jitterX = g_state.pixelOffset[0];
     inputs.jitterY = g_state.pixelOffset[1];

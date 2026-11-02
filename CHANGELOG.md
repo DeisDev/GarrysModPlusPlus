@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- With real-time lighting, sunlight and shadows follow the map's `env_sun`, so turning it in game (for example with the Sun Editor) moves the shadows. A sun turned below the horizon lights nothing. Turn off "Sun follows env_sun" to use the map's `light_environment` instead.
 - With real-time lighting, a physically based sky replaces the map's 2D skybox, in the skybox's colours, and lights reflections and indirect light ("Physical sky" in the menu, on by default). It follows `env_sun` and GMod's painted sky (`env_skypaint`), so addons that move the sun move it too. Clouds and stars painted on the skybox are not shown.
 - With real-time lighting, a sharp sun disc coloured by the atmosphere replaces `env_sun`'s sprite ("Sun disc" in the menu, on by default). It is as big as the map's `env_sun` sprite looked, and "Sun size" scales it.
 - The loading screen stays up until ray-traced lighting is ready, and its progress bar shows that work, so maps no longer open with a few frames of the game's own lighting.

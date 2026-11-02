@@ -261,7 +261,8 @@ struct ViewInputs {
     std::span<const gbuffer::WaterSurfaceDraw> waterDraws;
     std::span<ID3D12Resource* const> waterNormalMaps;
     // env_sun as the client has it, and the sun GMod's painted sky (env_skypaint) last drew: the procedural sky and the
-    // sun's disc show this sun rather than the map's (Lighting::RecordSky).
+    // sun's disc show this sun rather than the map's (Lighting::RecordSky). With sun_follows_env_sun the sunlight takes
+    // env_sun's direction too (Lighting::FillConstants).
     std::optional<gbuffer::EnvSun> envSun;
     std::optional<std::array<float, 3>> paintedSun;
 };
@@ -421,7 +422,7 @@ private:
     // Makes what the main view's 2D sky shows (shaders/sky_atmosphere.hlsl): with the physical sky, the procedural sky
     // in the game's colours, which `constants` then read in place of the game's sky; with the sun's disc, what draws it.
     // Publishes both in m_skyDraw.
-    void RecordSky(FrameConstants& constants, const ViewInputs& inputs);
+    void RecordSky(FrameConstants& constants, const ViewInputs& inputs, const Scene& scene);
     // Writes each body of water's surface as the game last drew it (the draw whose fog colour is the body's) into the
     // slot's m_waterDraws, with views of their normal maps from `firstView` on, and points `constants` at them.
     void WriteWaterDraws(UINT slot, const ViewInputs& inputs, const Scene& scene, UINT firstView, FrameConstants& constants);

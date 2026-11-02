@@ -299,6 +299,7 @@ void ResetLightingPage(Settings& settings)
 {
     const Settings defaults;
     settings.sun = defaults.sun;
+    settings.sunFollowsEnvSun = defaults.sunFollowsEnvSun;
     settings.sunIntensity = defaults.sunIntensity;
     settings.skyIntensity = defaults.skyIntensity;
     settings.mapLights = defaults.mapLights;
@@ -372,6 +373,7 @@ void DrawLightingPage(Settings& settings)
     widgets::BeginCard("##sources", Text("lighting.section_sources"));
     if (widgets::BeginRows("sources")) {
         StrengthRow("lighting.sun", &settings.sun, settings.sunIntensity, RangeOf(&Settings::sunIntensity));
+        SwitchRow("lighting.sun_follows_env_sun", settings.sunFollowsEnvSun, settings.sun, Text("lighting.sun_follows_env_sun_reason"));
         StrengthRow("lighting.sky", nullptr, settings.skyIntensity, RangeOf(&Settings::skyIntensity));
         StrengthRow("lighting.map_lights", &settings.mapLights, settings.lightIntensity, RangeOf(&Settings::lightIntensity));
         SwitchRow("lighting.dynamic_lights", settings.dynamicLights);

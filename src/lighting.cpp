@@ -917,15 +917,17 @@ bool Lighting::CreateSkyLight()
     return false;
 }
 
-void Lighting::RecordSky(FrameConstants& constants, const ViewInputs& inputs)
+void Lighting::RecordSky(FrameConstants& constants, const ViewInputs& inputs, const Scene& scene)
 {
     const Settings& settings = GetSettings();
     // The sun the sky shows: env_sun's, else the one GMod's painted sky draws, else the map's.
+    const bool mapSun = scene.Sun().present;
     std::optional<std::array<float, 3>> sun = inputs.envSun ? std::optional(inputs.envSun->direction) : inputs.paintedSun;
-    if (!sun && constants.sunEnabled != 0.0f)
+    if (!sun && mapSun)
         sun = std::array<float, 3>{constants.sunDirection[0], constants.sunDirection[1], constants.sunDirection[2]};
-    // The physical sky needs the map's sun, whose light the scene is lit by, and the game's sky to take its colours from.
-    const bool sky = settings.physicalSky && constants.sunEnabled != 0.0f && inputs.skyCube != nullptr && sun;
+    // The physical sky needs the map's sun, whose light the scene is lit by (even once it has set below the horizon), and
+    // the game's sky to take its colours from.
+    const bool sky = settings.physicalSky && mapSun && inputs.skyCube != nullptr && sun;
     // The disc replaces env_sun's sprite, and is the physical sky's sun on maps without one.
     const bool disc = settings.sunDisc && sun && (inputs.envSun ? inputs.envSun->on : sky);
     m_skyDraw = {};
@@ -1566,6 +1568,12 @@ bool Lighting::FillConstants(FrameConstants& constants, const Scene& scene, cons
         constants.eyeWater = scene.WaterAt(constants.eyePosition);
     const bsp::SunLight& sun = scene.Sun();
     const Settings& settings = GetSettings();
+    // The map's sun shines from where env_sun shows it, so the sun editor moves it; below the horizon it lights nothing.
+    if (settings.sunFollowsEnvSun && constants.sunEnabled != 0.0f && inputs.envSun) {
+        std::copy(inputs.envSun->direction.begin(), inputs.envSun->direction.end(), constants.sunDirection);
+        if (constants.sunDirection[2] <= 0.0f)
+            constants.sunEnabled = 0.0f;
+    }
     const float sunStyle = scene.LightStyle(sun.style);
     const float skyStyle = scene.LightStyle(sun.ambientStyle);
     for (int i = 0; i < 3; ++i) {
@@ -2198,7 +2206,7 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     if (bakedIndirect && main && constants.traceMask != 0 && !scene.Baked().Ready())
         BakeStep(scene, frame, slotConstantsGpu);
     if (main)
-        RecordSky(constants, inputs);
+        RecordSky(constants, inputs, scene);
     if (main && inputs.skyCube != nullptr && m_skyLight.resource) {
         Use(m_skyLight, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         const UINT faces = m_proceduralSkyReady ? m_proceduralSkyFaces : inputs.skyFacesView;

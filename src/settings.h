@@ -65,6 +65,8 @@ struct Settings {
     bool realtimeLighting = true;
     DebugView debugView = DebugView::Final;
     bool sun = true;
+    // The sun shines from env_sun's direction, which the sun editor turns, instead of light_environment's.
+    bool sunFollowsEnvSun = true;
     bool mapLights = true;
     bool dynamicLights = true;
     bool projectedLights = true;

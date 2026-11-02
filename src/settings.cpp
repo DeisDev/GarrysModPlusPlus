@@ -40,6 +40,7 @@ constexpr NamedField kFields[] = {
     {"realtime_lighting", &Settings::realtimeLighting},
     {"debug_view", &Settings::debugView},
     {"sun", &Settings::sun},
+    {"sun_follows_env_sun", &Settings::sunFollowsEnvSun},
     {"map_lights", &Settings::mapLights},
     {"dynamic_lights", &Settings::dynamicLights},
     {"projected_lights", &Settings::projectedLights},
