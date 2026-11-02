@@ -126,6 +126,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- The game no longer hitches every 30 seconds while new pipeline states are being made: the pipeline library (`gmodplusplus\cache\pipelines.bin`) is saved on another thread, and read in the background while the game starts.
 - Smooth gradients, such as the sky and fog, no longer break into bands of colour.
 - Some maps, such as gm_blackbrook_asylum, no longer crash the game as they finish loading.
 - Ground seen through water and in reflections uses full-resolution textures and shows blended terrain (WorldVertexTransition) as the game draws it, such as sand under gm_construct's lake instead of blurry grass.

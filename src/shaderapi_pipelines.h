@@ -41,7 +41,10 @@ struct CopySurface {
 // D3DTEXF_LINEAR does: a plain copy when the sizes and formats allow it, otherwise a draw.
 void StretchRect(const CopySurface& source, const D3D12_RECT& sourceRect, const CopySurface& destination, const D3D12_RECT& destinationRect);
 
-// Saves new pipeline states to the pipeline library on disk: when `now`, or at most every 30 seconds.
+// Starts reading the pipeline library from disk on another thread, so the first draw does not wait for the file.
+void ReadPipelineLibraryInBackground();
+// Saves new pipeline states to the pipeline library on disk: when `now`, on this thread after any save in progress;
+// otherwise at most every 30 seconds, on another thread.
 void SavePipelineLibrary(bool now);
 
 // Logs the next draws' state (developer diagnostics).

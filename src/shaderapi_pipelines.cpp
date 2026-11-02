@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cmath>
@@ -26,10 +27,14 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <future>
 #include <iterator>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <set>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -230,15 +235,38 @@ struct PipelineCache {
     // Shaders the render thread asked shader_precache::Build for, and the time it waited.
     size_t built = 0;
     double buildSeconds = 0;
-    // Pipeline states saved across launches (ID3D12PipelineLibrary); the blob must outlive the library.
+    // Pipeline states saved across launches (ID3D12PipelineLibrary); the blob must outlive the library, which saves on
+    // other threads (SavePipelineLibrary) also hold.
     ComPtr<ID3D12PipelineLibrary> library;
-    std::vector<std::uint8_t> libraryBlob;
+    std::shared_ptr<const std::vector<std::uint8_t>> libraryBlob;
     std::filesystem::path libraryPath;
     bool libraryDirty = false;
     std::chrono::steady_clock::time_point librarySaved;
 };
 
 PipelineCache g_cache;
+
+// pipelines.bin as ReadPipelineLibraryInBackground read it, for OpenPipelineLibrary.
+std::mutex g_libraryReadMutex;
+std::optional<std::shared_future<std::vector<std::uint8_t>>> g_libraryRead;
+// A save writing the library on another thread.
+std::atomic<bool> g_librarySaving = false;
+
+std::filesystem::path PipelineLibraryPath() { return ModDirectory() / L"cache" / L"pipelines.bin"; }
+
+std::vector<std::uint8_t> ReadWholeFile(const std::filesystem::path& path)
+{
+    std::vector<std::uint8_t> data;
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file)
+        return data;
+    data.resize(static_cast<size_t>(file.tellg()));
+    file.seekg(0);
+    file.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(data.size()));
+    if (!file)
+        data.clear();
+    return data;
+}
 int g_drawLog = 0;
 int g_drawLimit = -1;
 int g_frameDraws = 0;
@@ -352,12 +380,16 @@ void OpenPipelineLibrary(const std::filesystem::path& path)
         return;
     }
     g_cache.libraryPath = path;
-    if (std::ifstream file{ path, std::ios::binary })
-        g_cache.libraryBlob.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
-    HRESULT hr = device->CreatePipelineLibrary(g_cache.libraryBlob.data(), g_cache.libraryBlob.size(), IID_PPV_ARGS(&g_cache.library));
-    if (FAILED(hr) && !g_cache.libraryBlob.empty()) {
+    std::optional<std::shared_future<std::vector<std::uint8_t>>> read;
+    {
+        std::scoped_lock lock(g_libraryReadMutex);
+        read = std::exchange(g_libraryRead, std::nullopt);
+    }
+    g_cache.libraryBlob = std::make_shared<const std::vector<std::uint8_t>>(read ? read->get() : ReadWholeFile(path));
+    HRESULT hr = device->CreatePipelineLibrary(g_cache.libraryBlob->data(), g_cache.libraryBlob->size(), IID_PPV_ARGS(&g_cache.library));
+    if (FAILED(hr) && !g_cache.libraryBlob->empty()) {
         log::Info("Native: the saved pipeline library could not be used ({:#010x}); starting a new one", static_cast<unsigned>(hr));
-        g_cache.libraryBlob.clear();
+        g_cache.libraryBlob = std::make_shared<const std::vector<std::uint8_t>>();
         hr = device->CreatePipelineLibrary(nullptr, 0, IID_PPV_ARGS(&g_cache.library));
     }
     if (FAILED(hr)) {
@@ -388,7 +420,7 @@ bool Initialize()
         shader->info.stage = translator::Stage::Pixel;
         shader->info.colorOutputs = 1;
     }
-    OpenPipelineLibrary(ModDirectory() / L"cache" / L"pipelines.bin");
+    OpenPipelineLibrary(PipelineLibraryPath());
     g_cache.usable = true;
     return true;
 }
@@ -761,22 +793,24 @@ void StretchRect(const CopySurface& source, const D3D12_RECT& sourceRect, const 
     commands->DrawInstanced(3, 1, 0, 0);
 }
 
-void SavePipelineLibrary(bool now)
+namespace {
+
+// Writes the library's contents to disk, beside the file and renamed into place. The library synchronizes itself
+// (ID3D12Device1::CreatePipelineLibrary, Thread Safety), so this runs on any thread.
+void WritePipelineLibrary(ID3D12PipelineLibrary* library, const std::filesystem::path& path)
 {
-    if (g_cache.library == nullptr || !g_cache.libraryDirty)
-        return;
-    const auto time = std::chrono::steady_clock::now();
-    if (!now && time - g_cache.librarySaved < kPipelineLibrarySaveInterval)
-        return;
-    g_cache.librarySaved = time;
-    g_cache.libraryDirty = false;
-    std::vector<std::uint8_t> data(g_cache.library->GetSerializedSize());
-    HRESULT hr = g_cache.library->Serialize(data.data(), data.size());
+    // The render thread may store a pipeline between the size and the copy, which then no longer fits: measured again.
+    std::vector<std::uint8_t> data;
+    HRESULT hr = E_FAIL;
+    for (int attempt = 0; attempt < 3 && FAILED(hr); ++attempt) {
+        data.resize(library->GetSerializedSize());
+        hr = library->Serialize(data.data(), data.size());
+    }
     if (FAILED(hr)) {
         log::Info("Native: saving the pipeline library failed: {:#010x}", static_cast<unsigned>(hr));
         return;
     }
-    std::filesystem::path temporary = g_cache.libraryPath;
+    std::filesystem::path temporary = path;
     temporary += L".tmp";
     {
         std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
@@ -787,9 +821,50 @@ void SavePipelineLibrary(bool now)
         }
     }
     std::error_code error;
-    std::filesystem::rename(temporary, g_cache.libraryPath, error);
+    std::filesystem::rename(temporary, path, error);
     if (error)
-        log::Info("Native: replacing {} failed: {}", g_cache.libraryPath.string(), error.message());
+        log::Info("Native: replacing {} failed: {}", path.string(), error.message());
+}
+
+}
+
+void ReadPipelineLibraryInBackground()
+{
+    std::scoped_lock lock(g_libraryReadMutex);
+    if (g_libraryRead || g_cache.initialized)
+        return;
+    // A promise's future does not wait for the thread when destroyed; the thread is detached and the DLL pinned.
+    auto promise = std::make_shared<std::promise<std::vector<std::uint8_t>>>();
+    g_libraryRead = promise->get_future().share();
+    PinThisModule();
+    std::thread([promise, path = PipelineLibraryPath()] { promise->set_value(ReadWholeFile(path)); }).detach();
+}
+
+void SavePipelineLibrary(bool now)
+{
+    if (g_cache.library == nullptr || !g_cache.libraryDirty)
+        return;
+    const auto time = std::chrono::steady_clock::now();
+    if (!now && (time - g_cache.librarySaved < kPipelineLibrarySaveInterval || g_librarySaving))
+        return;
+    g_cache.librarySaved = time;
+    g_cache.libraryDirty = false;
+    if (now) {
+        // At shutdown: after any save still writing, on this thread.
+        while (g_librarySaving)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        WritePipelineLibrary(g_cache.library.Get(), g_cache.libraryPath);
+        return;
+    }
+    // Serializing a large library and writing it took the render thread long enough to hitch the game every 30 s while
+    // new pipeline states were being made. The thread holds the library and its blob for as long as it runs.
+    g_librarySaving = true;
+    PinThisModule();
+    std::thread([library = g_cache.library, blob = g_cache.libraryBlob, path = g_cache.libraryPath] {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        WritePipelineLibrary(library.Get(), path);
+        g_librarySaving = false;
+    }).detach();
 }
 
 void LogNextDraws(int count) { g_drawLog = count; }

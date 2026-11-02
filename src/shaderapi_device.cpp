@@ -6,6 +6,7 @@
 #include "native_lighting.h"
 #include "overlay.h"
 #include "settings.h"
+#include "shader_cache.h"
 #include "shaderapi.h"
 #include "shaderapi_meshes.h"
 #include "shaderapi_pipelines.h"
@@ -110,6 +111,9 @@ struct DeviceManagerObject : NativeObject {
 
 bool Connect(DeviceManagerObject*, CreateInterfaceFn factory)
 {
+    // The caches are read while the game starts up, so the first draws do not wait for the disk.
+    shader_cache::OpenInBackground();
+    ReadPipelineLibraryInBackground();
     Backend& backend = GetBackend();
     backend.shaderUtil = factory != nullptr ? factory("VShaderUtil001", nullptr) : nullptr;
     // shaderapidx9.dll asks for VFileSystem022 and reads files through its IBaseFileSystem base, which IFileSystem
