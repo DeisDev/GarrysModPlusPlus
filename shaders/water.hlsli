@@ -20,6 +20,10 @@ static const float kWaveSlope = 0.35;
 static const float kGlintRoughness = 0.03;
 // Rays through the water gather its light at this many points (ThroughWater).
 static const uint kWaterSteps = 2;
+// Seen from above, the surface fades out where the water under it is shallower than this, straight down from what the
+// refraction meets: its reflection, glint, tint and the 1 / n^2 its refraction loses leave what lies under it as it is
+// at the waterline. Without it the flat surface cut a hard line along the shore, darker by about half.
+static const float kShoreDepth = 8.0;
 
 bool IsWater(float4 flags) { return flags.r < 0.5 && flags.g > 0.5; }
 // A mirror's surface (translator::Variant::markMirror), which shows the game's reflection view.
@@ -96,8 +100,9 @@ struct WaterResult
 // lies under it (ThroughWater), and its radiance spreads over the wider cone it leaves the water in (1 / n^2); from
 // below, light from the air in Snell's window is
 // gathered into the narrower cone (n^2), beyond it the surface mirrors the water entirely, and the reflection crosses
-// the water too. Source's $refracttint tints what comes through. Water outside the map's bodies of water (brush
-// entities) keeps Source's refraction, fogged by Source, under the traced reflection.
+// the water too. Source's $refracttint tints what comes through. Seen from above, the surface fades out towards the
+// shore (kShoreDepth). Water outside the map's bodies of water (brush entities) keeps Source's refraction, fogged by
+// Source, under the traced reflection.
 // The two rays share one call of ReflectedRadiance and the water one of ThroughWater: inlined more often, their code
 // slowed every pixel of the pass.
 WaterResult ShadeWater(int2 pixel, float3 position)
@@ -147,11 +152,17 @@ WaterResult ShadeWater(int2 pixel, float3 position)
     for (uint r = 0; r < rays; ++r) {
         bool reflected = r == 0;
         float3 rayDirection = reflected ? direction : refracted;
-        float offset = reflected ? side * (traced ? kWaterSurfaceOffset : 2.0) : -side * kWaterSurfaceOffset;
+        // Both rays leave from the eye's side of the surface, which the refraction's mask leaves out: one that started past
+        // it began under the ground where the shore meets the water within that offset, saw nothing, and drew the water's
+        // own dark colour along the waterline.
+        float offset = side * (traced ? kWaterSurfaceOffset : 2.0);
+        // The refraction carries on the view, which never shows the local player (shaders/primary.hlsl): of a body the
+        // game does not draw in first person, only the feet showed under the water. Reflections show it.
+        uint mask = reflected ? g_frame.traceMask | (traced && !below ? kWaterMask : 0u) : g_frame.traceMask & ~kLocalPlayerMask;
         float hitDistance;
         float3 hitAlbedo;
-        float3 light = ReflectedRadiance(surface + float3(0.0, 0.0, offset), rayDirection, PixelAngle() * distance, PixelAngle(), seed, hitDistance,
-            hitAlbedo, reflected && traced && !below);
+        float3 light = ReflectedRadiance(surface + float3(0.0, 0.0, offset), rayDirection, PixelAngle() * distance, PixelAngle(), mask, seed, hitDistance,
+            hitAlbedo, true);
         if (reflected) {
             reflection = light * (tint * g_frame.reflectionScale);
             result.hitDistance = hitDistance;
@@ -163,6 +174,7 @@ WaterResult ShadeWater(int2 pixel, float3 position)
     }
 
     float3 transmitted;
+    float shore = 1.0;
     if (traced) {
         // From below the reflection crosses the water; from above what is seen through it does.
         float3 inWater = below ? reflection : seenDistance < kSkyHitDistance ? seen : 0.0;
@@ -177,6 +189,10 @@ WaterResult ShadeWater(int2 pixel, float3 position)
             transmitted = refracts ? crossed / (kWaterIor * kWaterIor) : 0.0;
         }
         transmitted *= LoadWaterBody(water).refractTint;
+        if (!below && refracts && seenDistance < kSkyHitDistance)
+            shore = smoothstep(0.0, kShoreDepth, -refracted.z * seenDistance);
+        fresnel *= shore;
+        transmitted = lerp(seen, transmitted, shore);
     } else {
         // Source's refraction holds the colour the game would have written, linear before its tonemap scale. Seen from
         // below, the reflected underwater scene lies behind more of Source's water fog.
@@ -197,11 +213,11 @@ WaterResult ShadeWater(int2 pixel, float3 position)
     if (result.refractedGuide && refracts) {
         WaterBody body = LoadWaterBody(water);
         float3 through = seenDistance < kSkyHitDistance ? exp(-body.extinction * seenDistance) : 0.0;
-        result.diffuseAlbedo = saturate((1.0 - fresnel) / (kWaterIor * kWaterIor) * body.refractTint *
-            (through * seenAlbedo + (1.0 - through) * WaterAlbedo(body)));
+        float3 waterGuide = body.refractTint / (kWaterIor * kWaterIor) * (through * seenAlbedo + (1.0 - through) * WaterAlbedo(body));
+        result.diffuseAlbedo = saturate((1.0 - fresnel) * lerp(seenAlbedo, waterGuide, shore));
     }
     if (!below)
-        result.color += SunGlint(surface, normal, toEye) * (g_frame.reflectionScale * (traced ? 1.0 : marks.a));
+        result.color += SunGlint(surface, normal, toEye) * (g_frame.reflectionScale * (traced ? shore : marks.a));
     result.specularAlbedo = saturate(fresnel * tint);
     return result;
 }

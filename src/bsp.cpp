@@ -684,6 +684,7 @@ void AddPolygon(Mesh& mesh, const Lumps& lumps, const Face& face, const std::vec
     for (const Float3& p : polygon) {
         mesh.positions.push_back(p);
         mesh.uvs.push_back(FaceUv(lumps, face, p));
+        mesh.blends.push_back(0.0f);
         mesh.luxels.push_back(lightmap != kNoFace ? FaceLuxel(lumps, face, p) : Float2{});
     }
     for (uint32_t i = 1; i + 1 < polygon.size(); ++i) {
@@ -736,6 +737,7 @@ bool AddDisplacement(Mesh& mesh, const Lumps& lumps, const Face& face, const Dis
             Float3 flat = Add(end0, Scale(segment, static_cast<float>(j)));
             mesh.positions.push_back(Add(flat, Scale(dv.vec, dv.dist)));
             mesh.uvs.push_back(FaceUv(lumps, face, flat));
+            mesh.blends.push_back(std::isfinite(dv.alpha) ? std::clamp(dv.alpha / 255.0f, 0.0f, 1.0f) : 0.0f);
             mesh.luxels.push_back({static_cast<float>(face.lightmapSize[0]) * static_cast<float>(j) * step,
                 static_cast<float>(face.lightmapSize[1]) * static_cast<float>(i) * step});
         }
