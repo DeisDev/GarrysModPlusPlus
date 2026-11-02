@@ -260,6 +260,10 @@ struct ViewInputs {
     // The water surfaces the game drew, last time each was drawn, and the normal map frame each had bound (or null).
     std::span<const gbuffer::WaterSurfaceDraw> waterDraws;
     std::span<ID3D12Resource* const> waterNormalMaps;
+    // env_sun as the client has it, and the sun GMod's painted sky (env_skypaint) last drew: the procedural sky and the
+    // sun's disc show this sun rather than the map's (Lighting::RecordSky).
+    std::optional<gbuffer::EnvSun> envSun;
+    std::optional<std::array<float, 3>> paintedSun;
 };
 
 // Lights a view's G-buffer on the D3D12 queue the game shares and writes the result back into its colour
@@ -300,6 +304,8 @@ public:
     D3D12_GPU_VIRTUAL_ADDRESS ForwardFrame() const { return m_volumeReady ? m_forwardFrame : 0; }
     D3D12_GPU_VIRTUAL_ADDRESS ForwardScene() const { return m_volumeReady ? m_forwardScene : 0; }
     std::array<int, 3> VolumeOrigin() const { return m_probeOrigin; }
+    // What the game's 2D sky draws show, as the last main view made it.
+    const gbuffer::SkyDraw& SkyDraw() const { return m_skyDraw; }
     // Developer tool: the next main view reports what blocks the sun at a pixel (TakeProbe).
     void RequestProbe(UINT x, UINT y)
     {
@@ -354,6 +360,7 @@ private:
         SunShadow,
         Caustics,
         Skin,
+        SkyAtmosphere,
         Count
     };
     // Mirrors PassConstants in shaders/common.hlsli: descriptor indices (none by default) and a parameter.
@@ -408,7 +415,13 @@ private:
     std::pair<UINT, UINT> RecordSunShadow(const FrameConstants& constants, const ViewInputs& inputs, bool denoise, UINT slot,
         D3D12_GPU_VIRTUAL_ADDRESS frameConstants, D3D12_GPU_VIRTUAL_ADDRESS scene);
     bool CreateTarget(Texture& texture, UINT width, UINT height, DXGI_FORMAT format, UINT depth = 0);
+    // A cube `size` texels a side: srv views it as a cube, uav and `faces` (an SRV, when given) as an array of its faces.
+    bool CreateCube(Texture& texture, UINT size, DXGI_FORMAT format, UINT* faces);
     bool CreateSkyLight();
+    // Makes what the main view's 2D sky shows (shaders/sky_atmosphere.hlsl): with the physical sky, the procedural sky
+    // in the game's colours, which `constants` then read in place of the game's sky; with the sun's disc, what draws it.
+    // Publishes both in m_skyDraw.
+    void RecordSky(FrameConstants& constants, const ViewInputs& inputs);
     // Writes each body of water's surface as the game last drew it (the draw whose fog colour is the body's) into the
     // slot's m_waterDraws, with views of their normal maps from `firstView` on, and points `constants` at them.
     void WriteWaterDraws(UINT slot, const ViewInputs& inputs, const Scene& scene, UINT firstView, FrameConstants& constants);
@@ -549,6 +562,21 @@ private:
     // (uav) and a cube (srv); ready once a main view has made it.
     Texture m_skyLight;
     bool m_skyLightReady = false;
+    // The procedural sky (shaders/sky_atmosphere.hlsl): the atmosphere's transmittance and multiple scattering tables,
+    // made once; the clear sky for m_atmosphereSun (faces m_atmosphereSkyFaces); the colour bands taken from the game's
+    // sky; and the sky that replaces it (faces m_proceduralSkyFaces), ready once a main view has made it this map.
+    Texture m_transmittance;
+    Texture m_multipleScattering;
+    Texture m_atmosphereSky;
+    UINT m_atmosphereSkyFaces = DescriptorHeap::kInvalid;
+    Texture m_skyBands;
+    Texture m_proceduralSky;
+    UINT m_proceduralSkyFaces = DescriptorHeap::kInvalid;
+    bool m_atmosphereFailed = false;
+    bool m_atmosphereTables = false;
+    std::optional<std::array<float, 3>> m_atmosphereSun;
+    bool m_proceduralSkyReady = false;
+    gbuffer::SkyDraw m_skyDraw;
     // The main view's caustics and the water's sun maps (shaders/caustics.hlsl): the photon counts, how much the water
     // focuses sunlight over the square from m_causticsOrigin, 1 / m_causticsInvSize across, and the sun maps of that
     // square and of the coarse one that covers the map; ready once a main view has traced them this map.

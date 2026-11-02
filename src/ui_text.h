@@ -43,6 +43,8 @@ enum class TextId {
     RenderTargetLighting,
     VolumetricLight,
     Fog,
+    PhysicalSky,
+    SunDisc,
     SectionAntiAliasing,
     AntiAliasingMode,
     AntiAliasingOff,

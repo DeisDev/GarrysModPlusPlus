@@ -1629,6 +1629,27 @@ int UserClipPlanes(float planes[6][4])
     }
     return count;
 }
+std::optional<std::array<float, 3>> ViewEye()
+{
+    Matrix eyeToWorld;
+    if (!Invert(Top(kMatrixView), eyeToWorld))
+        return std::nullopt;
+    return std::array<float, 3>{eyeToWorld.m[3][0], eyeToWorld.m[3][1], eyeToWorld.m[3][2]};
+}
+
+bool InvertRows(const std::array<Float4, 4>& rows, std::array<Float4, 4>& inverse)
+{
+    Matrix in;
+    for (int r = 0; r < 4; ++r)
+        std::copy_n(rows[static_cast<size_t>(r)].v, 4, in.m[r]);
+    Matrix out;
+    if (!Invert(in, out))
+        return false;
+    for (int r = 0; r < 4; ++r)
+        std::copy_n(out.m[r], 4, inverse[static_cast<size_t>(r)].v);
+    return true;
+}
+
 bool EyeBelowHeightClip()
 {
     if (g_clip.enabled == 0)

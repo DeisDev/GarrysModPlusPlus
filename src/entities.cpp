@@ -80,9 +80,24 @@ constexpr int kRopeDefaultSubdiv = 2;
 constexpr int kRopeMaxSubdiv = 7;
 constexpr float kWorldLimit = 65536.0f;
 
+// env_sun's client class, C_Sun in GMod's client.dll (ClientClass "CSun" at 0x87F2C8, DT_Sun built at 0x30380):
+// m_vDirection is a vector, m_bOn a one-byte bool, m_clrRender a color32, m_nMaterial and m_nSize ints. Its
+// OnDataChanged (0x1FCC10) gives the sun's sprite the material named by m_nMaterial's model, the half size m_nSize and
+// m_clrRender divided by its largest component (REA, 2026-11-02).
+constexpr char kSunClass[] = "CSun";
+struct SunProps {
+    int direction;
+    int on;
+    int color;
+    int material;
+    int size;
+};
+
 void* g_entityList = nullptr;
 // Offset of m_nSkin in each client class, or kNoProp.
 std::unordered_map<const void*, int> g_skinOffsets;
+// DT_Sun's offsets per client class.
+std::unordered_map<const void*, SunProps> g_sunProps;
 void* g_modelInfo = nullptr;
 void* g_engineClient = nullptr;
 bool g_attempted = false;
@@ -240,6 +255,58 @@ void CollectRopes(std::vector<Rope>& ropes)
         rope.material = material;
         ropes.push_back(std::move(rope));
     }
+}
+
+std::optional<gbuffer::EnvSun> FindSun()
+{
+    if (!Ready())
+        return std::nullopt;
+    std::optional<gbuffer::EnvSun> found;
+    const int highest = Slot<int(__fastcall*)(void*)>(g_entityList, kGetHighestEntityIndexSlot)(g_entityList);
+    for (int index = 1; index <= highest; ++index) {
+        void* entity = Slot<void*(__fastcall*)(void*, int)>(g_entityList, kGetClientEntitySlot)(g_entityList, index);
+        if (entity == nullptr)
+            continue;
+        void* networkable = Slot<void*(__fastcall*)(void*)>(entity, kGetClientNetworkableSlot)(entity);
+        const void* clientClass = networkable != nullptr ? Slot<const void*(__fastcall*)(void*)>(networkable, kGetClientClassSlot)(networkable) : nullptr;
+        if (clientClass == nullptr || std::strcmp(Field<const char*>(clientClass, kClientClassName), kSunClass) != 0)
+            continue;
+        auto props = g_sunProps.find(clientClass);
+        if (props == g_sunProps.end()) {
+            const void* table = Field<const void*>(clientClass, kClientClassRecvTable);
+            props = g_sunProps.emplace(clientClass, SunProps{FindProp(table, "m_vDirection", 0), FindProp(table, "m_bOn", 0), FindProp(table, "m_clrRender", 0),
+                FindProp(table, "m_nMaterial", 0), FindProp(table, "m_nSize", 0)}).first;
+            const SunProps& p = props->second;
+            if (p.direction == kNoProp || p.on == kNoProp || p.color == kNoProp || p.material == kNoProp || p.size == kNoProp)
+                log::Info("Entities: env_sun's DT_Sun lacks a known prop (direction {}, on {}, colour {}, material {}, size {}); its sun is ignored",
+                    p.direction, p.on, p.color, p.material, p.size);
+        }
+        const SunProps& p = props->second;
+        if (p.direction == kNoProp || p.on == kNoProp || p.color == kNoProp || p.material == kNoProp || p.size == kNoProp)
+            continue;
+        gbuffer::EnvSun sun;
+        sun.direction = Field<std::array<float, 3>>(entity, static_cast<size_t>(p.direction));
+        const float length = std::sqrt(sun.direction[0] * sun.direction[0] + sun.direction[1] * sun.direction[1] + sun.direction[2] * sun.direction[2]);
+        if (!std::isfinite(length) || length < 1e-3f)
+            continue;
+        for (float& c : sun.direction)
+            c /= length;
+        sun.on = Field<std::uint8_t>(entity, static_cast<size_t>(p.on)) != 0;
+        const std::array<std::uint8_t, 4> color = Field<std::array<std::uint8_t, 4>>(entity, static_cast<size_t>(p.color));
+        const float largest = static_cast<float>(std::max({color[0], color[1], color[2]}));
+        if (largest > 0.0f)
+            sun.color = {color[0] / largest, color[1] / largest, color[2] / largest};
+        const int material = Field<int>(entity, static_cast<size_t>(p.material));
+        const void* model = material != 0 ? Slot<const void*(__fastcall*)(void*, int)>(g_modelInfo, kModelInfoGetModelSlot)(g_modelInfo, material) : nullptr;
+        const char* name = model != nullptr ? Slot<const char*(__fastcall*)(void*, const void*)>(g_modelInfo, kGetModelNameSlot)(g_modelInfo, model) : nullptr;
+        sun.material = name != nullptr ? name : "";
+        sun.size = static_cast<float>(Field<int>(entity, static_cast<size_t>(p.size)));
+        if (sun.on)
+            return sun;
+        if (!found)
+            found = std::move(sun);
+    }
+    return found;
 }
 
 std::string WeaponWorldModel(const ModelEntity& weapon)

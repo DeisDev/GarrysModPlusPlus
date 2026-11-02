@@ -65,6 +65,7 @@
 #include <g_sharcUpdateCS.h>
 #include <g_sharcUpdateOmmCS.h>
 #include <g_skinCS.h>
+#include <g_skyAtmosphereCS.h>
 #include <g_skyCS.h>
 #include <g_surfaceCS.h>
 #include <g_swayCS.h>
@@ -105,6 +106,16 @@ constexpr UINT kWaterDrawStride = 80;
 constexpr UINT kInvalidView = ~0u;
 // Texels on a side of each face of the sky light (kSize in shaders/sky.hlsl).
 constexpr UINT kSkyLightSize = 8;
+// The procedural sky (shaders/sky_atmosphere.hlsl, shaders/atmosphere.hlsli): its tables, its cubes' faces, its colour
+// bands, and the shader's group size.
+constexpr UINT kTransmittanceWidth = 256;
+constexpr UINT kTransmittanceHeight = 64;
+constexpr UINT kMultipleScatteringSize = 32;
+constexpr UINT kProceduralSkySize = 256;
+constexpr UINT kSkyBands = 32;
+constexpr UINT kSkyGroup = 16;
+// The clear sky is made again once the sun has moved this far (cosine of 0.1 degrees); its disc follows it exactly.
+constexpr float kSkySunMoved = 0.9999985f;
 // Caustics (shaders/caustics.hlsl, kCausticsCells there) cover this many units square around the main view's eye.
 constexpr UINT kCausticsCells = 1024;
 constexpr float kCausticsRange = 2048.0f;
@@ -543,7 +554,8 @@ bool Lighting::Initialize(ID3D12Device5* device, ID3D12CommandQueue* queue, Desc
         cache ? std::span<const BYTE>(g_reflectionsCacheCS) : g_reflectionsCS, g_reflectionTemporalCS, g_dlssInputsCS, g_dlssResolveCS, g_directWideCS,
         g_swayCS, g_translucentDepthCS, g_viewRectCS, g_bakedBounceCS, g_skyCS, cache ? std::span<const BYTE>(g_sharcUpdateCS) : none,
         cache ? std::span<const BYTE>(g_sharcResolveCS) : none, g_directSunCS, g_restirPdfCS, g_restirPresampleCS, g_restirRegirCS, g_restirInitialCS,
-        g_restirTemporalCS, g_restirSpatialCS, g_restirShadeCS, g_nrdInputsCS, g_nrdResolveCS, g_sunShadowCS, g_causticsCS, g_skinCS};
+        g_restirTemporalCS, g_restirSpatialCS, g_restirShadeCS, g_nrdInputsCS, g_nrdResolveCS, g_sunShadowCS, g_causticsCS, g_skinCS,
+        g_skyAtmosphereCS};
     static_assert(std::size(shaders) == static_cast<size_t>(Pass::Count));
     for (size_t i = 0; i < m_pipelines.size() && SUCCEEDED(hr); ++i) {
         if (shaders[i].empty())
@@ -846,40 +858,128 @@ void Lighting::RecordCaustics(FrameConstants& constants, const Scene& scene)
     m_causticsReady = true;
 }
 
-bool Lighting::CreateSkyLight()
+bool Lighting::CreateCube(Texture& texture, UINT size, DXGI_FORMAT format, UINT* faces)
 {
     D3D12_HEAP_PROPERTIES heap = {D3D12_HEAP_TYPE_DEFAULT};
     D3D12_RESOURCE_DESC desc = {};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    desc.Width = kSkyLightSize;
-    desc.Height = kSkyLightSize;
+    desc.Width = size;
+    desc.Height = size;
     desc.DepthOrArraySize = 6;
     desc.MipLevels = 1;
-    desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    desc.Format = format;
     desc.SampleDesc.Count = 1;
     desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     if (FAILED(m_device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
-            IID_PPV_ARGS(&m_skyLight.resource))))
+            IID_PPV_ARGS(&texture.resource))))
         return false;
-    m_skyLight.state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-    m_skyLight.srv = m_descriptors->Allocate();
-    m_skyLight.uav = m_descriptors->Allocate();
-    if (m_skyLight.srv == DescriptorHeap::kInvalid || m_skyLight.uav == DescriptorHeap::kInvalid) {
-        m_skyLight = {};
+    texture.state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    texture.srv = m_descriptors->Allocate();
+    texture.uav = m_descriptors->Allocate();
+    if (faces != nullptr)
+        *faces = m_descriptors->Allocate();
+    if (texture.srv == DescriptorHeap::kInvalid || texture.uav == DescriptorHeap::kInvalid || (faces != nullptr && *faces == DescriptorHeap::kInvalid))
         return false;
-    }
     D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
-    srv.Format = desc.Format;
+    srv.Format = format;
     srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
     srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     srv.TextureCube.MipLevels = 1;
-    m_device->CreateShaderResourceView(m_skyLight.resource.Get(), &srv, m_descriptors->Cpu(m_skyLight.srv));
+    m_device->CreateShaderResourceView(texture.resource.Get(), &srv, m_descriptors->Cpu(texture.srv));
+    if (faces != nullptr) {
+        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+        srv.Texture2DArray = {};
+        srv.Texture2DArray.MipLevels = 1;
+        srv.Texture2DArray.ArraySize = 6;
+        m_device->CreateShaderResourceView(texture.resource.Get(), &srv, m_descriptors->Cpu(*faces));
+    }
     D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
-    uav.Format = desc.Format;
+    uav.Format = format;
     uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
     uav.Texture2DArray.ArraySize = 6;
-    m_device->CreateUnorderedAccessView(m_skyLight.resource.Get(), nullptr, &uav, m_descriptors->Cpu(m_skyLight.uav));
+    m_device->CreateUnorderedAccessView(texture.resource.Get(), nullptr, &uav, m_descriptors->Cpu(texture.uav));
     return true;
+}
+
+bool Lighting::CreateSkyLight()
+{
+    if (CreateCube(m_skyLight, kSkyLightSize, DXGI_FORMAT_R16G16B16A16_FLOAT, nullptr))
+        return true;
+    m_skyLight = {};
+    return false;
+}
+
+void Lighting::RecordSky(FrameConstants& constants, const ViewInputs& inputs)
+{
+    const Settings& settings = GetSettings();
+    // The sun the sky shows: env_sun's, else the one GMod's painted sky draws, else the map's.
+    std::optional<std::array<float, 3>> sun = inputs.envSun ? std::optional(inputs.envSun->direction) : inputs.paintedSun;
+    if (!sun && constants.sunEnabled != 0.0f)
+        sun = std::array<float, 3>{constants.sunDirection[0], constants.sunDirection[1], constants.sunDirection[2]};
+    // The physical sky needs the map's sun, whose light the scene is lit by, and the game's sky to take its colours from.
+    const bool sky = settings.physicalSky && constants.sunEnabled != 0.0f && inputs.skyCube != nullptr && sun;
+    // The disc replaces env_sun's sprite, and is the physical sky's sun on maps without one.
+    const bool disc = settings.sunDisc && sun && (inputs.envSun ? inputs.envSun->on : sky);
+    m_skyDraw = {};
+    m_proceduralSkyReady = false;
+    constants.skyCubeView = inputs.skyCube != nullptr ? inputs.skyCubeView : kInvalidView;
+    if ((!sky && !disc) || m_atmosphereFailed)
+        return;
+    if (!m_transmittance.resource) {
+        const bool created = CreateTarget(m_transmittance, kTransmittanceWidth, kTransmittanceHeight, DXGI_FORMAT_R16G16B16A16_FLOAT) &&
+            CreateTarget(m_multipleScattering, kMultipleScatteringSize, kMultipleScatteringSize, DXGI_FORMAT_R16G16B16A16_FLOAT) &&
+            CreateCube(m_atmosphereSky, kProceduralSkySize, DXGI_FORMAT_R32G32B32A32_FLOAT, &m_atmosphereSkyFaces) &&
+            CreateTarget(m_skyBands, kSkyBands, 1, DXGI_FORMAT_R32G32B32A32_FLOAT) &&
+            CreateCube(m_proceduralSky, kProceduralSkySize, DXGI_FORMAT_R16G16B16A16_FLOAT, &m_proceduralSkyFaces);
+        if (!created) {
+            m_atmosphereFailed = true;
+            log::Info("Lighting: creating the procedural sky's targets failed; the game's sky and sun stay");
+            return;
+        }
+    }
+    // The game's draws (shaders/sky_draw.hlsl) read the transmittance and the sky in their own command lists.
+    const D3D12_RESOURCE_STATES read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    const D3D12_RESOURCE_STATES write = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    if (!m_atmosphereTables) {
+        DispatchGroups(Pass::SkyAtmosphere, {.output0 = m_transmittance.uav, .step = 0}, kTransmittanceWidth / kSkyGroup, kTransmittanceHeight / kSkyGroup, 1);
+        Use(m_transmittance, kVolumeRead);
+        DispatchGroups(Pass::SkyAtmosphere, {.input0 = m_transmittance.srv, .output0 = m_multipleScattering.uav, .step = 1},
+            kMultipleScatteringSize / kSkyGroup, kMultipleScatteringSize / kSkyGroup, 1);
+        Use(m_multipleScattering, read);
+        m_atmosphereTables = true;
+    }
+    if (sky) {
+        const std::array<float, 3>& direction = *sun;
+        const bool moved = !m_atmosphereSun || direction[0] * (*m_atmosphereSun)[0] + direction[1] * (*m_atmosphereSun)[1] +
+                direction[2] * (*m_atmosphereSun)[2] < kSkySunMoved;
+        if (moved) {
+            Use(m_atmosphereSky, write);
+            DispatchGroups(Pass::SkyAtmosphere, {.input0 = m_transmittance.srv, .input1 = m_multipleScattering.srv, .input2 = std::bit_cast<UINT>(direction[0]),
+                .input3 = std::bit_cast<UINT>(direction[1]), .input4 = std::bit_cast<UINT>(direction[2]), .output0 = m_atmosphereSky.uav, .step = 2},
+                kProceduralSkySize / kSkyGroup, kProceduralSkySize / kSkyGroup, 6);
+            m_atmosphereSun = direction;
+        }
+        Use(m_atmosphereSky, read);
+        Use(m_skyBands, write);
+        DispatchGroups(Pass::SkyAtmosphere, {.input0 = inputs.skyFacesView, .input1 = m_atmosphereSkyFaces, .output0 = m_skyBands.uav, .step = 3}, 1, 1, 1);
+        Use(m_skyBands, read);
+        Use(m_proceduralSky, write);
+        DispatchGroups(Pass::SkyAtmosphere, {.input0 = m_atmosphereSkyFaces, .input1 = m_skyBands.srv, .output0 = m_proceduralSky.uav, .step = 4},
+            kProceduralSkySize / kSkyGroup, kProceduralSkySize / kSkyGroup, 6);
+        Use(m_proceduralSky, kVolumeRead);
+        constants.skyCubeView = m_proceduralSky.srv;
+        m_proceduralSkyReady = true;
+    }
+    m_skyDraw.sky = sky;
+    m_skyDraw.sunDisc = disc;
+    m_skyDraw.skyView = m_proceduralSky.srv;
+    m_skyDraw.transmittanceView = m_transmittance.srv;
+    m_skyDraw.sunDirection = *sun;
+    if (inputs.envSun) {
+        m_skyDraw.sunColor = inputs.envSun->color;
+        m_skyDraw.sprite = inputs.envSun->material;
+        m_skyDraw.spriteSize = inputs.envSun->size;
+    }
 }
 
 bool Lighting::EnsureTargets(UINT width, UINT height)
@@ -1507,7 +1607,8 @@ bool Lighting::FillConstants(FrameConstants& constants, const Scene& scene, cons
     constants.skyboxFogEnabled = skyboxFog.known && settings.fog ? 1u : 0u;
     std::memcpy(constants.skyboxFogParams, skyboxFog.params.data(), sizeof(constants.skyboxFogParams));
     std::memcpy(constants.skyboxFogColor, skyboxFog.color.data(), sizeof(constants.skyboxFogColor));
-    constants.skyCubeView = inputs.skyCube != nullptr ? inputs.skyCubeView : kInvalidView;
+    // The procedural sky the last main view made replaces the game's (RecordSky decides again for the main view).
+    constants.skyCubeView = inputs.skyCube == nullptr ? kInvalidView : m_proceduralSkyReady ? m_proceduralSky.srv : inputs.skyCubeView;
     constants.skyLightView = m_skyLightReady ? m_skyLight.srv : kInvalidView;
     // The 3D skybox is a scaled-down scene elsewhere in the map: the map's lights do not belong to it.
     const bool skybox = inputs.kind == gbuffer::ViewKind::Skybox;
@@ -1727,6 +1828,11 @@ bool Lighting::RayReconstructionSize(UINT outputWidth, UINT outputHeight, UINT& 
 
 void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const SceneInstance> dynamic, const std::vector<SkinnedEntity>& skinned)
 {
+    // A main view that stops before RecordSky leaves the game's sky.
+    if (inputs.kind == gbuffer::ViewKind::Main) {
+        m_skyDraw = {};
+        m_proceduralSkyReady = false;
+    }
     if (m_failed)
         return;
     const D3D12_RESOURCE_DESC colorDesc = inputs.color->GetDesc();
@@ -2079,9 +2185,12 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
         RecordCaustics(constants, scene);
     if (bakedIndirect && main && constants.traceMask != 0 && !scene.Baked().Ready())
         BakeStep(scene, frame, slotConstantsGpu);
+    if (main)
+        RecordSky(constants, inputs);
     if (main && inputs.skyCube != nullptr && m_skyLight.resource) {
         Use(m_skyLight, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        DispatchGroups(Pass::Sky, {.input0 = inputs.skyFacesView, .output0 = m_skyLight.uav, .step = 0}, kSkyLightSize, kSkyLightSize, 6);
+        const UINT faces = m_proceduralSkyReady ? m_proceduralSkyFaces : inputs.skyFacesView;
+        DispatchGroups(Pass::Sky, {.input0 = faces, .output0 = m_skyLight.uav, .step = 0}, kSkyLightSize, kSkyLightSize, 6);
         const D3D12_RESOURCE_BARRIER between = {D3D12_RESOURCE_BARRIER_TYPE_UAV, D3D12_RESOURCE_BARRIER_FLAG_NONE, {.UAV = {m_skyLight.resource.Get()}}};
         m_list->ResourceBarrier(1, &between);
         DispatchGroups(Pass::Sky, {.output0 = m_skyLight.uav, .step = 1}, 1, 1, 1);

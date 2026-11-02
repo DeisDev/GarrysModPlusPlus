@@ -80,6 +80,10 @@ struct Settings {
     bool renderTargetLighting = false;
     bool volumetricLight = true;
     bool fog = true;
+    // A physically based sky in the 2D skybox's colours replaces the skybox, on screen and in the lighting.
+    bool physicalSky = true;
+    // Our sun disc replaces env_sun's sprite.
+    bool sunDisc = true;
     float sunIntensity = 1.0f;
     float skyIntensity = 1.0f;
     float lightIntensity = 1.0f;

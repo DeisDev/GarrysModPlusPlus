@@ -49,6 +49,9 @@ void LightView(ViewInputs& inputs);
 // What the forward-lit translucent surfaces of the main view read, once its irradiance volume is ready.
 std::optional<gbuffer::ForwardConstants> ForwardLighting(const ViewInputs& inputs);
 
+// What the game's 2D sky draws show, as the last main view lit made it (Lighting::SkyDraw).
+std::optional<gbuffer::SkyDraw> SkyDraw();
+
 // The fence lighting's commands signal and its last value, for handing resources back.
 ID3D12Fence* Fence();
 uint64_t FenceValue();

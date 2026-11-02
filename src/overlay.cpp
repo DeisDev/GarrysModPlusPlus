@@ -496,6 +496,8 @@ void DrawImagePage(Settings& settings)
 
     widgets::BeginCard("##effects", Text(TextId::SectionEffects));
     widgets::Toggle(Text(TextId::Fog), &settings.fog);
+    widgets::Toggle(Text(TextId::PhysicalSky), &settings.physicalSky);
+    widgets::Toggle(Text(TextId::SunDisc), &settings.sunDisc);
     widgets::EndCard();
 }
 

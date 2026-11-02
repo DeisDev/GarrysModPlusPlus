@@ -2,16 +2,20 @@
 
 #include "engine_interfaces.h"
 #include "log.h"
+#include "shader_bytecode.h"
 #include "shaderapi.h"
+#include "shaderapi_meshes.h"
 #include "shaderapi_textures.h"
 #include "shader_twins.h"
 
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstring>
 #include <format>
 #include <map>
 #include <memory>
+#include <numbers>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -133,6 +137,11 @@ struct State {
     // By the address of the game's combo, which never moves once loaded.
     std::unordered_map<const DWORD*, std::unique_ptr<PixelShader>> pixelShaders;
     std::unordered_map<const DWORD*, gbuffer::VertexShaderClass> vertexShaders;
+    // What the 2D sky's draws show (SetSky), the sun the painted sky last drew, and each sky pixel shader's g_SunNormal
+    // register (-1 for none), by its combo's address.
+    std::optional<gbuffer::SkyDraw> skyDraw;
+    std::optional<std::array<float, 3>> paintedSun;
+    std::unordered_map<const DWORD*, int> sunNormalRegisters;
 };
 
 State g_state;
@@ -492,6 +501,7 @@ bool End(ViewKind kind, ViewInputs& inputs)
     inputs.outputSrgb = g_state.outputSrgb;
     inputs.fog = g_state.fog[kind == ViewKind::Skybox ? 1 : 0];
     inputs.sway = g_state.swayClock;
+    inputs.paintedSun = g_state.paintedSun;
     return true;
 }
 
@@ -836,14 +846,80 @@ UINT ProbeView(size_t index)
 // The engine loads the 2D skybox's faces as the materials "skybox/<sv_skyname><side>" (engine.dll 0x180102020, with
 // "skybox/%s%s") and draws all six (face mask 0x3f, 0x180101470 called from the world list draw 0x1800fdc90) inside
 // the views' world passes, which are captured.
-bool DrawsSky()
+bool SkyMaterial()
 {
-    if (!g_state.active)
-        return false;
     constexpr std::string_view kPrefix = "skybox/";
     const std::string_view name = BoundMaterialName();
     return name.size() > kPrefix.size() && std::equal(kPrefix.begin(), kPrefix.end(), name.begin(),
         [](char a, char b) { return a == std::tolower(static_cast<unsigned char>(b)); });
+}
+
+bool DrawsSky() { return g_state.active && SkyMaterial(); }
+
+// GMod's painted sky (g_sky_ps20b) reads the sun it draws from g_SunNormal (c5 in its constant table), env_skypaint's
+// sun normal, which its Lua entity keeps at env_sun's m_vDirection when the map has one.
+void RecordSkyShader(std::span<const DWORD> pixelCode)
+{
+    auto found = g_state.sunNormalRegisters.find(pixelCode.data());
+    if (found == g_state.sunNormalRegisters.end()) {
+        int reg = -1;
+        for (const bytecode::Constant& constant : bytecode::ConstantTable(pixelCode)) {
+            if (constant.name == "g_SunNormal" && constant.set == bytecode::RegisterSet::Float4)
+                reg = static_cast<int>(constant.index);
+        }
+        found = g_state.sunNormalRegisters.emplace(pixelCode.data(), reg).first;
+    }
+    g_state.paintedSun.reset();
+    if (found->second < 0)
+        return;
+    const float* normal = PixelRegister(static_cast<UINT>(found->second)).v;
+    const float length = std::sqrt(normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]);
+    if (std::isfinite(length) && length > 1e-3f)
+        g_state.paintedSun = std::array<float, 3>{normal[0] / length, normal[1] / length, normal[2] / length};
+}
+
+void SetSky(std::optional<gbuffer::SkyDraw> sky) { g_state.skyDraw = std::move(sky); }
+
+const gbuffer::SkyDraw* Sky() { return g_state.skyDraw && (g_state.skyDraw->sky || g_state.skyDraw->sunDisc) ? &*g_state.skyDraw : nullptr; }
+
+bool IsSunSprite(const MeshDraw& mesh)
+{
+    const gbuffer::SkyDraw* sky = Sky();
+    if (mesh.vertexCount != 4 || mesh.vertexData == nullptr || (mesh.vertexFormat & kVertexPosition) == 0 || sky == nullptr || !sky->sunDisc ||
+        sky->sprite.empty())
+        return false;
+    // The sprite's material is the model name of env_sun's m_nMaterial, with its extension.
+    std::string_view sprite = sky->sprite;
+    if (sprite.size() > 4 && sprite.ends_with(".vmt"))
+        sprite.remove_suffix(4);
+    const std::string_view name = BoundMaterialName();
+    const auto same = [](char a, char b) {
+        const auto fold = [](char c) { return c == '\\' ? '/' : static_cast<char>(std::tolower(static_cast<unsigned char>(c))); };
+        return fold(a) == fold(b);
+    };
+    if (name.size() != sprite.size() || !std::equal(name.begin(), name.end(), sprite.begin(), same))
+        return false;
+    const std::optional<std::array<float, 3>> eye = ViewEye();
+    if (!eye)
+        return false;
+    const UINT stride = mesh.streams[0].StrideInBytes;
+    std::array<std::array<float, 3>, 4> corners;
+    std::array<float, 3> centre = {};
+    for (size_t v = 0; v < corners.size(); ++v) {
+        std::memcpy(corners[v].data(), mesh.vertexData + v * stride, sizeof(corners[v]));
+        for (int c = 0; c < 3; ++c)
+            centre[c] += corners[v][c] * 0.25f;
+    }
+    const std::array<float, 3> toCentre = {centre[0] - (*eye)[0], centre[1] - (*eye)[1], centre[2] - (*eye)[2]};
+    const float distance = std::sqrt(toCentre[0] * toCentre[0] + toCentre[1] * toCentre[1] + toCentre[2] * toCentre[2]);
+    const std::array<float, 3>& sun = sky->sunDirection;
+    const float alignment = (toCentre[0] * sun[0] + toCentre[1] * sun[1] + toCentre[2] * sun[2]) / std::max(distance, 1e-3f);
+    const std::array<float, 3> toCorner = {corners[0][0] - centre[0], corners[0][1] - centre[1], corners[0][2] - centre[2]};
+    const float halfDiagonal = std::sqrt(toCorner[0] * toCorner[0] + toCorner[1] * toCorner[1] + toCorner[2] * toCorner[2]);
+    // The glare sprite at the same place is six times its own size (C_SunGlowOverlay::CalcSpriteColorAndSize).
+    constexpr float kSpriteDistance = 100.0f;
+    return std::fabs(distance - kSpriteDistance) < 1.0f && alignment > 0.99999f &&
+        std::fabs(halfDiagonal - sky->spriteSize * std::numbers::sqrt2_v<float>) < 0.01f * sky->spriteSize + 0.1f;
 }
 
 std::span<const D3D12_CPU_DESCRIPTOR_HANDLE> SkyFaces()

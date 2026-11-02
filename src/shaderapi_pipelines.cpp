@@ -14,6 +14,9 @@
 
 #include <d3d9types.h>
 
+#include <g_skyDrawPS.h>
+#include <g_sunDiscPS.h>
+
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -219,6 +222,9 @@ struct PipelineCache {
     std::unordered_map<std::uint64_t, ComPtr<ID3D12PipelineState>> blitPipelines;
     std::vector<unsigned char> blitVertexShader;
     std::vector<unsigned char> blitPixelShader;
+    // The pixel shaders the 2D sky's faces are drawn with in place of the game's (shaders/sky_draw.hlsl).
+    CompiledShader skyShader;
+    CompiledShader discShader;
     std::uint64_t boundGeneration = ~0ull;
     ID3D12PipelineState* boundPipeline = nullptr;
     // Shaders the render thread asked shader_precache::Build for, and the time it waited.
@@ -375,6 +381,13 @@ bool Initialize()
     if (!CreateRootSignature() || !CreateZeroBuffer())
         return false;
     CreateNullViews();
+    for (auto [shader, dxil] : { std::pair{ &g_cache.skyShader, std::span<const unsigned char>(g_skyDrawPS) },
+             std::pair{ &g_cache.discShader, std::span<const unsigned char>(g_sunDiscPS) } }) {
+        shader->dxil.assign(dxil.begin(), dxil.end());
+        shader->dxilHash = Fnv(dxil.data(), dxil.size());
+        shader->info.stage = translator::Stage::Pixel;
+        shader->info.colorOutputs = 1;
+    }
     OpenPipelineLibrary(ModDirectory() / L"cache" / L"pipelines.bin");
     g_cache.usable = true;
     return true;
@@ -947,6 +960,78 @@ void IssueDraws(ID3D12GraphicsCommandList* commands, const MeshDraw& mesh)
     }
 }
 
+// SkyDrawConstants of shaders/sky_draw.hlsl.
+struct SkyConstants {
+    std::array<Float4, 4> clipToWorld;
+    float viewport[4];
+    float sunDirection[3];
+    float tonemapScale;
+    float sunColor[3];
+    std::uint32_t skyView;
+    std::uint32_t transmittanceView;
+    std::uint32_t sunDisc;
+    std::uint32_t padding[2];
+};
+static_assert(sizeof(SkyConstants) == 128);
+
+// The sky shaders' constants for the 2D sky face being drawn, which they place by the view-projection (c8-c11) as the
+// draw's vertex patches leave it; 0 when it cannot be inverted.
+D3D12_GPU_VIRTUAL_ADDRESS SkyDrawConstants(const gbuffer::SkyDraw& sky, std::span<const capture::RegisterPatch> vertexPatches)
+{
+    const DynamicState& dynamic = Dynamic();
+    std::array<Float4, 4> viewProjection;
+    for (UINT r = 0; r < 4; ++r)
+        viewProjection[r] = dynamic.vertexFloats[gbuffer::kViewProjection + r];
+    for (const capture::RegisterPatch& patch : vertexPatches) {
+        if (patch.reg >= gbuffer::kViewProjection && patch.reg < gbuffer::kViewProjection + 4)
+            std::copy(patch.value.begin(), patch.value.end(), viewProjection[patch.reg - gbuffer::kViewProjection].v);
+    }
+    SkyConstants constants = {};
+    if (!InvertRows(viewProjection, constants.clipToWorld))
+        return 0;
+    const D3D12_VIEWPORT& viewport = dynamic.viewport;
+    const float rect[4] = { viewport.TopLeftX, viewport.TopLeftY, viewport.Width, viewport.Height };
+    std::copy(std::begin(rect), std::end(rect), constants.viewport);
+    std::copy(sky.sunDirection.begin(), sky.sunDirection.end(), constants.sunDirection);
+    constants.tonemapScale = dynamic.pixelFloats[gbuffer::kLightScaleRegister].v[0];
+    std::copy(sky.sunColor.begin(), sky.sunColor.end(), constants.sunColor);
+    constants.skyView = sky.skyView;
+    constants.transmittanceView = sky.transmittanceView;
+    constants.sunDisc = sky.sunDisc ? 1u : 0u;
+    return UploadConstants(&constants, sizeof(constants));
+}
+
+// Adds the sun's disc over a 2D sky face the game drew, through the same geometry and depth test.
+void DrawSunDisc(PipelineKey key, D3D12_GPU_VIRTUAL_ADDRESS constants, const MeshDraw& mesh)
+{
+    key.pixelShader = &g_cache.discShader;
+    D3D12_RENDER_TARGET_BLEND_DESC& blend = key.blend.RenderTarget[0];
+    blend.BlendEnable = TRUE;
+    blend.SrcBlend = D3D12_BLEND_ONE;
+    blend.DestBlend = D3D12_BLEND_ONE;
+    blend.BlendOp = D3D12_BLEND_OP_ADD;
+    blend.SrcBlendAlpha = D3D12_BLEND_ZERO;
+    blend.DestBlendAlpha = D3D12_BLEND_ONE;
+    blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+    blend.RenderTargetWriteMask &= D3D12_COLOR_WRITE_ENABLE_RED | D3D12_COLOR_WRITE_ENABLE_GREEN | D3D12_COLOR_WRITE_ENABLE_BLUE;
+    for (size_t i = 1; i < std::size(key.blend.RenderTarget); ++i)
+        key.blend.RenderTarget[i].RenderTargetWriteMask = 0;
+    // The face may have written its depth, which the disc then meets exactly.
+    key.depthStencil.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+    if (key.depthStencil.DepthFunc == D3D12_COMPARISON_FUNC_LESS)
+        key.depthStencil.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+    ID3D12PipelineState* pipeline = Pipeline(key);
+    if (pipeline == nullptr)
+        return;
+    ID3D12GraphicsCommandList* commands = GetBackend().Commands();
+    if (g_cache.boundPipeline != pipeline) {
+        commands->SetPipelineState(pipeline);
+        g_cache.boundPipeline = pipeline;
+    }
+    commands->SetGraphicsRootConstantBufferView(kRootForwardFrame, constants);
+    IssueDraws(commands, mesh);
+}
+
 // Draws a 2D skybox pass again into each face of the capture's sky cube, with the game's shaders and blending, so
 // lighting sees the whole sky as the game draws it. The tonemap scale (pixel c30.x, which Source's shaders multiply
 // their output by) is left out, so the cube holds the sky's radiance.
@@ -1029,6 +1114,9 @@ void DrawPass(const ShadowState& shadow, const MeshDraw& mesh)
         return;
     if (g_drawLimit >= 0 && g_frameDraws++ >= g_drawLimit)
         return;
+    // env_sun's sprite gives way to the sun's disc drawn with the 2D sky.
+    if (capture::IsSunSprite(mesh))
+        return;
     Backend& backend = GetBackend();
     const DynamicState& dynamic = Dynamic();
     const bool colorWrite = dynamic.overrideColorWrite ? dynamic.colorWriteEnable : shadow.colorWrite != 0;
@@ -1076,9 +1164,14 @@ void DrawPass(const ShadowState& shadow, const MeshDraw& mesh)
         return;
 
     Targets targets = pass.route == capture::Pass::Route::Game ? PrepareTargets(shadow.srgbWrite != 0) : capture::BindTargets(pass, shadow.srgbWrite != 0);
+    // The 2D sky's faces show the procedural sky, or get the sun's disc over the game's sky (shaders/sky_draw.hlsl).
+    const gbuffer::SkyDraw* sky = pass.route == capture::Pass::Route::Game && !depthOnly && targets.count == 1 && capture::SkyMaterial() ? capture::Sky() : nullptr;
+    const D3D12_GPU_VIRTUAL_ADDRESS skyConstants = sky != nullptr ? SkyDrawConstants(*sky, pass.vertexPatches) : 0;
+    const bool proceduralSky = skyConstants != 0 && sky->sky;
     const bool depthWrite = dynamic.overrideDepthEnable ? dynamic.depthEnable : shadow.depthWrite != 0;
-    const bool clearCoverage = pass.clearsCoverage && depthWrite && colorWrite && pixelBase != nullptr && pixelBase->info.colorOutputs == 1 &&
-        targets.count == 1 && targets.depth.ptr != 0;
+    // The sky lies behind everything, so no surface's coverage is left where it draws.
+    const bool clearCoverage = pass.clearsCoverage && !proceduralSky && depthWrite && colorWrite && pixelBase != nullptr &&
+        pixelBase->info.colorOutputs == 1 && targets.count == 1 && targets.depth.ptr != 0;
     if (clearCoverage)
         capture::AddCoverageTarget(targets);
 
@@ -1144,7 +1237,7 @@ void DrawPass(const ShadowState& shadow, const MeshDraw& mesh)
     if (vertexShader == nullptr || (pixelShader == nullptr && !depthOnly))
         return;
     key.vertexShader = vertexShader;
-    key.pixelShader = pixelShader;
+    key.pixelShader = proceduralSky ? &g_cache.skyShader : pixelShader;
 
     D3D12_RENDER_TARGET_BLEND_DESC& blend = key.blend.RenderTarget[0];
     blend.BlendEnable = blendEnabled;
@@ -1281,6 +1374,8 @@ void DrawPass(const ShadowState& shadow, const MeshDraw& mesh)
         commands->SetGraphicsRootConstantBufferView(kRootForwardFrame, pass.forwardFrame);
         commands->SetGraphicsRootShaderResourceView(kRootForwardScene, pass.forwardScene);
     }
+    if (proceduralSky)
+        commands->SetGraphicsRootConstantBufferView(kRootForwardFrame, skyConstants);
 
     commands->RSSetViewports(1, &viewport);
     D3D12_RECT scissor = { 0, 0, static_cast<LONG>(targets.width), static_cast<LONG>(targets.height) };
@@ -1294,8 +1389,14 @@ void DrawPass(const ShadowState& shadow, const MeshDraw& mesh)
     commands->OMSetStencilRef(static_cast<UINT>(dynamic.stencilRef) & 0xff);
     IssueDraws(commands, mesh);
 
-    if (pass.route == capture::Pass::Route::Game && pixelShader != nullptr && capture::DrawsSky())
+    if (skyConstants != 0 && !sky->sky && sky->sunDisc)
+        DrawSunDisc(key, skyConstants, mesh);
+    // The capture's sky cube keeps the game's own sky, whose colours the procedural sky takes.
+    if (pass.route == capture::Pass::Route::Game && pixelShader != nullptr && capture::DrawsSky()) {
+        capture::RecordSkyShader(pixelCode);
+        key.pixelShader = pixelShader;
         DrawSkyFaces(key, *vertexShader, *pixelShader, vertexState, pixelState, mesh);
+    }
 }
 
 }

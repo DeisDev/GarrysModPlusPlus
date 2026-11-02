@@ -48,6 +48,8 @@ constexpr std::array<const char*, static_cast<size_t>(TextId::Count)> kEnglish =
     "Cameras and mirrors",
     "Volumetric light",
     "Fog",
+    "Physical sky",
+    "Sun disc",
     "Anti-aliasing",
     "Mode",
     "Off",

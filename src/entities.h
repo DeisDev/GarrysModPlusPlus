@@ -1,6 +1,9 @@
 #pragma once
 
+#include "view_types.h"
+
 #include <array>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -38,6 +41,9 @@ void Collect(std::vector<ModelEntity>& entities);
 
 // Ropes the game draws whose simulation has placed their nodes.
 void CollectRopes(std::vector<Rope>& ropes);
+
+// The map's env_sun (the first one that is on, else the first), or nothing without one.
+std::optional<gbuffer::EnvSun> FindSun();
 
 // The world model path of a weapon from Collect that shows its view model, as the local player's weapons do in first
 // person; empty otherwise. Only for entities known to be weapons.

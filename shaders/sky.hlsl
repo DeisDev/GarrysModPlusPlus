@@ -1,7 +1,9 @@
 #include "common.hlsli"
+#include "cube.hlsli"
 
-// The sky's light for indirect rays (SkyLight in shaders/common.hlsli): the 2D sky the game drew (input0, the faces
-// of src/shaderapi_capture.cpp's cube: radiance before the tonemap scale, -1 where nothing was drawn) averaged down to
+// The sky's light for indirect rays (SkyLight in shaders/common.hlsli): the 2D sky (input0, the faces of
+// src/shaderapi_capture.cpp's cube of what the game drew, or of the procedural sky that replaces it: radiance before
+// the tonemap scale, -1 where nothing was drawn) averaged down to
 // kSize x kSize texels a face, then scaled so that a surface facing up under open sky gets the map's sky light
 // (g_frame.skyColor), as it did from a uniform sky. Directions the game has not drawn take the sky light itself.
 // output0: the kSize x kSize x 6 cube.
@@ -23,19 +25,6 @@ float4 GroupSum(float4 value, uint index)
         GroupMemoryBarrierWithGroupSync();
     }
     return g_sums[0];
-}
-
-// The direction through a cube face at (u, v) in [-1, 1], v down, in Direct3D's face order and orientation.
-float3 FaceDirection(uint face, float2 uv)
-{
-    switch (face) {
-    case 0: return float3(1.0, -uv.y, -uv.x);
-    case 1: return float3(-1.0, -uv.y, uv.x);
-    case 2: return float3(uv.x, 1.0, uv.y);
-    case 3: return float3(uv.x, -1.0, -uv.y);
-    case 4: return float3(uv.x, -uv.y, 1.0);
-    default: return float3(-uv.x, -uv.y, -1.0);
-    }
 }
 
 [RootSignature(ROOT_SIGNATURE)]

@@ -1855,6 +1855,7 @@ void LightView(ViewInputs& inputs)
         CollectEntities();
         engine::ActiveDynamicLights(g_state.dynamicLights);
         inputs.localPlayer = g_state.localPlayer;
+        inputs.envSun = entities::FindSun();
         break;
     case gbuffer::ViewKind::Skybox:
         g_state.dynamicInstances.clear();
@@ -1889,6 +1890,11 @@ void LightView(ViewInputs& inputs)
                 probe->drawnWaterNormal[1], probe->drawnWaterNormal[2], probe->rebuiltWaterNormal[0], probe->rebuiltWaterNormal[1],
                 probe->rebuiltWaterNormal[2]);
     }
+}
+
+std::optional<gbuffer::SkyDraw> SkyDraw()
+{
+    return g_state.lighting ? std::optional(g_state.lighting->SkyDraw()) : std::nullopt;
 }
 
 std::optional<gbuffer::ForwardConstants> ForwardLighting(const ViewInputs& inputs)

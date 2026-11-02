@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <string>
 
 namespace gmodpp::gbuffer {
 
@@ -64,6 +65,31 @@ struct Fog {
     std::array<float, 4> params = {};
     std::array<float, 3> color = {};
     bool known = false;
+};
+
+// env_sun as the client has it (C_Sun's DT_Sun, entities.cpp): the direction to the sun, whether it is on, its colour
+// with the largest component 1 (m_clrRender, as C_Sun::OnDataChanged tints its sprite), and its sprite: the material
+// (m_nMaterial's model name) and half size (m_nSize).
+struct EnvSun {
+    std::array<float, 3> direction;
+    bool on = false;
+    std::array<float, 3> color = {1.0f, 1.0f, 1.0f};
+    std::string material;
+    float size = 0.0f;
+};
+
+// What the game's 2D sky draws show in place of the game's (shaders/sky_draw.hlsl), as the last main view's lighting
+// made it: the procedural sky (`sky`, the cube skyView) and the sun's disc (`sunDisc`), which replaces env_sun's sprite.
+struct SkyDraw {
+    bool sky = false;
+    bool sunDisc = false;
+    UINT skyView = 0;
+    UINT transmittanceView = 0;
+    std::array<float, 3> sunDirection = {};
+    std::array<float, 3> sunColor = {1.0f, 1.0f, 1.0f};
+    // env_sun's sprite (EnvSun::material, EnvSun::size); no material without an env_sun.
+    std::string sprite;
+    float spriteSize = 0.0f;
 };
 
 // The irradiance volume that lights what the game draws after the capture (shaders/probes.hlsl): kProbeGrid

@@ -97,8 +97,20 @@ UINT ProbeView(size_t index);
 // The 2D skybox the game draws (the engine's "skybox/<name><side>" materials) is drawn again into a cube around the
 // eye, in Direct3D's cube face order, which ViewInputs::skyCube hands to lighting.
 inline constexpr UINT kSkyCubeSize = 512;
+// Whether the bound material is a 2D skybox face.
+bool SkyMaterial();
 // Whether the pass being drawn is a 2D skybox face during a capture.
 bool DrawsSky();
+// At a 2D skybox face drawn during a capture: notes the sun GMod's painted sky draws (its pixel shader's g_SunNormal),
+// or that the sky's shader draws none, for ViewInputs::paintedSun.
+void RecordSkyShader(std::span<const DWORD> pixelCode);
+// What the 2D sky's draws show in place of the game's, from the last main view lit (Lighting::SkyDraw); nothing puts
+// the game's sky back. Null without one.
+void SetSky(std::optional<gbuffer::SkyDraw> sky);
+const gbuffer::SkyDraw* Sky();
+// Whether the draw is the sprite of env_sun that the sun's disc replaces: its material, centred 100 units from the eye
+// toward the sun (CGlowOverlay::CalcBasis), m_nSize across each half (gbuffer::EnvSun).
+bool IsSunSprite(const MeshDraw& mesh);
 // The cube's six face targets (RGBA16F, radiance before the tonemap scale, -1 where nothing was drawn this map),
 // ready to be drawn into; empty when the cube cannot be created.
 std::span<const D3D12_CPU_DESCRIPTOR_HANDLE> SkyFaces();

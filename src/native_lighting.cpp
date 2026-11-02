@@ -46,6 +46,8 @@ struct State {
     std::optional<gbuffer::ForwardConstants> forward;
     std::string forwardLevel;
     std::set<std::string> loggedTargets;
+    // A main view was lit this frame; without one the game's sky is drawn.
+    bool mainLit = false;
 };
 
 State g_state;
@@ -106,6 +108,10 @@ void Finish(gbuffer::ViewKind kind)
     // Lighting submits its own commands, which must follow the game's that drew the view.
     GetBackend().Submit();
     world::LightView(inputs);
+    if (kind == gbuffer::ViewKind::Main) {
+        capture::SetSky(world::SkyDraw());
+        g_state.mainLit = true;
+    }
     if (const std::optional<gbuffer::ForwardConstants> forward = world::ForwardLighting(inputs)) {
         g_state.forward = forward;
         g_state.forwardLevel = engine::LevelName();
@@ -180,6 +186,8 @@ void OnPresent()
         capture::End(gbuffer::ViewKind::Main, ignored);
     }
     capture::EndForward();
+    if (!std::exchange(g_state.mainLit, false))
+        capture::SetSky(std::nullopt);
     RecordFrameInterval();
     GetStatistics().realtimeBlock = g_state.block;
     overlay::EnsureWindowHook();
