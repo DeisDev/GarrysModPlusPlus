@@ -377,6 +377,15 @@ void DeleteTexture(NativeObject*, std::intptr_t handle)
     }
     if (g_modified == texture)
         g_modified = nullptr;
+    // Its handle stays bound as a target until the game binds another; unbound, so a texture created at the same address
+    // is not taken for a target (IsTarget compares handles).
+    DynamicState& dynamic = Dynamic();
+    for (std::intptr_t& target : dynamic.colorTargets) {
+        if (target == handle)
+            target = 0;
+    }
+    if (dynamic.depthTarget == handle)
+        dynamic.depthTarget = 0;
     Backend& backend = GetBackend();
     for (Texture::Copy& copy : texture->copies) {
         DestroyCopy(copy);

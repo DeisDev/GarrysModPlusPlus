@@ -165,6 +165,13 @@ void Run(const Request& request)
             } else {
                 variant.alphaTest = request.alphaTest;
                 Ensure(combo.bytecode, variant, request.name);
+                // DrawPass clears the coverage only with a single colour output, which the translation lists.
+                translator::Translation base;
+                if (request.clearCoverage && translator::Translate(combo.bytecode, variant, base, error) && base.colorOutputs == 1) {
+                    variant.clearCoverage = 1;
+                    variant.markMirror = std::string_view(request.name).starts_with("lightmappedreflective_ps") ? 1 : 0;
+                    Ensure(combo.bytecode, variant, request.name);
+                }
             }
         }
         for (const bool forward : { false, true }) {
@@ -195,7 +202,7 @@ public:
         {
             std::scoped_lock lock(m_mutex);
             const auto id = std::tuple(static_cast<const void*>(request.file.data()), request.staticIndex, request.alphaTest, request.gbufferTwin,
-                request.forwardTwin, request.opacityMicromaps);
+                request.forwardTwin, request.clearCoverage, request.opacityMicromaps);
             if (!m_seen.insert(id).second)
                 return;
             m_queue.push_back({ request, counted });
@@ -244,7 +251,7 @@ private:
     std::mutex m_mutex;
     std::condition_variable m_ready;
     std::deque<Queued> m_queue;
-    std::set<std::tuple<const void*, std::int32_t, std::uint8_t, bool, bool, bool>> m_seen;
+    std::set<std::tuple<const void*, std::int32_t, std::uint8_t, bool, bool, bool, bool>> m_seen;
     std::size_t m_total = 0;
     std::size_t m_done = 0;
     bool m_started = false;

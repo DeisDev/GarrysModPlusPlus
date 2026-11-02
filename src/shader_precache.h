@@ -38,13 +38,18 @@ struct Request {
     // the forward twin that translucent ones draw.
     bool gbufferTwin = false;
     bool forwardTwin = false;
+    // Pixel shaders of opaque passes that write depth and colour: during real-time lighting the game's own shaders with one
+    // colour output also clear the G-buffer's coverage (translator::Variant::clearCoverage; markMirror for
+    // lightmappedreflective_ps).
+    bool clearCoverage = false;
     // The device has opacity micromaps (translator::Variant::opacityMicromaps).
     bool opacityMicromaps = false;
 };
 
 // Queues compiling every dynamic combo of the request's static combo on worker threads, in the variants its draws
 // usually take: vertex shaders as they are and, when they read a normal, for compressed vertices; pixel shaders with
-// the pass's alpha test; and the requested twins. A request equal to an earlier one is ignored, and so is every request
+// the pass's alpha test, and those with one colour output also clearing the coverage when requested; and the requested
+// twins. A request equal to an earlier one is ignored, and so is every request
 // when the shader cache cannot store what the workers compile.
 void Enqueue(const Request& request);
 

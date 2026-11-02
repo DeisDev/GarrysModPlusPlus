@@ -831,10 +831,12 @@ void PrecacheShaders(const ShadowState& state)
         if (file == state.pixelShader) {
             // As DrawPass and capture::Prepare choose them: captured passes with a depth test draw G-buffer twins,
             // translucent passes after the capture draw forward twins, and so does every pass of a view drawn into a
-            // texture when such views are lit ("Cameras and mirrors").
+            // texture when such views are lit ("Cameras and mirrors"); opaque passes writing depth and colour with the
+            // game's own shader clear the coverage.
             request.alphaTest = state.alphaTest ? static_cast<std::uint8_t>(state.alphaFunc + 1) : 0;
             request.gbufferTwin = twins && state.depthTest;
             request.forwardTwin = twins && (state.blend || GetSettings().renderTargetLighting);
+            request.clearCoverage = twins && state.depthTest && !state.blend && state.depthWrite && state.colorWrite;
             request.opacityMicromaps = GetStatistics().opacityMicromapsAvailable;
         }
         shader_precache::Enqueue(request);
