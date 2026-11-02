@@ -115,6 +115,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Some maps, such as gm_blackbrook_asylum, no longer crash the game as they finish loading.
 - Ground seen through water and in reflections uses full-resolution textures and shows blended terrain (WorldVertexTransition) as the game draws it, such as sand under gm_construct's lake instead of blurry grass.
 - Shadows on the ground seen through water are sharp instead of blocky.
 - Your own feet no longer float under the water when you look down into it; you still show in reflections.

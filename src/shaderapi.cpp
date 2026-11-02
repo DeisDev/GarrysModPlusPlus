@@ -35,6 +35,10 @@ constexpr unsigned kShaderUtilNoteAnisotropicLevel = 15;
 constexpr unsigned kShaderUtilInEditorMode = 16;
 constexpr unsigned kShaderUtilDrawClearBufferQuad = 19;
 constexpr unsigned kShaderUtilOnFlushBufferedPrimitives = 25;
+// materialsystem.dll 0x18001cd60, which calls CColorCorrectionSystem's 0x18000bee0 (its vtable slot 28): fills
+// ShaderColorCorrectionInfo_t (enabled, lookup count, weights). shaderapidx9.dll's IShaderAPI slot 96 (0x18000ebf0)
+// forwards to it.
+constexpr unsigned kShaderUtilGetCurrentColorCorrection = 31;
 // MaterialSystem_Config_t (public/materialsystem/materialsystem_config.h): bReverseDepth and m_bSuppressRendering,
 // the offsets shaderapidx9.dll reads (0x18002a170, 0x1800152c0).
 constexpr size_t kConfigReverseDepth = 0x3d;
@@ -847,6 +851,13 @@ int GetPixelFogCombo(NativeObject*) { return g_api.fogMode != 0 ? g_api.fogMode 
 
 bool InFlashlightMode(NativeObject*) { return UtilSlot<bool (*)(void*)>(kShaderUtilInFlashlightMode)(GetBackend().shaderUtil); }
 bool InEditorMode(NativeObject*) { return UtilSlot<bool (*)(void*)>(kShaderUtilInEditorMode)(GetBackend().shaderUtil); }
+
+// engine_post (stdshader_dx9.dll 0x180022ea0) binds as many colour correction volumes as this reports, up to sampler 8
+// and standard texture 19: an unfilled count bound the morph accumulator, which materialsystem does not have.
+void GetCurrentColorCorrection(NativeObject*, void* info)
+{
+    UtilSlot<void (*)(void*, void*)>(kShaderUtilGetCurrentColorCorrection)(GetBackend().shaderUtil, info);
+}
 
 // GetLightMapScaleFactor (0x180017ed0): 16 for integer HDR, 1 for float HDR, 2^2.2 without HDR.
 float GetLightMapScaleFactor(NativeObject*)
@@ -1821,6 +1832,7 @@ NativeObject* ShaderApi()
         c.Bind("InFlashlightMode", &InFlashlightMode);
         c.Bind("InEditorMode", &InEditorMode);
         c.Bind("BindStandardTexture", &BindStandardTexture);
+        c.Bind("GetCurrentColorCorrection", &GetCurrentColorCorrection);
         c.Bind("SetToneMappingScaleLinear", &SetToneMappingScaleLinear);
         c.Bind("GetToneMappingScaleLinear", &GetToneMappingScaleLinear);
         c.Bind("GetLightMapScaleFactor", &GetLightMapScaleFactor);

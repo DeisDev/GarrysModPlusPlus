@@ -19,8 +19,9 @@
 //   hardware config by slot 1 (HasStencilBuffer) calling slot 58 (StencilBufferBits), the setters at 60 and 70 and the
 //   HDR mode argument at 68.
 // - IDebugTextureInfo and IVBAllocTracker match the SDK.
-// - IShaderUtil is materialsystem.dll's, which shaderapidx9.dll calls back; RestoreShaderObjects at slot 12 is confirmed
-//   (materialsystem.dll vtable RVA 0xb0cb0, slot 12 = 0x180022370), the rest is the SDK's order unchecked.
+// - IShaderUtil is materialsystem.dll's, which shaderapidx9.dll calls back; confirmed in its vtable (RVA 0xb0cb0) are
+//   RestoreShaderObjects at slot 12 (0x180022370), MaxHWMorphBatchCount at 30 (0x18001e870, the morph manager's) and
+//   GetCurrentColorCorrection at 31 (0x18001cd60, the colour correction system's); the rest is the SDK's order unchecked.
 
 namespace gmodpp::shim {
 
