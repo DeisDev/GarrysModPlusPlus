@@ -15,7 +15,8 @@
 // distorted a texture by a few texels. The Fresnel term keeps the full normal, as Source's does: flattened, the water
 // near the horizon became a white mirror of the sky.
 static const float kWaveSlope = 0.35;
-// The sun's highlight: a GGX lobe of this roughness (alpha).
+// The sun's highlight: a GGX lobe of this roughness (alpha). Reflections are mirrors at the rippled normal: water has
+// no roughness besides its ripples, and a lobe sampled per pixel added noise that the denoisers smeared.
 static const float kGlintRoughness = 0.03;
 // Rays through the water gather its light at this many points (ThroughWater).
 static const uint kWaterSteps = 2;
@@ -40,6 +41,12 @@ float3 WaterNormal(float2 tangentSlope, float eyeAngle, float3 toEye, float slop
     }
     float z = sqrt(saturate(1.0 - dot(tangentSlope, tangentSlope)));
     return normalize(float3(slope, max(z, 0.2) * side));
+}
+
+// The body of water under a drawn water pixel at `position`, or kNoWater (also without ray tracing).
+uint DrawnWaterBody(float3 position)
+{
+    return g_frame.traceMask != 0 ? WaterBodyAt(position - float3(0.0, 0.0, 1.0)) : kNoWater;
 }
 
 // The world normal of a drawn water pixel from the normal map's tangent-space slope the G-buffer holds: by its body's
@@ -78,13 +85,16 @@ struct WaterResult
 {
     float3 color;
     float3 specularAlbedo;
+    // Ray Reconstruction's diffuse albedo guide, where `refractedGuide` (traced water seen from above).
+    float3 diffuseAlbedo;
+    bool refractedGuide;
     float hitDistance;
 };
 
 // The shaded water at a pixel, before the tonemap scale. The rippled normal splits the light by Fresnel's equations
-// into a reflection, which samples the glint's GGX lobe (a mirror without glossy reflections), and a refraction bent
-// by Snell's law. From above, the refraction crosses the water to what lies under it (ThroughWater), and its radiance
-// spreads over the wider cone it leaves the water in (1 / n^2); from below, light from the air in Snell's window is
+// into a mirror reflection and a refraction bent by Snell's law. From above, the refraction crosses the water to what
+// lies under it (ThroughWater), and its radiance spreads over the wider cone it leaves the water in (1 / n^2); from
+// below, light from the air in Snell's window is
 // gathered into the narrower cone (n^2), beyond it the surface mirrors the water entirely, and the reflection crosses
 // the water too. Source's $refracttint tints what comes through. Water outside the map's bodies of water (brush
 // entities) keeps Source's refraction, fogged by Source, under the traced reflection.
@@ -99,7 +109,7 @@ WaterResult ShadeWater(int2 pixel, float3 position)
     float3 toEye = g_frame.eyePosition - position;
     float distance = length(toEye);
     toEye /= max(distance, 1e-4);
-    uint water = g_frame.traceMask != 0 ? WaterBodyAt(position - float3(0.0, 0.0, 1.0)) : kNoWater;
+    uint water = DrawnWaterBody(position);
     bool traced = water != kNoWater;
     float tint = tangentNormal.z;
     float3 normal = DrawnWaterNormal(tangentNormal.xy, tangentNormal.w, toEye, kWaveSlope, water);
@@ -110,14 +120,12 @@ WaterResult ShadeWater(int2 pixel, float3 position)
     // Source's shore fade (the refraction's alpha) only for its own refraction.
     float fresnel = Fresnel(dot(fresnelNormal, toEye), ior) * (traced || below ? 1.0 : marks.a);
     uint seed = PixelSeed(pixel, 0x5Au);
-    float lobe = g_frame.glossyReflections != 0 ? LobeSpread(kGlintRoughness) : 0.0;
     // Rays leave from the body's surface itself: the depth buffer puts far water units off it, and a reflected ray that
     // started under the surface would meet its underside.
     float3 surface = traced ? float3(position.xy, LoadWaterBody(water).surfaceZ) : position;
 
     WaterResult result;
-    float weight;
-    float3 direction = ReflectionDirection(-toEye, normal, float3(0.0, 0.0, side), kGlintRoughness, float2(Random(seed), Random(seed)), weight);
+    float3 direction = reflect(-toEye, normal);
     // Ripples can tilt the direction into the surface; reflect it back off the plane.
     if (direction.z * side < 0.02)
         direction.z = side * max(abs(direction.z), 0.02);
@@ -133,6 +141,7 @@ WaterResult ShadeWater(int2 pixel, float3 position)
     float3 reflection = 0.0;
     float3 seen = 0.0;
     float seenDistance = kSkyHitDistance;
+    float3 seenAlbedo = 0.0;
     result.hitDistance = kSkyHitDistance;
     uint rays = g_frame.traceMask == 0 ? 0 : refracts ? 2 : 1;
     for (uint r = 0; r < rays; ++r) {
@@ -140,14 +149,16 @@ WaterResult ShadeWater(int2 pixel, float3 position)
         float3 rayDirection = reflected ? direction : refracted;
         float offset = reflected ? side * (traced ? kWaterSurfaceOffset : 2.0) : -side * kWaterSurfaceOffset;
         float hitDistance;
-        float3 light = ReflectedRadiance(surface + float3(0.0, 0.0, offset), rayDirection, PixelAngle() * distance, PixelAngle() + lobe, seed, hitDistance,
-            reflected && traced && !below);
+        float3 hitAlbedo;
+        float3 light = ReflectedRadiance(surface + float3(0.0, 0.0, offset), rayDirection, PixelAngle() * distance, PixelAngle(), seed, hitDistance,
+            hitAlbedo, reflected && traced && !below);
         if (reflected) {
-            reflection = light * (tint * weight * g_frame.reflectionScale);
+            reflection = light * (tint * g_frame.reflectionScale);
             result.hitDistance = hitDistance;
         } else {
             seen = light;
             seenDistance = hitDistance;
+            seenAlbedo = hitAlbedo;
         }
     }
 
@@ -177,6 +188,18 @@ WaterResult ShadeWater(int2 pixel, float3 position)
         }
     }
     result.color = fresnel * reflection + (1.0 - fresnel) * transmitted;
+    // Ray Reconstruction keeps the detail its albedo guide shows and smooths the rest as noisy light, so a refracting
+    // surface's guide should match the refracted colour (DLSS-RR Integration Guide, 3.5): from above, the albedo of what
+    // the refraction meets as far as the water lets it through, and the water's own albedo for the light it scatters,
+    // both as the surface transmits them. Source's refraction, which the guide holds elsewhere, is lit and bent otherwise.
+    result.refractedGuide = traced && !below;
+    result.diffuseAlbedo = 0.0;
+    if (result.refractedGuide && refracts) {
+        WaterBody body = LoadWaterBody(water);
+        float3 through = seenDistance < kSkyHitDistance ? exp(-body.extinction * seenDistance) : 0.0;
+        result.diffuseAlbedo = saturate((1.0 - fresnel) / (kWaterIor * kWaterIor) * body.refractTint *
+            (through * seenAlbedo + (1.0 - through) * WaterAlbedo(body)));
+    }
     if (!below)
         result.color += SunGlint(surface, normal, toEye) * (g_frame.reflectionScale * (traced ? 1.0 : marks.a));
     result.specularAlbedo = saturate(fresnel * tint);

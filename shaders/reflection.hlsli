@@ -139,11 +139,14 @@ float3 SeenWater(float3 position, float3 direction, uint instance, uint primitiv
 // The light along a reflected ray. Its cone is `coneWidth` across at the origin and widens by `coneSpread` per unit of
 // length: where it is wide enough for the radiance cache's voxels the cache gives the hit's light; elsewhere the hit is
 // lit where it is by the sun and one local light, with HitIndirectIrradiance as its indirect light. With `seeWater`
-// the ray meets water surfaces (SeenWater).
-float3 ReflectedRadiance(float3 origin, float3 direction, float coneWidth, float coneSpread, inout uint seed, out float hitDistance, bool seeWater = false)
+// the ray meets water surfaces (SeenWater). `hitAlbedo` is the textured albedo of the surface it meets (0 for the sky
+// and water).
+float3 ReflectedRadiance(float3 origin, float3 direction, float coneWidth, float coneSpread, inout uint seed, out float hitDistance, out float3 hitAlbedo,
+    bool seeWater = false)
 {
     HitSurface hit;
     HitInfo hitInfo;
+    hitAlbedo = 0.0;
     if (!TraceClosest(origin, direction, kMaxDistance, g_frame.traceMask | (seeWater ? kWaterMask : 0u), hit, hitInfo)) {
         hitDistance = kSkyHitDistance;
         return BeyondMap(origin, direction);
@@ -152,6 +155,7 @@ float3 ReflectedRadiance(float3 origin, float3 direction, float coneWidth, float
     if ((hit.flags & kInstanceWater) != 0)
         return ClampSample(SeenWater(hit.position, direction, hitInfo.instance, hitInfo.primitive, coneWidth + coneSpread * hitDistance));
     hit.albedo = TexturedAlbedo(hitInfo, hit.albedo, coneWidth + coneSpread * hitDistance);
+    hitAlbedo = hit.albedo;
     float3 emission = HitEmission(hit, hitInfo, hitDistance);
     float3 cached;
     if (CachedRadiance(hit, emission, hitDistance, coneWidth + coneSpread * hitDistance, cached))

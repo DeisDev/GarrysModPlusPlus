@@ -7,8 +7,8 @@
 // input0: denoised light (indirect plus the sampled direct remainder), or none for the sky's light; input1: raw
 // estimate (debug view); input2: reflections and self-illumination (shaders/reflections.hlsl), or none; input3:
 // exact direct light (rgb) and sun visibility (a) from shaders/direct.hlsl; input4: sampled direct remainder
-// (debug view); output0: shaded colour, encoded or (outputLinear) linear; output1, output2, output3 (or none): Ray
-// Reconstruction's specular albedo, roughness and hit distance guides, which water pixels overwrite.
+// (debug view); output0: shaded colour, encoded or (outputLinear) linear; output1, output2, output3, output4 (or none):
+// Ray Reconstruction's specular albedo, roughness, hit distance and diffuse albedo guides, which water pixels overwrite.
 
 // Light scattered by the haze between the eye and the pixel (shaders/volumetrics.hlsl), after the tonemap scale.
 float3 VolumetricLight(int2 pixel)
@@ -185,8 +185,12 @@ void main(uint3 id : SV_DispatchThreadID)
             RWTexture2D<float> roughness = ResourceDescriptorHeap[g_pass.output2];
             RWTexture2D<float> hitDistance = ResourceDescriptorHeap[g_pass.output3];
             specular[pixel] = float4(water.specularAlbedo, 1.0);
-            roughness[pixel] = g_frame.glossyReflections != 0 ? sqrt(kGlintRoughness) : 0.0;
+            roughness[pixel] = 0.0;
             hitDistance[pixel] = water.hitDistance;
+            if (water.refractedGuide) {
+                RWTexture2D<float4> albedoGuide = ResourceDescriptorHeap[g_pass.output4];
+                albedoGuide[pixel] = float4(water.diffuseAlbedo, 1.0);
+            }
         }
         return;
     }

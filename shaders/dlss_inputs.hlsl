@@ -2,8 +2,9 @@
 
 // Render-resolution inputs for DLSS Ray Reconstruction, taken from the native-resolution G-buffer: each render
 // pixel uses the native pixel under its centre, and the depth at the centre itself.
-// input0, input1: render width and height; output0: first of seven consecutive UAVs: colour, depth, normal,
-// flags, light, albedo, self-illumination.
+// input0, input1: render width and height; output0: first of eight consecutive UAVs: colour, depth, normal,
+// flags, light, albedo, self-illumination and Ray Reconstruction's albedo guide, whose traced water pixels
+// shaders/deferred_lighting.hlsl overwrites.
 
 // Depth at a point between native pixel centres (`centre` in native pixels). The native pixel's own depth would
 // put the point on its surface's plane up to half a pixel away, which by a crease lies behind the other surface.
@@ -53,6 +54,7 @@ void main(uint3 id : SV_DispatchThreadID)
     RWTexture2D<float4> lightOut = ResourceDescriptorHeap[g_pass.output0 + 4];
     RWTexture2D<float4> albedoOut = ResourceDescriptorHeap[g_pass.output0 + 5];
     RWTexture2D<float4> emissiveOut = ResourceDescriptorHeap[g_pass.output0 + 6];
+    RWTexture2D<float4> guideOut = ResourceDescriptorHeap[g_pass.output0 + 7];
     float4 colour = color.Load(load);
     colorOut[pixel] = colour;
     depthOut[pixel] = depth;
@@ -69,5 +71,6 @@ void main(uint3 id : SV_DispatchThreadID)
     else if (coverage.b > 0.5)
         guide = float4(0.5, 0.5, 0.5, 1.0);
     albedoOut[pixel] = guide;
+    guideOut[pixel] = guide;
     emissiveOut[pixel] = emissive.Load(load);
 }

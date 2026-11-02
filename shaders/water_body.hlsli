@@ -146,6 +146,9 @@ float2 SunLineCell(float3 position, out float along)
     return position.xy + up.xy * along;
 }
 
+// The caustics fade out over this outer share of their square's half-width, so its edge shows no line on the floor.
+static const float kCausticsEdgeFade = 0.5;
+
 // How much the rippled surface focuses sunlight at a point under water: 1 where the light falls as through flat water,
 // or outside the caustics' square.
 float CausticsAt(float3 position)
@@ -157,7 +160,8 @@ float CausticsAt(float3 position)
     if (any(uv <= 0.0) || any(uv >= 1.0))
         return 1.0;
     Texture2D<float> caustics = ResourceDescriptorHeap[g_frame.causticsView];
-    return caustics.SampleLevel(g_linearClamp, uv, 0.0);
+    float2 edge = 0.5 - abs(uv - 0.5);
+    return lerp(1.0, caustics.SampleLevel(g_linearClamp, uv, 0.0), saturate(min(edge.x, edge.y) / (0.5 * kCausticsEdgeFade)));
 }
 
 // A sun map texel's line meets no water surface (negative), or its light is not stopped.

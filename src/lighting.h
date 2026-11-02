@@ -371,8 +371,9 @@ private:
         UINT output4 = DescriptorHeap::kInvalid;
         UINT padding = 0;
     };
-    // Render-resolution copies of the G-buffer for Ray Reconstruction, written together by Pass::DlssInputs.
-    enum RayReconstructionInput { RrColor, RrDepth, RrNormal, RrFlags, RrLight, RrAlbedo, RrEmissive, RrInputCount };
+    // Render-resolution copies of the G-buffer for Ray Reconstruction, written together by Pass::DlssInputs, and its
+    // diffuse albedo guide, whose traced water pixels Pass::Lighting overwrites.
+    enum RayReconstructionInput { RrColor, RrDepth, RrNormal, RrFlags, RrLight, RrAlbedo, RrEmissive, RrAlbedoGuide, RrInputCount };
 
     bool EnsureTargets(UINT width, UINT height);
     // Creates the radiance cache's buffers, or frees them when `wanted` is false (waiting for the GPU).

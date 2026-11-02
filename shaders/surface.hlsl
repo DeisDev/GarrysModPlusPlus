@@ -2,7 +2,8 @@
 
 // Resolves the G-buffer into one surface texture the lighting passes share: the world normal (with a depth
 // fallback) turned toward the camera and the distance to the eye. Water (shaders/water.hlsli) has no G-buffer surface;
-// it gets the plane's normal and its distance negated, which every pass takes for no surface.
+// it gets its distance negated, which every pass takes for no surface, and the rippled normal its reflection leaves at,
+// which only Ray Reconstruction reads: with the plane's normal it took the ripples' detail for noise.
 
 // The step to the neighbour on the side of `pixel` (along `axis`) that lies in the pixel's own plane. Depth is linear
 // across a plane in screen space, so that side's second depth difference is zero; picking it keeps a pixel next
@@ -37,7 +38,12 @@ void main(uint3 id : SV_DispatchThreadID)
     float4 coverage = flags.Load(int3(pixel, 0));
     if (coverage.r < 0.5 || depth >= 1.0) {
         float3 toWater = g_frame.eyePosition - WorldPositionFromDepth(pixel, depth);
-        output[pixel] = IsWater(coverage) && depth < 1.0 ? float4(0.0, 0.0, toWater.z >= 0.0 ? 1.0 : -1.0, -length(toWater)) : 0.0;
+        output[pixel] = 0.0;
+        if (IsWater(coverage) && depth < 1.0) {
+            float4 slope = gbufferNormal.Load(int3(pixel, 0));
+            float3 position = g_frame.eyePosition - toWater;
+            output[pixel] = float4(DrawnWaterNormal(slope.xy, slope.w, normalize(toWater), kWaveSlope, DrawnWaterBody(position)), -length(toWater));
+        }
         // The developer probe on water: the normal map's tangent-space slope the game's draw sampled (and its eye angle)
         // and the one shaders sample at the same point (WaterSurfaceSlope), which should agree (Lighting::RequestProbe).
         if (g_frame.probeView != kNoView && IsWater(coverage) && depth < 1.0 && all(uint2(pixel) == uint2(g_frame.probePixel & 0xFFFF, g_frame.probePixel >> 16))) {

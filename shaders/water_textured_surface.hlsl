@@ -9,6 +9,9 @@ sampler BaseTextureSampler : register(s1);
 sampler NormalSampler : register(s4);
 
 float4 g_ReflectTint : register(c4);
+// z: the reflection's overbright factor, by which GMod also multiplies g_ReflectTint (4 under integer HDR, else 1;
+// stdshader_dx9.dll's water draw at 0x1800664a0).
+float4 g_WaterFogParams : register(c7);
 
 struct Input
 {
@@ -34,7 +37,7 @@ Output main(Input input)
     float eyeAngle = dot(input.tangentEye.xy, input.tangentEye.xy) > 1e-6 ? atan2(input.tangentEye.y, input.tangentEye.x) : kNoEyeAngle;
     Output output;
     output.albedo = float4(base.rgb, 1.0);
-    output.normal = float4(slope, dot(g_ReflectTint.rgb, 1.0 / 3.0) * base.a, eyeAngle);
+    output.normal = float4(slope, dot(g_ReflectTint.rgb, 1.0 / 3.0) / g_WaterFogParams.z * base.a, eyeAngle);
     output.emissive = 0.0;
     output.flags = float4(1.0, 1.0 - kMaterialWaterSurface / 255.0, 0.0, 1.0);
     return output;

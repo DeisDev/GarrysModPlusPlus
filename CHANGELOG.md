@@ -113,6 +113,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Water seen from above no longer looks smeared: its reflections are sharp mirrors broken up by its ripples, and with DLSS Ray Reconstruction what lies under it keeps its detail.
+- Fixed water reflections being four times too bright, which washed water near the far shore out to white.
+- Underwater caustics fade out towards the edge of the area they cover instead of stopping at a sharp line.
 - Fixed a possible GPU crash when a player or NPC changes model: the old model's ray tracing data was freed while frames still being drawn used it.
 - With opacity micromaps on, the passes for lit surfaces, water caustics, glass depth and baked bounce light, and the shaders of glass and other translucent surfaces, traced the micromaps without the opt-in that DirectX requires, which leaves the result undefined. They now use them like the other ray-traced passes, which also makes them faster in grass and foliage.
 - Fixed the weapon in your hands getting no shadows, occlusion or reflections from characters, NPCs and other players: its view traced a scene without them.

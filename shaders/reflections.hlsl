@@ -68,12 +68,10 @@ void main(uint3 id : SV_DispatchThreadID)
         // alpha, from just above the plane (shaders/water.hlsli).
         Texture2D<float4> normals = ResourceDescriptorHeap[g_frame.gbufferNormalView];
         float4 water = normals.Load(int3(pixel, 0));
-        direction = ReflectionDirection(view, WaterNormal(water.xy, water.w, -view, kWaveSlope), float3(0.0, 0.0, 1.0), kGlintRoughness,
-            float2(Random(seed), Random(seed)), weight);
+        direction = reflect(view, WaterNormal(water.xy, water.w, -view, kWaveSlope));
         direction.z = max(direction.z, 0.02);
         direction = normalize(direction);
         strength = Fresnel(dot(surface.xyz, -view), kWaterIor) * water.z * g_frame.reflectionScale;
-        lobe = g_frame.glossyReflections != 0 ? LobeSpread(kGlintRoughness) : 0.0;
         origin = position + float3(0.0, 0.0, 2.0);
         coneWidth = PixelAngle() * surface.w;
     } else {
@@ -103,10 +101,11 @@ void main(uint3 id : SV_DispatchThreadID)
     float reflectionDistance = 0.0;
     if (strength > 0.0) {
         float hitDistance;
-        float3 reflected = ReflectedRadiance(origin, direction, coneWidth, PixelAngle() + lobe, seed, hitDistance, (g_frame.traceMask & kSkyboxMask) == 0);
+        float3 hitAlbedo;
+        float3 reflected = ReflectedRadiance(origin, direction, coneWidth, PixelAngle() + lobe, seed, hitDistance, hitAlbedo, (g_frame.traceMask & kSkyboxMask) == 0);
         if (waterSurface) {
             output[pixel] = float4(reflected * strength * weight, hitDistance);
-            WriteGuides(pixel, saturate(strength), GuideRoughness(kGlintRoughness), hitDistance);
+            WriteGuides(pixel, saturate(strength), 0.0, hitDistance);
             return;
         }
         // As LightmappedGeneric and VertexLitGeneric shape their cubemap term.

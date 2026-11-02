@@ -24,7 +24,8 @@ float4 g_ReflectTint : register(c4);
 // xy: reflection distortion, zw: refraction distortion.
 float4 g_ReflectRefractScale : register(c5);
 float4 g_WaterFogColor : register(c6);
-// x: fog start, y: fog end minus start.
+// x: fog start, y: fog end minus start, z: the reflection's overbright factor, by which GMod also multiplies
+// g_ReflectTint (4 under integer HDR, else 1; stdshader_dx9.dll's water draw at 0x1800664a0).
 float4 g_WaterFogParams : register(c7);
 // w: the time in seconds.
 float4 g_EyePos : register(c9);
@@ -78,7 +79,7 @@ Output main(Input input)
     float2 slope = (bump.xy * 2.0 - 1.0) * (g_FlowParams1.z * (dot(flow, flow) + 0.1));
     float eyeAngle = dot(input.tangentEye.xy, input.tangentEye.xy) > 1e-6 ? atan2(input.tangentEye.y, input.tangentEye.x) : kNoEyeAngle;
     Output output;
-    output.normal = float4(slope, dot(g_ReflectTint.rgb, 1.0 / 3.0), eyeAngle);
+    output.normal = float4(slope, dot(g_ReflectTint.rgb, 1.0 / 3.0) / g_WaterFogParams.z, eyeAngle);
     output.emissive = 0.0;
 #if FLOW_COLOR
     float colorPhase = g_EyePos.w / (2.0 * g_ColorFlowParams.y) + noise;

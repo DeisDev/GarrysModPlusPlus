@@ -952,7 +952,8 @@ bool Lighting::EnsureTargets(UINT width, UINT height)
     ok = ok && CreateTarget(m_translucentDepth, width, height, DXGI_FORMAT_R32_FLOAT);
     // Ray Reconstruction's inputs use the top-left render-size part of these.
     constexpr DXGI_FORMAT kRrFormats[] = {DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R16G16B16A16_FLOAT,
-        DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16G16B16A16_FLOAT};
+        DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16G16B16A16_FLOAT,
+        DXGI_FORMAT_R16G16B16A16_FLOAT};
     static_assert(std::size(kRrFormats) == RrInputCount);
     for (UINT i = 0; i < RrInputCount; ++i)
         ok = ok && CreateTarget(m_rrInputs[i], width, height, kRrFormats[i]);
@@ -2495,10 +2496,11 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     PassArgs lighting = {.input0 = shaded != nullptr ? shaded->srv : kInvalidView, .input1 = m_giRaw.srv, .input2 = reflections, .input3 = direct.srv,
         .input4 = m_directRemainder.srv, .output0 = m_lit.uav};
     if (rayReconstruction) {
-        // Water pixels overwrite the reflection guides the reflections pass wrote.
+        // Water pixels overwrite the reflection guides the reflections pass wrote, and traced water the albedo guide.
         Use(m_rrSpecularAlbedo, write);
         Use(m_rrRoughness, write);
         Use(m_rrHitDistance, write);
+        Use(m_rrInputs[RrAlbedoGuide], write);
         D3D12_RESOURCE_BARRIER guides[3] = {};
         ID3D12Resource* guideResources[] = {m_rrSpecularAlbedo.resource.Get(), m_rrRoughness.resource.Get(), m_rrHitDistance.resource.Get()};
         for (size_t i = 0; i < std::size(guides); ++i) {
@@ -2509,6 +2511,7 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
         lighting.output1 = m_rrSpecularAlbedo.uav;
         lighting.output2 = m_rrRoughness.uav;
         lighting.output3 = m_rrHitDistance.uav;
+        lighting.output4 = m_rrInputs[RrAlbedoGuide].uav;
     }
     Dispatch(Pass::Lighting, lighting);
     mark();
@@ -2521,10 +2524,11 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
         Use(m_rrSpecularAlbedo, read);
         Use(m_rrRoughness, read);
         Use(m_rrHitDistance, read);
+        Use(m_rrInputs[RrAlbedoGuide], read);
         Use(m_rrOutput, write);
         SplitViewProjection(constants.viewProj, constants.eyePosition, m_worldToView, m_viewToClip);
         const RayReconstruction::Inputs rr{m_lit.resource.Get(), m_rrInputs[RrDepth].resource.Get(), m_motion.resource.Get(),
-            m_surface[current].resource.Get(), m_rrInputs[RrAlbedo].resource.Get(), m_rrSpecularAlbedo.resource.Get(), m_rrRoughness.resource.Get(),
+            m_surface[current].resource.Get(), m_rrInputs[RrAlbedoGuide].resource.Get(), m_rrSpecularAlbedo.resource.Get(), m_rrRoughness.resource.Get(),
             m_rrHitDistance.resource.Get(), m_rrOutput.resource.Get(), m_worldToView, m_viewToClip, renderWidth, renderHeight, inputs.jitterX,
             inputs.jitterY, !m_historyValid};
         rayReconstructed = m_rayReconstruction.Evaluate(m_list.Get(), GetSettings().upscaling, m_width, m_height, rr);
