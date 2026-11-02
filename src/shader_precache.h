@@ -30,17 +30,24 @@ enum class Priority : std::uint8_t {
     // Vertex shaders with a user clip plane, as the game draws the views of water's reflection and refraction: the
     // loading screen waits for them on maps with water.
     Water,
-    // Shaders of earlier sessions compiled again after an update (StartReplay), and developer requests: nothing waits.
+    // Shaders of earlier sessions compiled again after an update (StartReplay): nothing waits, and they run on at most half
+    // the workers.
     Background,
+    // EnqueueEveryShader's requests: nothing waits, and the corner notice leaves them out.
+    Developer,
     Count,
 };
+
+// Identifies a shader file's contents, so copies of a file with the same name are told apart (Request::fileHash).
+std::uint64_t HashFile(std::span<const std::uint8_t> bytes);
 
 // One static combo of a shader file that a material pass uses.
 struct Request {
     // The .vcs file's name, bytes and static combo directory, which must stay in place for the life of the process (as
-    // FindShaderFile's do).
+    // FindShaderFile's do), and HashFile of its bytes.
     const char* name = nullptr;
     std::span<const std::uint8_t> file;
+    std::uint64_t fileHash = 0;
     const vcs::Directory* directory = nullptr;
     // As IShaderShadow::SetVertexShader and SetPixelShader take it: the static combo times the file's dynamic combos.
     std::int32_t staticIndex = 0;
@@ -80,7 +87,7 @@ void StartReplay(const std::filesystem::path& gameDirectory);
 void SaveRemembered();
 
 // Developer tool (-gmodpp_dev, shaders.request): queues every static combo of every shader the game ships, with both
-// twins, to find combos the translator or the compiler cannot handle (Priority::Background, not remembered).
+// twins, to find combos the translator or the compiler cannot handle (Priority::Developer, not remembered).
 void EnqueueEveryShader(const std::filesystem::path& gameDirectory);
 
 struct Progress {

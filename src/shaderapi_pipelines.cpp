@@ -49,6 +49,8 @@ public:
     std::string name;
     bool vertex = false;
     std::vector<std::uint8_t> bytes;
+    // shader_precache::HashFile of the bytes.
+    std::uint64_t hash = 0;
     vcs::Directory directory;
     // Decoded static combos: their dynamic combos' bytecode by dynamic index.
     std::unordered_map<std::uint32_t, std::vector<std::vector<DWORD>>> statics;
@@ -906,6 +908,7 @@ const ShaderFile* FindShaderFile(const char* name, bool vertex)
         g_cache.missingFiles.insert(key);
         return nullptr;
     }
+    file->hash = shader_precache::HashFile(file->bytes);
     return g_cache.files.emplace(key, std::move(file)).first->second.get();
 }
 
@@ -919,6 +922,7 @@ void PrecacheShaders(const ShadowState& state)
         shader_precache::Request request;
         request.name = file->name.c_str();
         request.file = file->bytes;
+        request.fileHash = file->hash;
         request.directory = &file->directory;
         request.staticIndex = file == state.vertexShader ? state.vertexStaticIndex : state.pixelStaticIndex;
         request.vertex = file == state.vertexShader;

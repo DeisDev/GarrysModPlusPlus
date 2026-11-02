@@ -34,7 +34,8 @@ void OnPresent(UINT width, UINT height, bool consoleRequests);
 
 // What PrepareLevel is doing when it reports progress.
 enum class LoadStage { Scene, Pipelines, Bake };
-// The share of PrepareLevel's work done, from 0 to 1, and its current stage.
+// How full the loading bar is, from 0 to 1, and the current stage. The scene and the bake share one bar; a wait for the
+// lighting's pipeline states fills a bar of its own, and the bake after it another.
 using LoadProgress = std::function<void(float done, LoadStage stage)>;
 // While a map is being joined: starts loading its scene on another thread, once its name is known.
 void BeginLevelLoad();

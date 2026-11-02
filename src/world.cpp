@@ -1855,14 +1855,18 @@ void PrepareLevel(const LoadProgress& progress)
     // The lighting's pipeline states have been created in the background since the game started (Lighting::Initialize);
     // the first map loaded soon after a launch waits for the rest here instead of in its first frame. Without a scene the
     // map is not lit, and nothing waits.
+    bool waitedForPipelines = false;
     while (g_state.scene.Ready() && g_state.lighting->PreparingPipelines()) {
+        waitedForPipelines = true;
         const auto [created, total] = g_state.lighting->PipelineProgress();
         progress(total != 0 ? static_cast<float>(created) / static_cast<float>(total) : 0.0f, LoadStage::Pipelines);
         std::this_thread::sleep_for(std::chrono::milliseconds(15));
     }
     const auto loaded = std::chrono::steady_clock::now();
+    // After the pipeline states' bar the bake fills a bar of its own, rather than going back to the scene's share.
+    const float bakeStart = waitedForPipelines ? 0.0f : sceneShare;
     if (bake && g_state.scene.Ready())
-        g_state.lighting->Bake(g_state.scene, [&](float done) { progress(sceneShare + done * (1.0f - sceneShare), LoadStage::Bake); });
+        g_state.lighting->Bake(g_state.scene, [&](float done) { progress(bakeStart + done * (1.0f - bakeStart), LoadStage::Bake); });
     const auto ms = [](auto from, auto to) { return std::chrono::duration<double, std::milli>(to - from).count(); };
     log::Info("Loading screen: '{}' ready when the loading screen closes (scene loaded {}, {:.0f} ms waited for it; bake {:.0f} ms)", g_state.scene.Name(),
         background ? std::format("in the background in {:.0f} ms", ms(g_state.loaderStart, g_state.loaderEnd)) : std::string("then"), ms(start, loaded),

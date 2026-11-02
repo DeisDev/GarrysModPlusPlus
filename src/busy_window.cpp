@@ -37,12 +37,16 @@ std::atomic<long long> g_scopeStart = 0;
 // Time spent in scopes that ended since the last frame.
 std::atomic<long long> g_busyClosed = 0;
 std::atomic<int> g_reason = 0;
+std::atomic<long long> g_presents = 0;
 thread_local int t_depth = 0;
 
-// The window's text, by Reason, read on the render thread (ui::Text is not thread-safe) for the window's thread.
+// The window's text, by Reason, read on the render thread (ui::Text is not thread-safe) for the window's thread, and
+// the language and frame it was last checked in.
 std::mutex g_textMutex;
 std::wstring g_title;
 std::array<std::wstring, 2> g_text;
+std::string g_textLanguage;
+long long g_textChecked = -1;
 
 std::wstring Wide(std::string_view text)
 {
@@ -52,11 +56,19 @@ std::wstring Wide(std::string_view text)
     return result;
 }
 
+// Follows GMod's language, checked at most once a frame: finding its cvar is a search, and a scope comes for every
+// shader a frame reads or compiles.
 void LoadText()
 {
     std::scoped_lock lock(g_textMutex);
-    if (!g_title.empty())
+    const long long presents = g_presents;
+    if (presents == g_textChecked)
         return;
+    g_textChecked = presents;
+    ui::UpdateLanguage();
+    if (ui::Language() == g_textLanguage)
+        return;
+    g_textLanguage = ui::Language();
     g_title = Wide(ui::Text("busy.title"));
     g_text[static_cast<size_t>(Reason::Shaders)] = Wide(ui::Text("busy.shaders"));
     g_text[static_cast<size_t>(Reason::Pipelines)] = Wide(ui::Text("busy.pipelines"));
@@ -84,6 +96,10 @@ public:
         }
         if (m_window == nullptr && !Create(title))
             return;
+        if (title != m_title) {
+            m_title = title;
+            SetWindowTextW(m_window, m_title.c_str());
+        }
         if (text != m_text) {
             m_text = text;
             SetWindowTextW(m_label, m_text.c_str());
@@ -185,6 +201,7 @@ private:
     HFONT m_font = nullptr;
     UINT m_dpi = 96;
     bool m_visible = false;
+    std::wstring m_title;
     std::wstring m_text;
 };
 
@@ -248,6 +265,7 @@ void NotePresent()
 {
     g_busyClosed = 0;
     g_lastPresent = NowMs();
+    ++g_presents;
 }
 
 }
