@@ -51,7 +51,8 @@ void ShowProgress(void* self, float done, world::LoadStage stage)
 {
     ui::UpdateLanguage();
     // The game draws text glyph by glyph from left to right, so it gets it in display order.
-    const std::wstring text = Wide(ui::Visual(ui::Text(stage == world::LoadStage::Bake ? "loading.bake" : "loading.scene")));
+    const char* key = stage == world::LoadStage::Bake ? "loading.bake" : stage == world::LoadStage::Pipelines ? "loading.pipelines" : "loading.scene";
+    const std::wstring text = Wide(ui::Visual(ui::Text(key)));
     g_updateCustomProgressBar(self, done, text.c_str());
 }
 

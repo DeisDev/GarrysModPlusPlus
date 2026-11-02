@@ -29,7 +29,7 @@ void WaitForGpu();
 void OnPresent(UINT width, UINT height, bool consoleRequests);
 
 // What PrepareLevel is doing when it reports progress.
-enum class LoadStage { Scene, Bake };
+enum class LoadStage { Scene, Pipelines, Bake };
 // The share of PrepareLevel's work done, from 0 to 1, and its current stage.
 using LoadProgress = std::function<void(float done, LoadStage stage)>;
 // While a map is being joined: starts loading its scene on another thread, once its name is known.

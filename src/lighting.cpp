@@ -75,12 +75,14 @@
 #include <g_volumetricsOmmCS.h>
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstring>
 #include <fstream>
 #include <numeric>
+#include <thread>
 #include <tuple>
 
 using Microsoft::WRL::ComPtr;
@@ -414,6 +416,118 @@ ComPtr<ID3D12Resource> CreateBuffer(ID3D12Device* device, D3D12_HEAP_TYPE heap, 
 
 }
 
+namespace {
+
+// Runs the jobs on worker threads, one fewer than the logical cores (at least one), and returns the first failure. The
+// driver compiles a pipeline state's shaders as it is created, so creating them side by side divides the wait.
+HRESULT RunInParallel(std::span<const std::function<HRESULT()>> jobs, std::atomic<size_t>& done)
+{
+    std::atomic<size_t> next = 0;
+    std::atomic<HRESULT> result = S_OK;
+    auto work = [&] {
+        for (size_t i = next++; i < jobs.size(); i = next++) {
+            const HRESULT hr = jobs[i]();
+            HRESULT expected = S_OK;
+            if (FAILED(hr))
+                result.compare_exchange_strong(expected, hr);
+            done.fetch_add(1, std::memory_order_relaxed);
+        }
+    };
+    const size_t threads = std::min<size_t>(std::max(2u, std::thread::hardware_concurrency()) - 1, jobs.size());
+    {
+        std::vector<std::jthread> workers;
+        for (size_t i = 1; i < threads; ++i)
+            workers.emplace_back([&] {
+                SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                work();
+            });
+        work();
+    }
+    return result.load();
+}
+
+}
+
+HRESULT Lighting::CreatePipelines()
+{
+    const bool micromaps = m_opacityMicromaps;
+    // Devices with the radiance cache run the passes that read it in their variants built with SHaRC (which read it only
+    // while it is on); others run the plain passes and have no cache passes.
+    const bool cache = m_radianceCacheSupported;
+    std::vector<std::function<HRESULT()>> jobs;
+    auto compute = [&](std::span<const BYTE> shader, Microsoft::WRL::ComPtr<ID3D12PipelineState>& pipeline) {
+        if (shader.empty())
+            return;
+        jobs.push_back([this, shader, &pipeline] {
+            D3D12_COMPUTE_PIPELINE_STATE_DESC desc = {};
+            desc.pRootSignature = m_computeRoot.Get();
+            desc.CS = {shader.data(), shader.size()};
+            return m_device->CreateComputePipelineState(&desc, IID_PPV_ARGS(&pipeline));
+        });
+    };
+    const std::span<const BYTE> none;
+    const std::span<const BYTE> shaders[] = {g_surfaceCS, g_primaryCS, cache ? std::span<const BYTE>(g_probesCacheCS) : g_probesCS, g_aoCS,
+        g_volumetricsCS, g_directCS, cache ? std::span<const BYTE>(g_giTraceCacheCS) : g_giTraceCS, g_giTemporalCS, g_giFilterCS,
+        cache ? std::span<const BYTE>(g_deferredLightingCacheCS) : g_deferredLightingCS, g_taaCS, g_taaSharpenCS,
+        cache ? std::span<const BYTE>(g_reflectionsCacheCS) : g_reflectionsCS, g_reflectionTemporalCS, g_dlssInputsCS, g_dlssResolveCS, g_directWideCS,
+        g_swayCS, g_translucentDepthCS, g_viewRectCS, g_bakedBounceCS, g_skyCS, cache ? std::span<const BYTE>(g_sharcUpdateCS) : none,
+        cache ? std::span<const BYTE>(g_sharcResolveCS) : none, g_directSunCS, g_restirPdfCS, g_restirPresampleCS, g_restirRegirCS, g_restirInitialCS,
+        g_restirTemporalCS, g_restirSpatialCS, g_restirShadeCS, g_nrdInputsCS, g_nrdResolveCS, g_sunShadowCS, g_causticsCS, g_skinCS,
+        g_skyAtmosphereCS};
+    static_assert(std::size(shaders) == static_cast<size_t>(Pass::Count));
+    for (size_t i = 0; i < m_pipelines.size(); ++i)
+        compute(shaders[i], m_pipelines[i]);
+    // Variants of the passes that trace rays whose ray queries let opacity micromaps settle alpha tests.
+    const std::pair<Pass, std::span<const BYTE>> micromapShaders[] = {{Pass::Primary, g_primaryOmmCS},
+        {Pass::Probes, cache ? std::span<const BYTE>(g_probesCacheOmmCS) : g_probesOmmCS}, {Pass::Ao, g_aoOmmCS}, {Pass::Volumetrics, g_volumetricsOmmCS},
+        {Pass::Direct, g_directOmmCS}, {Pass::GiTrace, cache ? std::span<const BYTE>(g_giTraceCacheOmmCS) : g_giTraceOmmCS},
+        {Pass::Reflections, cache ? std::span<const BYTE>(g_reflectionsCacheOmmCS) : g_reflectionsOmmCS}, {Pass::DirectWide, g_directWideOmmCS},
+        {Pass::SharcUpdate, cache ? std::span<const BYTE>(g_sharcUpdateOmmCS) : none}, {Pass::DirectSun, g_directSunOmmCS},
+        {Pass::RestirInitial, g_restirInitialOmmCS}, {Pass::RestirShade, g_restirShadeOmmCS}, {Pass::SunShadow, g_sunShadowOmmCS},
+        {Pass::Lighting, cache ? std::span<const BYTE>(g_deferredLightingCacheOmmCS) : g_deferredLightingOmmCS},
+        {Pass::TranslucentDepth, g_translucentDepthOmmCS}, {Pass::Baked, g_bakedBounceOmmCS}, {Pass::Caustics, g_causticsOmmCS}};
+    for (size_t i = 0; i < std::size(micromapShaders) && micromaps; ++i)
+        compute(micromapShaders[i].second, m_micromapPipelines[static_cast<size_t>(micromapShaders[i].first)]);
+    for (const bool covered : {false, true}) {
+        jobs.push_back([this, covered] {
+            D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = {};
+            desc.pRootSignature = m_compositeRoot.Get();
+            desc.VS = {g_compositeVS, sizeof(g_compositeVS)};
+            desc.PS = covered ? D3D12_SHADER_BYTECODE{g_compositeCoveredPS, sizeof(g_compositeCoveredPS)} : D3D12_SHADER_BYTECODE{g_compositePS, sizeof(g_compositePS)};
+            desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_RED | D3D12_COLOR_WRITE_ENABLE_GREEN | D3D12_COLOR_WRITE_ENABLE_BLUE;
+            desc.SampleMask = UINT_MAX;
+            desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+            desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+            desc.RasterizerState.DepthClipEnable = TRUE;
+            desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+            desc.NumRenderTargets = 1;
+            desc.RTVFormats[0] = DXGI_FORMAT_B8G8R8A8_UNORM;
+            desc.SampleDesc.Count = 1;
+            return m_device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(covered ? &m_compositeCoveredPipeline : &m_compositePipeline));
+        });
+    }
+    m_pipelinesTotal = jobs.size();
+    return RunInParallel(jobs, m_pipelinesCreated);
+}
+
+bool Lighting::WaitForPipelines()
+{
+    if (m_pipelinesChecked)
+        return !m_failed;
+    m_pipelinesChecked = true;
+    const auto start = std::chrono::steady_clock::now();
+    const bool waited = PreparingPipelines();
+    if (m_pipelineBuilder.joinable())
+        m_pipelineBuilder.join();
+    if (waited)
+        log::Info("Lighting: waited {:.0f} ms for the pipeline states", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+    if (FAILED(m_pipelinesResult)) {
+        log::Info("Lighting: creating the pipeline states failed ({:#010x}); lighting disabled", Hex(m_pipelinesResult));
+        m_failed = true;
+    }
+    return !m_failed;
+}
+
 bool Lighting::Initialize(ID3D12Device5* device, ID3D12CommandQueue* queue, DescriptorHeap& descriptors, const RaytracingSupport& support,
     const std::filesystem::path& dlssDirectory)
 {
@@ -552,66 +666,9 @@ bool Lighting::Initialize(ID3D12Device5* device, ID3D12CommandQueue* queue, Desc
     if (SUCCEEDED(hr))
         hr = m_device->CreateRootSignature(0, g_surfaceCS, sizeof(g_surfaceCS), IID_PPV_ARGS(&m_computeRoot));
     const bool micromaps = support.opacityMicromaps;
-    // Devices with the radiance cache run the passes that read it in their variants built with SHaRC (which read it only
-    // while it is on); others run the plain passes and have no cache passes.
     const bool cache = m_radianceCacheSupported;
-    const std::span<const BYTE> none;
-    const std::span<const BYTE> shaders[] = {g_surfaceCS, g_primaryCS, cache ? std::span<const BYTE>(g_probesCacheCS) : g_probesCS, g_aoCS,
-        g_volumetricsCS, g_directCS, cache ? std::span<const BYTE>(g_giTraceCacheCS) : g_giTraceCS, g_giTemporalCS, g_giFilterCS,
-        cache ? std::span<const BYTE>(g_deferredLightingCacheCS) : g_deferredLightingCS, g_taaCS, g_taaSharpenCS,
-        cache ? std::span<const BYTE>(g_reflectionsCacheCS) : g_reflectionsCS, g_reflectionTemporalCS, g_dlssInputsCS, g_dlssResolveCS, g_directWideCS,
-        g_swayCS, g_translucentDepthCS, g_viewRectCS, g_bakedBounceCS, g_skyCS, cache ? std::span<const BYTE>(g_sharcUpdateCS) : none,
-        cache ? std::span<const BYTE>(g_sharcResolveCS) : none, g_directSunCS, g_restirPdfCS, g_restirPresampleCS, g_restirRegirCS, g_restirInitialCS,
-        g_restirTemporalCS, g_restirSpatialCS, g_restirShadeCS, g_nrdInputsCS, g_nrdResolveCS, g_sunShadowCS, g_causticsCS, g_skinCS,
-        g_skyAtmosphereCS};
-    static_assert(std::size(shaders) == static_cast<size_t>(Pass::Count));
-    for (size_t i = 0; i < m_pipelines.size() && SUCCEEDED(hr); ++i) {
-        if (shaders[i].empty())
-            continue;
-        D3D12_COMPUTE_PIPELINE_STATE_DESC desc = {};
-        desc.pRootSignature = m_computeRoot.Get();
-        desc.CS = {shaders[i].data(), shaders[i].size()};
-        hr = m_device->CreateComputePipelineState(&desc, IID_PPV_ARGS(&m_pipelines[i]));
-    }
-    // Variants of the passes that trace rays whose ray queries let opacity micromaps settle alpha tests.
-    const std::pair<Pass, std::span<const BYTE>> micromapShaders[] = {{Pass::Primary, g_primaryOmmCS},
-        {Pass::Probes, cache ? std::span<const BYTE>(g_probesCacheOmmCS) : g_probesOmmCS}, {Pass::Ao, g_aoOmmCS}, {Pass::Volumetrics, g_volumetricsOmmCS},
-        {Pass::Direct, g_directOmmCS}, {Pass::GiTrace, cache ? std::span<const BYTE>(g_giTraceCacheOmmCS) : g_giTraceOmmCS},
-        {Pass::Reflections, cache ? std::span<const BYTE>(g_reflectionsCacheOmmCS) : g_reflectionsOmmCS}, {Pass::DirectWide, g_directWideOmmCS},
-        {Pass::SharcUpdate, cache ? std::span<const BYTE>(g_sharcUpdateOmmCS) : none}, {Pass::DirectSun, g_directSunOmmCS},
-        {Pass::RestirInitial, g_restirInitialOmmCS}, {Pass::RestirShade, g_restirShadeOmmCS}, {Pass::SunShadow, g_sunShadowOmmCS},
-        {Pass::Lighting, cache ? std::span<const BYTE>(g_deferredLightingCacheOmmCS) : g_deferredLightingOmmCS},
-        {Pass::TranslucentDepth, g_translucentDepthOmmCS}, {Pass::Baked, g_bakedBounceOmmCS}, {Pass::Caustics, g_causticsOmmCS}};
-    for (size_t i = 0; i < std::size(micromapShaders) && SUCCEEDED(hr) && micromaps; ++i) {
-        if (micromapShaders[i].second.empty())
-            continue;
-        D3D12_COMPUTE_PIPELINE_STATE_DESC desc = {};
-        desc.pRootSignature = m_computeRoot.Get();
-        desc.CS = {micromapShaders[i].second.data(), micromapShaders[i].second.size()};
-        hr = m_device->CreateComputePipelineState(&desc, IID_PPV_ARGS(&m_micromapPipelines[static_cast<size_t>(micromapShaders[i].first)]));
-    }
     if (SUCCEEDED(hr))
         hr = m_device->CreateRootSignature(0, g_compositeVS, sizeof(g_compositeVS), IID_PPV_ARGS(&m_compositeRoot));
-    if (SUCCEEDED(hr)) {
-        D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = {};
-        desc.pRootSignature = m_compositeRoot.Get();
-        desc.VS = {g_compositeVS, sizeof(g_compositeVS)};
-        desc.PS = {g_compositePS, sizeof(g_compositePS)};
-        desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_RED | D3D12_COLOR_WRITE_ENABLE_GREEN | D3D12_COLOR_WRITE_ENABLE_BLUE;
-        desc.SampleMask = UINT_MAX;
-        desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-        desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-        desc.RasterizerState.DepthClipEnable = TRUE;
-        desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-        desc.NumRenderTargets = 1;
-        desc.RTVFormats[0] = DXGI_FORMAT_B8G8R8A8_UNORM;
-        desc.SampleDesc.Count = 1;
-        hr = m_device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&m_compositePipeline));
-        if (SUCCEEDED(hr)) {
-            desc.PS = {g_compositeCoveredPS, sizeof(g_compositeCoveredPS)};
-            hr = m_device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&m_compositeCoveredPipeline));
-        }
-    }
     if (SUCCEEDED(hr)) {
         D3D12_INDIRECT_ARGUMENT_DESC argument = {D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH};
         D3D12_COMMAND_SIGNATURE_DESC desc = {sizeof(D3D12_DISPATCH_ARGUMENTS), 1, &argument, 0};
@@ -698,7 +755,14 @@ bool Lighting::Initialize(ID3D12Device5* device, ID3D12CommandQueue* queue, Desc
     GetStatistics().opacityMicromapsAvailable = micromaps;
     GetStatistics().radianceCacheAvailable = cache;
     m_restirAvailable = m_restir.Initialize(m_device, *m_descriptors);
-    log::Info("Lighting: initialized");
+    m_pipelineBuilder = std::jthread([this] {
+        const auto start = std::chrono::steady_clock::now();
+        m_pipelinesResult = CreatePipelines();
+        log::Info("Lighting: created {} pipeline states in {:.0f} ms", m_pipelinesTotal.load(),
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+        m_pipelinesDone.store(true, std::memory_order_release);
+    });
+    log::Info("Lighting: initialized; creating its pipeline states in the background");
     return true;
 }
 
@@ -1778,7 +1842,7 @@ float Lighting::BakeProgress(Scene& scene) const
 
 void Lighting::Bake(Scene& scene, const std::function<void(float)>& progress)
 {
-    if (m_failed || !scene.Ready() || !scene.HasBaked() || scene.Baked().Ready())
+    if (!WaitForPipelines() || !scene.Ready() || !scene.HasBaked() || scene.Baked().Ready())
         return;
     m_useMicromaps = m_opacityMicromaps && GetSettings().opacityMicromaps && scene.HasMicromaps();
     WaitForGpu();
@@ -1853,7 +1917,7 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
         m_skyDraw = {};
         m_proceduralSkyReady = false;
     }
-    if (m_failed)
+    if (!WaitForPipelines())
         return;
     const D3D12_RESOURCE_DESC colorDesc = inputs.color->GetDesc();
     if (!EnsureTargets(static_cast<UINT>(colorDesc.Width), colorDesc.Height)) {

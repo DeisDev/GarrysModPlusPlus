@@ -1843,6 +1843,13 @@ void PrepareLevel(const LoadProgress& progress)
     JoinLoader();
     if (const std::optional<std::string> level = PendingLevel())
         LoadScene(*level, [&](float done) { progress(done * sceneShare, LoadStage::Scene); });
+    // The lighting's pipeline states have been created in the background since the game started (Lighting::Initialize);
+    // the first map loaded soon after a launch waits for the rest here instead of in its first frame.
+    while (g_state.lighting->PreparingPipelines()) {
+        const auto [created, total] = g_state.lighting->PipelineProgress();
+        progress(total != 0 ? static_cast<float>(created) / static_cast<float>(total) : 0.0f, LoadStage::Pipelines);
+        std::this_thread::sleep_for(std::chrono::milliseconds(15));
+    }
     const auto loaded = std::chrono::steady_clock::now();
     if (bake && g_state.scene.Ready())
         g_state.lighting->Bake(g_state.scene, [&](float done) { progress(sceneShare + done * (1.0f - sceneShare), LoadStage::Bake); });

@@ -14,10 +14,12 @@
 #include <wrl/client.h>
 
 #include <array>
+#include <atomic>
 #include <filesystem>
 #include <functional>
 #include <optional>
 #include <span>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -272,9 +274,14 @@ struct ViewInputs {
 // frames and denoised. The 3D skybox is lit without tracing.
 class Lighting {
 public:
-    // `dlssDirectory` holds nvngx_dlssd.dll.
+    // `dlssDirectory` holds nvngx_dlssd.dll. The pipeline states, which the driver compiles as they are created, are
+    // created on worker threads after Initialize returns, so the game opens its window without waiting for them; Run
+    // and Bake wait for them when they need them first.
     bool Initialize(ID3D12Device5* device, ID3D12CommandQueue* queue, DescriptorHeap& descriptors, const RaytracingSupport& support,
         const std::filesystem::path& dlssDirectory);
+    // Whether the pipeline states are still being created (non-blocking), and how many of them are done.
+    bool PreparingPipelines() const { return !m_pipelinesDone.load(std::memory_order_acquire); }
+    std::pair<size_t, size_t> PipelineProgress() const { return {m_pipelinesCreated.load(std::memory_order_relaxed), m_pipelinesTotal.load(std::memory_order_relaxed)}; }
     // Submits the view's commands to the queue. The game's commands that wrote the inputs must be submitted first.
     void Run(const ViewInputs& inputs, Scene& scene, std::span<const SceneInstance> dynamic, const std::vector<SkinnedEntity>& skinned);
     // Runs the rest of the map's bounce light bake without a view, waiting for each part, and reports the share done after
@@ -716,6 +723,17 @@ private:
     Microsoft::WRL::ComPtr<ID3D12Resource> m_probeReadback;
     UINT m_probeUav = DescriptorHeap::kInvalid;
     bool m_failed = false;
+
+    // Waits for the pipeline states the first time; false (and m_failed) when creating one failed.
+    bool WaitForPipelines();
+    HRESULT CreatePipelines();
+    std::atomic<size_t> m_pipelinesCreated = 0;
+    std::atomic<size_t> m_pipelinesTotal = 0;
+    HRESULT m_pipelinesResult = S_OK;
+    std::atomic<bool> m_pipelinesDone = false;
+    bool m_pipelinesChecked = false;
+    // Last, so it is joined before anything it creates or reads is destroyed.
+    std::jthread m_pipelineBuilder;
 };
 
 }
