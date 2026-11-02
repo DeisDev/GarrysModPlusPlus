@@ -131,7 +131,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Fixed
 
 - Maps with water no longer stutter the first time you look at water: the vertex shaders the water's reflection and refraction views draw with (with a clip plane) are compiled while the map loads.
-- The game no longer hitches every 30 seconds while new pipeline states are being made: the pipeline library (`gmodplusplus\cache\pipelines.bin`) is saved on another thread, and read in the background while the game starts.
+- Saving the pipeline library (`gmodplusplus\cache\pipelines.bin`), which happens every 30 seconds while new pipeline states are being made, no longer pauses the game: it is written on another thread. It is also read in the background while the game starts.
 - Smooth gradients, such as the sky and fog, no longer break into bands of colour.
 - Some maps, such as gm_blackbrook_asylum, no longer crash the game as they finish loading.
 - Ground seen through water and in reflections uses full-resolution textures and shows blended terrain (WorldVertexTransition) as the game draws it, such as sand under gm_construct's lake instead of blurry grass.
