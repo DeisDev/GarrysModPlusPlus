@@ -51,6 +51,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Direct light from the map's lamps, glowing surfaces, dynamic lights and flashlights is chosen with NVIDIA RTXDI (ReSTIR DI with a ReGIR light grid): maps with hundreds of lights get every light's contribution with fewer rays. "Light sampling" in the menu; Auto uses it with TAA, and with DLSS Ray Reconstruction traces the strongest lights directly.
 - Without DLSS Ray Reconstruction, indirect light and reflections are denoised by NVIDIA NRD (RELAX by default, REBLUR as an option), replacing the built-in filter. "Denoiser type" in the menu.
 - Debug views for the radiance cache's voxels, RTXDI's light sample and reused samples per pixel, and NRD's validation overlay.
+- The menu and loading screen follow GMod's language setting. Their text is in `gmodplusplus\localization`, so they can be translated; only English exists so far.
+- The menu draws characters its own fonts lack with the fonts the game uses for them (Tahoma and the fonts Windows links to it), so translations in any script the game shows display correctly.
+- Right-to-left languages such as Hebrew read correctly: text runs right to left, and the menu's layout is mirrored.
 
 ### Changed
 
@@ -62,6 +65,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Compiled shaders are kept in one file, `gmodplusplus\cache\shaders.bin`, instead of one file per shader, so reading them is faster. The old `gmodplusplus\cache\shaders` folder is deleted in the background.
 - The Low preset picks how map lights are sampled automatically, like the other presets.
 - The settings menu has a new look: the game's own fonts, a page list on the left, switches and grouped sections.
+- The settings menu is reorganised and easier to read: square corners, larger text, labels on the left and controls on the right, and the row under the mouse is highlighted.
+- Each setting is in one place. The Quality page (formerly Ray tracing) holds the preset and exactly the settings it sets; switches and strengths are on the Lighting page.
+- Settings that don't apply stay in place, greyed out, and say why when you point at them, instead of disappearing.
+- Each page has its own "Reset page" button, which resets only that page, in place of one button that reset every setting.
+- Quality presets also turn opacity micromaps back on.
 - Sun shadows are soft, sharp near the object and blurring with distance, as the real sun's size makes them.
 - Reflected surfaces are lit with the sun, a lamp and the radiance cache where they are, instead of borrowing the reflecting surface's light or reusing last frame's image.
 - The "Shadow rays" settings apply only to Legacy light sampling, and to Auto with DLSS Ray Reconstruction.

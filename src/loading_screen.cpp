@@ -3,6 +3,7 @@
 #include "log.h"
 #include "module_scan.h"
 #include "shader_precache.h"
+#include "text_layout.h"
 #include "ui_text.h"
 #include "world.h"
 
@@ -48,7 +49,9 @@ std::wstring Wide(std::string_view text)
 
 void ShowProgress(void* self, float done, world::LoadStage stage)
 {
-    const std::wstring text = Wide(ui::Text(stage == world::LoadStage::Bake ? ui::TextId::LoadingBake : ui::TextId::LoadingScene));
+    ui::UpdateLanguage();
+    // The game draws text glyph by glyph from left to right, so it gets it in display order.
+    const std::wstring text = Wide(ui::Visual(ui::Text(stage == world::LoadStage::Bake ? "loading.bake" : "loading.scene")));
     g_updateCustomProgressBar(self, done, text.c_str());
 }
 
@@ -61,7 +64,8 @@ void WaitForShaders(void* self)
         return;
     const std::size_t first = progress.done;
     const std::size_t requests = progress.total - first;
-    const std::wstring text = Wide(ui::Text(ui::TextId::LoadingShaders));
+    ui::UpdateLanguage();
+    const std::wstring text = Wide(ui::Visual(ui::Text("loading.shaders")));
     const auto start = std::chrono::steady_clock::now();
     while (progress.done < progress.total) {
         g_updateCustomProgressBar(self, static_cast<float>(progress.done - first) / static_cast<float>(progress.total - first), text.c_str());

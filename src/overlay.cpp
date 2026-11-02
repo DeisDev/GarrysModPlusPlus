@@ -6,6 +6,7 @@
 #include "overlay_widgets.h"
 #include "settings.h"
 #include "shaderapi_device.h"
+#include "text_layout.h"
 #include "ui_text.h"
 
 #include <MinHook.h>
@@ -16,7 +17,6 @@
 #include <intrin.h>
 
 #include <algorithm>
-#include <format>
 #include <span>
 #include <string>
 #include <vector>
@@ -28,11 +28,10 @@ namespace gmodpp::overlay {
 namespace {
 
 using ui::Text;
-using ui::TextId;
 
 constexpr UINT kToggleKey = VK_INSERT;
 
-enum class Page { General, Lighting, RayTracing, Image, Performance, Count };
+enum class Page { General, Lighting, Quality, Image, Performance, Count };
 
 using SetCursorPosFn = BOOL(WINAPI*)(int, int);
 using ClipCursorFn = BOOL(WINAPI*)(const RECT*);
@@ -163,350 +162,395 @@ void FreeDescriptor(ImGui_ImplDX12_InitInfo*, D3D12_CPU_DESCRIPTOR_HANDLE cpu, D
     g_state.descriptors->Free(static_cast<UINT>((cpu.ptr - start) / increment));
 }
 
-template <class... Args>
-std::string Format(TextId id, Args&&... args)
+// The width slider values keep for their text, so every track in the menu ends at the same place.
+float ValueWidth() { return ImGui::CalcTextSize(ui::Number(99.99, 2).c_str()).x; }
+
+void BeginRow(const char* key, bool enabled = true, const char* reason = nullptr)
 {
-    return std::vformat(Text(id), std::make_format_args(args...));
+    ImGui::PushID(key);
+    widgets::BeginRow(Text(key), enabled, reason);
 }
 
-template <class... Args>
-void TextLine(TextId id, Args&&... args)
+bool EndRow(bool clickableLabel = false)
 {
-    ImGui::TextUnformatted(Format(id, args...).c_str());
+    const bool clicked = widgets::EndRow(clickableLabel);
+    ImGui::PopID();
+    return clicked;
 }
 
-bool BeginRows(const char* id)
+// A switch; its label flips it too.
+void SwitchRow(const char* key, bool& value, bool enabled = true, const char* reason = nullptr)
 {
-    if (!ImGui::BeginTable(id, 2, ImGuiTableFlags_SizingStretchProp))
-        return false;
-    ImGui::TableSetupColumn(nullptr, ImGuiTableColumnFlags_WidthStretch, 0.42f);
-    ImGui::TableSetupColumn(nullptr, ImGuiTableColumnFlags_WidthStretch, 0.58f);
-    return true;
+    BeginRow(key, enabled, reason);
+    widgets::Switch("##switch", &value);
+    if (EndRow(true))
+        value = !value;
 }
 
-// Starts a table row with `label` on the left; the control goes on the right.
-void Row(TextId label)
+// A strength slider after the switch that enables it; without a switch (`on` null) it lines up with the others.
+void StrengthRow(const char* key, bool* on, float& value, SettingRange range, bool enabled = true, const char* reason = nullptr)
 {
-    ImGui::TableNextRow();
-    ImGui::TableNextColumn();
-    ImGui::AlignTextToFramePadding();
-    ImGui::TextUnformatted(Text(label));
-    ImGui::TableNextColumn();
-}
-
-// A switch (a plain label without one) and an optional intensity slider, which is off while the switch is.
-void ToggleRow(TextId label, bool* enabled, Settings& settings, float Settings::* intensity)
-{
-    ImGui::TableNextRow();
-    ImGui::TableNextColumn();
-    ImGui::PushID(static_cast<int>(label));
-    if (enabled != nullptr) {
-        widgets::Toggle(Text(label), enabled);
-    } else {
-        ImGui::AlignTextToFramePadding();
-        ImGui::TextUnformatted(Text(label));
+    BeginRow(key, enabled, reason);
+    const float start = ImGui::GetCursorPosX();
+    const float width = ImGui::GetContentRegionAvail().x - widgets::SwitchSpan();
+    // The switch comes first in the line's direction: on the left, or on the right for right-to-left languages.
+    const bool rightToLeft = widgets::RightToLeft();
+    const float switchX = rightToLeft ? start + width + widgets::SwitchSpan() - widgets::SwitchWidth() : start;
+    if (on != nullptr) {
+        ImGui::SetCursorPosX(switchX);
+        widgets::Switch("##switch", on);
+        ImGui::SameLine();
     }
-    ImGui::TableNextColumn();
-    if (intensity != nullptr) {
-        const SettingRange range = RangeOf(intensity);
-        ImGui::BeginDisabled(enabled != nullptr && !*enabled);
-        widgets::Slider("##intensity", &(settings.*intensity), range.minimum, range.maximum);
-        ImGui::EndDisabled();
-    }
-    ImGui::PopID();
+    ImGui::SetCursorPosX(rightToLeft ? start : start + widgets::SwitchSpan());
+    ImGui::BeginDisabled(on != nullptr && !*on);
+    widgets::Slider("##value", &value, range.minimum, range.maximum, ui::Number(value, 2).c_str(), ValueWidth(), width);
+    ImGui::EndDisabled();
+    if (EndRow(on != nullptr))
+        *on = !*on;
 }
 
-void ToggleRow(TextId label, bool& enabled, Settings& settings, float Settings::* intensity) { ToggleRow(label, &enabled, settings, intensity); }
-
-// A switch alone in the left column; returns true when it is flipped.
-bool SwitchRow(TextId label, bool& enabled)
+void SliderRow(const char* key, float& value, SettingRange range, bool enabled = true, const char* reason = nullptr)
 {
-    ImGui::TableNextRow();
-    ImGui::TableNextColumn();
-    ImGui::PushID(static_cast<int>(label));
-    const bool flipped = widgets::Toggle(Text(label), &enabled);
-    ImGui::PopID();
-    ImGui::TableNextColumn();
-    return flipped;
+    BeginRow(key, enabled, reason);
+    widgets::Slider("##value", &value, range.minimum, range.maximum, ui::Number(value, 2).c_str(), ValueWidth());
+    EndRow();
 }
 
-void SliderRow(TextId label, Settings& settings, float Settings::* field)
+void SliderRow(const char* key, int& value, SettingRange range, bool enabled = true, const char* reason = nullptr)
 {
-    Row(label);
-    ImGui::PushID(static_cast<int>(label));
-    const SettingRange range = RangeOf(field);
-    widgets::Slider("##value", &(settings.*field), range.minimum, range.maximum);
-    ImGui::PopID();
+    BeginRow(key, enabled, reason);
+    widgets::Slider("##value", &value, static_cast<int>(range.minimum), static_cast<int>(range.maximum), ui::Number(value, 0).c_str(), ValueWidth());
+    EndRow();
 }
 
-// A whole-number slider; changing it leaves the quality preset.
-void IntSliderRow(TextId label, Settings& settings, int Settings::* field)
-{
-    Row(label);
-    ImGui::PushID(static_cast<int>(label));
-    const SettingRange range = RangeOf(field);
-    if (widgets::Slider("##value", &(settings.*field), static_cast<int>(range.minimum), static_cast<int>(range.maximum)))
-        settings.qualityPreset = QualityPreset::Custom;
-    ImGui::PopID();
-}
-
-// A full-width drop-down list; returns true when another option is picked.
+// A full-width drop-down list of `options` (text keys) for an enum setting.
 template <class E>
-bool ComboRow(TextId label, E& value, std::span<const TextId> options)
+void ComboRow(const char* key, E& value, std::span<const char* const> options, bool enabled = true, const char* reason = nullptr)
 {
-    Row(label);
-    ImGui::PushID(static_cast<int>(label));
-    const int current = static_cast<int>(value);
-    bool changed = false;
-    ImGui::SetNextItemWidth(-FLT_MIN);
-    if (ImGui::BeginCombo("##combo", Text(options[static_cast<size_t>(current)]))) {
-        for (int i = 0; i < static_cast<int>(options.size()); ++i) {
-            if (ImGui::Selectable(Text(options[static_cast<size_t>(i)]), i == current) && i != current) {
-                value = static_cast<E>(i);
-                changed = true;
-            }
-        }
-        ImGui::EndCombo();
-    }
-    ImGui::PopID();
-    return changed;
-}
-
-// A row of buttons, one per option; returns true when another option is picked.
-template <class E>
-bool SegmentRow(TextId label, E& value, std::span<const TextId> options, std::span<const bool> available = {})
-{
-    Row(label);
+    BeginRow(key, enabled, reason);
     std::vector<const char*> texts;
-    for (TextId option : options)
+    for (const char* option : options)
         texts.push_back(Text(option));
     int index = static_cast<int>(value);
-    const bool changed = widgets::Segmented(Text(label), &index, texts, available);
+    widgets::Combo("##combo", &index, texts);
     value = static_cast<E>(index);
+    EndRow();
+}
+
+// A row of buttons, one per option (text keys); returns true when another option is picked.
+template <class E>
+bool SegmentRow(const char* key, E& value, std::span<const char* const> options, std::span<const bool> available = {})
+{
+    BeginRow(key);
+    std::vector<const char*> texts;
+    for (const char* option : options)
+        texts.push_back(Text(option));
+    int index = static_cast<int>(value);
+    const bool changed = widgets::Segmented("##segments", &index, texts, available);
+    value = static_cast<E>(index);
+    EndRow();
     return changed;
 }
 
-void DisplayCombo(Settings& settings)
+// A read-only figure.
+void ValueRow(const char* key, const std::string& value)
+{
+    BeginRow(key);
+    ImGui::AlignTextToFramePadding();
+    widgets::Text(value.c_str());
+    EndRow();
+}
+
+void DisplayRow(Settings& settings)
 {
     const std::vector<native::DisplayInfo> displays = native::Displays();
     auto name = [&](int display) {
         if (display <= 0 || display > static_cast<int>(displays.size()))
-            return std::string(Text(TextId::DisplayDefault));
+            return std::string(Text("general.display_default"));
         const native::DisplayInfo& info = displays[static_cast<size_t>(display) - 1];
-        const long width = info.area.right - info.area.left;
-        const long height = info.area.bottom - info.area.top;
-        return Format(info.primary ? TextId::DisplayPrimary : TextId::DisplayItem, display, width, height);
+        return ui::Format(info.primary ? "general.display_primary" : "general.display_item",
+            {{"number", std::to_string(display)}, {"width", std::to_string(info.area.right - info.area.left)},
+                {"height", std::to_string(info.area.bottom - info.area.top)}});
     };
-    ImGui::SetNextItemWidth(-FLT_MIN);
-    if (ImGui::BeginCombo("##display", name(settings.display).c_str())) {
-        for (int i = 0; i <= static_cast<int>(displays.size()); ++i) {
-            ImGui::PushID(i);
-            if (ImGui::Selectable(name(i).c_str(), i == settings.display))
-                settings.display = i;
-            ImGui::PopID();
-        }
-        ImGui::EndCombo();
-    }
+    std::vector<std::string> names;
+    for (int i = 0; i <= static_cast<int>(displays.size()); ++i)
+        names.push_back(name(i));
+    std::vector<const char*> texts;
+    for (const std::string& text : names)
+        texts.push_back(text.c_str());
+    BeginRow("general.display");
+    // A display that is gone shows as Default, which is where the game window then stays.
+    int index = settings.display <= static_cast<int>(displays.size()) ? settings.display : 0;
+    if (widgets::Combo("##combo", &index, texts))
+        settings.display = index;
+    EndRow();
+}
+
+// Each settings page resets what it shows, and nothing else.
+void ResetGeneralPage(Settings& settings)
+{
+    const Settings defaults;
+    settings.realtimeLighting = defaults.realtimeLighting;
+    settings.display = defaults.display;
+    settings.debugView = defaults.debugView;
+}
+
+void ResetLightingPage(Settings& settings)
+{
+    const Settings defaults;
+    settings.sun = defaults.sun;
+    settings.sunIntensity = defaults.sunIntensity;
+    settings.skyIntensity = defaults.skyIntensity;
+    settings.mapLights = defaults.mapLights;
+    settings.lightIntensity = defaults.lightIntensity;
+    settings.dynamicLights = defaults.dynamicLights;
+    settings.projectedLights = defaults.projectedLights;
+    settings.projectedIntensity = defaults.projectedIntensity;
+    settings.indirectLight = defaults.indirectLight;
+    settings.indirectIntensity = defaults.indirectIntensity;
+    settings.ambientOcclusion = defaults.ambientOcclusion;
+    settings.aoIntensity = defaults.aoIntensity;
+    settings.reflections = defaults.reflections;
+    settings.reflectionIntensity = defaults.reflectionIntensity;
+    settings.glossyReflections = defaults.glossyReflections;
+    settings.volumetricLight = defaults.volumetricLight;
+    settings.volumetricIntensity = defaults.volumetricIntensity;
+    settings.fog = defaults.fog;
+    settings.physicalSky = defaults.physicalSky;
+    settings.sunDisc = defaults.sunDisc;
+    settings.translucentLighting = defaults.translucentLighting;
+    settings.renderTargetLighting = defaults.renderTargetLighting;
+}
+
+void ResetQualityPage(Settings& settings) { ApplyPreset(settings, Settings{}.qualityPreset); }
+
+void ResetImagePage(Settings& settings)
+{
+    const Settings defaults;
+    settings.antiAliasing = defaults.antiAliasing;
+    settings.upscaling = defaults.upscaling;
+    settings.taaHistoryWeight = defaults.taaHistoryWeight;
+    settings.sharpening = defaults.sharpening;
+    settings.denoiser = defaults.denoiser;
+    settings.denoiserType = defaults.denoiserType;
 }
 
 void DrawGeneralPage(Settings& settings)
 {
-    widgets::BeginCard("##realtime");
-    widgets::Toggle(Text(TextId::RealtimeLighting), &settings.realtimeLighting);
-    constexpr TextId kBlocks[] = {TextId::RealtimeLighting, TextId::RealtimeUnsupported, TextId::RealtimeOtherThread};
+    widgets::BeginCard("##general");
+    if (widgets::BeginRows("general")) {
+        SwitchRow("general.realtime_lighting", settings.realtimeLighting);
+        DisplayRow(settings);
+        widgets::EndRows();
+    }
+    constexpr const char* kBlocks[] = {nullptr, "general.realtime_unsupported", "general.realtime_other_thread"};
     const RealtimeBlock block = GetStatistics().realtimeBlock;
     if (settings.realtimeLighting && block != RealtimeBlock::None)
-        ImGui::TextWrapped("%s", Text(kBlocks[static_cast<size_t>(block)]));
+        widgets::Text(Text(kBlocks[static_cast<size_t>(block)]));
     widgets::EndCard();
 
-    widgets::BeginCard("##view");
-    if (BeginRows("view")) {
-        Row(TextId::Display);
-        DisplayCombo(settings);
-        constexpr TextId kViews[] = {TextId::ViewFinal, TextId::ViewAlbedo, TextId::ViewNormals, TextId::ViewCoverage, TextId::ViewDirectLight,
-            TextId::ViewIndirectLight, TextId::ViewIndirectRaw, TextId::ViewSunVisibility, TextId::ViewAdditiveLight, TextId::ViewReflections,
-            TextId::ViewMotionVectors, TextId::ViewAmbientOcclusion, TextId::ViewRadianceCache, TextId::ViewLightSample, TextId::ViewReservoirM,
-            TextId::ViewDenoiserValidation};
+    widgets::BeginCard("##developer", Text("general.section_developer"));
+    if (widgets::BeginRows("developer")) {
+        constexpr const char* kViews[] = {"debug.final", "debug.albedo", "debug.normals", "debug.coverage", "debug.direct_light", "debug.indirect_light",
+            "debug.indirect_raw", "debug.sun_visibility", "debug.additive_light", "debug.reflections", "debug.motion_vectors", "debug.ambient_occlusion",
+            "debug.radiance_cache", "debug.light_sample", "debug.reservoir_samples", "debug.denoiser_validation"};
         static_assert(std::size(kViews) == static_cast<size_t>(DebugView::Count));
-        ComboRow(TextId::DebugView, settings.debugView, kViews);
-        ImGui::EndTable();
+        ComboRow("general.debug_view", settings.debugView, kViews);
+        widgets::EndRows();
     }
     widgets::EndCard();
 
-    if (ImGui::Button(Text(TextId::ResetDefaults)))
-        settings = Settings{};
-    ImGui::Dummy(ImVec2(0.0f, ImGui::GetStyle().ItemSpacing.y));
-
-    widgets::BeginCard("##credits", Text(TextId::SectionCredits));
-    widgets::Note(Text(TextId::CreditsDlss));
-    widgets::Note(Text(TextId::CreditsLicenses));
+    widgets::BeginCard("##credits", Text("general.section_credits"));
+    widgets::Note(Text("general.credits_nvidia"));
+    widgets::Note(Text("general.credits_license"));
     widgets::EndCard();
 }
 
 void DrawLightingPage(Settings& settings)
 {
-    widgets::BeginCard("##lights", Text(TextId::SectionLights));
-    if (BeginRows("lights")) {
-        ToggleRow(TextId::Sun, settings.sun, settings, &Settings::sunIntensity);
-        ToggleRow(TextId::SkyIntensity, nullptr, settings, &Settings::skyIntensity);
-        ToggleRow(TextId::MapLights, settings.mapLights, settings, &Settings::lightIntensity);
-        ToggleRow(TextId::DynamicLights, settings.dynamicLights, settings, nullptr);
-        ToggleRow(TextId::ProjectedLights, settings.projectedLights, settings, &Settings::projectedIntensity);
-        ImGui::EndTable();
+    widgets::BeginCard("##sources", Text("lighting.section_sources"));
+    if (widgets::BeginRows("sources")) {
+        StrengthRow("lighting.sun", &settings.sun, settings.sunIntensity, RangeOf(&Settings::sunIntensity));
+        StrengthRow("lighting.sky", nullptr, settings.skyIntensity, RangeOf(&Settings::skyIntensity));
+        StrengthRow("lighting.map_lights", &settings.mapLights, settings.lightIntensity, RangeOf(&Settings::lightIntensity));
+        SwitchRow("lighting.dynamic_lights", settings.dynamicLights);
+        StrengthRow("lighting.projected_lights", &settings.projectedLights, settings.projectedIntensity, RangeOf(&Settings::projectedIntensity));
+        widgets::EndRows();
     }
     widgets::EndCard();
 
-    widgets::BeginCard("##indirect", Text(TextId::SectionIndirect));
-    if (BeginRows("indirect")) {
-        ToggleRow(TextId::IndirectLight, settings.indirectLight, settings, &Settings::indirectIntensity);
-        ToggleRow(TextId::Denoiser, settings.denoiser, settings, nullptr);
-        // DLSS Ray Reconstruction denoises by itself.
-        ImGui::BeginDisabled(!settings.denoiser || settings.antiAliasing == AntiAliasing::RayReconstruction);
-        constexpr TextId kDenoisers[] = {TextId::DenoiserBuiltIn, TextId::DenoiserRelax, TextId::DenoiserReblur};
-        static_assert(std::size(kDenoisers) == static_cast<size_t>(DenoiserType::Count));
-        ComboRow(TextId::DenoiserMethod, settings.denoiserType, kDenoisers);
-        ImGui::EndDisabled();
-        ImGui::BeginDisabled(settings.indirectLighting != IndirectLighting::Baked);
-        ToggleRow(TextId::AmbientOcclusion, settings.ambientOcclusion, settings, &Settings::aoIntensity);
-        ImGui::EndDisabled();
-        ToggleRow(TextId::Reflections, settings.reflections, settings, &Settings::reflectionIntensity);
-        ImGui::BeginDisabled(!settings.reflections);
-        ToggleRow(TextId::GlossyReflections, settings.glossyReflections, settings, nullptr);
-        ImGui::EndDisabled();
-        ToggleRow(TextId::TranslucentLighting, settings.translucentLighting, settings, nullptr);
-        ToggleRow(TextId::RenderTargetLighting, settings.renderTargetLighting, settings, nullptr);
-        ToggleRow(TextId::VolumetricLight, settings.volumetricLight, settings, &Settings::volumetricIntensity);
-        ImGui::EndTable();
+    widgets::BeginCard("##indirect", Text("lighting.section_indirect"));
+    if (widgets::BeginRows("indirect")) {
+        StrengthRow("lighting.indirect_light", &settings.indirectLight, settings.indirectIntensity, RangeOf(&Settings::indirectIntensity));
+        // Traced indirect light holds its own occlusion.
+        StrengthRow("lighting.ambient_occlusion", &settings.ambientOcclusion, settings.aoIntensity, RangeOf(&Settings::aoIntensity),
+            settings.indirectLighting == IndirectLighting::Baked, Text("lighting.ambient_occlusion_reason"));
+        widgets::EndRows();
+    }
+    widgets::EndCard();
+
+    widgets::BeginCard("##reflections", Text("lighting.section_reflections"));
+    if (widgets::BeginRows("reflections")) {
+        StrengthRow("lighting.reflections", &settings.reflections, settings.reflectionIntensity, RangeOf(&Settings::reflectionIntensity));
+        SwitchRow("lighting.glossy_reflections", settings.glossyReflections, settings.reflections, Text("lighting.glossy_reflections_reason"));
+        widgets::EndRows();
+    }
+    widgets::EndCard();
+
+    widgets::BeginCard("##atmosphere", Text("lighting.section_atmosphere"));
+    if (widgets::BeginRows("atmosphere")) {
+        SwitchRow("lighting.physical_sky", settings.physicalSky);
+        SwitchRow("lighting.sun_disc", settings.sunDisc);
+        StrengthRow("lighting.volumetric_light", &settings.volumetricLight, settings.volumetricIntensity, RangeOf(&Settings::volumetricIntensity));
+        SwitchRow("lighting.fog", settings.fog);
+        widgets::EndRows();
+    }
+    widgets::EndCard();
+
+    widgets::BeginCard("##surfaces", Text("lighting.section_surfaces"));
+    if (widgets::BeginRows("surfaces")) {
+        SwitchRow("lighting.translucent_surfaces", settings.translucentLighting);
+        SwitchRow("lighting.render_targets", settings.renderTargetLighting);
+        widgets::EndRows();
     }
     widgets::EndCard();
 }
 
-void DrawRayTracingPage(Settings& settings)
+// Every setting on this page is set by the quality preset, so changing one makes the preset Custom.
+void DrawQualityPage(Settings& settings)
 {
-    widgets::BeginCard("##quality");
-    if (BeginRows("quality")) {
-        constexpr TextId kPresets[] = {TextId::PresetLow, TextId::PresetMedium, TextId::PresetHigh, TextId::PresetUltra, TextId::PresetCustom};
+    const Statistics& statistics = GetStatistics();
+    widgets::BeginCard("##preset");
+    if (widgets::BeginRows("preset")) {
+        constexpr const char* kPresets[] = {"quality.preset_low", "quality.preset_medium", "quality.preset_high", "quality.preset_ultra", "quality.preset_custom"};
         static_assert(std::size(kPresets) == static_cast<size_t>(QualityPreset::Count));
         QualityPreset preset = settings.qualityPreset;
-        if (SegmentRow(TextId::QualityPreset, preset, kPresets))
+        if (SegmentRow("quality.preset", preset, kPresets))
             ApplyPreset(settings, preset);
-        ImGui::EndTable();
+        widgets::EndRows();
     }
+    widgets::Note(Text("quality.preset_note"));
     widgets::EndCard();
 
-    widgets::BeginCard("##shadows", Text(TextId::SectionShadows));
-    if (BeginRows("shadows")) {
-        constexpr TextId kSampling[] = {TextId::LightSamplingLegacy, TextId::LightSamplingRis, TextId::LightSamplingRestir, TextId::LightSamplingAuto};
+    widgets::BeginCard("##shadows", Text("quality.section_shadows"));
+    if (widgets::BeginRows("shadows")) {
+        constexpr const char* kSampling[] = {"quality.sampling_legacy", "quality.sampling_ris", "quality.sampling_restir", "quality.sampling_auto"};
         static_assert(std::size(kSampling) == static_cast<size_t>(LightSampling::Count));
-        if (ComboRow(TextId::LightSampling, settings.lightSampling, kSampling))
-            settings.qualityPreset = QualityPreset::Custom;
-        // Auto uses these with DLSS Ray Reconstruction (Lighting::Run).
+        ComboRow("quality.light_sampling", settings.lightSampling, kSampling);
+        // The direct light pass that uses these runs for Legacy, which Auto picks with DLSS Ray Reconstruction
+        // (Lighting::Run).
         const bool directPass = settings.lightSampling == LightSampling::Legacy ||
             (settings.lightSampling == LightSampling::Auto && settings.antiAliasing == AntiAliasing::RayReconstruction);
-        ImGui::BeginDisabled(!directPass);
-        IntSliderRow(TextId::ExactLights, settings, &Settings::exactLights);
-        IntSliderRow(TextId::SampledLightRays, settings, &Settings::sampledLightRays);
-        ImGui::EndDisabled();
-        IntSliderRow(TextId::ViewmodelShadowRays, settings, &Settings::viewmodelShadowRays);
-        constexpr TextId kFoliage[] = {TextId::FoliageOff, TextId::FoliageSun, TextId::FoliageSunAndIndirect, TextId::FoliageAll};
+        const char* directReason = Text("quality.direct_pass_reason");
+        SliderRow("quality.exact_lights", settings.exactLights, RangeOf(&Settings::exactLights), directPass, directReason);
+        SliderRow("quality.sampled_light_rays", settings.sampledLightRays, RangeOf(&Settings::sampledLightRays), directPass, directReason);
+        SliderRow("quality.viewmodel_shadow_rays", settings.viewmodelShadowRays, RangeOf(&Settings::viewmodelShadowRays));
+        constexpr const char* kFoliage[] = {"quality.foliage_off", "quality.foliage_sun", "quality.foliage_sun_indirect", "quality.foliage_all"};
         static_assert(std::size(kFoliage) == static_cast<size_t>(FoliageShadows::Count));
-        if (ComboRow(TextId::FoliageShadows, settings.foliageShadows, kFoliage))
-            settings.qualityPreset = QualityPreset::Custom;
-        constexpr TextId kEmissive[] = {TextId::EmissiveOff, TextId::EmissiveBounce, TextId::EmissiveFull};
-        static_assert(std::size(kEmissive) == static_cast<size_t>(EmissiveLighting::Count));
-        if (SegmentRow(TextId::EmissiveLighting, settings.emissiveLighting, kEmissive))
-            settings.qualityPreset = QualityPreset::Custom;
-        ImGui::EndTable();
+        ComboRow("quality.foliage_shadows", settings.foliageShadows, kFoliage);
+        widgets::EndRows();
     }
     widgets::EndCard();
 
-    widgets::BeginCard("##indirect", Text(TextId::SectionIndirect));
-    if (BeginRows("indirect")) {
-        constexpr TextId kSources[] = {TextId::IndirectRayTraced, TextId::IndirectBaked};
+    widgets::BeginCard("##indirect", Text("quality.section_indirect"));
+    const bool cacheAvailable = statistics.radianceCacheAvailable;
+    if (widgets::BeginRows("indirect")) {
+        constexpr const char* kSources[] = {"quality.indirect_ray_traced", "quality.indirect_baked"};
         static_assert(std::size(kSources) == static_cast<size_t>(IndirectLighting::Count));
-        if (SegmentRow(TextId::IndirectSource, settings.indirectLighting, kSources))
-            settings.qualityPreset = QualityPreset::Custom;
-        IntSliderRow(TextId::IndirectRays, settings, &Settings::indirectRays);
-        IntSliderRow(TextId::IndirectBounces, settings, &Settings::indirectBounces);
-        const bool cacheAvailable = GetStatistics().radianceCacheAvailable;
-        ImGui::BeginDisabled(!cacheAvailable || settings.indirectLighting == IndirectLighting::Baked);
-        if (SwitchRow(TextId::RadianceCache, settings.radianceCache))
-            settings.qualityPreset = QualityPreset::Custom;
-        ImGui::EndDisabled();
-        if (!cacheAvailable) {
-            ImGui::AlignTextToFramePadding();
-            widgets::Note(Text(TextId::RadianceCacheUnavailable));
-        }
-        ImGui::BeginDisabled(settings.indirectLighting != IndirectLighting::Baked);
-        IntSliderRow(TextId::AoRays, settings, &Settings::aoRays);
-        ImGui::EndDisabled();
-        IntSliderRow(TextId::VolumeRays, settings, &Settings::volumeRays);
-        ImGui::EndTable();
+        SegmentRow("quality.indirect_source", settings.indirectLighting, kSources);
+        const bool baked = settings.indirectLighting == IndirectLighting::Baked;
+        SliderRow("quality.indirect_rays", settings.indirectRays, RangeOf(&Settings::indirectRays));
+        SliderRow("quality.indirect_bounces", settings.indirectBounces, RangeOf(&Settings::indirectBounces));
+        SwitchRow("quality.radiance_cache", settings.radianceCache, cacheAvailable && !baked,
+            Text(cacheAvailable ? "quality.radiance_cache_reason" : "quality.radiance_cache_unavailable"));
+        SliderRow("quality.volume_rays", settings.volumeRays, RangeOf(&Settings::volumeRays));
+        SliderRow("quality.ao_rays", settings.aoRays, RangeOf(&Settings::aoRays), baked, Text("quality.ao_rays_reason"));
+        widgets::EndRows();
+    }
+    if (!cacheAvailable)
+        widgets::Note(Text("quality.radiance_cache_unavailable"));
+    widgets::EndCard();
+
+    widgets::BeginCard("##effects", Text("quality.section_effects"));
+    if (widgets::BeginRows("effects")) {
+        constexpr const char* kEmissive[] = {"quality.emissive_off", "quality.emissive_bounce", "quality.emissive_full"};
+        static_assert(std::size(kEmissive) == static_cast<size_t>(EmissiveLighting::Count));
+        SegmentRow("quality.emissive", settings.emissiveLighting, kEmissive);
+        SliderRow("quality.volumetric_steps", settings.volumetricSteps, RangeOf(&Settings::volumetricSteps), settings.volumetricLight,
+            Text("quality.volumetric_steps_reason"));
+        widgets::EndRows();
     }
     widgets::EndCard();
 
-    widgets::BeginCard("##effects", Text(TextId::SectionEffects));
-    if (BeginRows("effects")) {
-        IntSliderRow(TextId::VolumetricSteps, settings, &Settings::volumetricSteps);
-        ImGui::EndTable();
+    widgets::BeginCard("##alpha", Text("quality.section_alpha"));
+    const bool micromapsAvailable = statistics.opacityMicromapsAvailable;
+    if (widgets::BeginRows("alpha")) {
+        SwitchRow("quality.opacity_micromaps", settings.opacityMicromaps, micromapsAvailable, Text("quality.micromaps_unavailable"));
+        SwitchRow("quality.fast_alpha_tests", settings.fastAlphaTests, micromapsAvailable && settings.opacityMicromaps,
+            Text(micromapsAvailable ? "quality.fast_alpha_tests_reason" : "quality.micromaps_unavailable"));
+        widgets::EndRows();
     }
+    if (!micromapsAvailable)
+        widgets::Note(Text("quality.micromaps_unavailable"));
     widgets::EndCard();
 
-    const Statistics& statistics = GetStatistics();
-    widgets::BeginCard("##alpha", Text(TextId::SectionAlphaTests));
-    ImGui::BeginDisabled(!statistics.opacityMicromapsAvailable);
-    widgets::Toggle(Text(TextId::OpacityMicromaps), &settings.opacityMicromaps);
-    ImGui::BeginDisabled(!settings.opacityMicromaps);
-    if (widgets::Toggle(Text(TextId::FastAlphaTests), &settings.fastAlphaTests))
-        settings.qualityPreset = QualityPreset::Custom;
-    ImGui::EndDisabled();
-    ImGui::EndDisabled();
-    if (!statistics.opacityMicromapsAvailable)
-        widgets::Note(Text(TextId::MicromapsUnavailable));
-    else
-        widgets::Note(Format(TextId::StatMicromaps, statistics.micromapTriangles, statistics.micromaps).c_str());
-    widgets::EndCard();
+    if (settings.qualityPreset != QualityPreset::Custom) {
+        Settings preset = settings;
+        ApplyPreset(preset, settings.qualityPreset);
+        if (preset != settings)
+            settings.qualityPreset = QualityPreset::Custom;
+    }
 }
 
 void DrawImagePage(Settings& settings)
 {
     const Statistics& statistics = GetStatistics();
-    widgets::BeginCard("##antialiasing", Text(TextId::SectionAntiAliasing));
-    if (BeginRows("antialiasing")) {
-        constexpr TextId kModes[] = {TextId::AntiAliasingOff, TextId::AntiAliasingTemporal, TextId::AntiAliasingDlssShort};
+    const bool rayReconstruction = settings.antiAliasing == AntiAliasing::RayReconstruction;
+    widgets::BeginCard("##antialiasing", Text("image.section_anti_aliasing"));
+    if (widgets::BeginRows("antialiasing")) {
+        constexpr const char* kModes[] = {"image.anti_aliasing_off", "image.anti_aliasing_taa", "image.anti_aliasing_dlss"};
         static_assert(std::size(kModes) == static_cast<size_t>(AntiAliasing::Count));
         const bool available[] = {true, true, statistics.rayReconstructionAvailable};
-        SegmentRow(TextId::AntiAliasingMode, settings.antiAliasing, kModes, available);
-        if (settings.antiAliasing == AntiAliasing::RayReconstruction) {
-            constexpr TextId kUpscaling[] = {TextId::UpscalingNative, TextId::DlssQuality, TextId::DlssBalanced, TextId::DlssPerformance,
-                TextId::DlssUltraPerformance};
-            static_assert(std::size(kUpscaling) == static_cast<size_t>(UpscalingMode::Count));
-            ComboRow(TextId::Upscaling, settings.upscaling, kUpscaling);
-        } else {
-            SliderRow(TextId::HistoryWeight, settings, &Settings::taaHistoryWeight);
-            SliderRow(TextId::Sharpening, settings, &Settings::sharpening);
-        }
-        ImGui::EndTable();
+        SegmentRow("image.anti_aliasing", settings.antiAliasing, kModes, available);
+        constexpr const char* kUpscaling[] = {"image.upscaling_native", "image.upscaling_quality", "image.upscaling_balanced", "image.upscaling_performance",
+            "image.upscaling_ultra_performance"};
+        static_assert(std::size(kUpscaling) == static_cast<size_t>(UpscalingMode::Count));
+        ComboRow("image.upscaling", settings.upscaling, kUpscaling, rayReconstruction, Text("image.upscaling_reason"));
+        const bool temporal = settings.antiAliasing == AntiAliasing::Temporal;
+        SliderRow("image.history_weight", settings.taaHistoryWeight, RangeOf(&Settings::taaHistoryWeight), temporal, Text("image.taa_reason"));
+        SliderRow("image.sharpening", settings.sharpening, RangeOf(&Settings::sharpening), temporal, Text("image.taa_reason"));
+        ValueRow("image.render_resolution",
+            statistics.renderWidth != 0 ? ui::Format("image.render_resolution_value",
+                                              {{"width", std::to_string(statistics.renderWidth)}, {"height", std::to_string(statistics.renderHeight)}})
+                                        : std::string(Text("image.render_resolution_unknown")));
+        widgets::EndRows();
     }
     if (!statistics.rayReconstructionAvailable)
-        widgets::Note(Text(TextId::DlssUnavailable));
-    if (statistics.renderWidth != 0)
-        widgets::Note(Format(TextId::StatRenderResolution, statistics.renderWidth, statistics.renderHeight).c_str());
+        widgets::Note(Text("image.dlss_unavailable"));
     widgets::EndCard();
 
-    widgets::BeginCard("##effects", Text(TextId::SectionEffects));
-    widgets::Toggle(Text(TextId::Fog), &settings.fog);
-    widgets::Toggle(Text(TextId::PhysicalSky), &settings.physicalSky);
-    widgets::Toggle(Text(TextId::SunDisc), &settings.sunDisc);
+    widgets::BeginCard("##denoiser", Text("image.section_denoiser"));
+    if (widgets::BeginRows("denoiser")) {
+        SwitchRow("image.denoiser", settings.denoiser);
+        constexpr const char* kDenoisers[] = {"image.denoiser_built_in", "image.denoiser_relax", "image.denoiser_reblur"};
+        static_assert(std::size(kDenoisers) == static_cast<size_t>(DenoiserType::Count));
+        // DLSS Ray Reconstruction denoises by itself.
+        ComboRow("image.denoiser_type", settings.denoiserType, kDenoisers, settings.denoiser && !rayReconstruction,
+            Text(rayReconstruction ? "image.denoiser_type_dlss_reason" : "image.denoiser_type_reason"));
+        widgets::EndRows();
+    }
     widgets::EndCard();
 }
 
-// A table cell's time, right-aligned.
-void Milliseconds(double ms)
+std::string Milliseconds(double ms) { return ui::Format("performance.milliseconds", {{"value", ui::Number(ms, 2)}}); }
+
+// A table cell's text at the end of the line: right-aligned, or left-aligned for right-to-left languages.
+void EndAligned(const std::string& text)
 {
-    const std::string text = Format(TextId::ValueMilliseconds, ms);
-    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - ImGui::CalcTextSize(text.c_str()).x);
-    ImGui::TextUnformatted(text.c_str());
+    const std::string visual = ui::Visual(text);
+    if (!widgets::RightToLeft())
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - ImGui::CalcTextSize(visual.c_str()).x);
+    ImGui::TextUnformatted(visual.c_str());
 }
 
 // Frame rate figures over the recorded history. Lows average the slowest 1% / 0.1% of frames.
@@ -538,24 +582,28 @@ void DrawFrameRate(const Statistics& statistics)
         recentTotal += chronological[i];
     const double average = total / static_cast<double>(count);
 
-    widgets::Heading(Text(TextId::SectionFrameRate));
-    const TextId labels[] = {TextId::StatFpsCurrent, TextId::StatFpsAverage, TextId::StatFpsMedian, TextId::StatFpsLow1, TextId::StatFpsLow01};
+    widgets::Heading(Text("performance.section_frame_rate"));
+    constexpr const char* kLabels[] = {"performance.fps_now", "performance.fps_average", "performance.fps_median", "performance.fps_low_1",
+        "performance.fps_low_01"};
     const double rates[] = {fps(recentTotal / static_cast<double>(recent)), fps(average), fps(sorted[count / 2]), fps(slowestAverage(0.01)),
         fps(slowestAverage(0.001))};
     const float spacing = ImGui::GetStyle().ItemSpacing.x;
-    const float width = (ImGui::GetContentRegionAvail().x - spacing * static_cast<float>(std::size(labels) - 1)) / static_cast<float>(std::size(labels));
-    for (size_t i = 0; i < std::size(labels); ++i) {
-        if (i > 0)
+    const float width = (ImGui::GetContentRegionAvail().x - spacing * static_cast<float>(std::size(kLabels) - 1)) / static_cast<float>(std::size(kLabels));
+    for (size_t n = 0; n < std::size(kLabels); ++n) {
+        const size_t i = widgets::RightToLeft() ? std::size(kLabels) - 1 - n : n;
+        if (n > 0)
             ImGui::SameLine();
-        widgets::Tile(Format(TextId::StatFpsValue, rates[i]).c_str(), Text(labels[i]), width);
+        widgets::Tile(ui::Number(rates[i], 0).c_str(), Text(kLabels[i]), width);
     }
     ImGui::Dummy(ImVec2(0.0f, ImGui::GetStyle().ItemSpacing.y));
 
-    widgets::BeginCard("##frametime", Text(TextId::StatFrameTimeGraph));
-    TextLine(TextId::StatFrameTime, average, sorted[std::min(count - 1, count * 99 / 100)]);
+    widgets::BeginCard("##frametime", Text("performance.section_frame_time"));
+    widgets::Text(ui::Format("performance.frame_time_summary", {{"average", ui::Number(average, 2)},
+                                                                 {"p99", ui::Number(sorted[std::min(count - 1, count * 99 / 100)], 2)}})
+                      .c_str());
     ImGui::PlotLines("##frametimes", chronological.data(), static_cast<int>(count), 0, nullptr, 0.0f, std::max(sorted.back(), 1.0f),
         ImVec2(-FLT_MIN, ImGui::GetFontSize() * 4.0f));
-    widgets::Note(Format(TextId::StatFrameTimeRange, sorted.front(), sorted.back(), count).c_str());
+    widgets::Note(ui::Format("performance.frame_time_range", {{"min", ui::Number(sorted.front(), 2)}, {"max", ui::Number(sorted.back(), 2)}}).c_str());
     widgets::EndCard();
 }
 
@@ -564,48 +612,75 @@ void DrawPerformancePage()
     const Statistics& statistics = GetStatistics();
     DrawFrameRate(statistics);
 
-    widgets::BeginCard("##passes", Text(TextId::SectionGpuPasses));
-    constexpr TextId kPasses[] = {TextId::PassSceneUpdate, TextId::PassSurface, TextId::PassRadianceCache, TextId::PassVolume, TextId::PassDirectLight,
-        TextId::PassLightSampling, TextId::PassAmbientOcclusion, TextId::PassIndirectTrace, TextId::PassReflections, TextId::PassAccumulation,
-        TextId::PassDenoiser, TextId::PassLighting, TextId::PassResolve};
+    widgets::BeginCard("##passes", Text("performance.section_gpu_passes"));
+    constexpr const char* kPasses[] = {"pass.scene_update", "pass.surface", "pass.radiance_cache", "pass.volume", "pass.direct_light", "pass.light_sampling",
+        "pass.ambient_occlusion", "pass.indirect_trace", "pass.reflections", "pass.accumulation", "pass.denoiser", "pass.lighting", "pass.resolve"};
     static_assert(std::size(kPasses) == static_cast<size_t>(GpuPass::Count));
     if (ImGui::BeginTable("passes", 3, ImGuiTableFlags_SizingStretchProp)) {
-        ImGui::TableSetupColumn(nullptr, ImGuiTableColumnFlags_WidthStretch, 0.45f);
-        ImGui::TableSetupColumn(nullptr, ImGuiTableColumnFlags_WidthStretch, 0.55f);
-        ImGui::TableSetupColumn(nullptr, ImGuiTableColumnFlags_WidthFixed, ImGui::CalcTextSize(Format(TextId::ValueMilliseconds, 100.0).c_str()).x);
+        // Name, bar and time, from right to left for right-to-left languages.
+        const int nameColumn = widgets::RightToLeft() ? 2 : 0;
+        const int timeColumn = 2 - nameColumn;
+        for (int column = 0; column < 3; ++column) {
+            if (column == timeColumn)
+                ImGui::TableSetupColumn(nullptr, ImGuiTableColumnFlags_WidthFixed, ImGui::CalcTextSize(Milliseconds(100.0).c_str()).x);
+            else
+                ImGui::TableSetupColumn(nullptr, ImGuiTableColumnFlags_WidthStretch, column == nameColumn ? 0.45f : 0.55f);
+        }
         double longest = statistics.otherViewsMs;
         for (double ms : statistics.passMs)
             longest = std::max(longest, ms);
-        auto passRow = [&](TextId label, double ms) {
+        auto passRow = [&](const char* label, double ms) {
             ImGui::TableNextRow();
-            ImGui::TableNextColumn();
-            ImGui::TextUnformatted(Text(label));
-            ImGui::TableNextColumn();
+            ImGui::TableSetColumnIndex(nameColumn);
+            widgets::Text(Text(label));
+            ImGui::TableSetColumnIndex(1);
             widgets::Meter(longest > 0.0 ? static_cast<float>(ms / longest) : 0.0f);
-            ImGui::TableNextColumn();
-            Milliseconds(ms);
+            ImGui::TableSetColumnIndex(timeColumn);
+            EndAligned(Milliseconds(ms));
         };
         for (size_t i = 0; i < std::size(kPasses); ++i)
             passRow(kPasses[i], statistics.passMs[i]);
-        passRow(TextId::PassOtherViews, statistics.otherViewsMs);
+        passRow("pass.other_views", statistics.otherViewsMs);
         ImGui::TableNextRow();
-        ImGui::TableNextColumn();
         ImGui::PushFont(widgets::GetFonts().strong);
-        ImGui::TextUnformatted(Text(TextId::StatLightingTime));
-        ImGui::TableNextColumn();
-        ImGui::TableNextColumn();
-        Milliseconds(statistics.lightingMs);
+        ImGui::TableSetColumnIndex(nameColumn);
+        widgets::Text(Text("performance.total"));
+        ImGui::TableSetColumnIndex(timeColumn);
+        EndAligned(Milliseconds(statistics.lightingMs));
         ImGui::PopFont();
         ImGui::EndTable();
     }
     widgets::EndCard();
 
-    widgets::BeginCard("##statistics", Text(TextId::SectionStatistics));
-    TextLine(TextId::StatLights, statistics.mapLights, statistics.dynamicLights, statistics.projectedLights);
-    TextLine(TextId::StatInstances, statistics.sceneInstances);
-    TextLine(TextId::StatShaders, statistics.gbufferShaders, statistics.replacedShaders);
+    widgets::BeginCard("##statistics", Text("performance.section_statistics"));
+    if (widgets::BeginRows("statistics")) {
+        ValueRow("performance.map_lights", ui::Number(statistics.mapLights, 0));
+        ValueRow("performance.dynamic_lights", ui::Number(statistics.dynamicLights, 0));
+        ValueRow("performance.projected_lights", ui::Number(statistics.projectedLights, 0));
+        ValueRow("performance.instances", ui::Number(statistics.sceneInstances, 0));
+        ValueRow("performance.patched_shaders", ui::Number(statistics.gbufferShaders, 0));
+        ValueRow("performance.replaced_shaders", ui::Number(statistics.replacedShaders, 0));
+        ValueRow("performance.micromap_triangles", ui::Number(statistics.micromapTriangles, 0));
+        ValueRow("performance.micromaps", ui::Number(statistics.micromaps, 0));
+        widgets::EndRows();
+    }
     widgets::EndCard();
 }
+
+struct PageInfo {
+    const char* key;
+    void (*draw)(Settings&);
+    void (*reset)(Settings&);
+};
+
+constexpr PageInfo kPages[] = {
+    {"page.general", &DrawGeneralPage, &ResetGeneralPage},
+    {"page.lighting", &DrawLightingPage, &ResetLightingPage},
+    {"page.quality", &DrawQualityPage, &ResetQualityPage},
+    {"page.image", &DrawImagePage, &ResetImagePage},
+    {"page.performance", [](Settings&) { DrawPerformancePage(); }, nullptr},
+};
+static_assert(std::size(kPages) == static_cast<size_t>(Page::Count));
 
 // Returns false when the close button was clicked.
 bool DrawMenu()
@@ -614,48 +689,60 @@ bool DrawMenu()
     const Settings before = settings;
     const float font = ImGui::GetFontSize();
     ImGui::SetNextWindowPos(ImVec2(font * 1.5f, font * 1.5f), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(font * 44.0f, font * 32.0f), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSizeConstraints(ImVec2(font * 30.0f, font * 16.0f), ImVec2(FLT_MAX, FLT_MAX));
+    ImGui::SetNextWindowSize(ImVec2(font * 46.0f, font * 34.0f), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSizeConstraints(ImVec2(font * 32.0f, font * 18.0f), ImVec2(FLT_MAX, FLT_MAX));
     constexpr ImGuiWindowFlags kFlags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse;
     bool keepOpen = true;
     if (ImGui::Begin("###gmodpp_menu", nullptr, kFlags)) {
-        keepOpen = !widgets::Header(Text(TextId::WindowTitle), Text(TextId::MenuHint));
+        keepOpen = !widgets::Header(Text("menu.title"), Text("menu.close_hint"));
 
-        constexpr TextId kPages[] = {TextId::TabGeneral, TextId::TabLighting, TextId::TabRayTracing, TextId::TabImage, TextId::TabPerformance};
-        static_assert(std::size(kPages) == static_cast<size_t>(Page::Count));
         const ImGuiStyle& style = ImGui::GetStyle();
         ImFont* navFont = widgets::GetFonts().strong;
         float navWidth = 0.0f;
-        for (TextId page : kPages)
-            navWidth = std::max(navWidth, navFont->CalcTextSizeA(navFont->FontSize, FLT_MAX, 0.0f, Text(page)).x);
+        for (const PageInfo& page : kPages)
+            navWidth = std::max(navWidth, navFont->CalcTextSizeA(navFont->FontSize, FLT_MAX, 0.0f, ui::Visual(Text(page.key)).c_str()).x);
         navWidth += style.FramePadding.x * 4.0f;
-        if (ImGui::BeginChild("##nav", ImVec2(navWidth, 0.0f))) {
-            for (size_t i = 0; i < std::size(kPages); ++i) {
-                if (widgets::NavItem(Text(kPages[i]), g_state.page == static_cast<Page>(i)))
-                    g_state.page = static_cast<Page>(i);
+        const float gap = style.ItemSpacing.x * 2.0f;
+        auto drawNav = [&] {
+            if (ImGui::BeginChild("##nav", ImVec2(navWidth, 0.0f))) {
+                for (size_t i = 0; i < std::size(kPages); ++i) {
+                    if (widgets::NavItem(Text(kPages[i].key), g_state.page == static_cast<Page>(i)))
+                        g_state.page = static_cast<Page>(i);
+                }
             }
-        }
-        ImGui::EndChild();
-        const ImVec2 navMin = ImGui::GetItemRectMin();
-        const ImVec2 navMax = ImGui::GetItemRectMax();
-        const float divider = navMax.x + style.ItemSpacing.x;
-        ImGui::GetWindowDrawList()->AddLine(ImVec2(divider, navMin.y), ImVec2(divider, navMax.y), ImGui::GetColorU32(ImGuiCol_Border));
-        ImGui::SameLine(0.0f, style.ItemSpacing.x * 2.0f);
+            ImGui::EndChild();
+        };
+        const PageInfo& page = kPages[static_cast<size_t>(g_state.page)];
+        auto drawPage = [&](float width) {
+            const float footer = page.reset != nullptr ? ImGui::GetFrameHeight() + style.ItemSpacing.y : 0.0f;
+            ImGui::BeginGroup();
+            // Each page keeps its own scroll position.
+            ImGui::PushID(static_cast<int>(g_state.page));
+            if (ImGui::BeginChild("##page", ImVec2(width, -footer)))
+                page.draw(settings);
+            ImGui::EndChild();
+            ImGui::PopID();
+            if (page.reset != nullptr && widgets::EndButton(Text("menu.reset_page")))
+                page.reset(settings);
+            ImGui::EndGroup();
+        };
 
-        // Each page keeps its own scroll position.
-        ImGui::PushID(static_cast<int>(g_state.page));
-        if (ImGui::BeginChild("##page")) {
-            switch (g_state.page) {
-            case Page::General: DrawGeneralPage(settings); break;
-            case Page::Lighting: DrawLightingPage(settings); break;
-            case Page::RayTracing: DrawRayTracingPage(settings); break;
-            case Page::Image: DrawImagePage(settings); break;
-            case Page::Performance: DrawPerformancePage(); break;
-            default: break;
-            }
+        // The page list is at the start of the line: left, or right for right-to-left languages.
+        ImDrawList* draw = ImGui::GetWindowDrawList();
+        const ImU32 border = ImGui::GetColorU32(ImGuiCol_Border);
+        if (widgets::RightToLeft()) {
+            drawPage(ImGui::GetContentRegionAvail().x - navWidth - gap);
+            ImGui::SameLine(0.0f, gap);
+            drawNav();
+            const float divider = ImGui::GetItemRectMin().x - style.ItemSpacing.x;
+            draw->AddLine(ImVec2(divider, ImGui::GetItemRectMin().y), ImVec2(divider, ImGui::GetItemRectMax().y), border);
+        } else {
+            drawNav();
+            const float divider = ImGui::GetItemRectMax().x + style.ItemSpacing.x;
+            draw->AddLine(ImVec2(divider, ImGui::GetItemRectMin().y), ImVec2(divider, ImGui::GetItemRectMax().y), border);
+            ImGui::SameLine(0.0f, gap);
+            drawPage(0.0f);
         }
-        ImGui::EndChild();
-        ImGui::PopID();
     }
     ImGui::End();
 
@@ -752,6 +839,7 @@ void EnsureWindowHook()
 
 void Render(ID3D12GraphicsCommandList* list, D3D12_CPU_DESCRIPTOR_HANDLE rtv)
 {
+    ui::UpdateLanguage();
     ImGui_ImplDX12_NewFrame();
     ImGui_ImplWin32_NewFrame();
     ImGui::NewFrame();

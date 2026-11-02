@@ -1,161 +1,37 @@
 #pragma once
 
+#include <initializer_list>
+#include <string>
+#include <string_view>
+
 namespace gmodpp::ui {
 
-// Every string the in-game menu and the loading screen show. Text() returns the current language's version; only English exists.
-enum class TextId {
-    WindowTitle,
-    MenuHint,
-    TabGeneral,
-    TabLighting,
-    TabImage,
-    TabPerformance,
-    SectionEffects,
-    RealtimeLighting,
-    RealtimeUnsupported,
-    RealtimeOtherThread,
-    DebugView,
-    ViewFinal,
-    ViewAlbedo,
-    ViewNormals,
-    ViewCoverage,
-    ViewDirectLight,
-    ViewIndirectLight,
-    ViewIndirectRaw,
-    ViewSunVisibility,
-    ViewAdditiveLight,
-    ViewReflections,
-    ViewMotionVectors,
-    ViewAmbientOcclusion,
-    SectionLights,
-    Sun,
-    SkyIntensity,
-    MapLights,
-    DynamicLights,
-    ProjectedLights,
-    Intensity,
-    SectionIndirect,
-    IndirectLight,
-    Denoiser,
-    AmbientOcclusion,
-    Reflections,
-    TranslucentLighting,
-    RenderTargetLighting,
-    VolumetricLight,
-    Fog,
-    PhysicalSky,
-    SunDisc,
-    SectionAntiAliasing,
-    AntiAliasingMode,
-    AntiAliasingOff,
-    AntiAliasingTemporal,
-    AntiAliasingDlss,
-    Upscaling,
-    UpscalingNative,
-    DlssQuality,
-    DlssBalanced,
-    DlssPerformance,
-    DlssUltraPerformance,
-    DlssUnavailable,
-    StatRenderResolution,
-    HistoryWeight,
-    Sharpening,
-    SectionStatistics,
-    StatLightingTime,
-    SectionPerformance,
-    StatFpsCurrent,
-    StatFpsAverage,
-    StatFpsMedian,
-    StatFpsLow1,
-    StatFpsLow01,
-    StatFrameTime,
-    StatFrameTimeRange,
-    StatFrameTimeGraph,
-    SectionGpuPasses,
-    PassSceneUpdate,
-    PassSurface,
-    PassVolume,
-    PassDirectLight,
-    PassIndirectTrace,
-    PassAccumulation,
-    PassDenoiser,
-    PassReflections,
-    PassLighting,
-    PassResolve,
-    StatLights,
-    StatInstances,
-    StatShaders,
-    ResetDefaults,
-    TabRayTracing,
-    QualityPreset,
-    PresetLow,
-    PresetMedium,
-    PresetHigh,
-    PresetUltra,
-    PresetCustom,
-    SectionShadows,
-    ExactLights,
-    SampledLightRays,
-    ViewmodelShadowRays,
-    FoliageShadows,
-    FoliageOff,
-    FoliageSun,
-    FoliageSunAndIndirect,
-    FoliageAll,
-    IndirectSource,
-    IndirectRayTraced,
-    IndirectBaked,
-    EmissiveLighting,
-    EmissiveOff,
-    EmissiveBounce,
-    EmissiveFull,
-    IndirectRays,
-    IndirectBounces,
-    AoRays,
-    VolumeRays,
-    VolumetricSteps,
-    SectionAlphaTests,
-    OpacityMicromaps,
-    FastAlphaTests,
-    MicromapsUnavailable,
-    StatMicromaps,
-    PassAmbientOcclusion,
-    PassOtherViews,
-    AntiAliasingDlssShort,
-    Display,
-    DisplayDefault,
-    DisplayItem,
-    DisplayPrimary,
-    SectionCredits,
-    CreditsDlss,
-    CreditsLicenses,
-    RadianceCache,
-    RadianceCacheUnavailable,
-    ViewRadianceCache,
-    PassRadianceCache,
-    GlossyReflections,
-    LightSampling,
-    LightSamplingLegacy,
-    LightSamplingRis,
-    LightSamplingRestir,
-    LightSamplingAuto,
-    ViewLightSample,
-    ViewReservoirM,
-    PassLightSampling,
-    DenoiserMethod,
-    DenoiserBuiltIn,
-    DenoiserRelax,
-    DenoiserReblur,
-    ViewDenoiserValidation,
-    SectionFrameRate,
-    StatFpsValue,
-    ValueMilliseconds,
-    LoadingScene,
-    LoadingBake,
-    LoadingShaders,
-    Count
-};
+// The text the in-game menu and the loading screen show, read from gmodplusplus\localization\<language>\
+// gmodpp.properties (GMod's .properties format, UTF-8) in GMod's language, over the English file.
 
-const char* Text(TextId id);
+// Loads the text again when GMod's language has changed. Call on the game's main thread before showing text.
+void UpdateLanguage();
+
+// The language of the text shown: GMod's, or "en" when it has no file.
+const std::string& Language();
+// Whether that language is written from right to left.
+bool RightToLeft();
+
+// The text of every language with a file, English included, and the symbols ui::Number writes: everything the
+// menu's fonts must be able to draw.
+std::string AllText();
+
+// The current language's text for `key`, or the key itself when no file has it.
+const char* Text(const char* key);
+
+struct Argument {
+    std::string_view name;
+    std::string value;
+};
+// The text for `key` with each {name} in it replaced by its argument.
+std::string Format(const char* key, std::initializer_list<Argument> arguments);
+
+// A number in the user's regional format, with `decimals` digits after the decimal separator.
+std::string Number(double value, int decimals);
 
 }

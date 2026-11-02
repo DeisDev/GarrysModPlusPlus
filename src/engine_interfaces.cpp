@@ -70,6 +70,17 @@ constexpr size_t kDlightSize = 72;
 constexpr std::string_view kLightStylePattern = "83 F8 7F 77 ?? 48 8D 0D ?? ?? ?? ?? 66 0F 6E 04 81 0F 5B C0";
 constexpr size_t kLightStyleDisplacement = 8;
 constexpr float kLightStyleNormal = 264.0f;
+// ICvar ("VEngineCvar004", vstdlib.dll). FindVar is slot 12 (vstdlib.dll+0x5130: FindCommandBase, then null for
+// commands). GMod's inlined ConVar::GetString, in vstdlib.dll's RevertFlaggedConVars (+0x6fa0) and in the
+// gmod_language change callback (filesystem_stdio.dll+0xd660), reads the flags at 40 (FCVAR_NEVER_AS_STRING 0x1000)
+// and the parent ConVar at 56, then the parent's string at 120 when it is not empty, else its m_pszString at 72.
+// filesystem_stdio.dll registers gmod_language (+0x1050) with an empty default. Confirmed with Ghidra (REA).
+constexpr int kFindVarSlot = 12;
+constexpr size_t kConVarFlags = 40;
+constexpr uint32_t kNeverAsString = 0x1000;
+constexpr size_t kConVarParent = 56;
+constexpr size_t kConVarString = 72;
+constexpr size_t kConVarOverride = 120;
 
 void* g_engineClient = nullptr;
 void* g_fileSystem = nullptr;
@@ -201,6 +212,31 @@ void ExecuteCommand(const std::string& command)
 {
     if (Ready())
         Slot<void(__fastcall*)(void*, const char*)>(g_engineClient, kClientCmdUnrestrictedSlot)(g_engineClient, command.c_str());
+}
+
+std::string GameLanguage()
+{
+    static void* cvar = nullptr;
+    if (cvar == nullptr) {
+        HMODULE module = nullptr;
+        cvar = CreateFrom(L"vstdlib.dll", "VEngineCvar004", module);
+        if (cvar == nullptr)
+            return {};
+    }
+    const std::byte* var = Slot<const std::byte*(__fastcall*)(void*, const char*)>(cvar, kFindVarSlot)(cvar, "gmod_language");
+    if (var == nullptr)
+        return {};
+    uint32_t flags;
+    std::memcpy(&flags, var + kConVarFlags, sizeof(flags));
+    if ((flags & kNeverAsString) != 0)
+        return {};
+    const std::byte* parent;
+    std::memcpy(&parent, var + kConVarParent, sizeof(parent));
+    const char* text;
+    std::memcpy(&text, parent + kConVarOverride, sizeof(text));
+    if (text == nullptr || *text == '\0')
+        std::memcpy(&text, parent + kConVarString, sizeof(text));
+    return text != nullptr ? std::string(text) : std::string();
 }
 
 bool ReadGameFile(const std::string& path, std::vector<std::byte>& data, size_t maxBytes)

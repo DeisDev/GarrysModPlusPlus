@@ -413,6 +413,7 @@ add_library(gmodpp SHARED
     src/shader_cache.cpp
     src/shader_precache.cpp
     src/shader_translator.cpp
+    src/text_layout.cpp
     src/ui_text.cpp
     src/vcs.cpp
     src/vpk.cpp
@@ -448,6 +449,7 @@ add_library(gmodpp SHARED
     src/light_queries.cpp
     src/loading_screen.cpp
     src/overlay.cpp
+    src/overlay_fonts.cpp
     src/overlay_widgets.cpp
     src/restir.cpp
     src/nrd_denoiser.cpp
@@ -463,7 +465,7 @@ target_include_directories(gmodpp BEFORE PRIVATE "${AGILITY_SDK_DIR}/build/nativ
 target_include_directories(gmodpp PRIVATE "${DXC_DIR}/inc" "${SHADER_OUTPUT_DIR}" "${DLSS_SDK_DIR}/include" "${RTXDI_DIR}/Include")
 # ReSTIRDI.cpp leaves a parameter unused in release builds (its check is an assert).
 set_source_files_properties("${RTXDI_DIR}/Source/ReSTIRDI.cpp" PROPERTIES COMPILE_OPTIONS /wd4100)
-target_link_libraries(gmodpp PRIVATE d3d12 dxgi dxguid lzma_dec dbghelp minhook imgui NRD "${DLSS_SDK_DIR}/lib/Windows_x86_64/x64/nvsdk_ngx_s.lib")
+target_link_libraries(gmodpp PRIVATE d3d12 dxgi dxguid dwrite icu lzma_dec dbghelp minhook imgui NRD "${DLSS_SDK_DIR}/lib/Windows_x86_64/x64/nvsdk_ngx_s.lib")
 
 # The mod laid out as the game folder: the loader in the root and everything else in gmodplusplus, with the licences
 # every bundled component requires. deploy copies it into the game and release zips it.
@@ -477,6 +479,7 @@ add_custom_target(stage
     COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:gmodpp> "${DXC_DIR}/bin/x64/dxcompiler.dll" "${DLSS_FEATURE_DLL}" "${STAGE_MOD}/"
     COMMAND ${CMAKE_COMMAND} -E copy "${AGILITY_RUNTIME_DIR}/D3D12Core.dll" "${AGILITY_RUNTIME_DIR}/d3d12SDKLayers.dll" "${STAGE_MOD}/D3D12/"
     COMMAND ${CMAKE_COMMAND} -E copy ${LIGHTING_HEADERS} "${STAGE_MOD}/hlsl/"
+    COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_CURRENT_SOURCE_DIR}/localization" "${STAGE_MOD}/localization"
     COMMAND ${CMAKE_COMMAND} -E copy ${TWIN_SOURCES} ${SDK_SHADER_PATHS} "${CMAKE_CURRENT_SOURCE_DIR}/shaders/twins/LICENSE"
         "${CMAKE_CURRENT_SOURCE_DIR}/shaders/twins/thirdpartylegalnotices.txt" "${STAGE_MOD}/twins/"
     COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE" "${CMAKE_CURRENT_SOURCE_DIR}/THIRD_PARTY_NOTICES.md"
