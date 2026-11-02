@@ -24,6 +24,10 @@ int LocalPlayerIndex();
 // Queues console commands as if typed into the console.
 void ExecuteCommand(const std::string& command);
 
+// GMod's language, the gmod_language console variable ("en", "de", "pt-br": the folder names of
+// garrysmod/resource/localization); empty when it is unset or can't be read.
+std::string GameLanguage();
+
 // Reads a file through the game's filesystem (loose files, mounted content and addons), at most `maxBytes`.
 bool ReadGameFile(const std::string& path, std::vector<std::byte>& data, size_t maxBytes = SIZE_MAX);
 

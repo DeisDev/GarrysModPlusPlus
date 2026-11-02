@@ -1,12 +1,19 @@
 #include "overlay_widgets.h"
 
 #include "log.h"
+#include "overlay_fonts.h"
+#include "text_layout.h"
+#include "ui_text.h"
+
+#include <dwrite.h>
 
 #include <algorithm>
 #include <cmath>
-#include <cstdio>
+#include <fstream>
+#include <map>
 #include <string>
 #include <type_traits>
+#include <vector>
 
 namespace gmodpp::overlay::widgets {
 
@@ -22,6 +29,7 @@ constexpr ImVec4 kFrame(0.137f, 0.161f, 0.200f, 1.0f);
 constexpr ImVec4 kFrameHover(0.165f, 0.192f, 0.239f, 1.0f);
 constexpr ImVec4 kFrameActive(0.192f, 0.224f, 0.278f, 1.0f);
 constexpr ImVec4 kBorder(1.0f, 1.0f, 1.0f, 0.07f);
+constexpr ImVec4 kRowHover(1.0f, 1.0f, 1.0f, 0.035f);
 constexpr ImVec4 kAccent(0.180f, 0.608f, 1.0f, 1.0f);
 constexpr ImVec4 kAccentHover(0.333f, 0.686f, 1.0f, 1.0f);
 constexpr ImVec4 kAccentActive(0.122f, 0.525f, 0.902f, 1.0f);
@@ -31,6 +39,21 @@ constexpr ImVec4 kTransparent(0.0f, 0.0f, 0.0f, 0.0f);
 Fonts g_fonts;
 // Font size over the 16 pixels the spacing was designed at.
 float g_scale = 1.0f;
+// Every character the fonts load, as Dear ImGui glyph ranges; the atlas reads them until it is built.
+ImVector<ImWchar> g_glyphRanges;
+// Font files by path while the fonts load; Dear ImGui keeps its own copy of each.
+std::map<std::filesystem::path, std::vector<char>> g_fontData;
+
+// The row between BeginRow and EndRow.
+struct Row {
+    float top = 0.0f;
+    float labelBottom = 0.0f;
+    float controlStart = 0.0f;
+    float controlEnd = 0.0f;
+    bool enabled = true;
+    const char* reason = nullptr;
+};
+Row g_row;
 
 ImVec4 WithAlpha(ImVec4 color, float alpha) { return ImVec4(color.x, color.y, color.z, alpha); }
 
@@ -41,18 +64,37 @@ ImVec4 Mix(const ImVec4& a, const ImVec4& b, float t)
 
 ImU32 Color(const ImVec4& color) { return ImGui::GetColorU32(color); }
 
-ImFont* LoadFont(const std::filesystem::path& path, float pixels)
+const std::vector<char>& FontData(const std::filesystem::path& path)
 {
-    const std::u8string utf8 = path.u8string();
-    const char* name = reinterpret_cast<const char*>(utf8.c_str());
-    std::error_code error;
-    if (!std::filesystem::is_regular_file(path, error)) {
-        log::Info("Overlay: font {} not found; using Dear ImGui's", name);
-        return nullptr;
+    auto [entry, added] = g_fontData.try_emplace(path);
+    if (added) {
+        std::ifstream file(path, std::ios::binary);
+        entry->second.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+        if (entry->second.empty())
+            log::Info("Overlay: font file {} could not be read", path.string());
     }
-    ImFontConfig config;
-    config.OversampleH = 2;
-    return ImGui::GetIO().Fonts->AddFontFromFileTTF(name, pixels, &config);
+    return entry->second;
+}
+
+// A game font and the fonts the game falls back to for the characters it lacks, merged into one Dear ImGui font in
+// that order (Dear ImGui, like GDI font linking, never replaces a glyph an earlier font has).
+ImFont* LoadFont(const std::filesystem::path& path, float pixels, DWRITE_FONT_WEIGHT weight, std::u16string_view characters)
+{
+    ImFont* font = nullptr;
+    for (const fonts::Face& face : fonts::GameFontChain(path, weight, characters)) {
+        const std::vector<char>& data = FontData(face.path);
+        if (data.empty())
+            continue;
+        ImFontConfig config;
+        config.OversampleH = 2;
+        config.FontNo = static_cast<int>(face.index);
+        config.FontDataOwnedByAtlas = false;
+        config.MergeMode = font != nullptr;
+        ImFont* added = ImGui::GetIO().Fonts->AddFontFromMemoryTTF(const_cast<char*>(data.data()), static_cast<int>(data.size()), pixels, &config, g_glyphRanges.Data);
+        if (font == nullptr)
+            font = added;
+    }
+    return font;
 }
 
 void SetColors(ImGuiStyle& style)
@@ -108,53 +150,74 @@ void SetColors(ImGuiStyle& style)
 void SetSizes(ImGuiStyle& style)
 {
     style.WindowPadding = ImVec2(12.0f, 10.0f);
-    style.WindowRounding = 8.0f;
+    style.WindowRounding = 0.0f;
     style.WindowBorderSize = 1.0f;
-    style.ChildRounding = 6.0f;
+    style.ChildRounding = 0.0f;
     style.ChildBorderSize = 1.0f;
-    style.PopupRounding = 6.0f;
+    style.PopupRounding = 0.0f;
     style.PopupBorderSize = 1.0f;
-    style.FramePadding = ImVec2(8.0f, 4.0f);
-    style.FrameRounding = 5.0f;
-    style.ItemSpacing = ImVec2(8.0f, 5.0f);
+    style.FramePadding = ImVec2(8.0f, 5.0f);
+    style.FrameRounding = 0.0f;
+    style.ItemSpacing = ImVec2(8.0f, 6.0f);
     style.ItemInnerSpacing = ImVec2(6.0f, 4.0f);
-    style.CellPadding = ImVec2(5.0f, 3.0f);
+    style.CellPadding = ImVec2(6.0f, 4.0f);
     style.ScrollbarSize = 8.0f;
-    style.ScrollbarRounding = 8.0f;
+    style.ScrollbarRounding = 0.0f;
     style.GrabMinSize = 12.0f;
-    style.GrabRounding = 6.0f;
+    style.GrabRounding = 0.0f;
+    style.TabRounding = 0.0f;
     style.SeparatorTextBorderSize = 1.0f;
     style.DisabledAlpha = 0.4f;
 }
 
-template <class T>
-bool SliderOf(const char* id, T* value, T minimum, T maximum)
+float SwitchHeight() { return std::round(ImGui::GetFontSize() * 1.05f); }
+
+// `text` in display order and its width in the current font.
+struct Line {
+    std::string text;
+    float width;
+};
+
+Line VisualLine(const char* text)
 {
-    constexpr bool kInteger = std::is_integral_v<T>;
+    std::string visual = ui::Visual(text);
+    const float width = ImGui::CalcTextSize(visual.c_str()).x;
+    return {std::move(visual), width};
+}
+
+// Where a line `width` wide starts in [start, end]: at the start of the line in the language's direction.
+float AlignedX(float start, float end, float width) { return RightToLeft() ? end - width : start; }
+
+template <class T>
+bool SliderOf(const char* id, T* value, T minimum, T maximum, const char* text, float textWidth, float width)
+{
     ImGui::PushID(id);
     const ImGuiStyle& style = ImGui::GetStyle();
-    char text[32];
-    if constexpr (kInteger)
-        std::snprintf(text, sizeof(text), "%d", *value);
-    else
-        std::snprintf(text, sizeof(text), "%.2f", *value);
-    const float valueWidth = std::max(ImGui::CalcTextSize(kInteger ? "0000" : "00.00").x, ImGui::CalcTextSize(text).x);
+    const bool rightToLeft = RightToLeft();
+    const ImVec2 origin = ImGui::GetCursorScreenPos();
+    const float total = width > 0.0f ? width : ImGui::GetContentRegionAvail().x;
+    const float valueWidth = std::max(textWidth, ImGui::CalcTextSize(text).x);
     const float spacing = style.ItemInnerSpacing.x * 1.5f;
-    const float total = ImGui::GetContentRegionAvail().x;
-    ImGui::SetNextItemWidth(std::max(total - valueWidth - spacing, ImGui::GetFontSize() * 4.0f));
+    const float trackWidth = std::max(total - valueWidth - spacing, ImGui::GetFontSize() * 4.0f);
+    const float trackX = rightToLeft ? origin.x + total - trackWidth : origin.x;
+    ImGui::SetCursorScreenPos(ImVec2(trackX, origin.y));
+    ImGui::SetNextItemWidth(trackWidth);
     for (ImGuiCol hidden : {ImGuiCol_FrameBg, ImGuiCol_FrameBgHovered, ImGuiCol_FrameBgActive, ImGuiCol_SliderGrab, ImGuiCol_SliderGrabActive})
         ImGui::PushStyleColor(hidden, kTransparent);
     // Whole numbers go through a float slider too: ImGui widens an integer slider's grab to one unit, which would
-    // start each track at a different place.
-    float position = static_cast<float>(*value);
-    const bool moved = ImGui::SliderFloat("##slider", &position, static_cast<float>(minimum), static_cast<float>(maximum), "", ImGuiSliderFlags_NoInput);
+    // start each track at a different place. Right to left, the slider's position runs from the maximum.
+    const float low = static_cast<float>(minimum);
+    const float high = static_cast<float>(maximum);
+    float position = rightToLeft ? low + high - static_cast<float>(*value) : static_cast<float>(*value);
+    const bool moved = ImGui::SliderFloat("##slider", &position, low, high, "", ImGuiSliderFlags_NoInput);
     ImGui::PopStyleColor(5);
     const T previous = *value;
     if (moved) {
-        if constexpr (kInteger)
-            *value = std::clamp(static_cast<T>(std::lround(position)), minimum, maximum);
+        const float picked = rightToLeft ? low + high - position : position;
+        if constexpr (std::is_integral_v<T>)
+            *value = std::clamp(static_cast<T>(std::lround(picked)), minimum, maximum);
         else
-            *value = std::round(position * 100.0f) / 100.0f;
+            *value = std::clamp(std::round(picked * 100.0f) / 100.0f, minimum, maximum);
     }
     const bool changed = *value != previous;
 
@@ -168,19 +231,28 @@ bool SliderOf(const char* id, T* value, T minimum, T maximum)
     const float t = range > 0.0f ? std::clamp(static_cast<float>(*value - minimum) / range, 0.0f, 1.0f) : 0.0f;
     const float left = min.x + kPadding + grab * 0.5f;
     const float right = max.x - kPadding - grab * 0.5f;
-    const float x = left + t * (right - left);
-    const float y = (min.y + max.y) * 0.5f;
-    const float track = std::max(2.0f, ImGui::GetFontSize() * 0.12f);
+    const float x = std::round(rightToLeft ? right - t * (right - left) : left + t * (right - left));
+    const float y = std::round((min.y + max.y) * 0.5f);
+    const float track = std::max(1.0f, std::round(ImGui::GetFontSize() * 0.1f));
     ImDrawList* draw = ImGui::GetWindowDrawList();
-    draw->AddRectFilled(ImVec2(left, y - track), ImVec2(right, y + track), Color(kFrameActive), track);
-    draw->AddRectFilled(ImVec2(left, y - track), ImVec2(x, y + track), Color(hot ? kAccentHover : kAccent), track);
-    const float radius = style.GrabMinSize * 0.5f;
-    draw->AddCircleFilled(ImVec2(x, y), radius, Color(kOnAccent));
-    if (hot)
-        draw->AddCircle(ImVec2(x, y), radius + 1.5f * g_scale, Color(WithAlpha(kAccent, 0.6f)), 0, 2.0f * g_scale);
+    draw->AddRectFilled(ImVec2(left, y - track), ImVec2(right, y + track), Color(kFrameActive));
+    const ImU32 fill = Color(hot ? kAccentHover : kAccent);
+    if (rightToLeft)
+        draw->AddRectFilled(ImVec2(x, y - track), ImVec2(right, y + track), fill);
+    else
+        draw->AddRectFilled(ImVec2(left, y - track), ImVec2(x, y + track), fill);
+    const float half = std::round(style.GrabMinSize * 0.5f);
+    draw->AddRectFilled(ImVec2(x - half, y - half), ImVec2(x + half, y + half), Color(kOnAccent));
+    if (hot) {
+        const float ring = half + std::round(2.0f * g_scale);
+        draw->AddRect(ImVec2(x - ring, y - ring), ImVec2(x + ring, y + ring), Color(WithAlpha(kAccent, 0.6f)), 0.0f, 0, std::max(1.0f, 1.5f * g_scale));
+    }
 
-    ImGui::SameLine(0.0f, spacing + valueWidth - ImGui::CalcTextSize(text).x);
-    ImGui::TextUnformatted(text);
+    // The value is right-aligned in its space, after the track in the line's direction.
+    const float textX = rightToLeft ? origin.x + valueWidth - ImGui::CalcTextSize(text).x : origin.x + total - ImGui::CalcTextSize(text).x;
+    draw->AddText(ImVec2(std::floor(textX), std::floor(origin.y + style.FramePadding.y)), ImGui::GetColorU32(ImGuiCol_Text), text);
+    ImGui::SetCursorScreenPos(origin);
+    ImGui::Dummy(ImVec2(total, ImGui::GetFrameHeight()));
     ImGui::PopID();
     return changed;
 }
@@ -189,20 +261,32 @@ bool SliderOf(const char* id, T* value, T minimum, T maximum)
 
 void LoadTheme(const std::filesystem::path& fontDirectory, int displayHeight)
 {
-    const float size = std::clamp(std::round(static_cast<float>(displayHeight) * 14.0f / 1080.0f), 13.0f, 28.0f);
+    const float size = std::clamp(std::round(static_cast<float>(displayHeight) * 15.0f / 1080.0f), 14.0f, 30.0f);
     g_scale = size / 16.0f;
+
+    std::u16string characters = ui::DrawnCharacters(ui::AllText());
+    for (char16_t c = 0x20; c < 0x7F; ++c)
+        characters += c;
+    ImFontGlyphRangesBuilder ranges;
+    for (char16_t c : characters) {
+        if (c >= 0x20)
+            ranges.AddChar(static_cast<ImWchar>(c));
+    }
+    ranges.BuildRanges(&g_glyphRanges);
+
     ImGuiIO& io = ImGui::GetIO();
-    g_fonts.body = LoadFont(fontDirectory / L"Roboto-Regular.ttf", size);
+    g_fonts.body = LoadFont(fontDirectory / L"Roboto-Regular.ttf", size, DWRITE_FONT_WEIGHT_NORMAL, characters);
     if (g_fonts.body == nullptr)
         g_fonts.body = io.Fonts->AddFontDefault();
-    g_fonts.strong = LoadFont(fontDirectory / L"Roboto-Medium.ttf", size);
-    g_fonts.title = LoadFont(fontDirectory / L"coolvetica.ttf", std::round(size * 1.5f));
-    g_fonts.figure = LoadFont(fontDirectory / L"Roboto-Light.ttf", std::round(size * 1.6f));
+    g_fonts.strong = LoadFont(fontDirectory / L"Roboto-Medium.ttf", size, DWRITE_FONT_WEIGHT_MEDIUM, characters);
+    g_fonts.title = LoadFont(fontDirectory / L"coolvetica.ttf", std::round(size * 1.5f), DWRITE_FONT_WEIGHT_NORMAL, characters);
+    g_fonts.figure = LoadFont(fontDirectory / L"Roboto-Light.ttf", std::round(size * 1.6f), DWRITE_FONT_WEIGHT_LIGHT, characters);
     for (ImFont** font : {&g_fonts.strong, &g_fonts.title, &g_fonts.figure}) {
         if (*font == nullptr)
             *font = g_fonts.body;
     }
     io.FontDefault = g_fonts.body;
+    g_fontData.clear();
 
     ImGuiStyle& style = ImGui::GetStyle();
     style = ImGuiStyle();
@@ -214,27 +298,37 @@ void LoadTheme(const std::filesystem::path& fontDirectory, int displayHeight)
 
 const Fonts& GetFonts() { return g_fonts; }
 
+bool RightToLeft() { return ui::RightToLeft(); }
+
 bool Header(const char* title, const char* hint)
 {
     const ImGuiStyle& style = ImGui::GetStyle();
+    const bool rightToLeft = RightToLeft();
     ImDrawList* draw = ImGui::GetWindowDrawList();
     const ImVec2 origin = ImGui::GetCursorScreenPos();
     const float width = ImGui::GetContentRegionAvail().x;
     const float height = std::max(g_fonts.title->FontSize, ImGui::GetFrameHeight());
+    const float end = origin.x + width;
 
-    draw->AddText(g_fonts.title, g_fonts.title->FontSize, ImVec2(origin.x, origin.y + (height - g_fonts.title->FontSize) * 0.5f), Color(kText), title);
+    const std::string titleText = ui::Visual(title);
+    const float titleWidth = g_fonts.title->CalcTextSizeA(g_fonts.title->FontSize, FLT_MAX, 0.0f, titleText.c_str()).x;
+    draw->AddText(g_fonts.title, g_fonts.title->FontSize, ImVec2(AlignedX(origin.x, end, titleWidth), origin.y + (height - g_fonts.title->FontSize) * 0.5f),
+        Color(kText), titleText.c_str());
 
+    // The close button and the hint before it sit at the end of the line.
     const float close = ImGui::GetFrameHeight();
-    const float hintWidth = ImGui::CalcTextSize(hint).x;
-    const float hintX = origin.x + width - close - style.ItemSpacing.x - hintWidth;
-    draw->AddText(ImVec2(std::floor(hintX), std::floor(origin.y + (height - ImGui::GetFontSize()) * 0.5f)), Color(kTextDim), hint);
+    const Line hintLine = VisualLine(hint);
+    const float closeX = rightToLeft ? origin.x : end - close;
+    const float hintX = rightToLeft ? origin.x + close + style.ItemSpacing.x : closeX - style.ItemSpacing.x - hintLine.width;
+    draw->AddText(ImVec2(std::floor(hintX), std::floor(origin.y + (height - ImGui::GetFontSize()) * 0.5f)), Color(kTextDim), hintLine.text.c_str());
 
-    ImGui::SetCursorScreenPos(ImVec2(origin.x + width - close, origin.y + (height - close) * 0.5f));
+    const ImVec2 closeMin(closeX, std::round(origin.y + (height - close) * 0.5f));
+    ImGui::SetCursorScreenPos(closeMin);
     const bool clicked = ImGui::InvisibleButton("##close", ImVec2(close, close));
     const bool hovered = ImGui::IsItemHovered();
-    const ImVec2 center(origin.x + width - close * 0.5f, origin.y + height * 0.5f);
     if (hovered)
-        draw->AddCircleFilled(center, close * 0.5f, Color(kFrameHover));
+        draw->AddRectFilled(closeMin, ImVec2(closeMin.x + close, closeMin.y + close), Color(kFrameHover));
+    const ImVec2 center(closeMin.x + close * 0.5f, closeMin.y + close * 0.5f);
     const float arm = close * 0.18f;
     const ImU32 cross = Color(hovered ? kText : kTextDim);
     draw->AddLine(ImVec2(center.x - arm, center.y - arm), ImVec2(center.x + arm, center.y + arm), cross, 1.6f * g_scale);
@@ -248,34 +342,49 @@ bool Header(const char* title, const char* hint)
 bool NavItem(const char* label, bool selected)
 {
     const ImGuiStyle& style = ImGui::GetStyle();
+    const bool rightToLeft = RightToLeft();
     const ImVec2 origin = ImGui::GetCursorScreenPos();
-    const ImVec2 size(ImGui::GetContentRegionAvail().x, ImGui::GetFrameHeight() * 1.15f);
+    const ImVec2 size(ImGui::GetContentRegionAvail().x, std::round(ImGui::GetFrameHeight() * 1.2f));
     const bool clicked = ImGui::InvisibleButton(label, size);
     const bool hovered = ImGui::IsItemHovered();
     ImDrawList* draw = ImGui::GetWindowDrawList();
     const ImVec2 end(origin.x + size.x, origin.y + size.y);
     if (selected) {
-        // The outline is drawn inside the item so its child window doesn't clip it.
-        const float border = std::max(1.0f, 1.5f * g_scale);
-        const float inset = border * 0.5f;
-        draw->AddRectFilled(origin, end, Color(WithAlpha(kAccent, 0.16f)), style.FrameRounding);
-        draw->AddRect(ImVec2(origin.x + inset, origin.y + inset), ImVec2(end.x - inset, end.y - inset), Color(kAccent), style.FrameRounding, 0, border);
+        const float bar = std::max(2.0f, std::round(3.0f * g_scale));
+        draw->AddRectFilled(origin, end, Color(WithAlpha(kAccent, 0.16f)));
+        if (rightToLeft)
+            draw->AddRectFilled(ImVec2(end.x - bar, origin.y), end, Color(kAccent));
+        else
+            draw->AddRectFilled(origin, ImVec2(origin.x + bar, end.y), Color(kAccent));
     } else if (hovered) {
-        draw->AddRectFilled(origin, end, Color(kSurfaceHover), style.FrameRounding);
+        draw->AddRectFilled(origin, end, Color(kSurfaceHover));
     }
     ImFont* font = g_fonts.strong;
-    const ImVec2 text(std::floor(origin.x + style.FramePadding.x * 1.4f), std::floor(origin.y + (size.y - font->FontSize) * 0.5f));
+    const std::string text = ui::Visual(label);
+    const float textWidth = font->CalcTextSizeA(font->FontSize, FLT_MAX, 0.0f, text.c_str()).x;
+    const float padding = style.FramePadding.x * 1.6f;
+    const ImVec2 position(std::floor(AlignedX(origin.x + padding, end.x - padding, textWidth)), std::floor(origin.y + (size.y - font->FontSize) * 0.5f));
     const ImVec4 clip(origin.x, origin.y, end.x, end.y);
-    draw->AddText(font, font->FontSize, text, Color(selected || hovered ? kText : kTextDim), label, nullptr, 0.0f, &clip);
+    draw->AddText(font, font->FontSize, position, Color(selected || hovered ? kText : kTextDim), text.c_str(), nullptr, 0.0f, &clip);
     return clicked;
+}
+
+void Text(const char* text)
+{
+    ImFont* font = ImGui::GetFont();
+    const float width = std::max(ImGui::GetContentRegionAvail().x, 1.0f);
+    const float start = ImGui::GetCursorPosX();
+    const float scale = ImGui::GetFontSize() / font->FontSize;
+    for (const std::string& line : ui::VisualLines(text, width, [&](char16_t c) { return font->GetCharAdvance(static_cast<ImWchar>(c)) * scale; })) {
+        ImGui::SetCursorPosX(AlignedX(start, start + width, ImGui::CalcTextSize(line.c_str()).x));
+        ImGui::TextUnformatted(line.c_str());
+    }
 }
 
 void Heading(const char* text)
 {
     ImGui::PushFont(g_fonts.strong);
-    ImGui::PushStyleColor(ImGuiCol_Text, kTextDim);
-    ImGui::TextUnformatted(text);
-    ImGui::PopStyleColor();
+    Text(text);
     ImGui::PopFont();
 }
 
@@ -284,7 +393,7 @@ void BeginCard(const char* id, const char* heading)
     if (heading != nullptr)
         Heading(heading);
     ImGui::PushStyleColor(ImGuiCol_ChildBg, kSurface);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0f * g_scale, 8.0f * g_scale));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(std::round(10.0f * g_scale), std::round(8.0f * g_scale)));
     ImGui::BeginChild(id, ImVec2(0.0f, 0.0f), ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding | ImGuiChildFlags_Borders);
     ImGui::PopStyleVar();
     ImGui::PopStyleColor();
@@ -296,15 +405,63 @@ void EndCard()
     ImGui::Dummy(ImVec2(0.0f, ImGui::GetStyle().ItemSpacing.y));
 }
 
-bool Toggle(const char* text, bool* value)
+bool BeginRows(const char* id)
 {
+    if (!ImGui::BeginTable(id, 2, ImGuiTableFlags_SizingStretchProp))
+        return false;
+    const bool rightToLeft = RightToLeft();
+    ImGui::TableSetupColumn(nullptr, ImGuiTableColumnFlags_WidthStretch, rightToLeft ? 0.58f : 0.42f);
+    ImGui::TableSetupColumn(nullptr, ImGuiTableColumnFlags_WidthStretch, rightToLeft ? 0.42f : 0.58f);
+    return true;
+}
+
+void EndRows() { ImGui::EndTable(); }
+
+void BeginRow(const char* label, bool enabled, const char* reason)
+{
+    // Right to left, the label is in the second column, on the right.
+    const int labelColumn = RightToLeft() ? 1 : 0;
+    ImGui::TableNextRow();
+    ImGui::TableSetColumnIndex(labelColumn);
+    g_row = {.top = ImGui::GetCursorScreenPos().y, .enabled = enabled, .reason = reason};
+    ImGui::BeginDisabled(!enabled);
+    ImGui::AlignTextToFramePadding();
+    Text(label);
+    g_row.labelBottom = ImGui::GetItemRectMax().y;
+    ImGui::TableSetColumnIndex(1 - labelColumn);
+    g_row.controlStart = ImGui::GetCursorScreenPos().x;
+    g_row.controlEnd = g_row.controlStart + ImGui::GetContentRegionAvail().x;
+}
+
+bool EndRow(bool clickableLabel)
+{
+    ImGui::EndDisabled();
     const ImGuiStyle& style = ImGui::GetStyle();
+    const ImVec2 min(ImGui::GetWindowPos().x, g_row.top - style.CellPadding.y);
+    const ImVec2 max(ImGui::GetWindowPos().x + ImGui::GetWindowWidth(), std::max(g_row.labelBottom, ImGui::GetItemRectMax().y) + style.CellPadding.y);
+    if (!ImGui::IsWindowHovered() || !ImGui::IsMouseHoveringRect(min, max, false))
+        return false;
+    ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, Color(kRowHover));
+    if (!g_row.enabled) {
+        if (g_row.reason != nullptr)
+            ImGui::SetTooltip("%s", ui::Visual(g_row.reason).c_str());
+        return false;
+    }
+    const float mouse = ImGui::GetIO().MousePos.x;
+    const bool onLabel = RightToLeft() ? mouse > g_row.controlEnd + style.CellPadding.x : mouse < g_row.controlStart - style.CellPadding.x;
+    if (!clickableLabel || !onLabel)
+        return false;
+    ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+    return ImGui::IsMouseClicked(ImGuiMouseButton_Left);
+}
+
+bool Switch(const char* id, bool* value)
+{
     const float frame = ImGui::GetFrameHeight();
-    const float height = ImGui::GetFontSize() * 1.15f;
-    const float width = height * 1.8f;
-    const float textWidth = ImGui::CalcTextSize(text).x;
+    const float height = SwitchHeight();
+    const float width = SwitchWidth();
     const ImVec2 origin = ImGui::GetCursorScreenPos();
-    const bool clicked = ImGui::InvisibleButton(text, ImVec2(width + style.ItemInnerSpacing.x + textWidth, frame));
+    const bool clicked = ImGui::InvisibleButton(id, ImVec2(width, frame));
     if (clicked)
         *value = !*value;
     const bool hovered = ImGui::IsItemHovered();
@@ -318,52 +475,64 @@ bool Toggle(const char* text, bool* value)
     storage->SetFloat(key, t);
 
     ImDrawList* draw = ImGui::GetWindowDrawList();
-    const ImVec2 min(origin.x, origin.y + (frame - height) * 0.5f);
+    const ImVec2 min(origin.x, std::round(origin.y + (frame - height) * 0.5f));
     const ImVec2 max(min.x + width, min.y + height);
-    draw->AddRectFilled(min, max, Color(Mix(hovered ? kFrameHover : kFrameActive, hovered ? kAccentHover : kAccent, t)), height * 0.5f);
-    const float x = min.x + height * 0.5f + t * (width - height);
-    draw->AddCircleFilled(ImVec2(x, min.y + height * 0.5f), height * 0.36f, Color(Mix(kKnobOff, kOnAccent, t)));
-    const ImVec2 textPos(std::floor(max.x + style.ItemInnerSpacing.x), std::floor(origin.y + (frame - ImGui::GetFontSize()) * 0.5f));
-    draw->AddText(textPos, Color(kText), text);
+    draw->AddRectFilled(min, max, Color(Mix(hovered ? kFrameHover : kFrameActive, hovered ? kAccentHover : kAccent, t)));
+    const float inset = std::max(2.0f, std::round(height * 0.15f));
+    const float knob = height - inset * 2.0f;
+    // On is at the end of the line: right, or left for right-to-left languages.
+    const float travel = RightToLeft() ? 1.0f - t : t;
+    const float x = std::round(min.x + inset + travel * (width - height));
+    draw->AddRectFilled(ImVec2(x, min.y + inset), ImVec2(x + knob, min.y + inset + knob), Color(Mix(kKnobOff, kOnAccent, t)));
     return clicked;
 }
+
+float SwitchWidth() { return std::round(SwitchHeight() * 1.9f); }
+
+float SwitchSpan() { return SwitchWidth() + ImGui::GetStyle().ItemInnerSpacing.x * 2.0f; }
 
 bool Segmented(const char* id, int* value, std::span<const char* const> options, std::span<const bool> available)
 {
     ImGui::PushID(id);
     const ImGuiStyle& style = ImGui::GetStyle();
+    const bool rightToLeft = RightToLeft();
     const ImVec2 origin = ImGui::GetCursorScreenPos();
     const float width = ImGui::GetContentRegionAvail().x;
     const float height = ImGui::GetFrameHeight();
     const float segment = width / static_cast<float>(options.size());
-    const float inset = std::max(2.0f, style.FramePadding.y * 0.5f);
+    const float inset = std::max(2.0f, std::round(style.FramePadding.y * 0.5f));
     ImDrawList* draw = ImGui::GetWindowDrawList();
-    draw->AddRectFilled(origin, ImVec2(origin.x + width, origin.y + height), Color(kFrame), style.FrameRounding);
+    draw->AddRectFilled(origin, ImVec2(origin.x + width, origin.y + height), Color(kFrame));
     bool changed = false;
     for (size_t i = 0; i < options.size(); ++i) {
         const int index = static_cast<int>(i);
         const bool enabled = available.empty() || available[i];
-        const float left = origin.x + segment * static_cast<float>(i);
+        const size_t slot = rightToLeft ? options.size() - 1 - i : i;
+        const float left = std::round(origin.x + segment * static_cast<float>(slot));
+        const float right = std::round(origin.x + segment * static_cast<float>(slot + 1));
         ImGui::BeginDisabled(!enabled);
         ImGui::PushID(index);
         ImGui::SetCursorScreenPos(ImVec2(left, origin.y));
-        if (ImGui::InvisibleButton("##segment", ImVec2(segment, height)) && *value != index) {
+        if (ImGui::InvisibleButton("##segment", ImVec2(right - left, height)) && *value != index) {
             *value = index;
             changed = true;
         }
         const bool hovered = ImGui::IsItemHovered();
         ImGui::PopID();
         const ImVec2 min(left + inset, origin.y + inset);
-        const ImVec2 max(left + segment - inset, origin.y + height - inset);
+        const ImVec2 max(right - inset, origin.y + height - inset);
         const bool selected = *value == index;
         if (selected)
-            draw->AddRectFilled(min, max, Color(kAccent), std::max(0.0f, style.FrameRounding - inset));
+            draw->AddRectFilled(min, max, Color(kAccent));
         else if (hovered)
-            draw->AddRectFilled(min, max, Color(kFrameHover), std::max(0.0f, style.FrameRounding - inset));
-        const ImVec2 size = ImGui::CalcTextSize(options[i]);
-        const ImVec2 text(std::floor(std::max(min.x + style.FramePadding.x * 0.5f, (min.x + max.x - size.x) * 0.5f)), std::floor(origin.y + (height - size.y) * 0.5f));
+            draw->AddRectFilled(min, max, Color(kFrameHover));
+        const Line line = VisualLine(options[i]);
+        const float padding = style.FramePadding.x * 0.5f;
+        const float centred = std::max(min.x + padding, (min.x + max.x - line.width) * 0.5f);
+        const float x = rightToLeft ? std::min(max.x - padding - line.width, centred) : centred;
+        const ImVec2 position(std::floor(x), std::floor(origin.y + (height - ImGui::GetFontSize()) * 0.5f));
         const ImVec4 clip(min.x, min.y, max.x, max.y);
-        draw->AddText(nullptr, 0.0f, text, Color(selected ? kOnAccent : kText), options[i], nullptr, 0.0f, &clip);
+        draw->AddText(nullptr, 0.0f, position, Color(selected ? kOnAccent : kText), line.text.c_str(), nullptr, 0.0f, &clip);
         ImGui::EndDisabled();
     }
     ImGui::SetCursorScreenPos(origin);
@@ -372,30 +541,103 @@ bool Segmented(const char* id, int* value, std::span<const char* const> options,
     return changed;
 }
 
-bool Slider(const char* id, float* value, float minimum, float maximum) { return SliderOf(id, value, minimum, maximum); }
+bool Combo(const char* id, int* value, std::span<const char* const> options)
+{
+    ImGui::PushID(id);
+    const ImGuiStyle& style = ImGui::GetStyle();
+    const bool rightToLeft = RightToLeft();
+    const ImVec2 origin = ImGui::GetCursorScreenPos();
+    const float width = ImGui::GetContentRegionAvail().x;
+    const float height = ImGui::GetFrameHeight();
+    if (ImGui::InvisibleButton("##combo", ImVec2(width, height)))
+        ImGui::OpenPopup("##options");
+    const bool hovered = ImGui::IsItemHovered();
+    const bool open = ImGui::IsPopupOpen("##options");
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    const ImVec2 end(origin.x + width, origin.y + height);
+    draw->AddRectFilled(origin, end, Color(open ? kFrameActive : hovered ? kFrameHover : kFrame));
 
-bool Slider(const char* id, int* value, int minimum, int maximum) { return SliderOf(id, value, minimum, maximum); }
+    // The arrow is at the end of the line, the choice at its start.
+    const float arrowX = rightToLeft ? origin.x : end.x - height;
+    const ImVec2 arrow(arrowX + height * 0.5f, origin.y + height * 0.5f);
+    const float arm = std::round(height * 0.16f);
+    draw->AddTriangleFilled(ImVec2(arrow.x - arm, arrow.y - arm * 0.5f), ImVec2(arrow.x + arm, arrow.y - arm * 0.5f), ImVec2(arrow.x, arrow.y + arm * 0.6f),
+        ImGui::GetColorU32(ImGuiCol_Text));
+    const int current = std::clamp(*value, 0, static_cast<int>(options.size()) - 1);
+    const Line line = VisualLine(options[static_cast<size_t>(current)]);
+    const float textStart = rightToLeft ? origin.x + height : origin.x + style.FramePadding.x;
+    const float textEnd = rightToLeft ? end.x - style.FramePadding.x : end.x - height;
+    const ImVec4 clip(textStart, origin.y, textEnd, end.y);
+    draw->AddText(nullptr, 0.0f, ImVec2(std::floor(AlignedX(textStart, textEnd, line.width)), std::floor(origin.y + style.FramePadding.y)),
+        ImGui::GetColorU32(ImGuiCol_Text), line.text.c_str(), nullptr, 0.0f, &clip);
+
+    bool changed = false;
+    ImGui::SetNextWindowPos(ImVec2(origin.x, end.y));
+    ImGui::SetNextWindowSizeConstraints(ImVec2(width, 0.0f), ImVec2(width, FLT_MAX));
+    if (ImGui::BeginPopup("##options", ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove)) {
+        ImGui::PushStyleVar(ImGuiStyleVar_SelectableTextAlign, ImVec2(rightToLeft ? 1.0f : 0.0f, 0.5f));
+        for (int i = 0; i < static_cast<int>(options.size()); ++i) {
+            ImGui::PushID(i);
+            if (ImGui::Selectable(ui::Visual(options[static_cast<size_t>(i)]).c_str(), i == current) && i != current) {
+                *value = i;
+                changed = true;
+            }
+            if (i == current && ImGui::IsWindowAppearing())
+                ImGui::SetItemDefaultFocus();
+            ImGui::PopID();
+        }
+        ImGui::PopStyleVar();
+        ImGui::EndPopup();
+    }
+    ImGui::SetCursorScreenPos(origin);
+    ImGui::Dummy(ImVec2(width, height));
+    ImGui::PopID();
+    return changed;
+}
+
+bool Slider(const char* id, float* value, float minimum, float maximum, const char* text, float textWidth, float width)
+{
+    return SliderOf(id, value, minimum, maximum, text, textWidth, width);
+}
+
+bool Slider(const char* id, int* value, int minimum, int maximum, const char* text, float textWidth, float width)
+{
+    return SliderOf(id, value, minimum, maximum, text, textWidth, width);
+}
+
+bool EndButton(const char* label)
+{
+    const std::string text = ui::Visual(label);
+    const float width = ImGui::CalcTextSize(text.c_str()).x + ImGui::GetStyle().FramePadding.x * 2.0f;
+    if (!RightToLeft())
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - width);
+    return ImGui::Button(text.c_str());
+}
 
 void Note(const char* text)
 {
     ImGui::PushStyleColor(ImGuiCol_Text, kTextDim);
-    ImGui::TextWrapped("%s", text);
+    Text(text);
     ImGui::PopStyleColor();
 }
 
 void Tile(const char* figure, const char* label, float width)
 {
-    const ImGuiStyle& style = ImGui::GetStyle();
     const ImVec2 origin = ImGui::GetCursorScreenPos();
-    const ImVec2 padding(10.0f * g_scale, 6.0f * g_scale);
+    const ImVec2 padding(std::round(10.0f * g_scale), std::round(6.0f * g_scale));
     const float height = padding.y * 2.0f + g_fonts.figure->FontSize + ImGui::GetFontSize();
     const ImVec2 end(origin.x + width, origin.y + height);
     ImDrawList* draw = ImGui::GetWindowDrawList();
-    draw->AddRectFilled(origin, end, Color(kSurface), style.ChildRounding);
-    draw->AddRect(origin, end, Color(kBorder), style.ChildRounding);
-    const ImVec4 clip(origin.x, origin.y, end.x - padding.x * 0.5f, end.y);
-    draw->AddText(g_fonts.figure, g_fonts.figure->FontSize, ImVec2(origin.x + padding.x, origin.y + padding.y), Color(kText), figure, nullptr, 0.0f, &clip);
-    draw->AddText(nullptr, 0.0f, ImVec2(origin.x + padding.x, origin.y + padding.y + g_fonts.figure->FontSize), Color(kTextDim), label, nullptr, 0.0f, &clip);
+    draw->AddRectFilled(origin, end, Color(kSurface));
+    draw->AddRect(origin, end, Color(kBorder));
+    const ImVec4 clip(origin.x + padding.x * 0.5f, origin.y, end.x - padding.x * 0.5f, end.y);
+    const std::string figureText = ui::Visual(figure);
+    const float figureWidth = g_fonts.figure->CalcTextSizeA(g_fonts.figure->FontSize, FLT_MAX, 0.0f, figureText.c_str()).x;
+    draw->AddText(g_fonts.figure, g_fonts.figure->FontSize, ImVec2(AlignedX(origin.x + padding.x, end.x - padding.x, figureWidth), origin.y + padding.y), Color(kText),
+        figureText.c_str(), nullptr, 0.0f, &clip);
+    const Line line = VisualLine(label);
+    draw->AddText(nullptr, 0.0f, ImVec2(AlignedX(origin.x + padding.x, end.x - padding.x, line.width), origin.y + padding.y + g_fonts.figure->FontSize),
+        Color(kTextDim), line.text.c_str(), nullptr, 0.0f, &clip);
     ImGui::Dummy(ImVec2(width, height));
 }
 
@@ -404,13 +646,15 @@ void Meter(float fraction)
     const ImVec2 origin = ImGui::GetCursorScreenPos();
     const float width = ImGui::GetContentRegionAvail().x;
     const float frame = ImGui::GetTextLineHeight();
-    const float thickness = std::max(3.0f, ImGui::GetFontSize() * 0.3f);
-    const float y = origin.y + (frame - thickness) * 0.5f;
+    const float thickness = std::max(3.0f, std::round(ImGui::GetFontSize() * 0.3f));
+    const float y = std::round(origin.y + (frame - thickness) * 0.5f);
     ImDrawList* draw = ImGui::GetWindowDrawList();
-    draw->AddRectFilled(ImVec2(origin.x, y), ImVec2(origin.x + width, y + thickness), Color(kFrame), thickness);
-    const float filled = width * std::clamp(fraction, 0.0f, 1.0f);
-    if (filled > 0.0f)
-        draw->AddRectFilled(ImVec2(origin.x, y), ImVec2(origin.x + std::max(filled, thickness), y + thickness), Color(WithAlpha(kAccent, 0.8f)), thickness);
+    draw->AddRectFilled(ImVec2(origin.x, y), ImVec2(origin.x + width, y + thickness), Color(kFrame));
+    const float filled = std::max(width * std::clamp(fraction, 0.0f, 1.0f), 1.0f);
+    if (fraction > 0.0f) {
+        const float start = RightToLeft() ? origin.x + width - filled : origin.x;
+        draw->AddRectFilled(ImVec2(start, y), ImVec2(start + filled, y + thickness), Color(WithAlpha(kAccent, 0.8f)));
+    }
     ImGui::Dummy(ImVec2(width, frame));
 }
 

@@ -134,7 +134,7 @@ struct Settings {
     bool operator==(const Settings&) const = default;
 };
 
-// Sets the ray tracing detail settings to a preset's values; QualityPreset::Custom leaves them.
+// Sets the ray tracing detail settings (the menu's Quality page) to a preset's values; QualityPreset::Custom leaves them.
 void ApplyPreset(Settings& settings, QualityPreset preset);
 
 Settings& GetSettings();
