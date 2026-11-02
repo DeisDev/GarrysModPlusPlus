@@ -30,6 +30,8 @@ void Store(std::uint64_t key, const translator::Translation& info, std::span<con
 bool Contains(std::uint64_t key);
 // Whether compiled shaders can be stored (the file could be created or opened for writing).
 bool Writable();
+// Opens the file on another thread, so the first shader the game asks for does not wait for it to be read.
+void OpenInBackground();
 
 // Where the HLSL of translations that fail to compile, and with -gmodpp_dev every compiled translation, is written.
 std::filesystem::path DumpDirectory();
