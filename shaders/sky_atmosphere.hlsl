@@ -14,7 +14,7 @@
 //    of guessed albedo, a band takes the game's colour and brightness. Without the game's sky above the horizon the scale
 //    makes it as bright as the map's sky light.
 // 4: the procedural sky (output0, a cube's faces): step 2's sky (input0) times the multiplier of its elevation (input1),
-//    blended between the bands' centres.
+//    a smooth curve through the bands.
 
 static const uint kBands = 32;
 static const uint kLanesPerBand = 8;
@@ -238,8 +238,16 @@ void main(uint3 id : SV_DispatchThreadID, uint index : SV_GroupIndex)
     uint width, height, faces;
     output.GetDimensions(width, height, faces);
     float3 direction = normalize(FaceDirection(id.z, (float2(id.xy) + 0.5) * (2.0 / width) - 1.0));
-    float band = clamp((asin(direction.z) / 3.14159265 + 0.5) * kBands - 0.5, 0.0, kBands - 1.0);
-    uint lower = uint(band);
-    float3 multiplier = lerp(bands.Load(int3(lower, 0, 0)).rgb, bands.Load(int3(min(lower + 1, kBands - 1), 0, 0)).rgb, band - lower);
+    // A uniform cubic B-spline through the bands: straight lines between their centres turned at each one, which showed
+    // as stripes of colour.
+    float band = (asin(direction.z) / 3.14159265 + 0.5) * kBands - 0.5;
+    int first = int(floor(band)) - 1;
+    float t = band - floor(band);
+    float weights[4] = {pow(1.0 - t, 3.0) / 6.0, (3.0 * t * t * t - 6.0 * t * t + 4.0) / 6.0, (-3.0 * t * t * t + 3.0 * t * t + 3.0 * t + 1.0) / 6.0,
+        t * t * t / 6.0};
+    float3 multiplier = 0.0;
+    [unroll]
+    for (int k = 0; k < 4; ++k)
+        multiplier += weights[k] * bands.Load(int3(clamp(first + k, 0, int(kBands) - 1), 0, 0)).rgb;
     output[id] = float4(min(sky.Load(int4(id, 0)).rgb * multiplier, 65504.0), 1.0);
 }

@@ -45,6 +45,7 @@ enum class TextId {
     Fog,
     PhysicalSky,
     SunDisc,
+    SunSize,
     SectionAntiAliasing,
     AntiAliasingMode,
     AntiAliasingOff,

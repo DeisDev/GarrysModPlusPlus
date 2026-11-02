@@ -495,9 +495,15 @@ void DrawImagePage(Settings& settings)
     widgets::EndCard();
 
     widgets::BeginCard("##effects", Text(TextId::SectionEffects));
-    widgets::Toggle(Text(TextId::Fog), &settings.fog);
-    widgets::Toggle(Text(TextId::PhysicalSky), &settings.physicalSky);
-    widgets::Toggle(Text(TextId::SunDisc), &settings.sunDisc);
+    if (BeginRows("effects")) {
+        SwitchRow(TextId::Fog, settings.fog);
+        SwitchRow(TextId::PhysicalSky, settings.physicalSky);
+        SwitchRow(TextId::SunDisc, settings.sunDisc);
+        ImGui::BeginDisabled(!settings.sunDisc);
+        SliderRow(TextId::SunSize, settings, &Settings::sunSize);
+        ImGui::EndDisabled();
+        ImGui::EndTable();
+    }
     widgets::EndCard();
 }
 

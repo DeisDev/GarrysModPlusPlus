@@ -1,3 +1,5 @@
+#include "dither.hlsli"
+
 #define ROOT_SIGNATURE "DescriptorTable(SRV(t0), visibility = SHADER_VISIBILITY_PIXEL), DescriptorTable(SRV(t1), visibility = SHADER_VISIBILITY_PIXEL)"
 
 Texture2D<float4> g_result : register(t0);
@@ -18,10 +20,18 @@ VertexOutput VSMain(uint vertex : SV_VertexID)
     return output;
 }
 
+// The lit image, already encoded as the game's colour target holds it, dithered into the 8-bit target.
+float4 Result(float2 pixel)
+{
+    float4 color = g_result.Load(int3(pixel, 0));
+    color.rgb += DitherNoise(uint2(pixel)) / 255.0;
+    return color;
+}
+
 [RootSignature(ROOT_SIGNATURE)]
 float4 PSMain(VertexOutput input) : SV_Target
 {
-    return g_result.Load(int3(input.position.xy, 0));
+    return Result(input.position.xy);
 }
 
 // PSMain for the pixels the G-buffer covers: the viewmodel's run lights only a rectangle around them.
@@ -30,7 +40,7 @@ float4 CoveredPS(VertexOutput input) : SV_Target
 {
     if (g_flags.Load(int3(input.position.xy, 0)).r < 0.5)
         discard;
-    return g_result.Load(int3(input.position.xy, 0));
+    return Result(input.position.xy);
 }
 
 // Writes a depth texture (shaders/translucent_depth.hlsl) into the depth buffer.

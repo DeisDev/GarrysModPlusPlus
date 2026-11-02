@@ -87,6 +87,8 @@ struct SkyDraw {
     UINT transmittanceView = 0;
     std::array<float, 3> sunDirection = {};
     std::array<float, 3> sunColor = {1.0f, 1.0f, 1.0f};
+    // The disc's angular radius in radians.
+    float sunRadius = 0.0f;
     // env_sun's sprite (EnvSun::material, EnvSun::size); no material without an env_sun.
     std::string sprite;
     float spriteSize = 0.0f;

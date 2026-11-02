@@ -1,4 +1,5 @@
 #include "atmosphere.hlsli"
+#include "dither.hlsli"
 
 // The game's 2D sky passes drawn with the procedural sky (SkyMain), or the sun's disc added over the game's own sky
 // (DiscMain), in place of the game's pixel shader (src/shaderapi_pipelines.cpp, DrawSky). The translated vertex shader
@@ -17,7 +18,10 @@ struct SkyDrawConstants
     uint skyView;
     uint transmittanceView;
     uint sunDisc;
-    uint2 padding;
+    // The disc's angular radius in radians.
+    float sunRadius;
+    // How the target stores colour: 0 floating point, 1 8-bit, 2 8-bit sRGB.
+    uint target;
 };
 
 ConstantBuffer<SkyDrawConstants> g_sky : register(b0, space1);
@@ -42,6 +46,18 @@ struct Interpolants
     float4 fog : FOG;
 };
 
+// The sRGB curve (LinearToSrgb and SrgbToLinear in shaders/common.hlsli, whose bindings this shader cannot share).
+float3 EncodeSrgb(float3 color)
+{
+    color = max(color, 0.0);
+    return select(color <= 0.0031308, color * 12.92, 1.055 * pow(color, 1.0 / 2.4) - 0.055);
+}
+
+float3 DecodeSrgb(float3 color)
+{
+    return select(color <= 0.04045, color / 12.92, pow((max(color, 0.0) + 0.055) / 1.055, 2.4));
+}
+
 // The world direction through a pixel centre. Translated vertex shaders move the game's geometry by D3D9's half-pixel
 // offset (gmodpp_halfPixel), so a pixel centre shows the game's clip-space point half a pixel up and left of it.
 float3 ViewDirection(float2 pixel)
@@ -53,22 +69,22 @@ float3 ViewDirection(float2 pixel)
     return normalize(farPoint.xyz / farPoint.w - nearPoint.xyz / nearPoint.w);
 }
 
-// The sun's disc in a direction. It is thousands of times brighter than the sky (its irradiance over 6.8e-5 sr), so it
-// is shown as bright as the target holds, in the colour the atmosphere leaves it (env_sun's tint times the transmittance
-// toward it), with Allen's limb darkening at 550 nm (I / I0 = 0.3 + 0.93 mu - 0.23 mu^2; Cox, Allen's Astrophysical
-// Quantities, 2000). Its edge covers the share of the pixel inside it, and the ground hides it below the horizon.
+// The sun's disc in a direction. It is thousands of times brighter than the sky, so it is shown as bright as the target
+// holds, in the colour the atmosphere leaves it (env_sun's tint times the transmittance toward it), with Allen's limb
+// darkening at 550 nm (I / I0 = 0.3 + 0.93 mu - 0.23 mu^2; Cox, Allen's Astrophysical Quantities, 2000). Its edge
+// covers the share of the pixel inside it, and the ground hides it below the horizon.
 float3 SunDisc(float3 direction)
 {
     float3 sun = g_sky.sunDirection;
     float angle = atan2(length(cross(direction, sun)), dot(direction, sun));
-    float coverage = saturate((kSunDiscRadius - angle) / max(fwidth(angle), 1e-7) + 0.5);
+    float coverage = saturate((g_sky.sunRadius - angle) / max(fwidth(angle), 1e-7) + 0.5);
     float3 eye = float3(0.0, 0.0, kGroundRadius + kEyeHeight);
     if (coverage <= 0.0 || SphereDistance(eye, direction, kGroundRadius) >= 0.0)
         return 0.0;
     Texture2D<float4> transmittance = ResourceDescriptorHeap[g_sky.transmittanceView];
     float3 color = g_sky.sunColor * AtmosphereTransmittance(transmittance, g_linearClamp, eye.z, sun.z);
     color /= max(max(color.r, max(color.g, color.b)), 1e-6);
-    float r = saturate(angle / kSunDiscRadius);
+    float r = saturate(angle / g_sky.sunRadius);
     float mu = sqrt(1.0 - r * r);
     return color * ((0.3 + 0.93 * mu - 0.23 * mu * mu) * coverage);
 }
@@ -80,7 +96,12 @@ float4 SkyMain(Interpolants input) : SV_Target0
     float3 color = sky.SampleLevel(g_linearClamp, direction, 0.0).rgb * g_sky.tonemapScale;
     if (g_sky.sunDisc != 0)
         color += SunDisc(direction);
-    return float4(color, 1.0);
+    // An 8-bit target rounds the sky's smooth gradients, after encoding them as sRGB when it does.
+    if (g_sky.target != 0) {
+        float noise = DitherNoise(uint2(input.position.xy)) / 255.0;
+        color = g_sky.target == 2 ? DecodeSrgb(EncodeSrgb(color) + noise) : color + noise;
+    }
+    return float4(max(color, 0.0), 1.0);
 }
 
 float4 DiscMain(Interpolants input) : SV_Target0

@@ -23,9 +23,6 @@ static const float kEyeHeight = 0.2;
 static const uint2 kTransmittanceSize = uint2(256, 64);
 static const uint kMultipleScatteringSize = 32;
 
-// The angular radius of the sun's disc, as the lighting traces it (kSunAngularRadius in shaders/scene.hlsli).
-static const float kSunDiscRadius = 0.00465;
-
 struct Medium
 {
     float3 rayleigh;

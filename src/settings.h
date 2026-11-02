@@ -82,8 +82,9 @@ struct Settings {
     bool fog = true;
     // A physically based sky in the 2D skybox's colours replaces the skybox, on screen and in the lighting.
     bool physicalSky = true;
-    // Our sun disc replaces env_sun's sprite.
+    // Our sun disc replaces env_sun's sprite, scaled from the size it has (Lighting::RecordSky).
     bool sunDisc = true;
+    float sunSize = 1.0f;
     float sunIntensity = 1.0f;
     float skyIntensity = 1.0f;
     float lightIntensity = 1.0f;

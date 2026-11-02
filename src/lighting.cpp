@@ -116,6 +116,14 @@ constexpr UINT kSkyBands = 32;
 constexpr UINT kSkyGroup = 16;
 // The clear sky is made again once the sun has moved this far (cosine of 0.1 degrees); its disc follows it exactly.
 constexpr float kSkySunMoved = 0.9999985f;
+// The sun's disc (shaders/sky_draw.hlsl) is as wide as env_sun's sprite looks: its half size m_nSize at 100 units
+// (CGlowOverlay::CalcBasis), times the radius at which the default sprite's texture (sprites/light_glow02, 128x128,
+// read as sRGB) falls to half its centre's brightness, 0.12 of the sprite's half size. Maps without env_sun get three
+// times the real sun's angular radius (kSunAngularRadius in shaders/scene.hlsli), which the shadows keep.
+constexpr float kSunSpriteDistance = 100.0f;
+constexpr float kSunSpriteHalfBrightness = 0.12f;
+constexpr float kRealSunRadius = 0.00465f;
+constexpr float kSunWithoutSprite = 3.0f;
 // Caustics (shaders/caustics.hlsl, kCausticsCells there) cover this many units square around the main view's eye.
 constexpr UINT kCausticsCells = 1024;
 constexpr float kCausticsRange = 2048.0f;
@@ -975,11 +983,15 @@ void Lighting::RecordSky(FrameConstants& constants, const ViewInputs& inputs)
     m_skyDraw.skyView = m_proceduralSky.srv;
     m_skyDraw.transmittanceView = m_transmittance.srv;
     m_skyDraw.sunDirection = *sun;
+    m_skyDraw.sunRadius = kRealSunRadius * kSunWithoutSprite;
     if (inputs.envSun) {
         m_skyDraw.sunColor = inputs.envSun->color;
         m_skyDraw.sprite = inputs.envSun->material;
         m_skyDraw.spriteSize = inputs.envSun->size;
+        if (inputs.envSun->size > 0.0f)
+            m_skyDraw.sunRadius = std::atan(kSunSpriteHalfBrightness * inputs.envSun->size / kSunSpriteDistance);
     }
+    m_skyDraw.sunRadius *= settings.sunSize;
 }
 
 bool Lighting::EnsureTargets(UINT width, UINT height)

@@ -50,6 +50,7 @@ constexpr std::array<const char*, static_cast<size_t>(TextId::Count)> kEnglish =
     "Fog",
     "Physical sky",
     "Sun disc",
+    "Sun size",
     "Anti-aliasing",
     "Mode",
     "Off",

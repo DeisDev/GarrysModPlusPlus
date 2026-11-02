@@ -57,6 +57,7 @@ constexpr NamedField kFields[] = {
     {"fog", &Settings::fog},
     {"physical_sky", &Settings::physicalSky},
     {"sun_disc", &Settings::sunDisc},
+    {"sun_size", &Settings::sunSize, {0.25f, 4.0f}},
     {"sun_intensity", &Settings::sunIntensity, {0.0f, 4.0f}},
     {"sky_intensity", &Settings::skyIntensity, {0.0f, 4.0f}},
     {"light_intensity", &Settings::lightIntensity, {0.0f, 4.0f}},
