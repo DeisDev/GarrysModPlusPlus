@@ -19,6 +19,7 @@
 #include <functional>
 #include <optional>
 #include <span>
+#include <stop_token>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -281,6 +282,14 @@ public:
         const std::filesystem::path& dlssDirectory);
     // Whether the pipeline states are still being created (non-blocking), and how many of them are done.
     bool PreparingPipelines() const { return !m_pipelinesDone.load(std::memory_order_acquire); }
+    // False once creating the pipeline states has failed: the game's own light is kept, as when Initialize fails. Joins
+    // the builder once it has finished, without waiting for it.
+    bool Usable()
+    {
+        if (!m_pipelinesChecked && !PreparingPipelines())
+            WaitForPipelines();
+        return !m_pipelinesFailed;
+    }
     std::pair<size_t, size_t> PipelineProgress() const { return {m_pipelinesCreated.load(std::memory_order_relaxed), m_pipelinesTotal.load(std::memory_order_relaxed)}; }
     // Submits the view's commands to the queue. The game's commands that wrote the inputs must be submitted first.
     void Run(const ViewInputs& inputs, Scene& scene, std::span<const SceneInstance> dynamic, const std::vector<SkinnedEntity>& skinned);
@@ -726,7 +735,8 @@ private:
 
     // Waits for the pipeline states the first time; false (and m_failed) when creating one failed.
     bool WaitForPipelines();
-    HRESULT CreatePipelines();
+    HRESULT CreatePipelines(std::stop_token stop);
+    bool m_pipelinesFailed = false;
     std::atomic<size_t> m_pipelinesCreated = 0;
     std::atomic<size_t> m_pipelinesTotal = 0;
     HRESULT m_pipelinesResult = S_OK;

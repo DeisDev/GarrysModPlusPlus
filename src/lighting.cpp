@@ -418,7 +418,7 @@ ComPtr<ID3D12Resource> CreateBuffer(ID3D12Device* device, D3D12_HEAP_TYPE heap, 
 
 }
 
-HRESULT Lighting::CreatePipelines()
+HRESULT Lighting::CreatePipelines(std::stop_token stop)
 {
     const bool micromaps = m_opacityMicromaps;
     // Devices with the radiance cache run the passes that read it in their variants built with SHaRC (which read it only
@@ -428,7 +428,10 @@ HRESULT Lighting::CreatePipelines()
     auto compute = [&](std::span<const BYTE> shader, Microsoft::WRL::ComPtr<ID3D12PipelineState>& pipeline) {
         if (shader.empty())
             return;
-        jobs.push_back([this, shader, &pipeline] {
+        jobs.push_back([this, shader, &pipeline, stop] {
+            // The game is closing.
+            if (stop.stop_requested())
+                return E_ABORT;
             D3D12_COMPUTE_PIPELINE_STATE_DESC desc = {};
             desc.pRootSignature = m_computeRoot.Get();
             desc.CS = {shader.data(), shader.size()};
@@ -496,6 +499,7 @@ bool Lighting::WaitForPipelines()
     if (FAILED(m_pipelinesResult)) {
         log::Info("Lighting: creating the pipeline states failed ({:#010x}); lighting disabled", Hex(m_pipelinesResult));
         m_failed = true;
+        m_pipelinesFailed = true;
     }
     return !m_failed;
 }
@@ -727,9 +731,9 @@ bool Lighting::Initialize(ID3D12Device5* device, ID3D12CommandQueue* queue, Desc
     GetStatistics().opacityMicromapsAvailable = micromaps;
     GetStatistics().radianceCacheAvailable = cache;
     m_restirAvailable = m_restir.Initialize(m_device, *m_descriptors);
-    m_pipelineBuilder = std::jthread([this] {
+    m_pipelineBuilder = std::jthread([this](std::stop_token stop) {
         const auto start = std::chrono::steady_clock::now();
-        m_pipelinesResult = CreatePipelines();
+        m_pipelinesResult = CreatePipelines(stop);
         log::Info("Lighting: created {} pipeline states in {:.0f} ms", m_pipelinesTotal.load(),
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
         m_pipelinesDone.store(true, std::memory_order_release);

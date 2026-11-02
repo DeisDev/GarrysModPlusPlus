@@ -259,9 +259,10 @@ std::vector<std::uint8_t> ReadWholeFile(const std::filesystem::path& path)
 {
     std::vector<std::uint8_t> data;
     std::ifstream file(path, std::ios::binary | std::ios::ate);
-    if (!file)
+    const std::streamoff size = file ? static_cast<std::streamoff>(file.tellg()) : -1;
+    if (size <= 0)
         return data;
-    data.resize(static_cast<size_t>(file.tellg()));
+    data.resize(static_cast<size_t>(size));
     file.seekg(0);
     file.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(data.size()));
     if (!file)
@@ -846,6 +847,9 @@ void ReadPipelineLibraryInBackground()
 
 void SavePipelineLibrary(bool now)
 {
+    // At shutdown a save still writing finishes first, whether or not anything is left to save after it.
+    while (now && g_librarySaving)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
     if (g_cache.library == nullptr || !g_cache.libraryDirty)
         return;
     const auto time = std::chrono::steady_clock::now();
@@ -854,9 +858,6 @@ void SavePipelineLibrary(bool now)
     g_cache.librarySaved = time;
     g_cache.libraryDirty = false;
     if (now) {
-        // At shutdown: after any save still writing, on this thread.
-        while (g_librarySaving)
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
         WritePipelineLibrary(g_cache.library.Get(), g_cache.libraryPath);
         return;
     }

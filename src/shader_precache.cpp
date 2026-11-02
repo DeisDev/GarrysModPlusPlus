@@ -225,14 +225,20 @@ public:
         {
             std::scoped_lock lock(m_mutex);
             RequestId id = IdOf(request);
-            if (m_started.contains(id))
+            const size_t p = static_cast<size_t>(priority);
+            if (m_started.contains(id)) {
+                // Already compiling at a lower priority (StartReplay's): counted here too, done when that run ends.
+                if (const auto running = m_inProgress.find(id); running != m_inProgress.end() && running->second.front() > priority) {
+                    running->second.push_back(priority);
+                    ++m_total[p];
+                }
                 return;
+            }
             // A request still waiting at a lower priority is queued again at this one; the first copy taken runs.
             const auto queued = m_queuedAt.find(id);
             if (queued != m_queuedAt.end() && queued->second <= priority)
                 return;
             m_queuedAt[id] = priority;
-            const size_t p = static_cast<size_t>(priority);
             m_queues[p].push_back({ request, std::move(id) });
             ++m_total[p];
             if (!m_running) {
@@ -255,13 +261,12 @@ public:
         return { m_done[p], m_total[p] };
     }
 
-    // Calls `callback` on a worker once every Background request queued so far has finished; returns true instead when
-    // they all have already.
+    // Calls `callback` on a worker once every request queued so far, of every priority, has finished (a Background
+    // request may have been run by a more urgent copy); returns true instead when they all have already.
     bool OnBackgroundDone(std::function<void()> callback)
     {
         std::scoped_lock lock(m_mutex);
-        const size_t p = static_cast<size_t>(Priority::Background);
-        if (m_done[p] == m_total[p])
+        if (AllDone())
             return true;
         m_backgroundDone = std::move(callback);
         return false;
@@ -290,8 +295,10 @@ private:
                 m_queues[p].pop_front();
                 // A copy queued again at a more urgent priority may have run already.
                 run = m_started.insert(queued.id).second;
-                if (run)
+                if (run) {
                     m_queuedAt.erase(queued.id);
+                    m_inProgress[queued.id] = { static_cast<Priority>(p) };
+                }
             }
             const bool background = p == static_cast<size_t>(Priority::Background);
             // Background requests keep the workers' priority: a draw may wait in Build for a shader one compiles.
@@ -301,11 +308,18 @@ private:
             {
                 std::scoped_lock lock(m_mutex);
                 ++m_done[p];
+                if (run) {
+                    // The more urgent priorities that came to wait for this run while it went on.
+                    const auto running = m_inProgress.find(queued.id);
+                    for (size_t i = 1; i < running->second.size(); ++i)
+                        ++m_done[static_cast<size_t>(running->second[i])];
+                    m_inProgress.erase(running);
+                }
                 if (background) {
                     --m_backgroundRunning;
                     m_ready.notify_one();
                 }
-                if (background && m_done[p] == m_total[p])
+                if (m_backgroundDone && AllDone())
                     callback = std::exchange(m_backgroundDone, nullptr);
             }
             if (callback)
@@ -318,6 +332,8 @@ private:
     std::array<std::deque<Queued>, static_cast<size_t>(Priority::Count)> m_queues;
     std::map<RequestId, Priority> m_queuedAt;
     std::set<RequestId> m_started;
+    // Requests running: the priority they run at, then the more urgent ones that wait for them.
+    std::map<RequestId, std::vector<Priority>> m_inProgress;
     std::array<std::size_t, static_cast<size_t>(Priority::Count)> m_total = {};
     std::array<std::size_t, static_cast<size_t>(Priority::Count)> m_done = {};
     std::function<void()> m_backgroundDone;
@@ -325,6 +341,16 @@ private:
     unsigned m_backgroundLimit = 1;
     unsigned m_backgroundRunning = 0;
     bool m_running = false;
+
+    // Under m_mutex.
+    bool AllDone() const
+    {
+        for (size_t p = 0; p < m_queues.size(); ++p) {
+            if (m_done[p] != m_total[p])
+                return false;
+        }
+        return true;
+    }
 
     // The most urgent queue a worker may take from, or the queue count when none. Under m_mutex.
     size_t Takeable() const
@@ -495,16 +521,22 @@ private:
         if (!std::getline(file, header) || !header.starts_with(kRememberedHeader))
             return;
         std::istringstream(header.substr(kRememberedHeader.size())) >> std::hex >> m_generation;
+        // A file cut off in a line loses that line, and is written again whole by the next Add rather than appended to.
+        const bool whole = contents.ends_with('\n');
         for (std::string text; std::getline(file, text);) {
+            if (!whole && file.eof())
+                break;
             Line line;
             std::istringstream fields(text);
-            if (!(fields >> line.name >> std::dec >> line.staticIndex >> std::hex >> line.flags) || line.staticIndex < 0 || !m_known.insert(text).second)
+            if (!(fields >> line.name >> std::dec >> line.staticIndex >> std::hex >> line.flags) || line.staticIndex < 0)
+                continue;
+            // Keyed as Add writes it, whatever line ending the file has.
+            if (!m_known.insert(std::format("{} {} {:x}", line.name, line.staticIndex, line.flags)).second)
                 continue;
             m_lines.push_back(std::move(line));
         }
-        // A file cut off in a line is written again whole by the next Add, rather than appended to.
-        if (contents.ends_with('\n'))
-            m_append.open(Path(), std::ios::app);
+        if (whole)
+            m_append.open(Path(), std::ios::binary | std::ios::app);
     }
 
     // Writes the file again (beside it, renamed into place) and opens it for appending. Under m_mutex.
@@ -516,7 +548,7 @@ private:
         std::filesystem::path temporary = Path();
         temporary += L".tmp";
         {
-            std::ofstream file(temporary, std::ios::trunc);
+            std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
             file << kRememberedHeader << ' ' << std::format("{:016x}", m_generation) << '\n';
             for (const Line& line : m_lines)
                 file << std::format("{} {} {:x}", line.name, line.staticIndex, line.flags) << '\n';
@@ -531,7 +563,7 @@ private:
             std::filesystem::remove(temporary, error);
             return;
         }
-        m_append.open(Path(), std::ios::app);
+        m_append.open(Path(), std::ios::binary | std::ios::app);
     }
 
     std::mutex m_mutex;

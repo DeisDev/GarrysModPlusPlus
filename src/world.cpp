@@ -1780,7 +1780,7 @@ void Shutdown()
     g_state.lighting.reset();
 }
 
-bool Ready() { return g_state.lighting && g_state.scene.Ready(); }
+bool Ready() { return g_state.lighting && g_state.lighting->Usable() && g_state.scene.Ready(); }
 
 std::optional<std::pair<size_t, size_t>> LightingPipelineProgress()
 {
@@ -1853,8 +1853,9 @@ void PrepareLevel(const LoadProgress& progress)
     if (const std::optional<std::string> level = PendingLevel())
         LoadScene(*level, [&](float done) { progress(done * sceneShare, LoadStage::Scene); });
     // The lighting's pipeline states have been created in the background since the game started (Lighting::Initialize);
-    // the first map loaded soon after a launch waits for the rest here instead of in its first frame.
-    while (g_state.lighting->PreparingPipelines()) {
+    // the first map loaded soon after a launch waits for the rest here instead of in its first frame. Without a scene the
+    // map is not lit, and nothing waits.
+    while (g_state.scene.Ready() && g_state.lighting->PreparingPipelines()) {
         const auto [created, total] = g_state.lighting->PipelineProgress();
         progress(total != 0 ? static_cast<float>(created) / static_cast<float>(total) : 0.0f, LoadStage::Pipelines);
         std::this_thread::sleep_for(std::chrono::milliseconds(15));

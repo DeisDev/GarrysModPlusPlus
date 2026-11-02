@@ -284,7 +284,10 @@ private:
         std::ifstream file(IndexPath(), std::ios::binary | std::ios::ate);
         if (!file)
             return 0;
-        const std::uint64_t bytes = static_cast<std::uint64_t>(file.tellg());
+        const std::streamoff length = static_cast<std::streamoff>(file.tellg());
+        if (length < static_cast<std::streamoff>(sizeof(IndexHeader)))
+            return 0;
+        const std::uint64_t bytes = static_cast<std::uint64_t>(length);
         IndexHeader header = {};
         file.seekg(0);
         file.read(reinterpret_cast<char*>(&header), sizeof(header));
@@ -362,8 +365,15 @@ private:
     void OpenIndexForAppend()
     {
         m_indexFile.open(IndexPath(), std::ios::binary | std::ios::in | std::ios::out);
-        if (m_indexFile)
+        if (m_indexFile.is_open())
             m_indexFile.seekp(static_cast<std::streamoff>(sizeof(IndexHeader) + m_indexEntries * sizeof(IndexEntry)));
+        if (!m_indexFile.is_open() || !m_indexFile) {
+            // Records stored without it would be missing from it next launch: without an index, that launch scans.
+            m_indexFile.close();
+            std::error_code error;
+            std::filesystem::remove(IndexPath(), error);
+            log::Info("Shader cache: opening {} failed; the next launch reads every record of {}", IndexPath().string(), Path().string());
+        }
     }
 
     // Under m_mutex, after the record was written.
@@ -402,9 +412,13 @@ private:
         if (stamp) {
             m_stamp = *stamp;
             valid = ReadIndex(m_stamp, size);
-            indexed = valid != 0;
-            if (!indexed)
+            // An index that ends before the pack misses records (an index entry not written, or a build without the
+            // index appending): the pack is scanned instead and the index written again.
+            indexed = valid != 0 && valid == size;
+            if (!indexed) {
+                m_index.clear();
                 valid = ScanPack(size);
+            }
         }
         if (valid == 0) {
             m_index.clear();
