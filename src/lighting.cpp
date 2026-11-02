@@ -5,6 +5,7 @@
 #include "light_queries.h"
 #include "log.h"
 #include "options.h"
+#include "parallel_jobs.h"
 #include "settings.h"
 
 #include <g_aoCS.h>
@@ -417,38 +418,6 @@ ComPtr<ID3D12Resource> CreateBuffer(ID3D12Device* device, D3D12_HEAP_TYPE heap, 
 
 }
 
-namespace {
-
-// Runs the jobs on worker threads, one fewer than the logical cores (at least one), and returns the first failure. The
-// driver compiles a pipeline state's shaders as it is created, so creating them side by side divides the wait.
-HRESULT RunInParallel(std::span<const std::function<HRESULT()>> jobs, std::atomic<size_t>& done)
-{
-    std::atomic<size_t> next = 0;
-    std::atomic<HRESULT> result = S_OK;
-    auto work = [&] {
-        for (size_t i = next++; i < jobs.size(); i = next++) {
-            const HRESULT hr = jobs[i]();
-            HRESULT expected = S_OK;
-            if (FAILED(hr))
-                result.compare_exchange_strong(expected, hr);
-            done.fetch_add(1, std::memory_order_relaxed);
-        }
-    };
-    const size_t threads = std::min<size_t>(std::max(2u, std::thread::hardware_concurrency()) - 1, jobs.size());
-    {
-        std::vector<std::jthread> workers;
-        for (size_t i = 1; i < threads; ++i)
-            workers.emplace_back([&] {
-                SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-                work();
-            });
-        work();
-    }
-    return result.load();
-}
-
-}
-
 HRESULT Lighting::CreatePipelines()
 {
     const bool micromaps = m_opacityMicromaps;
@@ -508,7 +477,7 @@ HRESULT Lighting::CreatePipelines()
         });
     }
     m_pipelinesTotal = jobs.size();
-    return RunInParallel(jobs, m_pipelinesCreated);
+    return RunInParallel(jobs, &m_pipelinesCreated);
 }
 
 bool Lighting::WaitForPipelines()
