@@ -60,6 +60,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- The first frame of a map denoised by NRD, and changing the resolution with it, pause for a shorter time: its pipeline states are created on several threads.
 - The game reaches its main menu sooner: the ray tracing pipeline states are created on several threads in the background instead of one by one before the game window responds. A map opened before they are ready waits for the rest on its loading screen ("Preparing ray tracing shaders...").
 - Characters, NPCs and ragdolls are posed for ray tracing on the GPU instead of the CPU each frame, and their shapes stay in video memory, so maps with many players and NPCs render faster.
 - Props and models that appear for the first time during play no longer pause the game while their ray tracing data is uploaded: the upload no longer waits for the frames in flight to finish.

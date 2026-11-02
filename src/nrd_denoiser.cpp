@@ -1,9 +1,11 @@
 #include "nrd_denoiser.h"
 
 #include "log.h"
+#include "parallel_jobs.h"
 
 #include <algorithm>
 #include <cstring>
+#include <functional>
 
 using Microsoft::WRL::ComPtr;
 
@@ -155,12 +157,20 @@ bool NrdDenoiser::Initialize(ID3D12Device* device, DescriptorHeap& descriptors, 
     HRESULT hr = D3D12SerializeVersionedRootSignature(&rootDesc, &blob, &errors);
     if (SUCCEEDED(hr))
         hr = m_device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&m_root));
-    for (uint32_t i = 0; i < instance.pipelinesNum && SUCCEEDED(hr); ++i) {
-        const nrd::ComputeShaderDesc& shader = instance.pipelines[i].computeShaderDXIL;
-        D3D12_COMPUTE_PIPELINE_STATE_DESC desc = {};
-        desc.pRootSignature = m_root.Get();
-        desc.CS = {shader.bytecode, static_cast<SIZE_T>(shader.size)};
-        hr = m_device->CreateComputePipelineState(&desc, IID_PPV_ARGS(&m_pipelines.emplace_back()));
+    // Created side by side: the first frame lit with NRD, and every resize, waited for dozens of them one by one.
+    if (SUCCEEDED(hr)) {
+        m_pipelines.resize(instance.pipelinesNum);
+        std::vector<std::function<HRESULT()>> jobs;
+        for (uint32_t i = 0; i < instance.pipelinesNum; ++i) {
+            jobs.push_back([this, &instance, i] {
+                const nrd::ComputeShaderDesc& shader = instance.pipelines[i].computeShaderDXIL;
+                D3D12_COMPUTE_PIPELINE_STATE_DESC desc = {};
+                desc.pRootSignature = m_root.Get();
+                desc.CS = {shader.bytecode, static_cast<SIZE_T>(shader.size)};
+                return m_device->CreateComputePipelineState(&desc, IID_PPV_ARGS(&m_pipelines[i]));
+            });
+        }
+        hr = RunInParallel(jobs);
     }
 
     // Texture pools.
