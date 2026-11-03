@@ -50,6 +50,10 @@ enum class IndirectLighting : uint32_t { RayTraced = 0, Baked, Count };
 // them directly, as area lights with shadows.
 enum class EmissiveLighting : uint32_t { Off = 0, Bounce, Full, Count };
 
+// What the map's sun (light_environment, and env_sun where the map has one) is: the Sun, or on night maps the Moon, whose
+// sky shows the stars. Auto takes it for the Moon while the map's own sky looks dark on screen.
+enum class MapSun : uint32_t { Auto = 0, Sun, Moon, Count };
+
 // How the main view's local lights are sampled: the light grid's strongest lights exactly and the rest sampled
 // (Legacy); NVIDIA RTXDI's importance sampling from its ReGIR light grid (RIS); the same with samples reused across
 // frames and neighbours (ReSTIR DI); or Auto: reused samples with TAA, importance sampling with DLSS Ray Reconstruction
@@ -82,8 +86,27 @@ struct Settings {
     bool renderTargetLighting = false;
     bool volumetricLight = true;
     bool fog = true;
-    // A physically based sky in the 2D skybox's colours replaces the skybox, on screen and in the lighting.
+    // A physically based sky in the 2D skybox's colours replaces the skybox, on screen and in the lighting. It darkens to
+    // night as the sun sets, as does the light of the sun and sky, down to nightBrightness of the map's sky.
     bool physicalSky = true;
+    MapSun mapSun = MapSun::Auto;
+    float nightBrightness = 0.05f;
+    // What the physical sky shows at night, and how: stars at starAmount times Earth's count, down to visual magnitude
+    // faintestStars, starBrightness times as bright, twinkling twinkleStrength times as strongly and twinkleSpeed times as
+    // fast as by default; the Milky Way milkyWayBrightness times as bright; shooting stars shootingStarFrequency times
+    // as often.
+    bool stars = true;
+    float starAmount = 1.0f;
+    float faintestStars = 10.0f;
+    float starBrightness = 1.0f;
+    bool twinkling = true;
+    float twinkleStrength = 1.0f;
+    float twinkleSpeed = 1.0f;
+    bool milkyWay = true;
+    float milkyWayBrightness = 1.0f;
+    bool shootingStars = true;
+    float shootingStarFrequency = 1.0f;
+    bool satellites = true;
     // Our sun disc replaces env_sun's sprite, scaled from the size it has (Lighting::RecordSky).
     bool sunDisc = true;
     float sunSize = 1.0f;

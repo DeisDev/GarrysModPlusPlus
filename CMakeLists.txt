@@ -434,6 +434,7 @@ add_library(gmodpp SHARED
     src/native_lighting.cpp
     src/world.cpp
     src/lighting.cpp
+    src/night_sky.cpp
     src/gbuffer_shaders.cpp
     src/scene.cpp
     src/bsp.cpp

@@ -249,9 +249,10 @@ void ComboRow(const char* key, E& value, std::span<const char* const> options, b
 
 // A row of buttons, one per option (text keys); returns true when another option is picked.
 template <class E>
-bool SegmentRow(const char* key, E& value, std::span<const char* const> options, std::span<const bool> available = {})
+bool SegmentRow(const char* key, E& value, std::span<const char* const> options, std::span<const bool> available = {}, bool enabled = true,
+    const char* reason = nullptr)
 {
-    BeginRow(key);
+    BeginRow(key, enabled, reason);
     std::vector<const char*> texts;
     for (const char* option : options)
         texts.push_back(Text(option));
@@ -328,6 +329,20 @@ void ResetLightingPage(Settings& settings)
     settings.volumetricIntensity = defaults.volumetricIntensity;
     settings.fog = defaults.fog;
     settings.physicalSky = defaults.physicalSky;
+    settings.mapSun = defaults.mapSun;
+    settings.nightBrightness = defaults.nightBrightness;
+    settings.stars = defaults.stars;
+    settings.starAmount = defaults.starAmount;
+    settings.faintestStars = defaults.faintestStars;
+    settings.starBrightness = defaults.starBrightness;
+    settings.twinkling = defaults.twinkling;
+    settings.twinkleStrength = defaults.twinkleStrength;
+    settings.twinkleSpeed = defaults.twinkleSpeed;
+    settings.milkyWay = defaults.milkyWay;
+    settings.milkyWayBrightness = defaults.milkyWayBrightness;
+    settings.shootingStars = defaults.shootingStars;
+    settings.shootingStarFrequency = defaults.shootingStarFrequency;
+    settings.satellites = defaults.satellites;
     settings.sunDisc = defaults.sunDisc;
     settings.sunSize = defaults.sunSize;
     settings.translucentLighting = defaults.translucentLighting;
@@ -413,10 +428,37 @@ void DrawLightingPage(Settings& settings)
     widgets::BeginCard("##atmosphere", Text("lighting.section_atmosphere"));
     if (widgets::BeginRows("atmosphere")) {
         SwitchRow("lighting.physical_sky", settings.physicalSky);
+        const char* const physicalSkyReason = Text("lighting.physical_sky_reason");
+        constexpr const char* kMapSuns[] = {"lighting.map_sun_auto", "lighting.map_sun_sun", "lighting.map_sun_moon"};
+        static_assert(std::size(kMapSuns) == static_cast<size_t>(MapSun::Count));
+        SegmentRow("lighting.map_sun", settings.mapSun, kMapSuns, {}, settings.physicalSky || settings.sunDisc, Text("lighting.map_sun_reason"));
+        SliderRow("lighting.night_brightness", settings.nightBrightness, RangeOf(&Settings::nightBrightness), settings.physicalSky, physicalSkyReason);
         SwitchRow("lighting.sun_disc", settings.sunDisc);
         SliderRow("lighting.sun_size", settings.sunSize, RangeOf(&Settings::sunSize), settings.sunDisc, Text("lighting.sun_size_reason"));
         StrengthRow("lighting.volumetric_light", &settings.volumetricLight, settings.volumetricIntensity, RangeOf(&Settings::volumetricIntensity));
         SwitchRow("lighting.fog", settings.fog);
+        widgets::EndRows();
+    }
+    widgets::EndCard();
+
+    widgets::BeginCard("##night", Text("lighting.section_night_sky"));
+    if (widgets::BeginRows("night")) {
+        const bool sky = settings.physicalSky;
+        const char* const skyReason = Text("lighting.physical_sky_reason");
+        const bool stars = sky && settings.stars;
+        const char* const starsReason = sky ? Text("lighting.stars_reason") : skyReason;
+        SwitchRow("lighting.stars", settings.stars, sky, skyReason);
+        SliderRow("lighting.star_amount", settings.starAmount, RangeOf(&Settings::starAmount), stars, starsReason);
+        SliderRow("lighting.faintest_stars", settings.faintestStars, RangeOf(&Settings::faintestStars), stars, starsReason);
+        SliderRow("lighting.star_brightness", settings.starBrightness, RangeOf(&Settings::starBrightness), stars, starsReason);
+        StrengthRow("lighting.twinkling", &settings.twinkling, settings.twinkleStrength, RangeOf(&Settings::twinkleStrength), stars, starsReason);
+        SliderRow("lighting.twinkle_speed", settings.twinkleSpeed, RangeOf(&Settings::twinkleSpeed), stars && settings.twinkling,
+            stars ? Text("lighting.twinkling_reason") : starsReason);
+        StrengthRow("lighting.milky_way", &settings.milkyWay, settings.milkyWayBrightness, RangeOf(&Settings::milkyWayBrightness), sky, skyReason);
+        SwitchRow("lighting.shooting_stars", settings.shootingStars, sky, skyReason);
+        SliderRow("lighting.shooting_star_frequency", settings.shootingStarFrequency, RangeOf(&Settings::shootingStarFrequency), sky && settings.shootingStars,
+            sky ? Text("lighting.shooting_stars_reason") : skyReason);
+        SwitchRow("lighting.satellites", settings.satellites, sky, skyReason);
         widgets::EndRows();
     }
     widgets::EndCard();

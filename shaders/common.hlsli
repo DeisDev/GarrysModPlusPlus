@@ -163,7 +163,9 @@ struct FrameConstants
     uint nrdValidationView;
     // Shadow rays over the sun's disc for the viewmodel's pixels (shaders/direct.hlsl).
     uint viewmodelShadowRays;
-    uint padding;
+    // What the sky shows beyond its atmosphere (NightSkyConstants in shaders/night_sky.hlsli) to rays that leave the
+    // map, or kNoView.
+    uint nightSkyView;
     // The map's bodies of water (shaders/water_body.hlsli), each BSP leaf's body, their normal maps' frames and the
     // highest surface; the body holding the eye (kNoView in air), the clock their normal maps animate by, and the main
     // view's caustics (shaders/caustics.hlsl) over the square from causticsOrigin, 1 / causticsInvSize across.
@@ -188,6 +190,14 @@ struct FrameConstants
     uint brushWaterFirst;
     float2 coarseCausticsOrigin;
     uint2 padding5;
+    // How the baked bounce light's sun and sky parts (shaders/baked.hlsli) scale: the sun's and sky's light now over
+    // what they were baked with.
+    float3 bakedSunScale;
+    float bakedSkyScale;
+    // The 2D sky's motion since the last main view (shaders/primary.hlsl): the rows of the turn from this view's
+    // directions to last view's, for the directions within skyMotionDisc.w (a cosine) of skyMotionDisc.xyz.
+    float4 skyMotion[3];
+    float4 skyMotionDisc;
     uint4 lightWarpViews[16];
 };
 

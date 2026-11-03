@@ -47,6 +47,7 @@ void main(uint3 id : SV_DispatchThreadID)
     float4 surface = SurfaceAt(g_frame.surfaceView, pixel);
     float depth = DepthAt(pixel);
     float3 position = WorldPositionFromDepth(pixel, depth);
+    bool sky = depth >= 1.0;
     if (g_pass.input0 != kNoView && g_pass.step == 1) {
         RWTexture2D<float> skyboxDistance = ResourceDescriptorHeap[g_pass.input0];
         skyboxDistance[pixel] = depth < 1.0 && g_frame.worldToSky > 0.0 ? length(position - g_frame.eyePosition) / g_frame.worldToSky : 0.0;
@@ -57,10 +58,16 @@ void main(uint3 id : SV_DispatchThreadID)
         skyboxDistance.GetDimensions(skyboxSize.x, skyboxSize.y);
         int2 source = min(int2((float2(pixel) + 0.5) * float2(skyboxSize) / float2(g_frame.size)), int2(skyboxSize) - 1);
         float distance = skyboxDistance.Load(int3(source, 0));
-        if (distance > 0.0)
+        if (distance > 0.0) {
             position = g_frame.eyePosition + normalize(position - g_frame.eyePosition) * distance;
+            sky = false;
+        }
     }
     float3 previous = position;
+    // The 2D sky turns with the sun where it shows the stars or the sun's disc (FrameConstants::skyMotion).
+    float3 toSky = position - g_frame.eyePosition;
+    if (sky && dot(normalize(toSky), g_frame.skyMotionDisc.xyz) >= g_frame.skyMotionDisc.w)
+        previous = g_frame.eyePosition + float3(dot(g_frame.skyMotion[0].xyz, toSky), dot(g_frame.skyMotion[1].xyz, toSky), dot(g_frame.skyMotion[2].xyz, toSky));
     uint4 visible = uint4(kNoView, 0, 0, 0);
     uint pixelFlags = 0;
     float3 faceNormal = surface.xyz;

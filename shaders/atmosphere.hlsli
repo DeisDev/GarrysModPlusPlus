@@ -23,6 +23,20 @@ static const float kEyeHeight = 0.2;
 static const uint2 kTransmittanceSize = uint2(256, 64);
 static const uint kMultipleScatteringSize = 32;
 
+// The Sun's apparent visual magnitude (NASA's Sun fact sheet); stars, satellites and meteors are as bright as their
+// magnitudes make them against it, in the units above (sunlight of irradiance 1 outside the air).
+static const float kSunMagnitude = -26.74;
+// The radiance of a natural moonless night sky at the zenith (airglow, zodiacal light and faint stars), 22.0 visual
+// magnitudes per square arcsecond (Falchi et al. 2016), in those units per steradian: 10^(-0.4 (22.0 - kSunMagnitude))
+// over the 2.3504e-11 sr of a square arcsecond.
+static const float kNightSkyRadiance = 1.358e-9;
+
+// The irradiance of a point of light of a visual magnitude, in those units.
+float MagnitudeFlux(float magnitude)
+{
+    return exp2(-1.32877124 * (magnitude - kSunMagnitude));
+}
+
 struct Medium
 {
     float3 rayleigh;

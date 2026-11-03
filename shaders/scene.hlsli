@@ -1676,11 +1676,10 @@ bool SampleLight(LightSet set, float3 position, float3 normal, inout uint seed, 
     return true;
 }
 
-// Direct light at a hit off screen: the sun, with its shadow ray under `sunMask`, and the local lights, all from
-// `origin` off the hit's surface. `tracedSun` as SunIrradiance's `traced`.
-float3 HitDirectIrradiance(HitSurface hit, float3 origin, uint sunMask, inout uint seed, bool tracedSun = false)
+// The local lights' direct light at a hit off screen, from `origin` off the hit's surface.
+float3 HitLampIrradiance(HitSurface hit, float3 origin, inout uint seed)
 {
-    float3 irradiance = SunIrradiance(hit, origin, sunMask, tracedSun);
+    float3 irradiance = 0.0;
     LightSet set = LightSetAt(hit.position);
     // Projected lights (the flashlight) are few and bright, and each is traced: picked as one light among a cell's many,
     // their rare, heavily weighted samples were clamped (ClampSample), and the flashlight barely lit the floor under
@@ -1711,6 +1710,13 @@ float3 HitDirectIrradiance(HitSurface hit, float3 origin, uint sunMask, inout ui
         g_receiverNormal = 0.0;
     }
     return irradiance;
+}
+
+// Direct light at a hit off screen: the sun, with its shadow ray under `sunMask`, and the local lights, all from
+// `origin` off the hit's surface. `tracedSun` as SunIrradiance's `traced`.
+float3 HitDirectIrradiance(HitSurface hit, float3 origin, uint sunMask, inout uint seed, bool tracedSun = false)
+{
+    return SunIrradiance(hit, origin, sunMask, tracedSun) + HitLampIrradiance(hit, origin, seed);
 }
 
 // The light lamps and projected lights scatter in the water of `body` towards a ray along `direction` (away from the

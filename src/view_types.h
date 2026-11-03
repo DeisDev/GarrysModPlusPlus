@@ -78,11 +78,28 @@ struct EnvSun {
     float size = 0.0f;
 };
 
+// What the night sky over the procedural sky shows (SkyDraw::nightSky; kNightStars and on in shaders/sky_draw.hlsl).
+enum NightSkyPart : uint32_t { kNightStars = 1, kNightMilkyWay = 2, kNightSatellites = 4, kNightMeteors = 8 };
+inline constexpr size_t kMaxSatellites = 8;
+inline constexpr size_t kMaxMeteors = 2;
+
+// A meteor's streak (MeteorStreak in shaders/night_sky.hlsli): along the great circle from the direction it started
+// from around `axis`, from its tail's angle to its head's, and its irradiance in the atmosphere's units.
+struct Meteor {
+    std::array<float, 3> start = {};
+    std::array<float, 3> axis = {};
+    float head = 0.0f;
+    float tail = 0.0f;
+    float flux = 0.0f;
+};
+
 // What the game's 2D sky draws show in place of the game's (shaders/sky_draw.hlsl), as the last main view's lighting
 // made it: the procedural sky (`sky`, the cube skyView) and the sun's disc (`sunDisc`), which replaces env_sun's sprite.
 struct SkyDraw {
     bool sky = false;
     bool sunDisc = false;
+    // The disc is the Moon: the map's sun is the Moon (Settings::mapSun).
+    bool moon = false;
     UINT skyView = 0;
     UINT transmittanceView = 0;
     std::array<float, 3> sunDirection = {};
@@ -92,6 +109,25 @@ struct SkyDraw {
     // env_sun's sprite (EnvSun::material, EnvSun::size); no material without an env_sun.
     std::string sprite;
     float spriteSize = 0.0f;
+    // The night sky over the procedural sky (NightSkyPart bits), the local frame to the stars' frame (its rows), the clock
+    // stars twinkle by in seconds, and the satellites (direction, irradiance) and meteors in view.
+    uint32_t nightSky = 0;
+    std::array<std::array<float, 3>, 3> starFrame = {{{1.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f, 1.0f}}};
+    float starTime = 0.0f;
+    // The Milky Way's starlight, a cube in the stars' frame.
+    UINT milkyWayView = 0;
+    // How the stars look (NightSkyConstants in shaders/night_sky.hlsli): times Earth's count, the faintest magnitude
+    // drawn, times their brightness, how strongly (0 for none) and fast they twinkle; and times the Milky Way's brightness.
+    float starDensity = 1.0f;
+    float faintestStar = 10.0f;
+    float starBrightness = 1.0f;
+    float twinkleStrength = 1.0f;
+    float twinkleSpeed = 1.0f;
+    float milkyWayBrightness = 1.0f;
+    std::array<std::array<float, 4>, kMaxSatellites> satellites = {};
+    uint32_t satelliteCount = 0;
+    std::array<Meteor, kMaxMeteors> meteors = {};
+    uint32_t meteorCount = 0;
 };
 
 // The irradiance volume that lights what the game draws after the capture (shaders/probes.hlsl): kProbeGrid

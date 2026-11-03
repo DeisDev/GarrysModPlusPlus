@@ -1,6 +1,5 @@
 #include "common.hlsli"
-#include "atmosphere.hlsli"
-#include "cube.hlsli"
+#include "night_sky.hlsli"
 
 // The procedural sky that replaces the game's 2D sky (shaders/atmosphere.hlsli), in steps:
 // 0: the transmittance table (output0, kTransmittanceSize).
@@ -8,13 +7,26 @@
 // 2: the clear sky around an eye kEyeHeight above the ground, lit by sunlight of irradiance 1 from the direction in
 //    input2-4 (float bits), into a cube's faces (output0) from both tables (input0, input1).
 // 3: the game's colours (one group): the mean radiance of the game's sky (input0, the faces of the capture's cube, -1
-//    where nothing was drawn) and of step 2's sky (input1) in kBands bands of elevation, and from them each band's
-//    multiplier (output0, kBands x 1). Above the horizon a band keeps its brightness and takes the game's colour, and
-//    one scale makes the sky above the horizon as bright as the game's; below it, where the clear sky is only a ground
-//    of guessed albedo, a band takes the game's colour and brightness. Without the game's sky above the horizon the scale
-//    makes it as bright as the map's sky light.
-// 4: the procedural sky (output0, a cube's faces): step 2's sky (input0) times the multiplier of its elevation (input1),
-//    a smooth curve through the bands.
+//    where nothing was drawn) and of the sky with the map's sun (input1, step 2's sky for light_environment's sun, which
+//    the game's sky shows) in kBands bands of elevation, and from them each band's multiplier (output0, kBands x 1). The
+//    map's sky counts with the night's floor (input2, float bits), so that it still matches the game's. Above the horizon
+//    a band keeps its brightness and takes the game's colour, and one scale makes the sky above the horizon as bright as
+//    the game's; below it, where the clear sky is only a ground of guessed albedo, a band takes the game's colour and
+//    brightness. Without the game's sky above the horizon the scale makes it as bright as the map's sky light (input3,
+//    float bits: its luminance). Texel kBands: the mean luminance of the game's sky above the horizon where it was drawn
+//    (x, -1 without any), which tells night maps (Lighting::ReadMapSky).
+// 4: the procedural sky (output0, a cube's faces): step 2's sky for the sun the sky shows (input0) plus the night's floor
+//    (input3, float bits) times the sky with the map's sun (input2), times the multiplier of its elevation (input1), a
+//    smooth curve through the bands. So the sky is the game's where the sun is the map's, and darkens and reddens as the
+//    sun sets as the clear sky does, down to the floor. Alpha: log2 of how much brighter it is than the physical sky with
+//    a natural night sky's own light (kNightSkyRadiance), the gain the night sky's stars are drawn with
+//    (shaders/sky_draw.hlsl), as the eye adapted to this sky would see them. The physical sky is lit by the map's sun's
+//    irradiance in input4 (float bits): 1 for the Sun, the full Moon's for a night map's.
+// 5: the daylight table (output0, kDaylightEntries x 1), one group per entry, for the CPU (Lighting::DaylightAt): for the
+//    sun at the entry's elevation (DaylightElevation), the transmittance toward it from the eye (rgb) and the luminance
+//    of the clear sky's irradiance on a surface facing up (a), from both tables (input0, input1).
+// 6: the Milky Way's starlight in S10 units into a cube's faces (output0), in the stars' frame (MilkyWayStarlight in
+//    shaders/night_sky.hlsli).
 
 static const uint kBands = 32;
 static const uint kLanesPerBand = 8;
@@ -27,6 +39,12 @@ static const uint kTransmittanceSteps = 40;
 static const uint kMultipleScatteringSteps = 20;
 static const uint kSkySteps = 32;
 
+// The daylight table's entries span the sun's elevation from -90 to 90 degrees (kDaylightEntries in src/lighting.cpp);
+// each integrates the sky over kDaylightRings x kDaylightAzimuths directions, even in azimuth and in the cosine to the
+// zenith.
+static const uint kDaylightRings = 16;
+static const uint kDaylightAzimuths = 32;
+
 static const float kIsotropicPhase = 1.0 / (4.0 * 3.14159265);
 
 groupshared float4 g_capturedSums[kBands * kLanesPerBand];
@@ -34,6 +52,7 @@ groupshared float3 g_skySums[kBands * kLanesPerBand];
 groupshared float3 g_captured[kBands];
 groupshared float3 g_sky[kBands];
 groupshared float g_scale;
+groupshared float g_daylightSums[kBands * kLanesPerBand];
 
 struct Scattered
 {
@@ -144,7 +163,7 @@ void ColourBands(uint index)
             skyBand += g_skySums[index + l];
         }
         g_captured[band] = capturedBand.w > 0.0 ? capturedBand.rgb / capturedBand.w : -1.0;
-        g_sky[band] = skyBand / (kAzimuths * kHeights);
+        g_sky[band] = skyBand * ((1.0 + asfloat(g_pass.input2)) / (kAzimuths * kHeights));
     }
     GroupMemoryBarrierWithGroupSync();
     if (index == 0) {
@@ -152,6 +171,7 @@ void ColourBands(uint index)
         // drew, or the map's sky light over the clear sky's mean.
         float captured = 0.0;
         float drawn = 0.0;
+        float drawnWeights = 0.0;
         float all = 0.0;
         float weights = 0.0;
         for (uint b = kBands / 2; b < kBands; ++b) {
@@ -162,9 +182,12 @@ void ColourBands(uint index)
             if (g_captured[b].x >= 0.0) {
                 captured += Luminance(g_captured[b]) * weight;
                 drawn += sky;
+                drawnWeights += weight;
             }
         }
-        g_scale = captured > 0.0 && drawn > 0.0 ? captured / drawn : Luminance(g_frame.skyColor) / max(all / weights, 1e-30);
+        RWTexture2D<float4> bands = ResourceDescriptorHeap[g_pass.output0];
+        bands[uint2(kBands, 0)] = float4(drawnWeights > 0.0 ? captured / drawnWeights : -1.0, 0.0, 0.0, 1.0);
+        g_scale = captured > 0.0 && drawn > 0.0 ? captured / drawn : asfloat(g_pass.input3) / max(all / weights, 1e-30);
     }
     GroupMemoryBarrierWithGroupSync();
     if (index < kBands) {
@@ -173,10 +196,48 @@ void ColourBands(uint index)
     }
 }
 
-// Step 3 runs as one group of kBands x kLanesPerBand threads.
+float DaylightElevation(uint entry, uint entries)
+{
+    return ((entry + 0.5) / entries - 0.5) * 3.14159265;
+}
+
+void Daylight(uint entry, uint index)
+{
+    Texture2D<float4> transmittance = ResourceDescriptorHeap[g_pass.input0];
+    Texture2D<float4> multipleScattering = ResourceDescriptorHeap[g_pass.input1];
+    RWTexture2D<float4> output = ResourceDescriptorHeap[g_pass.output0];
+    uint entries, height;
+    output.GetDimensions(entries, height);
+    float elevation = DaylightElevation(entry, entries);
+    float3 sun = float3(cos(elevation), 0.0, sin(elevation));
+    float3 origin = float3(0.0, 0.0, kGroundRadius + kEyeHeight);
+    // The irradiance is the integral of radiance times the cosine z over dz and the azimuth.
+    float irradiance = 0.0;
+    [loop]
+    for (uint k = index; k < kDaylightRings * kDaylightAzimuths; k += kBands * kLanesPerBand) {
+        float z = (k / kDaylightAzimuths + 0.5) / kDaylightRings;
+        float azimuth = (k % kDaylightAzimuths + 0.5) / kDaylightAzimuths * 2.0 * 3.14159265;
+        float across = sqrt(1.0 - z * z);
+        float3 direction = float3(across * cos(azimuth), across * sin(azimuth), z);
+        irradiance += Luminance(Integrate(origin, direction, sun, kSkySteps, true, transmittance, multipleScattering).radiance) * z;
+    }
+    g_daylightSums[index] = irradiance;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint stride = kBands * kLanesPerBand / 2; stride > 0; stride /= 2) {
+        if (index < stride)
+            g_daylightSums[index] += g_daylightSums[index + stride];
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (index == 0) {
+        float total = g_daylightSums[0] * (2.0 * 3.14159265 / (kDaylightRings * kDaylightAzimuths));
+        output[uint2(entry, 0)] = float4(AtmosphereTransmittance(transmittance, g_linearClamp, origin.z, sun.z), total);
+    }
+}
+
+// Steps 3 and 5 run as groups of kBands x kLanesPerBand threads.
 [RootSignature(ROOT_SIGNATURE)]
 [numthreads(16, 16, 1)]
-void main(uint3 id : SV_DispatchThreadID, uint index : SV_GroupIndex)
+void main(uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint index : SV_GroupIndex)
 {
     if (g_pass.step == 0) {
         RWTexture2D<float4> output = ResourceDescriptorHeap[g_pass.output0];
@@ -232,9 +293,21 @@ void main(uint3 id : SV_DispatchThreadID, uint index : SV_GroupIndex)
         ColourBands(index);
         return;
     }
+    if (g_pass.step == 5) {
+        Daylight(group.x, index);
+        return;
+    }
+    if (g_pass.step == 6) {
+        RWTexture2DArray<float4> output = ResourceDescriptorHeap[g_pass.output0];
+        uint width, height, faces;
+        output.GetDimensions(width, height, faces);
+        output[id] = float4(MilkyWayStarlight(normalize(FaceDirection(id.z, (float2(id.xy) + 0.5) * (2.0 / width) - 1.0))), 1.0);
+        return;
+    }
     RWTexture2DArray<float4> output = ResourceDescriptorHeap[g_pass.output0];
     Texture2DArray<float4> sky = ResourceDescriptorHeap[g_pass.input0];
     Texture2D<float4> bands = ResourceDescriptorHeap[g_pass.input1];
+    Texture2DArray<float4> mapSky = ResourceDescriptorHeap[g_pass.input2];
     uint width, height, faces;
     output.GetDimensions(width, height, faces);
     float3 direction = normalize(FaceDirection(id.z, (float2(id.xy) + 0.5) * (2.0 / width) - 1.0));
@@ -249,5 +322,8 @@ void main(uint3 id : SV_DispatchThreadID, uint index : SV_GroupIndex)
     [unroll]
     for (int k = 0; k < 4; ++k)
         multiplier += weights[k] * bands.Load(int3(clamp(first + k, 0, int(kBands) - 1), 0, 0)).rgb;
-    output[id] = float4(min(sky.Load(int4(id, 0)).rgb * multiplier, 65504.0), 1.0);
+    float3 clear = sky.Load(int4(id, 0)).rgb;
+    float3 radiance = min((clear + asfloat(g_pass.input3) * mapSky.Load(int4(id, 0)).rgb) * multiplier, 65504.0);
+    float gain = Luminance(radiance) / (Luminance(clear) * asfloat(g_pass.input4) + kNightSkyRadiance);
+    output[id] = float4(radiance, log2(max(gain, 1e-30)));
 }

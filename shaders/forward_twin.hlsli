@@ -132,7 +132,7 @@ bool ForwardRayHit(float3 origin, float3 direction, out ForwardSurface surface, 
     HitInfo hitInfo;
     uint mask = g_frame.traceMask | ((g_frame.traceMask & kSkyboxMask) == 0 ? kWaterMask : 0u);
     if (!TraceClosest(origin, direction, kMaxDistance, mask, hit, hitInfo)) {
-        radiance = BeyondMap(origin, direction, 1.0, 0.002);
+        radiance = BeyondMap(origin, direction, 1.0, 0.002, true, true);
         return false;
     }
     if ((hit.flags & kInstanceWater) != 0) {

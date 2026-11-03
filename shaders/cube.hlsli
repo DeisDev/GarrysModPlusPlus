@@ -14,22 +14,27 @@ float3 FaceDirection(uint face, float2 uv)
     }
 }
 
-// The texel (x, y, face) of a size x size cube that a direction passes through; the inverse of FaceDirection.
-uint3 CubeTexel(float3 direction, uint size)
+// The face a direction passes through and where, (u, v) in [-1, 1]; the inverse of FaceDirection.
+float2 CubeFaceUv(float3 direction, out uint face)
 {
     float3 a = abs(direction);
-    uint face;
-    float2 uv;
     if (a.x >= a.y && a.x >= a.z) {
         face = direction.x > 0.0 ? 0 : 1;
-        uv = float2(direction.x > 0.0 ? -direction.z : direction.z, -direction.y) / a.x;
-    } else if (a.y >= a.z) {
-        face = direction.y > 0.0 ? 2 : 3;
-        uv = float2(direction.x, direction.y > 0.0 ? direction.z : -direction.z) / a.y;
-    } else {
-        face = direction.z > 0.0 ? 4 : 5;
-        uv = float2(direction.z > 0.0 ? direction.x : -direction.x, -direction.y) / a.z;
+        return float2(direction.x > 0.0 ? -direction.z : direction.z, -direction.y) / a.x;
     }
+    if (a.y >= a.z) {
+        face = direction.y > 0.0 ? 2 : 3;
+        return float2(direction.x, direction.y > 0.0 ? direction.z : -direction.z) / a.y;
+    }
+    face = direction.z > 0.0 ? 4 : 5;
+    return float2(direction.z > 0.0 ? direction.x : -direction.x, -direction.y) / a.z;
+}
+
+// The texel (x, y, face) of a size x size cube that a direction passes through.
+uint3 CubeTexel(float3 direction, uint size)
+{
+    uint face;
+    float2 uv = CubeFaceUv(direction, face);
     return uint3(min(uint2((uv * 0.5 + 0.5) * float(size)), size - 1), face);
 }
 

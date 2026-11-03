@@ -1,6 +1,7 @@
 #ifndef GMODPP_REFLECTION_HLSLI
 #define GMODPP_REFLECTION_HLSLI
 
+#include "night_sky.hlsli"
 #include "radiance_cache.hlsli"
 
 // Radiance along reflected rays, shared by the reflections pass and water (shaders/water.hlsli).
@@ -9,18 +10,40 @@ static const float kMaxDistance = 16384.0;
 // Ray Reconstruction's hit distance for reflections of the sky.
 static const float kSkyHitDistance = 65504.0;
 
+// The 2D sky toward a ray whose cone widens by `coneSpread`, before the tonemap scale, with `night` the night sky over it
+// as the sky's draw shows it, and with `disc` the sun's or Moon's disc while the cone is narrower than it: for mirrors no
+// highlight lights (water's glint and Phong highlights already show the sun).
+float3 SkyBeyond(float3 direction, float coneSpread, bool night, bool disc)
+{
+    float3 radiance = SkyRadiance(direction);
+    if (g_frame.nightSkyView == kNoView || (!night && !disc))
+        return radiance;
+    StructuredBuffer<NightSkyConstants> constants = ResourceDescriptorHeap[g_frame.nightSkyView];
+    NightSkyConstants beyond = constants[0];
+    Texture2D<float4> transmittance = ResourceDescriptorHeap[beyond.transmittanceView];
+    if (night && beyond.parts != 0) {
+        TextureCube<float4> sky = ResourceDescriptorHeap[g_frame.skyCubeView];
+        float logGain = sky.SampleLevel(g_linearClamp, direction, 0.0).a;
+        radiance += NightSkyLight(beyond, direction, logGain, kPointFootprint * coneSpread, g_frame.tonemapScale, transmittance, g_linearClamp);
+    }
+    if (disc && beyond.disc != 0) {
+        float narrow = saturate(2.0 - coneSpread / beyond.sunRadius);
+        radiance += SunDisc(beyond, direction, coneSpread, transmittance, g_linearClamp) * (narrow / g_frame.tonemapScale);
+    }
+    return radiance;
+}
+
 // What a ray that leaves the map sees: as the game draws the 3D skybox behind the map, the ray goes on from the matching
 // point of the skybox (as SunVisibility's do), textured, lit by the sun and the sky and in the skybox's fog, and past it
-// the 2D sky. The ray's cone is `coneWidth` across at `origin` and widens by `coneSpread` per unit of length.
-float3 BeyondMap(float3 origin, float3 direction, float coneWidth, float coneSpread)
+// the 2D sky (SkyBeyond, with `night` and `disc`). The ray's cone is `coneWidth` across at `origin` and widens by
+// `coneSpread` per unit of length.
+float3 BeyondMap(float3 origin, float3 direction, float coneWidth, float coneSpread, bool night = true, bool disc = false)
 {
-    if (g_frame.worldToSky <= 0.0 || (g_frame.traceMask & kSkyboxMask) != 0)
-        return SkyRadiance(direction);
-    float3 skyOrigin = float3(g_frame.skyCameraX, g_frame.skyCameraY, g_frame.skyCameraZ) + origin * g_frame.worldToSky;
     HitSurface hit;
     HitInfo hitInfo;
-    if (!TraceClosest(skyOrigin, direction, kMaxDistance, kSkyboxMask, hit, hitInfo))
-        return SkyRadiance(direction);
+    float3 skyOrigin = float3(g_frame.skyCameraX, g_frame.skyCameraY, g_frame.skyCameraZ) + origin * g_frame.worldToSky;
+    if (g_frame.worldToSky <= 0.0 || (g_frame.traceMask & kSkyboxMask) != 0 || !TraceClosest(skyOrigin, direction, kMaxDistance, kSkyboxMask, hit, hitInfo))
+        return SkyBeyond(direction, coneSpread, night, disc);
     float distance = length(hit.position - skyOrigin);
     // Untextured, alpha-tested tree cards took their texture's average, grey from its clear texels, and shone white.
     hit.albedo = TexturedAlbedo(hitInfo, hit.albedo, coneWidth * g_frame.worldToSky + coneSpread * distance);
@@ -82,15 +105,16 @@ float PixelAngle()
 
 // The light along one ray from a water surface, for SeenWater: its first hit, textured and lit by the radiance cache
 // where the ray's cone is wide enough for it, else by the sun, one local light and the indirect light volume (or the
-// sky's light), or the sky and 3D skybox (BeyondMap). `seed` is fixed by the
-// caller, so the same point always takes the same light. `distance` is the hit's distance, kSkyHitDistance for none.
+// sky's light), or the sky and 3D skybox (BeyondMap) without the night sky: a second copy of it, inlined where forward
+// twins see water, cost them compile time for stars seen in water in mirrors and glass. `seed` is fixed by the caller, so
+// the same point always takes the same light. `distance` is the hit's distance, kSkyHitDistance for none.
 float3 WaterRayRadiance(float3 origin, float3 direction, float coneWidth, uint seed, out float distance)
 {
     HitSurface hit;
     HitInfo hitInfo;
     if (!TraceClosest(origin, direction, kMaxDistance, g_frame.traceMask & ~kWaterMask, hit, hitInfo)) {
         distance = kSkyHitDistance;
-        return BeyondMap(origin, direction, coneWidth, PixelAngle());
+        return BeyondMap(origin, direction, coneWidth, PixelAngle(), false);
     }
     distance = hitInfo.t;
     hit.albedo = TexturedAlbedo(hitInfo, hit.albedo, coneWidth);
@@ -161,16 +185,17 @@ float3 SeenWater(float3 position, float3 direction, uint instance, uint primitiv
 // The light along a reflected ray. Its cone is `coneWidth` across at the origin and widens by `coneSpread` per unit of
 // length: where it is wide enough for the radiance cache's voxels the cache gives the hit's light; elsewhere the hit is
 // lit where it is (LiveHitRadiance). `mask` is what the ray meets; with kWaterMask, water surfaces (SeenWater).
-// `hitAlbedo` is the textured albedo of the surface it meets (0 for the sky and water). `tracedSun` as LiveHitRadiance's.
+// `hitAlbedo` is the textured albedo of the surface it meets (0 for the sky and water). `tracedSun` as LiveHitRadiance's,
+// `disc` as SkyBeyond's.
 float3 ReflectedRadiance(float3 origin, float3 direction, float coneWidth, float coneSpread, uint mask, inout uint seed, out float hitDistance,
-    out float3 hitAlbedo, bool tracedSun = false)
+    out float3 hitAlbedo, bool tracedSun = false, bool disc = false)
 {
     HitSurface hit;
     HitInfo hitInfo;
     hitAlbedo = 0.0;
     if (!TraceClosest(origin, direction, kMaxDistance, mask, hit, hitInfo)) {
         hitDistance = kSkyHitDistance;
-        return BeyondMap(origin, direction, coneWidth, coneSpread);
+        return BeyondMap(origin, direction, coneWidth, coneSpread, true, disc);
     }
     hitDistance = hitInfo.t;
     if ((hit.flags & kInstanceWater) != 0)

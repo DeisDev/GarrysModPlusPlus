@@ -190,12 +190,15 @@ static_assert(sizeof(BakedTriangle) == 32);
 
 // The format of the baked light cache (gmodplusplus\cacheaked): bump when shaders/baked_bounce.hlsl or the data it
 // reads changes.
-inline constexpr uint32_t kBakeVersion = 16;
+inline constexpr uint32_t kBakeVersion = 17;
+// The parts baked light is kept in, one after another (kBakedParts in shaders/baked.hlsli): from the sun, the sky and the
+// lamps.
+inline constexpr uint32_t kBakedParts = 3;
 
 // The map's baked bounce light on the GPU (indirect_lighting = 1): raw views of the lightmap layout of
 // bsp::BakedLighting and of the world's BakedTriangles; the bounce light shaders/baked_bounce.hlsl traces per lightmap
-// sample as half4, then filters within each face; and the leaf ambient samples, whose cubes it traces in place. The
-// cache holds the filtered light, then the ambient samples.
+// sample as half4, then filters within each face; and the leaf ambient samples, whose cubes it traces in place. Light
+// and samples are kept in kBakedParts parts. The cache holds the filtered light, then the ambient samples.
 struct BakedBuffers {
     UINT facesView = DescriptorHeap::kInvalid;
     UINT trianglesView = DescriptorHeap::kInvalid;

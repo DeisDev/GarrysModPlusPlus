@@ -1,27 +1,21 @@
-#include "atmosphere.hlsli"
-#include "dither.hlsli"
+#include "night_sky.hlsli"
 
-// The game's 2D sky passes drawn with the procedural sky (SkyMain), or the sun's disc added over the game's own sky
-// (DiscMain), in place of the game's pixel shader (src/shaderapi_pipelines.cpp, DrawSky). The translated vertex shader
-// still places the faces; the constants come through the forward twins' root parameter (register space 1).
+// The game's 2D sky passes drawn with the procedural sky and its night sky (SkyMain), or the sun's disc added over the
+// game's own sky (DiscMain), in place of the game's pixel shader (src/shaderapi_pipelines.cpp, DrawSky). The translated
+// vertex shader still places the faces; the constants come through the forward twins' root parameter (register space 1).
 struct SkyDrawConstants
 {
     // Clip space to world space for the draw: the inverse of its view-projection rows (vertex c8-c11) as drawn.
     row_major float4x4 clipToWorld;
     // The viewport's left, top, width and height in pixels.
     float4 viewport;
-    float3 sunDirection;
     // cLightScale.x of the game's sky shader, which Source multiplies its colour by.
     float tonemapScale;
-    // env_sun's colour, its largest component 1.
-    float3 sunColor;
     uint skyView;
-    uint transmittanceView;
-    uint sunDisc;
-    // The disc's angular radius in radians.
-    float sunRadius;
     // How the target stores colour: 0 floating point, 1 8-bit, 2 8-bit sRGB.
     uint target;
+    uint padding;
+    NightSkyConstants night;
 };
 
 ConstantBuffer<SkyDrawConstants> g_sky : register(b0, space1);
@@ -69,33 +63,25 @@ float3 ViewDirection(float2 pixel)
     return normalize(farPoint.xyz / farPoint.w - nearPoint.xyz / nearPoint.w);
 }
 
-// The sun's disc in a direction. It is thousands of times brighter than the sky, so it is shown as bright as the target
-// holds, in the colour the atmosphere leaves it (env_sun's tint times the transmittance toward it), with Allen's limb
-// darkening at 550 nm (I / I0 = 0.3 + 0.93 mu - 0.23 mu^2; Cox, Allen's Astrophysical Quantities, 2000). Its edge
-// covers the share of the pixel inside it, and the ground hides it below the horizon.
-float3 SunDisc(float3 direction)
+// The angle a pixel spans around the direction through it.
+float PixelAngle(float2 pixel, float3 direction)
 {
-    float3 sun = g_sky.sunDirection;
-    float angle = atan2(length(cross(direction, sun)), dot(direction, sun));
-    float coverage = saturate((g_sky.sunRadius - angle) / max(fwidth(angle), 1e-7) + 0.5);
-    float3 eye = float3(0.0, 0.0, kGroundRadius + kEyeHeight);
-    if (coverage <= 0.0 || SphereDistance(eye, direction, kGroundRadius) >= 0.0)
-        return 0.0;
-    Texture2D<float4> transmittance = ResourceDescriptorHeap[g_sky.transmittanceView];
-    float3 color = g_sky.sunColor * AtmosphereTransmittance(transmittance, g_linearClamp, eye.z, sun.z);
-    color /= max(max(color.r, max(color.g, color.b)), 1e-6);
-    float r = saturate(angle / g_sky.sunRadius);
-    float mu = sqrt(1.0 - r * r);
-    return color * ((0.3 + 0.93 * mu - 0.23 * mu * mu) * coverage);
+    return sqrt(length(ViewDirection(pixel + float2(1.0, 0.0)) - direction) * length(ViewDirection(pixel + float2(0.0, 1.0)) - direction));
 }
 
 float4 SkyMain(Interpolants input) : SV_Target0
 {
     float3 direction = ViewDirection(input.position.xy);
+    float pixelAngle = PixelAngle(input.position.xy, direction);
     TextureCube<float4> sky = ResourceDescriptorHeap[g_sky.skyView];
-    float3 color = sky.SampleLevel(g_linearClamp, direction, 0.0).rgb * g_sky.tonemapScale;
-    if (g_sky.sunDisc != 0)
-        color += SunDisc(direction);
+    Texture2D<float4> transmittance = ResourceDescriptorHeap[g_sky.night.transmittanceView];
+    float4 procedural = sky.SampleLevel(g_linearClamp, direction, 0.0);
+    float3 color = procedural.rgb;
+    if (g_sky.night.parts != 0)
+        color += NightSkyLight(g_sky.night, direction, procedural.a, kPointFootprint * pixelAngle, g_sky.tonemapScale, transmittance, g_linearClamp);
+    color *= g_sky.tonemapScale;
+    if (g_sky.night.disc != 0)
+        color += SunDisc(g_sky.night, direction, pixelAngle, transmittance, g_linearClamp);
     // An 8-bit target rounds the sky's smooth gradients, after encoding them as sRGB when it does.
     if (g_sky.target != 0) {
         float noise = DitherNoise(uint2(input.position.xy)) / 255.0;
@@ -106,5 +92,7 @@ float4 SkyMain(Interpolants input) : SV_Target0
 
 float4 DiscMain(Interpolants input) : SV_Target0
 {
-    return float4(SunDisc(ViewDirection(input.position.xy)), 0.0);
+    float3 direction = ViewDirection(input.position.xy);
+    Texture2D<float4> transmittance = ResourceDescriptorHeap[g_sky.night.transmittanceView];
+    return float4(SunDisc(g_sky.night, direction, PixelAngle(input.position.xy, direction), transmittance, g_linearClamp), 0.0);
 }

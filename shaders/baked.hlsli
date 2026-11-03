@@ -4,7 +4,11 @@
 #include "scene.hlsli"
 
 // The baked bounce light of indirect_lighting = 1 (src/bsp.h BakedLighting, src/scene.h BakedBuffers), which
-// shaders/baked_bounce.hlsl traces into the map's style-0 lightmap layout and leaf ambient samples.
+// shaders/baked_bounce.hlsl traces into the map's style-0 lightmap layout and leaf ambient samples, in kBakedParts parts
+// one after another: the light that came from the sun, from the sky and from the map's lamps and glowing surfaces. The
+// first two follow the sun and sky as they are now (FrameConstants::bakedSunScale and bakedSkyScale), so day and night
+// and the strength settings change them; the lamps' stays as baked.
+static const uint kBakedParts = 3;
 
 // Mirrors bsp::FaceLightmap in src/bsp.h.
 struct FaceLightmap
@@ -67,6 +71,20 @@ FaceLightmap LoadFace(uint view, uint face)
     return faces.Load<FaceLightmap>(face * 96);
 }
 
+// The parts of baked light added up as the sun and sky are now.
+float3 DaylitLight(float3 sun, float3 sky, float3 lamps)
+{
+    return sun * g_frame.bakedSunScale + sky * g_frame.bakedSkyScale + lamps;
+}
+
+// The lightmap samples in each part of a baked light buffer.
+uint BakedPartSamples(ByteAddressBuffer light)
+{
+    uint bytes;
+    light.GetDimensions(bytes);
+    return bytes / (8 * kBakedParts);
+}
+
 // ColorRGBExp32: c * 2^exponent / 255 (TexLightToLinear in mathlib/mathlib.h).
 float3 DecodeSample(uint packed)
 {
@@ -101,14 +119,20 @@ float3 BumpWeights(FaceLightmap face, float3 normal)
     return weights / max(dot(weights, 1.0), 1e-4);
 }
 
+// A lightmap sample's baked light, its parts added up as the sun and sky are now; `part` samples to a part.
+float3 DaylitSample(ByteAddressBuffer light, uint sample, uint part)
+{
+    return DaylitLight(LoadLuxelLight(light, sample), LoadLuxelLight(light, part + sample), LoadLuxelLight(light, 2 * part + sample));
+}
+
 // One luxel's baked light for a normal: the flat lightmap's, or the bump lightmaps' mixed by `weights`.
-float3 LuxelLight(ByteAddressBuffer light, FaceLightmap face, uint luxel, float3 weights)
+float3 LuxelLight(ByteAddressBuffer light, uint part, FaceLightmap face, uint luxel, float3 weights)
 {
     if (face.bumped == 0)
-        return LoadLuxelLight(light, face.sample + luxel);
+        return DaylitSample(light, face.sample + luxel, part);
     uint luxels = face.width * face.height;
-    return weights.x * LoadLuxelLight(light, face.sample + luxels + luxel) + weights.y * LoadLuxelLight(light, face.sample + 2 * luxels + luxel) +
-        weights.z * LoadLuxelLight(light, face.sample + 3 * luxels + luxel);
+    return weights.x * DaylitSample(light, face.sample + luxels + luxel, part) + weights.y * DaylitSample(light, face.sample + 2 * luxels + luxel, part) +
+        weights.z * DaylitSample(light, face.sample + 3 * luxels + luxel, part);
 }
 
 // The baked indirect light at a G-buffer pixel that shows the world, read bilinearly from its face's luxels as
@@ -130,16 +154,17 @@ float3 BakedIrradiance(int2 pixel, float3 normal)
     uint2 high = min(low + 1, uint2(last));
     float2 f = saturate(coord - float2(low));
     ByteAddressBuffer light = ResourceDescriptorHeap[g_frame.bakedLightView];
+    uint part = BakedPartSamples(light);
     float3 weights = face.bumped != 0 ? BumpWeights(face, normal) : 0.0;
-    float3 a = LuxelLight(light, face, low.y * face.width + low.x, weights);
-    float3 b = LuxelLight(light, face, low.y * face.width + high.x, weights);
-    float3 c = LuxelLight(light, face, high.y * face.width + low.x, weights);
-    float3 d = LuxelLight(light, face, high.y * face.width + high.x, weights);
+    float3 a = LuxelLight(light, part, face, low.y * face.width + low.x, weights);
+    float3 b = LuxelLight(light, part, face, low.y * face.width + high.x, weights);
+    float3 c = LuxelLight(light, part, face, high.y * face.width + low.x, weights);
+    float3 d = LuxelLight(light, part, face, high.y * face.width + high.x, weights);
     return lerp(lerp(a, b, f.x), lerp(c, d, f.x), f.y);
 }
 
 // The leaf ambient cube at a point: its leaf's samples, weighted by inverse squared distance as the engine weights
-// them. False where the leaf has no samples.
+// them, their parts added up as the sun and sky are now. False where the leaf has no samples.
 bool LeafAmbientCube(float3 position, out float3 cube[6])
 {
     for (uint side = 0; side < 6; ++side)
@@ -152,13 +177,18 @@ bool LeafAmbientCube(float3 position, out float3 cube[6])
     if (range.y == 0)
         return false;
     ByteAddressBuffer samples = ResourceDescriptorHeap[g_frame.ambientSamplesView];
+    uint bytes;
+    samples.GetDimensions(bytes);
+    uint part = bytes / (112 * kBakedParts);
     float weights = 0.0;
     for (uint i = 0; i < range.y; ++i) {
-        AmbientSample sample = samples.Load<AmbientSample>((range.x + i) * 112);
-        float3 offset = sample.position.xyz - position;
+        AmbientSample sun = samples.Load<AmbientSample>((range.x + i) * 112);
+        AmbientSample sky = samples.Load<AmbientSample>((part + range.x + i) * 112);
+        AmbientSample lamps = samples.Load<AmbientSample>((2 * part + range.x + i) * 112);
+        float3 offset = sun.position.xyz - position;
         float weight = 1.0 / max(dot(offset, offset), 1.0);
         for (uint s = 0; s < 6; ++s)
-            cube[s] += sample.cube[s].rgb * weight;
+            cube[s] += DaylitLight(sun.cube[s].rgb, sky.cube[s].rgb, lamps.cube[s].rgb) * weight;
         weights += weight;
     }
     for (uint s = 0; s < 6; ++s)

@@ -2,6 +2,7 @@
 
 #include "d3d12_device.h"
 #include "dlss.h"
+#include "night_sky.h"
 #include "nrd_denoiser.h"
 #include "restir.h"
 #include "scene.h"
@@ -154,7 +155,8 @@ struct FrameConstants {
     uint32_t nrdValidationView;
     // Settings::viewmodelShadowRays.
     uint32_t viewmodelShadowRays;
-    uint32_t padding;
+    // What the sky shows beyond its atmosphere (NightSkyConstants) to rays that leave the map, or kInvalidView.
+    uint32_t nightSkyView;
     // The map's bodies of water (Scene::Water), each BSP leaf's body, the normal map frames they animate through, and the
     // highest surface; the body holding the eye (kInvalidView in air), the clock their normal maps animate by, and the
     // main view's caustics (shaders/caustics.hlsl) over the square from causticsOrigin, 1 / causticsInvSize across.
@@ -179,6 +181,14 @@ struct FrameConstants {
     uint32_t brushWaterFirst;
     float coarseCausticsOrigin[2];
     uint32_t padding5[2];
+    // How the baked bounce light's sun and sky parts scale: the sun's and sky's light now over what BakeStep bakes with.
+    float bakedSunScale[3];
+    float bakedSkyScale;
+    // The 2D sky's motion since the last main view (shaders/primary.hlsl): the rows of the turn from this view's
+    // directions to last view's, for the directions within skyMotionDisc[3] (a cosine; 2 for none, -2 for all) of
+    // skyMotionDisc's direction.
+    float skyMotion[3][4];
+    float skyMotionDisc[4];
     uint32_t lightWarpViews[64];
 };
 
@@ -311,6 +321,10 @@ public:
         m_historyValid = false;
         m_probeHistoryValid = false;
         m_cacheClear = true;
+        m_nightSky.Reset();
+        m_loggedLowMapSun = false;
+        m_nightMap.reset();
+        m_mapSkyReadbackPending = {};
     }
     // Whether the last main view filled the irradiance volume for translucent surfaces, and the volume's first cell.
     bool VolumeReady() const { return m_volumeReady; }
@@ -435,10 +449,34 @@ private:
     // A cube `size` texels a side: srv views it as a cube, uav and `faces` (an SRV, when given) as an array of its faces.
     bool CreateCube(Texture& texture, UINT size, DXGI_FORMAT format, UINT* faces);
     bool CreateSkyLight();
+    // Makes the procedural sky's tables (shaders/sky_atmosphere.hlsl) on the slot's allocator before the view records,
+    // and reads the daylight table back, waiting for the GPU. Once; false (and m_atmosphereFailed) when it cannot.
+    bool MakeAtmosphereTables(UINT slot, D3D12_GPU_VIRTUAL_ADDRESS frameConstants);
+    // Whether the physical sky replaces the game's sky in a view: it needs the tables, the map's sun above the horizon
+    // (light_environment's, which the game's sky was made for) and the game's sky to take its colours from.
+    bool ShowsPhysicalSky(const ViewInputs& inputs, const Scene& scene) const;
+    // The daylight table at the sun's height (the z of its direction): the transmittance toward it from the eye (rgb) and
+    // the clear sky's irradiance on a surface facing up (luminance).
+    std::array<float, 4> DaylightAt(float sunZ) const;
+    // What day and night make of the map's light with the physical sky: its sky light scales with the clear sky's
+    // irradiance under the sun the sky shows against that under the map's sun, down to the night's floor, and the
+    // sunlight with the transmittance toward the sun it shines from (`constants`) against that toward the map's sun.
+    struct Daylight {
+        float sky = 1.0f;
+        std::array<float, 3> sun = {1.0f, 1.0f, 1.0f};
+    };
+    std::optional<Daylight> DaylightFor(const FrameConstants& constants, const ViewInputs& inputs, const Scene& scene) const;
+    // Whether the map's sun is the Moon: Settings::mapSun, or with Auto a night map (m_nightMap).
+    bool MapSunIsMoon() const;
+    // Reads the slot's copy of how bright the game's sky is above the horizon, and from it whether the map is a night map.
+    void ReadMapSky(UINT slot);
+    // Writes m_skyDraw's night sky and disc for rays that leave the map into the slot's NightSkyConstants and points
+    // `constants` at them; false when their buffer cannot be made (logged once).
+    bool WriteNightSky(UINT slot, FrameConstants& constants);
     // Makes what the main view's 2D sky shows (shaders/sky_atmosphere.hlsl): with the physical sky, the procedural sky
-    // in the game's colours, which `constants` then read in place of the game's sky; with the sun's disc, what draws it.
-    // Publishes both in m_skyDraw.
-    void RecordSky(FrameConstants& constants, const ViewInputs& inputs, const Scene& scene);
+    // in the game's colours, which `constants` then read in place of the game's sky, and its night sky; with the sun's
+    // disc, what draws it. Publishes both in m_skyDraw.
+    void RecordSky(FrameConstants& constants, const ViewInputs& inputs, const Scene& scene, UINT slot);
     // Writes each body of water's surface as the game last drew it (the draw whose fog colour is the body's) into the
     // slot's m_waterDraws, with views of their normal maps from `firstView` on, and points `constants` at them.
     void WriteWaterDraws(UINT slot, const ViewInputs& inputs, const Scene& scene, UINT firstView, FrameConstants& constants);
@@ -579,21 +617,44 @@ private:
     // (uav) and a cube (srv); ready once a main view has made it.
     Texture m_skyLight;
     bool m_skyLightReady = false;
-    // The procedural sky (shaders/sky_atmosphere.hlsl): the atmosphere's transmittance and multiple scattering tables,
-    // made once; the clear sky for m_atmosphereSun (faces m_atmosphereSkyFaces); the colour bands taken from the game's
-    // sky; and the sky that replaces it (faces m_proceduralSkyFaces), ready once a main view has made it this map.
+    // The procedural sky (shaders/sky_atmosphere.hlsl): the atmosphere's transmittance and multiple scattering tables and
+    // the daylight table (m_daylight, on the CPU), made once; the clear sky for m_atmosphereSun (faces
+    // m_atmosphereSkyFaces) and for the map's sun m_mapSkySun (faces m_mapSkyFaces); the colour bands taken from the
+    // game's sky; and the sky that replaces it (faces m_proceduralSkyFaces), ready once a main view has made it this map.
     Texture m_transmittance;
     Texture m_multipleScattering;
+    std::vector<std::array<float, 4>> m_daylight;
+    // The Milky Way's starlight in the stars' frame (shaders/sky_atmosphere.hlsl, step 6), made with the tables.
+    Texture m_milkyWay;
     Texture m_atmosphereSky;
     UINT m_atmosphereSkyFaces = DescriptorHeap::kInvalid;
+    Texture m_mapSky;
+    UINT m_mapSkyFaces = DescriptorHeap::kInvalid;
     Texture m_skyBands;
     Texture m_proceduralSky;
     UINT m_proceduralSkyFaces = DescriptorHeap::kInvalid;
     bool m_atmosphereFailed = false;
     bool m_atmosphereTables = false;
     std::optional<std::array<float, 3>> m_atmosphereSun;
+    std::optional<std::array<float, 3>> m_mapSkySun;
     bool m_proceduralSkyReady = false;
+    bool m_loggedLowMapSun = false;
+    // Per slot: the mean luminance of the game's sky above the horizon (m_skyBands' last texel) on its way to the CPU, and
+    // the tonemap scale it was shown with. Whether the map is a night map, once its sky has been read this map.
+    std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, kSlots> m_mapSkyReadback;
+    std::array<float, kSlots> m_mapSkyReadbackTonemap = {};
+    std::array<bool, kSlots> m_mapSkyReadbackPending = {};
+    std::optional<bool> m_nightMap;
+    // Per slot: what the last main view's sky shows beyond its atmosphere, for rays that leave the map
+    // (FrameConstants::nightSkyView), and the view the last main view wrote (kInvalid without one).
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_nightSkyConstants;
+    std::byte* m_nightSkyMapped = nullptr;
+    std::array<UINT, kSlots> m_nightSkyViews = {};
+    UINT m_nightSkyView = DescriptorHeap::kInvalid;
+    bool m_nightSkyFailed = false;
     gbuffer::SkyDraw m_skyDraw;
+    // The stars' frame, satellites and meteors of the physical sky's night.
+    NightSky m_nightSky;
     // The main view's caustics and the water's sun maps (shaders/caustics.hlsl): the photon counts, how much the water
     // focuses sunlight over the square from m_causticsOrigin, 1 / m_causticsInvSize across, and the sun maps of that
     // square and of the coarse one that covers the map; ready once a main view has traced them this map.

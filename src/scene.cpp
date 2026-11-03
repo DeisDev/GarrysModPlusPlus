@@ -736,9 +736,12 @@ bool Scene::LoadBaked(const bsp::BakedLighting& baked, std::span<const BakedTria
     leafAmbient.resize((leafAmbient.size() + 3) & ~size_t(3));
     m_baked.leafAmbientView = upload(leafAmbient.data(), leafAmbient.size() * sizeof(uint32_t));
     const UINT trianglesView = upload(triangles.data(), triangles.size() * sizeof(BakedTriangle));
-    // A half4 per lightmap sample, the samples padded as the views need.
-    const UINT64 lightBytes = static_cast<UINT64>((baked.samples.size() + 3) & ~size_t(3)) * 8;
-    const size_t ambientBytes = baked.ambientSamples.size() * sizeof(bsp::AmbientSample);
+    // A half4 per lightmap sample and part, the samples padded as the views need, and the ambient samples once per part.
+    const UINT64 lightBytes = static_cast<UINT64>((baked.samples.size() + 3) & ~size_t(3)) * 8 * kBakedParts;
+    std::vector<bsp::AmbientSample> ambientParts;
+    for (uint32_t part = 0; part < kBakedParts; ++part)
+        ambientParts.insert(ambientParts.end(), baked.ambientSamples.begin(), baked.ambientSamples.end());
+    const size_t ambientBytes = ambientParts.size() * sizeof(bsp::AmbientSample);
     const bool fromCache = cached.size() == lightBytes + ambientBytes;
     if (fromCache) {
         m_bakedFiltered = UploadToDefault(cached.data(), lightBytes, staging);
@@ -748,7 +751,7 @@ bool Scene::LoadBaked(const bsp::BakedLighting& baked, std::span<const BakedTria
         m_bakedFiltered = CreateBuffer(lightBytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         // The bake traces the ambient cubes in place; the samples' positions come from the map.
         if (ambientBytes != 0) {
-            ComPtr<ID3D12Resource> source = UploadToDefault(baked.ambientSamples.data(), ambientBytes, staging);
+            ComPtr<ID3D12Resource> source = UploadToDefault(ambientParts.data(), ambientBytes, staging);
             m_bakedAmbient = CreateBuffer(ambientBytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
             if (source && m_bakedAmbient) {
                 D3D12_RESOURCE_BARRIER toCopy = Transition(source.Get(), D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);

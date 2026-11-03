@@ -19,7 +19,7 @@ namespace {
 
 using Field = std::variant<bool Settings::*, float Settings::*, int Settings::*, DebugView Settings::*, AntiAliasing Settings::*, UpscalingMode Settings::*,
     QualityPreset Settings::*, FoliageShadows Settings::*, IndirectLighting Settings::*, EmissiveLighting Settings::*, LightSampling Settings::*,
-    DenoiserType Settings::*>;
+    DenoiserType Settings::*, MapSun Settings::*>;
 
 template <class Enum>
 Enum EnumValue(double value, Enum fallback)
@@ -57,6 +57,20 @@ constexpr NamedField kFields[] = {
     {"volumetric_intensity", &Settings::volumetricIntensity, {0.0f, 4.0f}},
     {"fog", &Settings::fog},
     {"physical_sky", &Settings::physicalSky},
+    {"map_sun", &Settings::mapSun},
+    {"night_brightness", &Settings::nightBrightness, {0.01f, 0.25f}},
+    {"stars", &Settings::stars},
+    {"star_amount", &Settings::starAmount, {0.0f, 4.0f}},
+    {"faintest_stars", &Settings::faintestStars, {1.0f, 10.0f}},
+    {"star_brightness", &Settings::starBrightness, {0.1f, 10.0f}},
+    {"twinkling", &Settings::twinkling},
+    {"twinkle_strength", &Settings::twinkleStrength, {0.0f, 4.0f}},
+    {"twinkle_speed", &Settings::twinkleSpeed, {0.25f, 4.0f}},
+    {"milky_way", &Settings::milkyWay},
+    {"milky_way_brightness", &Settings::milkyWayBrightness, {0.0f, 4.0f}},
+    {"shooting_stars", &Settings::shootingStars},
+    {"shooting_star_frequency", &Settings::shootingStarFrequency, {0.1f, 10.0f}},
+    {"satellites", &Settings::satellites},
     {"sun_disc", &Settings::sunDisc},
     {"sun_size", &Settings::sunSize, {0.25f, 4.0f}},
     {"sun_intensity", &Settings::sunIntensity, {0.0f, 4.0f}},

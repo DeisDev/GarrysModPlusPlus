@@ -3,6 +3,7 @@
 #include "busy_window.h"
 #include "command_line.h"
 #include "log.h"
+#include "night_sky.h"
 #include "settings.h"
 #include "shaderapi_capture.h"
 #include "shader_cache.h"
@@ -1049,16 +1050,13 @@ void IssueDraws(ID3D12GraphicsCommandList* commands, const MeshDraw& mesh)
 struct SkyConstants {
     std::array<Float4, 4> clipToWorld;
     float viewport[4];
-    float sunDirection[3];
     float tonemapScale;
-    float sunColor[3];
     std::uint32_t skyView;
-    std::uint32_t transmittanceView;
-    std::uint32_t sunDisc;
-    float sunRadius;
     std::uint32_t target;
+    std::uint32_t padding;
+    NightSkyConstants night;
 };
-static_assert(sizeof(SkyConstants) == 128);
+static_assert(sizeof(SkyConstants) == 448);
 
 // SkyDrawConstants::target: how a colour target stores colour.
 std::uint32_t TargetEncoding(DXGI_FORMAT format)
@@ -1092,14 +1090,10 @@ D3D12_GPU_VIRTUAL_ADDRESS SkyDrawConstants(const gbuffer::SkyDraw& sky, std::spa
     const D3D12_VIEWPORT& viewport = dynamic.viewport;
     const float rect[4] = { viewport.TopLeftX, viewport.TopLeftY, viewport.Width, viewport.Height };
     std::copy(std::begin(rect), std::end(rect), constants.viewport);
-    std::copy(sky.sunDirection.begin(), sky.sunDirection.end(), constants.sunDirection);
     constants.tonemapScale = dynamic.pixelFloats[gbuffer::kLightScaleRegister].v[0];
-    std::copy(sky.sunColor.begin(), sky.sunColor.end(), constants.sunColor);
     constants.skyView = sky.skyView;
-    constants.transmittanceView = sky.transmittanceView;
-    constants.sunDisc = sky.sunDisc ? 1u : 0u;
-    constants.sunRadius = sky.sunRadius;
     constants.target = TargetEncoding(format);
+    constants.night = PackNightSky(sky);
     return UploadConstants(&constants, sizeof(constants));
 }
 

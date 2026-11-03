@@ -104,7 +104,8 @@ void main(uint3 id : SV_DispatchThreadID)
         float hitDistance;
         float3 hitAlbedo;
         uint mask = g_frame.traceMask | ((g_frame.traceMask & kSkyboxMask) == 0 ? kWaterMask : 0u);
-        float3 reflected = ReflectedRadiance(origin, direction, coneWidth, PixelAngle() + lobe, mask, seed, hitDistance, hitAlbedo);
+        // Water has its glint for the sun's disc.
+        float3 reflected = ReflectedRadiance(origin, direction, coneWidth, PixelAngle() + lobe, mask, seed, hitDistance, hitAlbedo, false, !waterSurface);
         if (waterSurface) {
             output[pixel] = float4(reflected * strength * weight, hitDistance);
             WriteGuides(pixel, saturate(strength), 0.0, hitDistance);
