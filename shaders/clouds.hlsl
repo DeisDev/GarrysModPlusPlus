@@ -140,6 +140,9 @@ static const uint kWeatherSize = 512;
 static const uint kCirrusSize = 1024;
 // The finer strands (the strands' green) repeat this many times within the strands' tile.
 static const float kCirrusFineTiles = 3.0;
+// How far the flow bends the strands, in tiles per unit of flow: some 150 m, about a fibre's spacing (our choice). The flow
+// spans the tile: 400 m over flow cells half the tile across made swirls, like marble (2026-11-03).
+static const float kCirrusWarp = 0.015;
 
 // The clouds' light (step 4): the light's irradiance above the air in the sky's units (rgb) and the sky's scale (a); the
 // clear sky's mean radiance over the upper hemisphere (rgb) and the cloudy sky's irradiance on a surface facing up over
@@ -354,16 +357,30 @@ float Ridges(float2 p, int2 cells, uint seed)
     return ridge * ridge;
 }
 
-// The cirrus' strands over a tile at `uv` in [0, 1): fibres 32 times longer along x than across, bent across by slow noise
-// so they curve and fan out, thick and thin in patches along their length (r); and finer, shorter fibres (g), which
-// CirrusDepth repeats kCirrusFineTiles times within the tile.
+// A slow divergence-free flow over a tile at `uv`: the curl of gradient noise `cells` cells across, by central
+// differences, about one tile unit per cell.
+float2 CurlFlow(float2 uv, int cells, uint seed)
+{
+    const float step = 0.5 / kCirrusSize;
+    int3 period = int3(cells, cells, 1);
+    float right = GradientFbm(float3(uv + float2(step, 0.0), 0.5), period, 3, seed);
+    float left = GradientFbm(float3(uv - float2(step, 0.0), 0.5), period, 3, seed);
+    float up = GradientFbm(float3(uv + float2(0.0, step), 0.5), period, 3, seed);
+    float down = GradientFbm(float3(uv - float2(0.0, step), 0.5), period, 3, seed);
+    return float2(up - down, left - right) / (2.0 * step * float(cells));
+}
+
+// The cirrus' strands over a tile at `uv` in [0, 1): fibres 32 times longer along x than across that follow the lines of
+// a slow divergence-free flow (the curl of noise, as the Photon shader pack's cirrus streaks do), so they curve and fan
+// out, thick and thin in patches along their length (r); and finer, shorter fibres (g), which CirrusDepth repeats
+// kCirrusFineTiles times within the tile. Fibres bent across by plain noise ran in parallel waves, like combed hair
+// (2026-11-03).
 float2 CirrusStrands(float2 uv)
 {
-    float bend = GradientFbm(float3(uv, 0.5), int3(3, 2, 1), 3, 0x1b873593u) - 0.5;
-    float2 bent = float2(uv.x, uv.y + 0.1 * bend);
+    float2 bent = uv + kCirrusWarp * CurlFlow(uv, 1, 0x1b873593u);
     float strands = (Ridges(bent, int2(3, 96), 0x85ebca77u) + 0.5 * Ridges(bent, int2(6, 192), 0xc2b2ae3du)) / 1.5;
-    float patches = smoothstep(0.35, 0.65, GradientFbm(float3(uv, 0.5), int3(6, 8, 1), 3, 0x27d4eb2fu));
-    float fine = Ridges(bent, int2(8, 160), 0x165667b1u) * smoothstep(0.3, 0.7, GradientFbm(float3(uv, 0.5), int3(10, 12, 1), 2, 0xd3a2646cu));
+    float patches = smoothstep(0.4, 0.7, GradientFbm(float3(bent, 0.5), int3(6, 8, 1), 3, 0x27d4eb2fu));
+    float fine = Ridges(bent, int2(8, 160), 0x165667b1u) * smoothstep(0.3, 0.7, GradientFbm(float3(bent, 0.5), int3(10, 12, 1), 2, 0xd3a2646cu));
     return float2(saturate(strands * patches * 1.5), fine);
 }
 
