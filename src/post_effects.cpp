@@ -2,6 +2,7 @@
 
 #include "color.h"
 #include "log.h"
+#include "overlay.h"
 #include "settings.h"
 #include "shaderapi.h"
 #include "shaderapi_device.h"
@@ -546,7 +547,8 @@ void PostProcessView(D3D12_RECT rect)
     const bool effects = depthOfField || motionBlur || lens || settings.contrastSharpening || grain || grade;
     // Frame generation takes the main view's depth, motion and the view without the HUD from here.
     FsrFrameGeneration* fsrGeneration = GetBackend().FsrFrameGenerator();
-    const bool frameGeneration = camera && post->motionView != kInvalid && (streamline::FrameGenerationWanted() || fsrGeneration != nullptr);
+    // Neither generator runs while the menu is open: it moves without motion vectors (FSR turns off on frames without inputs).
+    const bool frameGeneration = camera && post->motionView != kInvalid && !overlay::Open() && (streamline::FrameGenerationWanted() || fsrGeneration != nullptr);
     if (!effects && !frameGeneration)
         return;
     if (Dynamic().colorTargets[0] != kDefaultTarget) {

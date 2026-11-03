@@ -41,14 +41,14 @@ using enum Section;
 
 constexpr NamedField kFields[] = {
     {"realtime_lighting", &Settings::realtimeLighting, General},
-    {"debug_view", &Settings::debugView, General, {}, false},
-    {"display", &Settings::display, General, {0.0f, 16.0f}, false},
+    {"debug_view", &Settings::debugView, Developer, {}, false},
+    {"display", &Settings::display, Display, {0.0f, 16.0f}, false},
     {"background_full_speed", &Settings::backgroundFullSpeed, Display, {}, false},
-    {"reflex", &Settings::reflex, General, {}, false},
-    {"frame_generation", &Settings::frameGeneration, General, {}, false},
-    {"generated_frames", &Settings::generatedFrames, General, {1.0f, 5.0f}, false},
-    {"anti_lag", &Settings::antiLag, General, {}, false},
-    {"hardware_warning", &Settings::hardwareWarning, General, {}, false},
+    {"reflex", &Settings::reflex, Latency, {}, false},
+    {"frame_generation", &Settings::frameGeneration, Latency, {}, false},
+    {"generated_frames", &Settings::generatedFrames, Latency, {1.0f, 5.0f}, false},
+    {"anti_lag", &Settings::antiLag, Latency, {}, false},
+    {"hardware_warning", &Settings::hardwareWarning, Display, {}, false},
 
     {"sun", &Settings::sun, Lighting},
     {"sun_intensity", &Settings::sunIntensity, Lighting, {0.0f, 4.0f}},

@@ -2,6 +2,7 @@
 
 #include "lighting.h"
 #include "log.h"
+#include "overlay.h"
 #include "settings.h"
 
 #include <sl.h>
@@ -85,7 +86,8 @@ void ApplyOptions()
 {
     const Settings& settings = GetSettings();
     const bool gameFrames = g_state.frameCount - g_state.lastTagged <= kGameFrameGrace;
-    const bool generate = g_state.frameGeneration && settings.frameGeneration == FrameGeneration::Dlss && gameFrames;
+    // Off while the menu is open (ProgrammingGuideDLSS_G.md, 6.4): it has no motion vectors, so generated frames tore it.
+    const bool generate = g_state.frameGeneration && settings.frameGeneration == FrameGeneration::Dlss && gameFrames && !overlay::Open();
     if (g_state.reflexLoaded) {
         sl::ReflexMode mode = settings.reflex == ReflexMode::Boost ? sl::ReflexMode::eLowLatencyWithBoost
             : settings.reflex == ReflexMode::On || generate               ? sl::ReflexMode::eLowLatency
@@ -279,7 +281,10 @@ uint32_t PresentedFrames()
     return state.numFramesActuallyPresented;
 }
 
-bool FrameGenerationWanted() { return g_state.active && g_state.frameGeneration && GetSettings().frameGeneration == FrameGeneration::Dlss; }
+bool FrameGenerationWanted()
+{
+    return g_state.active && g_state.frameGeneration && GetSettings().frameGeneration == FrameGeneration::Dlss && !overlay::Open();
+}
 
 void TagFrame(ID3D12GraphicsCommandList* list, const FrameInputs& inputs, const PostView& post)
 {

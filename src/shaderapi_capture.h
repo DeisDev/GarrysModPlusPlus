@@ -33,6 +33,9 @@ bool End(gbuffer::ViewKind kind, ViewInputs& inputs);
 void BeginForward(const gbuffer::ForwardConstants& constants, bool mainView);
 void EndForward();
 bool ForwardActive();
+// Whether every draw until EndForward is dropped, set as each view begins: the water's reflection view, whose texture
+// traced water never shows.
+void SkipView(bool skip);
 
 // INT_RENDERPARM_ENABLE_FIXED_LIGHTING while capturing or lighting translucent surfaces, or -1 to keep the game's.
 int FixedLighting();

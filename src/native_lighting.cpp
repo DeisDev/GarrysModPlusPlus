@@ -38,6 +38,7 @@ struct State {
     bool available = false;
     bool loggedThread = false;
     bool loggedRefractionView = false;
+    bool loggedReflectionView = false;
     bool viewmodelCapture = false;
     float viewmodelDepth[2] = {};
     // Why the last main view was not captured, for the menu.
@@ -97,6 +98,28 @@ bool CanLightRenderTargetView()
     if (GetOptions().devMode && g_state.loggedTargets.insert(name).second && g_state.loggedTargets.size() <= 16)
         log::Info("Real-time lighting: a view is drawn into '{}'", name);
     return !name.starts_with("_rt_waterrefraction");
+}
+
+// The water's reflection view (CAboveWaterView::CReflectionView: the camera mirrored below the water, drawing what lies
+// above it into _rt_WaterReflection): traced water never shows its texture, so its draws are dropped (SkipView). Mirrors
+// (func_reflective_glass) clip with their own plane, not the water's height, so theirs are kept.
+bool IsWaterReflectionView()
+{
+    if (!g_state.available || !world::Ready() || !GetSettings().realtimeLighting || capture::Active() || capture::ForwardActive() || !GetBackend().OnRenderThread())
+        return false;
+    const DynamicState& dynamic = Dynamic();
+    if (dynamic.colorTargets[0] == kDefaultTarget || dynamic.colorTargets[0] == 0 || !EyeBelowHeightClip())
+        return false;
+    const Texture* target = TextureFromHandle(dynamic.colorTargets[0]);
+    if (target == nullptr)
+        return false;
+    std::string name = target->name;
+    std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (!name.starts_with("_rt_waterreflection"))
+        return false;
+    if (GetOptions().devMode && !std::exchange(g_state.loggedReflectionView, true))
+        log::Info("Real-time lighting: the water's reflection view is not drawn (its reflections are ray traced)");
+    return true;
 }
 
 void Finish(gbuffer::ViewKind kind)
@@ -207,6 +230,10 @@ void OnViewOpaqueBegin()
 {
     using namespace native;
     streamline::MarkRenderStart();
+    const bool waterReflection = realtime::IsWaterReflectionView();
+    capture::SkipView(waterReflection);
+    if (waterReflection)
+        return;
     if (realtime::CanLightRenderTargetView()) {
         capture::BeginForward(*realtime::g_state.forward, false);
         return;

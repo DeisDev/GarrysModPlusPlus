@@ -1324,14 +1324,15 @@ void DrawGameDetailCard(const Settings& settings)
                 [](int picked) { WriteVar("mat_picmip", std::to_string(2 - picked), true); });
             GameChoiceRow("graphics.shader_detail", kTwoLevels, VarInt("mat_reducefillrate", 0) != 0 ? 0 : 1,
                 [](int picked) { WriteVar("mat_reducefillrate", picked == 0 ? "1" : "0", true); });
+            // Real-time lighting ray traces water's reflections, the flashlight's shadows and the projected prop shadows, and
+            // skips the game's passes for them.
+            const bool traced = settings.realtimeLighting && statistics.realtimeBlock != RealtimeBlock::Unsupported;
             constexpr const char* kWater[] = {"graphics.water_simple", "graphics.water_world", "graphics.water_all"};
             const int water = VarInt("r_waterforceexpensive", 0) == 0 ? 0 : VarInt("r_waterforcereflectentities", 0) != 0 ? 2 : 1;
             GameChoiceRow("graphics.water_detail", kWater, water, [](int picked) {
                 WriteVar("r_waterforceexpensive", picked > 0 ? "1" : "0", false);
                 WriteVar("r_waterforcereflectentities", picked > 1 ? "1" : "0", true);
-            });
-            // Real-time lighting skips the flashlight's and the projected prop shadows these set (ray traced instead).
-            const bool traced = settings.realtimeLighting && statistics.realtimeBlock != RealtimeBlock::Unsupported;
+            }, !traced, Text("graphics.water_detail_reason"));
             const int shadows = VarInt("r_flashlightdepthtexture", 0) != 0 ? 2 : VarInt("r_shadowrendertotexture", 0) != 0 ? 1 : 0;
             GameChoiceRow("graphics.shadow_detail", kThreeLevels, shadows, [](int picked) {
                 WriteVar("r_shadowrendertotexture", picked > 0 ? "1" : "0", false);

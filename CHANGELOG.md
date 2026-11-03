@@ -167,6 +167,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - The "Game" flashlight option. It made props see-through and left them unlit by the flashlight.
 
 ### Fixed
+
+- Frame generation turns off while the menu is open, so dragging the menu no longer tears or ghosts.
+- "Reset page" on the Image page now resets frame generation, Reflex and Anti-Lag too, and on the Lighting page no longer resets the display, hardware warning, debug view and latency settings.
+- The lens flare sits on the sun disc on maps whose painted sky puts the sun elsewhere than the map's sunlight, and on the Moon once the sun has set.
+- With real-time lighting, the game's water reflection pass is skipped (its reflections are ray traced) and Water detail is greyed out in the menu and hidden in the game's Advanced video options, like Shadow detail.
 - Volumetric light no longer rebuilds its froxel volume twice a frame (and logs it each time) when the held weapon is lit at a different resolution than the main view, as with DLSS or FSR upscaling.
 
 - Choosing DLSS on a GPU without it (such as AMD and Intel GPUs), for example through a preset made on another PC, now gives TAA instead of no anti-aliasing.

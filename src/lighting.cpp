@@ -3235,12 +3235,21 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
         m_skyLightReady = false;
         constants.skyLightView = kInvalidView;
     }
-    // The lens flare's light: the sun, or the Moon in its slot, with its disc as the sky draws it.
-    const bool flareLight = main && m_flareVisibility.resource && constants.traceMask != 0 && constants.sunEnabled != 0.0f;
+    // The lens flare's light: the disc the sky shows, which sunlight need not come from (SkySun: a painted sky's sun on
+    // a map without env_sun), while it is up, else the Moon of day maps; as bright as the sun's slot.
+    std::optional<std::array<float, 3>> flareDirection = main ? SkySun(inputs, scene) : std::nullopt;
+    if (flareDirection && (*flareDirection)[2] <= 0.0f) {
+        const std::optional<MoonState> moon = MoonFor(inputs, scene);
+        flareDirection = moon && moon->direction[2] > 0.0f ? std::optional(moon->direction) : std::nullopt;
+    }
+    const bool flareLight = flareDirection && m_flareVisibility.resource && constants.traceMask != 0 && constants.sunEnabled != 0.0f;
     const float flareRadius = m_skyDraw.sunDisc ? m_skyDraw.sunRadius : kRealSunRadius;
     if (flareLight) {
         Use(m_flareVisibility, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        DispatchGroups(Pass::FlareVisibility, {.input0 = std::bit_cast<UINT>(flareRadius), .output0 = m_flareVisibility.uav}, 1, 1, 1);
+        DispatchGroups(Pass::FlareVisibility,
+            {.input0 = std::bit_cast<UINT>(flareRadius), .input1 = std::bit_cast<UINT>((*flareDirection)[0]), .input2 = std::bit_cast<UINT>((*flareDirection)[1]),
+                .input3 = std::bit_cast<UINT>((*flareDirection)[2]), .output0 = m_flareVisibility.uav},
+            1, 1, 1);
         Use(m_flareVisibility, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     }
     m_gridWidth = m_width;
@@ -3947,7 +3956,8 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
         post.frame = inputs.frame;
         post.viewProj = inputs.viewProj;
         post.light = flareLight;
-        std::copy_n(constants.sunDirection, 3, post.lightDirection.begin());
+        if (flareLight)
+            post.lightDirection = *flareDirection;
         for (size_t i = 0; i < 3; ++i)
             post.lightColor[i] = constants.sunColor[i] * constants.tonemapScale;
         post.lightRadius = flareRadius;

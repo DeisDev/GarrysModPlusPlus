@@ -152,8 +152,9 @@ std::optional<VPanel> LabelOf(const std::vector<VPanel>& children, std::string_v
 }
 
 // Hides MSAA and the Direct3D 9Ex row, and moves the rows below Direct3D 9Ex up into its place. With real-time
-// lighting on, Shadow detail is hidden too: the flashlight's shadows and the projected prop shadows it sets are
-// skipped and ray traced instead (shaderapi_capture.cpp).
+// lighting on, Water detail and Shadow detail are hidden too: the water's reflection view, the flashlight's shadows
+// and the projected prop shadows they set are skipped and ray traced instead (native_lighting.cpp,
+// shaderapi_capture.cpp).
 bool Trim(void* dialog)
 {
     const VPanel root = VPanelOf(dialog);
@@ -177,6 +178,11 @@ bool Trim(void* dialog)
     for (VPanel panel : {*msaa, *msaaLabel, *d3d9ex, *d3d9exLabel})
         CallPanels<void>(kSetVisible, panel, false);
     if (GetSettings().realtimeLighting) {
+        if (const auto water = find("WaterDetail")) {
+            CallPanels<void>(kSetVisible, *water, false);
+            if (const auto label = LabelOf(children, "Label7", *water))
+                CallPanels<void>(kSetVisible, *label, false);
+        }
         if (const auto shadows = find("ShadowDetail")) {
             CallPanels<void>(kSetVisible, *shadows, false);
             if (const auto label = LabelOf(children, "Label8", *shadows))

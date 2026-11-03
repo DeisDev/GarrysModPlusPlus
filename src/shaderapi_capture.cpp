@@ -94,6 +94,7 @@ struct State {
     SkyCube sky;
     bool active = false;
     bool forwardActive = false;
+    bool skipView = false;
     std::array<float, 2> jitter = {};
     gbuffer::Matrix4 viewProj = {};
     std::array<std::array<float, 4>, bytecode::kForwardUniforms> forwardConstants = {};
@@ -535,8 +536,11 @@ void BeginForward(const gbuffer::ForwardConstants& constants, bool mainView)
 
 bool ForwardActive() { return g_state.forwardActive; }
 
+void SkipView(bool skip) { g_state.skipView = skip; }
+
 void EndForward()
 {
+    g_state.skipView = false;
     if (!g_state.forwardActive)
         return;
     g_state.forwardActive = false;
@@ -626,6 +630,10 @@ Pass Prepare(std::span<const DWORD> vertexCode, std::span<const DWORD> pixelCode
     bool blend, int sourceBlend, int destinationBlend, bool srgbWrite, std::uint32_t srgbRead)
 {
     Pass pass;
+    if (g_state.skipView) {
+        pass.route = Pass::Route::Skip;
+        return pass;
+    }
     if (!g_state.active && !g_state.forwardActive)
         return pass;
     // Swaying props are drawn in the views' opaque passes, which are captured.
@@ -954,6 +962,7 @@ void Release()
     g_state.height = 0;
     g_state.active = false;
     g_state.forwardActive = false;
+    g_state.skipView = false;
 }
 
 }
