@@ -249,13 +249,16 @@ GlassRays RefractedGlass(float3 tint, float3 bumped, float3 faceNormal, float3 p
 }
 
 // oC0 albedo (alpha: opacity), oC1 normal (alpha: the cubemap's mask, glass's reflectivity), oC2 light the material
-// shows unlit, oC3 world position: the colour the game's lit shaders would write, with the tonemap scale and range fog
-// as on opaque surfaces (shaders/deferred_lighting.hlsl). Refract's twin writes its own outputs (RefractedGlass): oC1's
-// alpha -1 less its cubemap's mask, oC2 the face normal and in alpha 1 where it blurs.
-// Glass reflects what a pane's two faces reflect (GlassReflectance) of the traced scene along the mirrored view, where
-// its cubemap was. The game blends the draw by its alpha: where the pane is clear (1 - alpha) the reflection takes its
-// share and leaves the rest of what lies behind to the blend, so it adds to both the colour and the alpha. A face of a
-// thick pane reflects Fresnel's share alone; a thin pane, 2F / (1 + F).
+// shows unlit, oC3 world position (alpha: the cubemap's share the game adds to the draw's colour, its mask times tint and
+// LightmappedGeneric's $fresnelreflection Fresnel): the colour the game's lit shaders would write, with the tonemap
+// scale and range fog as on opaque surfaces (shaders/deferred_lighting.hlsl). Refract's twin writes its own outputs
+// (RefractedGlass): oC1's alpha -1 less its cubemap's mask, oC2 the face normal and in alpha 1 where it blurs.
+// Glass reflects the traced scene along the mirrored view where its cubemap was. Where the pane is clear (1 - alpha) it
+// reflects what its two faces reflect (GlassReflectance): the game blends the draw by its alpha, so that share adds to
+// both the colour and the alpha and leaves the rest of what lies behind to the blend. A face of a thick pane reflects
+// Fresnel's share alone; a thin pane, 2F / (1 + F). Its own surface (alpha) reflects as the game's cubemap did, as
+// opaque surfaces do (shaders/reflections.hlsl): with Fresnel's 4% alone, dirty and tinted windows seen head-on, as
+// from afar, lost the reflection their mappers gave them and looked opaque (gm_dust_station, 2026-11-03).
 // `mainView`: the main view's draws see the medium between the eye and the surface as its froxel volume holds it
 // (shaders/froxels.hlsli); views drawn into textures see from elsewhere and light the fog where it meets the surface.
 float4 gmodpp_ForwardTwin(float4 albedo, float4 normal, float4 emissive, float4 position, bool mainView)
@@ -287,7 +290,7 @@ float4 gmodpp_ForwardTwin(float4 albedo, float4 normal, float4 emissive, float4 
             rays.count = 1;
             rays.reflectOrigin = position.xyz + facing * 0.5;
             rays.reflectDirection = reflect(-toEye, facing);
-            rays.reflectWeight = clear / max(alpha, 1e-4);
+            rays.reflectWeight = (clear + saturate(albedo.a) * saturate(position.w) * g_frame.reflectionScale) / max(alpha, 1e-4);
         }
     }
     // The pixel's own surface (k = 0), then what its rays hit, lit by one call of ForwardLight: DXC inlines every call,

@@ -324,9 +324,10 @@ float4 main( PS_INPUT i ) : COLOR
 	twin.emissive = float4( twinEmissive, 0 );
 #if FORWARD_TWIN
 	// shaders/forward_twin.hlsli lights the draw at its world position, and where the material has a cubemap traces
-	// the reflection it stood for (normal alpha: the cubemap's mask).
-	twin.flags = float4( i.worldPos_projPosZ.xyz, alpha );
+	// the reflection it stood for (normal alpha: the cubemap's mask; flags alpha: the share of it the game adds to the
+	// draw's colour, its mask and tint).
 	twin.normal.a = ( CUBEMAP && bCubemap && any( g_EnvmapTint_TintReplaceFactor.rgb > 0.0f ) ) ? saturate( specularFactor ) : 0.0f;
+	twin.flags = float4( i.worldPos_projPosZ.xyz, saturate( twin.normal.a * dot( g_EnvmapTint_TintReplaceFactor.rgb, float3( 0.299f, 0.587f, 0.114f ) ) ) );
 #else
 	// Green: 1 less the material bits over 255 (shaders/common.hlsli kMaterialHalfLambert).
 	// Green: 1 less the material bits over 255 (shaders/common.hlsli); with light warp the translator puts the warp

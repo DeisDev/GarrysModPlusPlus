@@ -159,6 +159,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fixed shadows and reflections in the 3D skybox jittering when zoomed in.
 - With DLSS Ray Reconstruction or FSR upscaling, the sky (clouds, stars, the sun) is no longer blurred.
 - Fixed rippled refractive glass (such as on ffa_devcqb) showing bands of mirror-like reflection when seen at an angle.
+- Fixed dirty and tinted windows losing their reflection and looking opaque when seen head-on, as from a distance. They now reflect as strongly as their material sets.
+- Fixed eyes and teeth in mirrors and camera screens reflecting the scene like glass.
 - The settings menu no longer shows the game's mouse cursor next to its own.
 - Switching pages in the settings menu no longer makes the page's content jump around for a few frames.
 - Maps with water no longer stutter the first time you look at water: the vertex shaders the water's reflection and refraction views draw with (with a clip plane) are compiled while the map loads.

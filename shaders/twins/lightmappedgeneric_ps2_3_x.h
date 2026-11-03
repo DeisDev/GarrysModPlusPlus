@@ -530,9 +530,12 @@ HALF4 main( PS_INPUT i ) : COLOR
 	twin.emissive = float4( twinEmissive, twinPhongExponent );
 #if FORWARD_TWIN
 	// shaders/forward_twin.hlsli lights the draw at its world position, and where the material has a cubemap traces
-	// the reflection it stood for (normal alpha: the cubemap's mask).
-	twin.flags = float4( i.worldPos_projPosZ.xyz, alpha );
+	// the reflection it stood for (normal alpha: the cubemap's mask; flags alpha: the share of it the game adds to the
+	// draw's colour, its mask, tint and $fresnelreflection's Fresnel as below).
 	twin.normal.a = ( CUBEMAP && bCubemap && any( g_EnvmapTint.rgb > 0.0f ) ) ? saturate( dot( specularFactor, float3( 1.0f, 1.0f, 1.0f ) / 3.0f ) ) : 0.0f;
+	float twinFresnel = pow( 1.0f - saturate( dot( normalize( twin.normal.xyz ), normalize( g_EyePos - i.worldPos_projPosZ.xyz ) ) ), 5.0f );
+	twinFresnel = twinFresnel * g_OneMinusFresnelReflection + g_FresnelReflection;
+	twin.flags = float4( i.worldPos_projPosZ.xyz, saturate( twin.normal.a * dot( g_EnvmapTint.rgb, float3( 0.299f, 0.587f, 0.114f ) ) * twinFresnel ) );
 #else
 	// Green: 1 less the material bits over 255 (shaders/common.hlsli kMaterialLightWarp, kMaterialWarpTotal); with the
 	// light warp the translator puts its texture's slot in alpha.
