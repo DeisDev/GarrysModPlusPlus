@@ -206,6 +206,8 @@ static const float kCellCarve = 1.2;
 // from 7 km, where altocumulus' cloudlets are 1 to 5 degrees wide (WMO International Cloud Atlas). Read at twice, they
 // were twice that and clumped into cumulus-like masses (2026-11-03).
 static const float kCellTiles = 4.0;
+// The share of the low layer's billows from cells half the size (Shapes).
+static const float kSmallBillows = 0.4;
 static const float2 kCumulusErosion = float2(0.47, 0.57);
 static const float2 kStratusErosion = float2(0.1, 0.14);
 static const float kMiddleErosion = 0.43;
@@ -402,13 +404,15 @@ float Billows(float2 uv, int cells, uint seed)
     return Remap(GradientFbm(p, int3(cells / 2, cells / 2, 1), 5, seed + 3u), 0.0, 1.0, worley, 1.0);
 }
 
-// The shapes at `uv` in [0, 1): the low layer's billows (r, about 2.5 km cells over its 40 km tile) and its smooth
-// noise for stratus (g), and the middle layer's billows (b) and the finer billows that cut them into cells (a, read at
-// kCellTiles times the frequency).
+// The shapes at `uv` in [0, 1): the low layer's billows (r: cells about 2.5 km across over its 40 km tile mixed with cells
+// half that, kSmallBillows of them, so a small coverage cuts out many small cumulus, as fair weather's humilis are a few
+// hundred metres to a kilometre across, rather than the few largest; with the large cells alone fair weather had a few
+// big clouds, 2026-11-03) and its smooth noise for stratus (g), and the middle layer's billows (b) and the finer billows
+// that cut them into cells (a, read at kCellTiles times the frequency). Steps 11 and 12 spread each channel evenly.
 float4 Shapes(float2 uv)
 {
-    return float4(Billows(uv, 16, 0x2f1b6c3du), GradientFbm(float3(uv, 0.5), int3(8, 8, 1), 5, 0x7a4c91e3u), Billows(uv, 16, 0x5a8e2f41u),
-        Billows(uv, 16, 0x1d9f6b27u));
+    float low = lerp(Billows(uv, 16, 0x2f1b6c3du), Billows(uv, 32, 0x6c8e9cf5u), kSmallBillows);
+    return float4(low, GradientFbm(float3(uv, 0.5), int3(8, 8, 1), 5, 0x7a4c91e3u), Billows(uv, 16, 0x5a8e2f41u), Billows(uv, 16, 0x1d9f6b27u));
 }
 
 groupshared uint g_histogram[4 * kHistogramBins];
