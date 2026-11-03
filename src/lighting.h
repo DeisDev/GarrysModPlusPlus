@@ -458,12 +458,25 @@ private:
     // The daylight table at the sun's height (the z of its direction): the transmittance toward it from the eye (rgb) and
     // the clear sky's irradiance on a surface facing up (luminance).
     std::array<float, 4> DaylightAt(float sunZ) const;
+    // The Moon of day maps (NightSky::Moon) with the physical sky: its direction, its irradiance in the atmosphere's units,
+    // and the share of the map's sky and sunlight its light is shown at: the moonlit night over the moonless one, by its
+    // phase's brightness against the full Moon's, coming in as civil twilight ends (the sun 0 to 6 degrees down: the eye
+    // adapts, and moonlight too faint to see by day shows).
+    struct MoonState {
+        std::array<float, 3> direction;
+        float irradiance;
+        float scale;
+    };
+    std::optional<MoonState> MoonFor(const ViewInputs& inputs, const Scene& scene) const;
     // What day and night make of the map's light with the physical sky: its sky light scales with the clear sky's
-    // irradiance under the sun the sky shows against that under the map's sun, down to the night's floor, and the
-    // sunlight with the transmittance toward the sun it shines from (`constants`) against that toward the map's sun.
+    // irradiance under the sun the sky shows against that under the map's sun, plus the moonless floor and the moonlit
+    // sky, and the sunlight with the transmittance toward the sun it shines from (`constants`) against that toward the
+    // map's sun. With the sun below the horizon the Moon, when up, lights the map in its place (`moonlight`, its
+    // direction), its light scaled likewise.
     struct Daylight {
         float sky = 1.0f;
         std::array<float, 3> sun = {1.0f, 1.0f, 1.0f};
+        std::optional<std::array<float, 3>> moonlight;
     };
     std::optional<Daylight> DaylightFor(const FrameConstants& constants, const ViewInputs& inputs, const Scene& scene) const;
     // Whether the map's sun is the Moon: Settings::mapSun, or with Auto a night map (m_nightMap).
@@ -637,6 +650,10 @@ private:
     bool m_atmosphereTables = false;
     std::optional<std::array<float, 3>> m_atmosphereSun;
     std::optional<std::array<float, 3>> m_mapSkySun;
+    // The clear sky under the Moon of day maps (faces m_moonSkyFaces), for m_moonSkySun.
+    Texture m_moonSky;
+    UINT m_moonSkyFaces = DescriptorHeap::kInvalid;
+    std::optional<std::array<float, 3>> m_moonSkySun;
     bool m_proceduralSkyReady = false;
     bool m_loggedLowMapSun = false;
     // Per slot: the mean luminance of the game's sky above the horizon (m_skyBands' last texel) on its way to the CPU, and

@@ -330,8 +330,10 @@ void ResetLightingPage(Settings& settings)
     settings.fog = defaults.fog;
     settings.physicalSky = defaults.physicalSky;
     settings.mapSun = defaults.mapSun;
-    settings.nightBrightness = defaults.nightBrightness;
+    settings.moonlitNight = defaults.moonlitNight;
+    settings.moonlessNight = defaults.moonlessNight;
     settings.stars = defaults.stars;
+    settings.earlierStars = defaults.earlierStars;
     settings.starAmount = defaults.starAmount;
     settings.faintestStars = defaults.faintestStars;
     settings.starBrightness = defaults.starBrightness;
@@ -343,6 +345,8 @@ void ResetLightingPage(Settings& settings)
     settings.shootingStars = defaults.shootingStars;
     settings.shootingStarFrequency = defaults.shootingStarFrequency;
     settings.satellites = defaults.satellites;
+    settings.moon = defaults.moon;
+    settings.moonPhase = defaults.moonPhase;
     settings.sunDisc = defaults.sunDisc;
     settings.sunSize = defaults.sunSize;
     settings.translucentLighting = defaults.translucentLighting;
@@ -432,7 +436,8 @@ void DrawLightingPage(Settings& settings)
         constexpr const char* kMapSuns[] = {"lighting.map_sun_auto", "lighting.map_sun_sun", "lighting.map_sun_moon"};
         static_assert(std::size(kMapSuns) == static_cast<size_t>(MapSun::Count));
         SegmentRow("lighting.map_sun", settings.mapSun, kMapSuns, {}, settings.physicalSky || settings.sunDisc, Text("lighting.map_sun_reason"));
-        SliderRow("lighting.night_brightness", settings.nightBrightness, RangeOf(&Settings::nightBrightness), settings.physicalSky, physicalSkyReason);
+        SliderRow("lighting.moonlit_night", settings.moonlitNight, RangeOf(&Settings::moonlitNight), settings.physicalSky, physicalSkyReason);
+        SliderRow("lighting.moonless_night", settings.moonlessNight, RangeOf(&Settings::moonlessNight), settings.physicalSky, physicalSkyReason);
         SwitchRow("lighting.sun_disc", settings.sunDisc);
         SliderRow("lighting.sun_size", settings.sunSize, RangeOf(&Settings::sunSize), settings.sunDisc, Text("lighting.sun_size_reason"));
         StrengthRow("lighting.volumetric_light", &settings.volumetricLight, settings.volumetricIntensity, RangeOf(&Settings::volumetricIntensity));
@@ -451,6 +456,7 @@ void DrawLightingPage(Settings& settings)
         SliderRow("lighting.star_amount", settings.starAmount, RangeOf(&Settings::starAmount), stars, starsReason);
         SliderRow("lighting.faintest_stars", settings.faintestStars, RangeOf(&Settings::faintestStars), stars, starsReason);
         SliderRow("lighting.star_brightness", settings.starBrightness, RangeOf(&Settings::starBrightness), stars, starsReason);
+        SliderRow("lighting.earlier_stars", settings.earlierStars, RangeOf(&Settings::earlierStars), sky, skyReason);
         StrengthRow("lighting.twinkling", &settings.twinkling, settings.twinkleStrength, RangeOf(&Settings::twinkleStrength), stars, starsReason);
         SliderRow("lighting.twinkle_speed", settings.twinkleSpeed, RangeOf(&Settings::twinkleSpeed), stars && settings.twinkling,
             stars ? Text("lighting.twinkling_reason") : starsReason);
@@ -459,6 +465,8 @@ void DrawLightingPage(Settings& settings)
         SliderRow("lighting.shooting_star_frequency", settings.shootingStarFrequency, RangeOf(&Settings::shootingStarFrequency), sky && settings.shootingStars,
             sky ? Text("lighting.shooting_stars_reason") : skyReason);
         SwitchRow("lighting.satellites", settings.satellites, sky, skyReason);
+        SwitchRow("lighting.moon", settings.moon, sky, skyReason);
+        SliderRow("lighting.moon_phase", settings.moonPhase, RangeOf(&Settings::moonPhase), sky && settings.moon, sky ? Text("lighting.moon_reason") : skyReason);
         widgets::EndRows();
     }
     widgets::EndCard();

@@ -76,10 +76,13 @@ float4 SkyMain(Interpolants input) : SV_Target0
     TextureCube<float4> sky = ResourceDescriptorHeap[g_sky.skyView];
     Texture2D<float4> transmittance = ResourceDescriptorHeap[g_sky.night.transmittanceView];
     float4 procedural = sky.SampleLevel(g_linearClamp, direction, 0.0);
+    float moonCoverage;
+    float3 moon = MoonDisc(g_sky.night, direction, pixelAngle, procedural.a, g_sky.tonemapScale, transmittance, g_linearClamp, moonCoverage);
     float3 color = procedural.rgb;
     if (g_sky.night.parts != 0)
-        color += NightSkyLight(g_sky.night, direction, procedural.a, kPointFootprint * pixelAngle, g_sky.tonemapScale, transmittance, g_linearClamp);
-    color *= g_sky.tonemapScale;
+        color += NightSkyLight(g_sky.night, direction, procedural.a, kPointFootprint * pixelAngle, g_sky.tonemapScale, transmittance, g_linearClamp) *
+            (1.0 - moonCoverage);
+    color = color * g_sky.tonemapScale + moon;
     if (g_sky.night.disc != 0)
         color += SunDisc(g_sky.night, direction, pixelAngle, transmittance, g_linearClamp);
     // An 8-bit target rounds the sky's smooth gradients, after encoding them as sRGB when it does.

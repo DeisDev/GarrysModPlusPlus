@@ -30,14 +30,25 @@ struct NightSkyConstants {
     float twinkleStrength;
     float twinkleSpeed;
     float milkyWayBrightness;
+    float moonDirection[3];
+    float moonIrradiance;
+    float moonScale;
+    float moonlessFloor;
+    float mapLight;
+    float starTwilight;
     float satellites[gbuffer::kMaxSatellites][4];
     float meteorStarts[gbuffer::kMaxMeteors][4];
     float meteorAxes[gbuffer::kMaxMeteors][4];
     float meteorFluxes[gbuffer::kMaxMeteors][4];
 };
-static_assert(sizeof(NightSkyConstants) == 352);
+static_assert(sizeof(NightSkyConstants) == 384);
 
 NightSkyConstants PackNightSky(const gbuffer::SkyDraw& draw);
+
+// The Moon's irradiance in the atmosphere's units (sunlight of irradiance 1) at a phase, the share of its disc lit (1
+// full): the full Moon's mean magnitude at opposition, -12.74 (NASA's Moon fact sheet), fainter by 0.026 |a| + 4e-9 a^4
+// magnitudes at phase angle a in degrees (Allen's Astrophysical Quantities).
+float MoonIrradiance(float phase);
 
 // The moving parts of the night sky over the procedural sky (shaders/night_sky.hlsli): the stars' frame, which turns
 // with the sun as Earth's turn carries the stars and the sun together, and the satellites and meteors in view.
@@ -52,6 +63,13 @@ public:
     // when it did not turn), and the angle it turned by in radians.
     std::array<std::array<float, 3>, 3> TurnBack() const;
     float TurnAngle() const;
+    // Places the Moon of day maps among the stars at `phase` (the share of its disc lit, 1 full) from the sun, when it
+    // has no place yet or the phase changed: along the sun's vertical circle, past the zenith away from the sun's side of
+    // the sky by its elongation, so a full Moon is opposite the sun and a first quarter at the zenith while the sun sets.
+    // From then on it turns with the stars, keeping its angle from the sun.
+    void PlaceMoon(const std::array<float, 3>& sun, float phase);
+    // The Moon's direction now, once placed.
+    std::optional<std::array<float, 3>> Moon() const;
     // Writes `parts` (gbuffer::NightSkyPart), the stars' frame and clock, and the satellites `sun` lights and the meteors
     // in view now, at `meteorFrequency` times the shower's rate, into `draw`.
     void Write(uint32_t parts, const std::array<float, 3>& sun, float meteorFrequency, gbuffer::SkyDraw& draw) const;
@@ -60,6 +78,9 @@ private:
     // The stars' frame to the local frame, a unit quaternion (w, x, y, z).
     std::array<double, 4> m_rotation = {1.0, 0.0, 0.0, 0.0};
     std::array<double, 4> m_turn = {1.0, 0.0, 0.0, 0.0};
+    // The Moon's direction in the stars' frame, and the phase it was placed at.
+    std::optional<std::array<double, 3>> m_moon;
+    float m_moonPhase = 0.0f;
     std::optional<std::array<double, 3>> m_sun;
     std::chrono::steady_clock::time_point m_start = std::chrono::steady_clock::now();
 };

@@ -21,15 +21,21 @@ float3 SkyBeyond(float3 direction, float coneSpread, bool night, bool disc)
     StructuredBuffer<NightSkyConstants> constants = ResourceDescriptorHeap[g_frame.nightSkyView];
     NightSkyConstants beyond = constants[0];
     Texture2D<float4> transmittance = ResourceDescriptorHeap[beyond.transmittanceView];
-    if (night && beyond.parts != 0) {
+    float logGain = 0.0;
+    if (night && (beyond.parts != 0 || beyond.moonIrradiance > 0.0)) {
         TextureCube<float4> sky = ResourceDescriptorHeap[g_frame.skyCubeView];
-        float logGain = sky.SampleLevel(g_linearClamp, direction, 0.0).a;
-        radiance += NightSkyLight(beyond, direction, logGain, kPointFootprint * coneSpread, g_frame.tonemapScale, transmittance, g_linearClamp);
+        logGain = sky.SampleLevel(g_linearClamp, direction, 0.0).a;
     }
-    if (disc && beyond.disc != 0) {
-        float narrow = saturate(2.0 - coneSpread / beyond.sunRadius);
+    float moonCoverage = 0.0;
+    float narrow = saturate(2.0 - coneSpread / beyond.sunRadius);
+    if (disc && night)
+        radiance += MoonDisc(beyond, direction, coneSpread, logGain, g_frame.tonemapScale, transmittance, g_linearClamp, moonCoverage) *
+            (narrow / g_frame.tonemapScale);
+    if (night && beyond.parts != 0)
+        radiance += NightSkyLight(beyond, direction, logGain, kPointFootprint * coneSpread, g_frame.tonemapScale, transmittance, g_linearClamp) *
+            (1.0 - moonCoverage * narrow);
+    if (disc && beyond.disc != 0)
         radiance += SunDisc(beyond, direction, coneSpread, transmittance, g_linearClamp) * (narrow / g_frame.tonemapScale);
-    }
     return radiance;
 }
 

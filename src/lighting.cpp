@@ -129,9 +129,8 @@ constexpr UINT kMilkyWaySize = 512;
 // and for a day map again above kNightSkyShown x kNightSkyHysteresis, so it does not flip with the exposure.
 constexpr float kNightSkyShown = 0.03f;
 constexpr float kNightSkyHysteresis = 1.5f;
-// The full Moon's irradiance in the atmosphere's units (sunlight of irradiance 1): its mean visual magnitude at
-// opposition, -12.74 (NASA's Moon fact sheet), against the Sun's -26.74.
-constexpr float kFullMoonIrradiance = 2.512e-6f;
+// Moonlight comes in over civil twilight, as the sun sinks to 6 degrees below the horizon (USNO): sin(6 degrees).
+constexpr float kCivilTwilight = 0.104528f;
 // The clear sky is made again once the sun has moved this far (cosine of 0.1 degrees); its disc follows it exactly.
 constexpr float kSkySunMoved = 0.9999985f;
 // The sun's disc (shaders/sky_draw.hlsl) is as wide as env_sun's sprite looks: its half size m_nSize at 100 units
@@ -1077,6 +1076,18 @@ std::array<float, 4> Lighting::DaylightAt(float sunZ) const
     return result;
 }
 
+std::optional<Lighting::MoonState> Lighting::MoonFor(const ViewInputs& inputs, const Scene& scene) const
+{
+    const Settings& settings = GetSettings();
+    const std::optional<std::array<float, 3>> moon = m_nightSky.Moon();
+    if (!moon || !settings.moon || settings.moonPhase <= 0.0f || MapSunIsMoon() || !ShowsPhysicalSky(inputs, scene))
+        return std::nullopt;
+    const float night = std::clamp(-(*SkySun(inputs, scene))[2] / kCivilTwilight, 0.0f, 1.0f);
+    const float irradiance = MoonIrradiance(settings.moonPhase);
+    const float moonlit = std::max(settings.moonlitNight - settings.moonlessNight, 0.0f);
+    return MoonState{*moon, irradiance, night * moonlit * irradiance / MoonIrradiance(1.0f)};
+}
+
 std::optional<Lighting::Daylight> Lighting::DaylightFor(const FrameConstants& constants, const ViewInputs& inputs, const Scene& scene) const
 {
     if (!ShowsPhysicalSky(inputs, scene))
@@ -1085,12 +1096,20 @@ std::optional<Lighting::Daylight> Lighting::DaylightFor(const FrameConstants& co
     if (map[3] <= 0.0f)
         return std::nullopt;
     const std::array<float, 4> sky = DaylightAt((*SkySun(inputs, scene))[2]);
-    const std::array<float, 4> sun = DaylightAt(constants.sunDirection[2]);
-    const float floor = GetSettings().nightBrightness;
+    const float floor = GetSettings().moonlessNight;
+    const std::optional<MoonState> moon = MoonFor(inputs, scene);
+    const std::array<float, 4> moonlit = moon ? DaylightAt(moon->direction[2]) : std::array<float, 4>{};
     Daylight daylight;
-    daylight.sky = (sky[3] + floor * map[3]) / ((1.0f + floor) * map[3]);
-    for (size_t i = 0; i < 3; ++i)
-        daylight.sun[i] = map[i] > 0.0f ? sun[i] / map[i] : 1.0f;
+    daylight.sky = (sky[3] + floor * map[3] + (moon ? moon->scale * moonlit[3] : 0.0f)) / ((1.0f + floor) * map[3]);
+    if (constants.sunEnabled != 0.0f) {
+        const std::array<float, 4> sun = DaylightAt(constants.sunDirection[2]);
+        for (size_t i = 0; i < 3; ++i)
+            daylight.sun[i] = map[i] > 0.0f ? sun[i] / map[i] : 1.0f;
+    } else if (moon && moon->direction[2] > 0.0f && moon->scale > 0.0f) {
+        for (size_t i = 0; i < 3; ++i)
+            daylight.sun[i] = map[i] > 0.0f ? moon->scale * moonlit[i] / map[i] : 0.0f;
+        daylight.moonlight = moon->direction;
+    }
     return daylight;
 }
 
@@ -1182,6 +1201,7 @@ void Lighting::RecordSky(FrameConstants& constants, const ViewInputs& inputs, co
     if (sky && !m_proceduralSky.resource) {
         const bool created = CreateCube(m_atmosphereSky, kProceduralSkySize, DXGI_FORMAT_R32G32B32A32_FLOAT, &m_atmosphereSkyFaces) &&
             CreateCube(m_mapSky, kProceduralSkySize, DXGI_FORMAT_R32G32B32A32_FLOAT, &m_mapSkyFaces) &&
+            CreateCube(m_moonSky, kProceduralSkySize, DXGI_FORMAT_R32G32B32A32_FLOAT, &m_moonSkyFaces) &&
             CreateTarget(m_skyBands, kSkyBands + 1, 1, DXGI_FORMAT_R32G32B32A32_FLOAT) &&
             CreateCube(m_proceduralSky, kProceduralSkySize, DXGI_FORMAT_R16G16B16A16_FLOAT, &m_proceduralSkyFaces) &&
             std::ranges::all_of(m_mapSkyReadback, [&](ComPtr<ID3D12Resource>& readback) {
@@ -1195,65 +1215,11 @@ void Lighting::RecordSky(FrameConstants& constants, const ViewInputs& inputs, co
             return;
         }
     }
-    // The stars' frame and the 2D sky's motion turn with the sun.
-    m_nightSky.FollowSun(*sun);
-    // The game's draws (shaders/sky_draw.hlsl) read the transmittance and the sky in their own command lists.
-    const D3D12_RESOURCE_STATES read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-    const D3D12_RESOURCE_STATES write = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-    if (sky) {
-        // The clear sky under a sun, made again once the sun has moved.
-        const auto clearSky = [&](Texture& cube, const std::array<float, 3>& direction, std::optional<std::array<float, 3>>& madeFor) {
-            if (madeFor && direction[0] * (*madeFor)[0] + direction[1] * (*madeFor)[1] + direction[2] * (*madeFor)[2] >= kSkySunMoved)
-                return;
-            Use(cube, write);
-            DispatchGroups(Pass::SkyAtmosphere, {.input0 = m_transmittance.srv, .input1 = m_multipleScattering.srv, .input2 = std::bit_cast<UINT>(direction[0]),
-                .input3 = std::bit_cast<UINT>(direction[1]), .input4 = std::bit_cast<UINT>(direction[2]), .output0 = cube.uav, .step = 2},
-                kProceduralSkySize / kSkyGroup, kProceduralSkySize / kSkyGroup, 6);
-            madeFor = direction;
-        };
-        clearSky(m_atmosphereSky, *sun, m_atmosphereSun);
-        clearSky(m_mapSky, *MapSunDirection(scene), m_mapSkySun);
-        Use(m_atmosphereSky, read);
-        Use(m_mapSky, read);
-        const UINT floor = std::bit_cast<UINT>(settings.nightBrightness);
-        // The map's sky light before day and night scale it, for a game's sky not drawn above the horizon.
-        const std::optional<Daylight> daylight = DaylightFor(constants, inputs, scene);
-        const float mapSkyLight = Luminance(constants.skyColor) / (daylight ? daylight->sky : 1.0f);
-        Use(m_skyBands, write);
-        DispatchGroups(Pass::SkyAtmosphere, {.input0 = inputs.skyFacesView, .input1 = m_mapSkyFaces, .input2 = floor, .input3 = std::bit_cast<UINT>(mapSkyLight),
-            .output0 = m_skyBands.uav, .step = 3}, 1, 1, 1);
-        Use(m_skyBands, read | D3D12_RESOURCE_STATE_COPY_SOURCE);
-        // How bright the game's sky is above the horizon, for the CPU to tell night maps by (ReadMapSky).
-        const D3D12_TEXTURE_COPY_LOCATION destination = {m_mapSkyReadback[slot].Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-            {.PlacedFootprint = {0, {DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 1, 1, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT}}}};
-        const D3D12_TEXTURE_COPY_LOCATION source = {m_skyBands.resource.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {.SubresourceIndex = 0}};
-        const D3D12_BOX texel = {kSkyBands, 0, 0, kSkyBands + 1, 1, 1};
-        m_list->CopyTextureRegion(&destination, 0, 0, 0, &source, &texel);
-        m_mapSkyReadbackTonemap[slot] = inputs.tonemapScale;
-        m_mapSkyReadbackPending[slot] = true;
-        // The physical sky's stars are drawn against the sky the map's sun lights: the Sun's, or the Moon's on night maps.
-        const float mapLight = MapSunIsMoon() ? kFullMoonIrradiance : 1.0f;
-        Use(m_proceduralSky, write);
-        DispatchGroups(Pass::SkyAtmosphere, {.input0 = m_atmosphereSkyFaces, .input1 = m_skyBands.srv, .input2 = m_mapSkyFaces, .input3 = floor,
-            .input4 = std::bit_cast<UINT>(mapLight), .output0 = m_proceduralSky.uav, .step = 4}, kProceduralSkySize / kSkyGroup, kProceduralSkySize / kSkyGroup, 6);
-        Use(m_proceduralSky, kVolumeRead);
-        constants.skyCubeView = m_proceduralSky.srv;
-        m_proceduralSkyReady = true;
-        const uint32_t parts = (settings.stars ? gbuffer::kNightStars : 0u) | (settings.milkyWay ? gbuffer::kNightMilkyWay : 0u) |
-            (settings.satellites ? gbuffer::kNightSatellites : 0u) | (settings.shootingStars ? gbuffer::kNightMeteors : 0u);
-        if (parts != 0)
-            m_nightSky.Write(parts, *sun, settings.shootingStarFrequency, m_skyDraw);
-        m_skyDraw.milkyWayView = m_milkyWay.srv;
-        m_skyDraw.starDensity = settings.starAmount;
-        m_skyDraw.faintestStar = settings.faintestStars;
-        m_skyDraw.starBrightness = settings.starBrightness;
-        m_skyDraw.twinkleStrength = settings.twinkling ? settings.twinkleStrength : 0.0f;
-        m_skyDraw.twinkleSpeed = settings.twinkleSpeed;
-        m_skyDraw.milkyWayBrightness = settings.milkyWayBrightness;
-    }
+
+    // What the 2D sky shows beyond its atmosphere: the sun's disc, the Moon of day maps and the night sky.
     m_skyDraw.sky = sky;
     m_skyDraw.sunDisc = disc;
-    m_skyDraw.moon = MapSunIsMoon();
+    m_skyDraw.discIsMoon = MapSunIsMoon();
     m_skyDraw.skyView = m_proceduralSky.srv;
     m_skyDraw.transmittanceView = m_transmittance.srv;
     m_skyDraw.sunDirection = *sun;
@@ -1266,15 +1232,95 @@ void Lighting::RecordSky(FrameConstants& constants, const ViewInputs& inputs, co
             m_skyDraw.sunRadius = std::atan(kSunSpriteHalfBrightness * inputs.envSun->size / kSunSpriteDistance);
     }
     m_skyDraw.sunRadius *= settings.sunSize;
+    const std::optional<MoonState> moon = MoonFor(inputs, scene);
+    if (moon) {
+        m_skyDraw.moonDirection = moon->direction;
+        m_skyDraw.moonIrradiance = moon->irradiance;
+        m_skyDraw.moonScale = moon->scale;
+    }
+    m_skyDraw.moonlessFloor = settings.moonlessNight;
+    // The physical sky's stars are drawn against the sky the map's sun lights: the Sun's, or the Moon's on night maps.
+    m_skyDraw.mapLight = MapSunIsMoon() ? MoonIrradiance(1.0f) : 1.0f;
+    // Earlier stars: the sun's sky counts as dark as it would be with the sun lower, by the clear sky's irradiance there
+    // against here.
+    const float sunElevation = std::asin(std::clamp((*sun)[2], -1.0f, 1.0f));
+    const float here = DaylightAt((*sun)[2])[3];
+    const float lower = DaylightAt(std::sin(std::max(sunElevation - settings.earlierStars * std::numbers::pi_v<float> / 180.0f, -0.5f * std::numbers::pi_v<float>)))[3];
+    m_skyDraw.starTwilight = here > 0.0f ? std::min(lower / here, 1.0f) : 1.0f;
+    if (sky) {
+        const uint32_t parts = (settings.stars ? gbuffer::kNightStars : 0u) | (settings.milkyWay ? gbuffer::kNightMilkyWay : 0u) |
+            (settings.satellites ? gbuffer::kNightSatellites : 0u) | (settings.shootingStars ? gbuffer::kNightMeteors : 0u);
+        if (parts != 0)
+            m_nightSky.Write(parts, *sun, settings.shootingStarFrequency, m_skyDraw);
+        m_skyDraw.milkyWayView = m_milkyWay.srv;
+        m_skyDraw.starDensity = settings.starAmount;
+        m_skyDraw.faintestStar = settings.faintestStars;
+        m_skyDraw.starBrightness = settings.starBrightness;
+        m_skyDraw.twinkleStrength = settings.twinkling ? settings.twinkleStrength : 0.0f;
+        m_skyDraw.twinkleSpeed = settings.twinkleSpeed;
+        m_skyDraw.milkyWayBrightness = settings.milkyWayBrightness;
+    }
     // The 2D sky's motion since the last main view, for TAA and Ray Reconstruction: with the physical sky all of it turns
-    // with the sun (its stars, disc and glow); over the game's own sky only the disc moves, over the directions it covered
-    // then or now.
+    // with the sun (its stars, disc, Moon and glow); over the game's own sky only the disc moves, over the directions it
+    // covered then or now.
     const std::array<std::array<float, 3>, 3> back = m_nightSky.TurnBack();
     for (size_t row = 0; row < 3; ++row)
         std::copy(back[row].begin(), back[row].end(), constants.skyMotion[row]);
     std::copy(sun->begin(), sun->end(), constants.skyMotionDisc);
     constants.skyMotionDisc[3] = sky ? -2.0f : std::cos(std::min(1.5f * m_skyDraw.sunRadius + m_nightSky.TurnAngle(), std::numbers::pi_v<float>));
-    WriteNightSky(slot, constants);
+    if (!WriteNightSky(slot, constants)) {
+        // The procedural sky reads what WriteNightSky writes.
+        if (sky) {
+            m_atmosphereFailed = true;
+            m_skyDraw = {};
+        }
+        return;
+    }
+    if (!sky)
+        return;
+
+    // The game's draws (shaders/sky_draw.hlsl) read the transmittance and the sky in their own command lists.
+    const D3D12_RESOURCE_STATES read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    const D3D12_RESOURCE_STATES write = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    // The clear sky under a sun, made again once the sun has moved.
+    const auto clearSky = [&](Texture& cube, const std::array<float, 3>& direction, std::optional<std::array<float, 3>>& madeFor) {
+        if (madeFor && direction[0] * (*madeFor)[0] + direction[1] * (*madeFor)[1] + direction[2] * (*madeFor)[2] >= kSkySunMoved)
+            return;
+        Use(cube, write);
+        DispatchGroups(Pass::SkyAtmosphere, {.input0 = m_transmittance.srv, .input1 = m_multipleScattering.srv, .input2 = std::bit_cast<UINT>(direction[0]),
+            .input3 = std::bit_cast<UINT>(direction[1]), .input4 = std::bit_cast<UINT>(direction[2]), .output0 = cube.uav, .step = 2},
+            kProceduralSkySize / kSkyGroup, kProceduralSkySize / kSkyGroup, 6);
+        madeFor = direction;
+    };
+    clearSky(m_atmosphereSky, *sun, m_atmosphereSun);
+    clearSky(m_mapSky, *MapSunDirection(scene), m_mapSkySun);
+    if (moon)
+        clearSky(m_moonSky, moon->direction, m_moonSkySun);
+    Use(m_atmosphereSky, read);
+    Use(m_mapSky, read);
+    Use(m_moonSky, read);
+    const UINT floor = std::bit_cast<UINT>(settings.moonlessNight);
+    // The map's sky light before day and night scale it, for a game's sky not drawn above the horizon.
+    const std::optional<Daylight> daylight = DaylightFor(constants, inputs, scene);
+    const float mapSkyLight = Luminance(constants.skyColor) / (daylight ? daylight->sky : 1.0f);
+    Use(m_skyBands, write);
+    DispatchGroups(Pass::SkyAtmosphere, {.input0 = inputs.skyFacesView, .input1 = m_mapSkyFaces, .input2 = floor, .input3 = std::bit_cast<UINT>(mapSkyLight),
+        .output0 = m_skyBands.uav, .step = 3}, 1, 1, 1);
+    Use(m_skyBands, read | D3D12_RESOURCE_STATE_COPY_SOURCE);
+    // How bright the game's sky is above the horizon, for the CPU to tell night maps by (ReadMapSky).
+    const D3D12_TEXTURE_COPY_LOCATION destination = {m_mapSkyReadback[slot].Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+        {.PlacedFootprint = {0, {DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 1, 1, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT}}}};
+    const D3D12_TEXTURE_COPY_LOCATION source = {m_skyBands.resource.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {.SubresourceIndex = 0}};
+    const D3D12_BOX texel = {kSkyBands, 0, 0, kSkyBands + 1, 1, 1};
+    m_list->CopyTextureRegion(&destination, 0, 0, 0, &source, &texel);
+    m_mapSkyReadbackTonemap[slot] = inputs.tonemapScale;
+    m_mapSkyReadbackPending[slot] = true;
+    Use(m_proceduralSky, write);
+    DispatchGroups(Pass::SkyAtmosphere, {.input0 = m_atmosphereSkyFaces, .input1 = m_skyBands.srv, .input2 = m_mapSkyFaces, .input3 = constants.nightSkyView,
+        .input4 = m_moonSkyFaces, .output0 = m_proceduralSky.uav, .step = 4}, kProceduralSkySize / kSkyGroup, kProceduralSkySize / kSkyGroup, 6);
+    Use(m_proceduralSky, kVolumeRead);
+    constants.skyCubeView = m_proceduralSky.srv;
+    m_proceduralSkyReady = true;
 }
 
 bool Lighting::EnsureTargets(UINT width, UINT height)
@@ -1858,6 +1904,10 @@ bool Lighting::FillConstants(FrameConstants& constants, const Scene& scene, cons
     const float sunStyle = scene.LightStyle(sun.style);
     const float skyStyle = scene.LightStyle(sun.ambientStyle);
     const Daylight daylight = DaylightFor(constants, inputs, scene).value_or(Daylight{});
+    if (daylight.moonlight) {
+        std::copy(daylight.moonlight->begin(), daylight.moonlight->end(), constants.sunDirection);
+        constants.sunEnabled = 1.0f;
+    }
     for (int i = 0; i < 3; ++i) {
         constants.sunColor[i] *= settings.sun ? settings.sunIntensity * sunStyle * daylight.sun[i] : 0.0f;
         constants.skyColor[i] *= settings.skyIntensity * skyStyle * daylight.sky;
@@ -2165,6 +2215,13 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     if (m_mapSkyReadbackPending[slot]) {
         m_mapSkyReadbackPending[slot] = false;
         ReadMapSky(slot);
+    }
+    // The stars' frame (and the Moon among the stars) turns with the sun the sky shows, once a frame.
+    if (inputs.kind == gbuffer::ViewKind::Main) {
+        if (const std::optional<std::array<float, 3>> sun = SkySun(inputs, scene)) {
+            m_nightSky.FollowSun(*sun);
+            m_nightSky.PlaceMoon(*sun, GetSettings().moonPhase);
+        }
     }
     // Timings of the view that last used this slot: the main view's per pass, the others' whole runs.
     if (m_slotFenceValues[slot] != 0 && !m_slotWasMain[slot]) {

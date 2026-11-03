@@ -15,13 +15,15 @@
 //    brightness. Without the game's sky above the horizon the scale makes it as bright as the map's sky light (input3,
 //    float bits: its luminance). Texel kBands: the mean luminance of the game's sky above the horizon where it was drawn
 //    (x, -1 without any), which tells night maps (Lighting::ReadMapSky).
-// 4: the procedural sky (output0, a cube's faces): step 2's sky for the sun the sky shows (input0) plus the night's floor
-//    (input3, float bits) times the sky with the map's sun (input2), times the multiplier of its elevation (input1), a
-//    smooth curve through the bands. So the sky is the game's where the sun is the map's, and darkens and reddens as the
-//    sun sets as the clear sky does, down to the floor. Alpha: log2 of how much brighter it is than the physical sky with
-//    a natural night sky's own light (kNightSkyRadiance), the gain the night sky's stars are drawn with
-//    (shaders/sky_draw.hlsl), as the eye adapted to this sky would see them. The physical sky is lit by the map's sun's
-//    irradiance in input4 (float bits): 1 for the Sun, the full Moon's for a night map's.
+// 4: the procedural sky (output0, a cube's faces): step 2's sky for the sun the sky shows (input0), plus the moonless
+//    night's floor times the sky with the map's sun (input2) and the Moon's share times the sky it lights (input4, step
+//    2's sky for the Moon of day maps), times the multiplier of its elevation (input1), a smooth curve through the bands;
+//    the floor and shares come from the slot's NightSkyConstants (input3). So the sky is the game's where the sun is the
+//    map's, and darkens and reddens as the sun sets as the clear sky does, down to the floor and the moonlit sky. Alpha:
+//    log2 of how much brighter it is than the physical sky (the sun's at the map's sun's irradiance, the Moon's at its
+//    own) with a natural night sky's own light (kNightSkyRadiance), the gain the night sky's stars and the Moon are drawn
+//    with (shaders/sky_draw.hlsl), as the eye adapted to this sky would see them. The sun's sky counts as dark as it would
+//    be with the sun Settings::earlierStars lower (NightSkyConstants::starTwilight), so the night sky comes out earlier.
 // 5: the daylight table (output0, kDaylightEntries x 1), one group per entry, for the CPU (Lighting::DaylightAt): for the
 //    sun at the entry's elevation (DaylightElevation), the transmittance toward it from the eye (rgb) and the luminance
 //    of the clear sky's irradiance on a surface facing up (a), from both tables (input0, input1).
@@ -308,6 +310,8 @@ void main(uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint index :
     Texture2DArray<float4> sky = ResourceDescriptorHeap[g_pass.input0];
     Texture2D<float4> bands = ResourceDescriptorHeap[g_pass.input1];
     Texture2DArray<float4> mapSky = ResourceDescriptorHeap[g_pass.input2];
+    StructuredBuffer<NightSkyConstants> nightSky = ResourceDescriptorHeap[g_pass.input3];
+    NightSkyConstants night = nightSky[0];
     uint width, height, faces;
     output.GetDimensions(width, height, faces);
     float3 direction = normalize(FaceDirection(id.z, (float2(id.xy) + 0.5) * (2.0 / width) - 1.0));
@@ -323,7 +327,12 @@ void main(uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint index :
     for (int k = 0; k < 4; ++k)
         multiplier += weights[k] * bands.Load(int3(clamp(first + k, 0, int(kBands) - 1), 0, 0)).rgb;
     float3 clear = sky.Load(int4(id, 0)).rgb;
-    float3 radiance = min((clear + asfloat(g_pass.input3) * mapSky.Load(int4(id, 0)).rgb) * multiplier, 65504.0);
-    float gain = Luminance(radiance) / (Luminance(clear) * asfloat(g_pass.input4) + kNightSkyRadiance);
+    float3 moonlit = 0.0;
+    if (night.moonIrradiance > 0.0) {
+        Texture2DArray<float4> moonSky = ResourceDescriptorHeap[g_pass.input4];
+        moonlit = moonSky.Load(int4(id, 0)).rgb;
+    }
+    float3 radiance = min((clear + night.moonlessFloor * mapSky.Load(int4(id, 0)).rgb + night.moonScale * moonlit) * multiplier, 65504.0);
+    float gain = Luminance(radiance) / (Luminance(clear) * night.mapLight * night.starTwilight + Luminance(moonlit) * night.moonIrradiance + kNightSkyRadiance);
     output[id] = float4(radiance, log2(max(gain, 1e-30)));
 }

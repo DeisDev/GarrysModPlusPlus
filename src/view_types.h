@@ -99,7 +99,7 @@ struct SkyDraw {
     bool sky = false;
     bool sunDisc = false;
     // The disc is the Moon: the map's sun is the Moon (Settings::mapSun).
-    bool moon = false;
+    bool discIsMoon = false;
     UINT skyView = 0;
     UINT transmittanceView = 0;
     std::array<float, 3> sunDirection = {};
@@ -119,11 +119,20 @@ struct SkyDraw {
     // How the stars look (NightSkyConstants in shaders/night_sky.hlsli): times Earth's count, the faintest magnitude
     // drawn, times their brightness, how strongly (0 for none) and fast they twinkle; and times the Milky Way's brightness.
     float starDensity = 1.0f;
-    float faintestStar = 10.0f;
+    float faintestStar = 6.5f;
     float starBrightness = 1.0f;
     float twinkleStrength = 1.0f;
     float twinkleSpeed = 1.0f;
     float milkyWayBrightness = 1.0f;
+    // The Moon of day maps (NightSkyConstants): its direction and irradiance (0 without one), the share of the sky its
+    // light shows, the moonless night's floor, and the map's own sun's irradiance in the atmosphere's units.
+    std::array<float, 3> moonDirection = {};
+    float moonIrradiance = 0.0f;
+    float moonScale = 0.0f;
+    float moonlessFloor = 0.0f;
+    float mapLight = 1.0f;
+    // How much darker the sun's sky counts when the night sky is drawn against it (Settings::earlierStars).
+    float starTwilight = 1.0f;
     std::array<std::array<float, 4>, kMaxSatellites> satellites = {};
     uint32_t satelliteCount = 0;
     std::array<Meteor, kMaxMeteors> meteors = {};

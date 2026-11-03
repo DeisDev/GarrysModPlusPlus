@@ -15,6 +15,7 @@ using Quaternion = std::array<double, 4>;
 constexpr double kGroundRadius = 6360.0;
 constexpr double kEyeHeight = 0.2;
 constexpr double kSunMagnitude = -26.74;
+constexpr double kFullMoonMagnitude = -12.74;
 // Earth's gravitational parameter GM in km^3/s^2.
 constexpr double kEarthGm = 398600.4418;
 
@@ -189,7 +190,7 @@ NightSkyConstants PackNightSky(const gbuffer::SkyDraw& draw)
     std::copy(draw.sunDirection.begin(), draw.sunDirection.end(), constants.sunDirection);
     constants.sunRadius = draw.sunRadius;
     std::copy(draw.sunColor.begin(), draw.sunColor.end(), constants.sunColor);
-    constants.disc = draw.sunDisc ? (draw.moon ? 2u : 1u) : 0u;
+    constants.disc = draw.sunDisc ? (draw.discIsMoon ? 2u : 1u) : 0u;
     constants.transmittanceView = draw.transmittanceView;
     constants.parts = draw.nightSky;
     constants.satelliteCount = draw.satelliteCount;
@@ -204,6 +205,12 @@ NightSkyConstants PackNightSky(const gbuffer::SkyDraw& draw)
     constants.twinkleStrength = draw.twinkleStrength;
     constants.twinkleSpeed = draw.twinkleSpeed;
     constants.milkyWayBrightness = draw.milkyWayBrightness;
+    std::copy(draw.moonDirection.begin(), draw.moonDirection.end(), constants.moonDirection);
+    constants.moonIrradiance = draw.moonIrradiance;
+    constants.moonScale = draw.moonScale;
+    constants.moonlessFloor = draw.moonlessFloor;
+    constants.mapLight = draw.mapLight;
+    constants.starTwilight = draw.starTwilight;
     for (size_t i = 0; i < draw.satelliteCount; ++i)
         std::copy(draw.satellites[i].begin(), draw.satellites[i].end(), constants.satellites[i]);
     for (size_t i = 0; i < draw.meteorCount; ++i) {
@@ -217,10 +224,19 @@ NightSkyConstants PackNightSky(const gbuffer::SkyDraw& draw)
     return constants;
 }
 
+float MoonIrradiance(float phase)
+{
+    const double elongation = std::acos(std::clamp(1.0 - 2.0 * phase, -1.0, 1.0));
+    const double phaseAngle = 180.0 - elongation * 180.0 / std::numbers::pi;
+    const double magnitude = kFullMoonMagnitude + 0.026 * phaseAngle + 4e-9 * std::pow(phaseAngle, 4.0);
+    return static_cast<float>(MagnitudeFlux(magnitude));
+}
+
 void NightSky::Reset()
 {
     m_rotation = {1.0, 0.0, 0.0, 0.0};
     m_turn = {1.0, 0.0, 0.0, 0.0};
+    m_moon.reset();
     m_sun.reset();
     m_start = std::chrono::steady_clock::now();
 }
@@ -265,6 +281,27 @@ std::array<std::array<float, 3>, 3> NightSky::TurnBack() const
 float NightSky::TurnAngle() const
 {
     return static_cast<float>(2.0 * std::acos(std::clamp(m_turn[0], -1.0, 1.0)));
+}
+
+void NightSky::PlaceMoon(const std::array<float, 3>& sun, float phase)
+{
+    if (m_moon && std::abs(phase - m_moonPhase) < 1e-5f)
+        return;
+    const Vector toSun = Normalize({sun[0], sun[1], sun[2]});
+    const double across = std::sqrt(toSun[0] * toSun[0] + toSun[1] * toSun[1]);
+    const Vector side = across > 1e-6 ? Vector{toSun[0] / across, toSun[1] / across, 0.0} : Vector{1.0, 0.0, 0.0};
+    const double angle = std::asin(std::clamp(toSun[2], -1.0, 1.0)) + std::acos(std::clamp(1.0 - 2.0 * phase, -1.0, 1.0));
+    const Vector local = {side[0] * std::cos(angle), side[1] * std::cos(angle), std::sin(angle)};
+    m_moon = Rotate({m_rotation[0], -m_rotation[1], -m_rotation[2], -m_rotation[3]}, local);
+    m_moonPhase = phase;
+}
+
+std::optional<std::array<float, 3>> NightSky::Moon() const
+{
+    if (!m_moon)
+        return std::nullopt;
+    const Vector moon = Rotate(m_rotation, *m_moon);
+    return std::array<float, 3>{static_cast<float>(moon[0]), static_cast<float>(moon[1]), static_cast<float>(moon[2])};
 }
 
 void NightSky::Write(uint32_t parts, const std::array<float, 3>& sun, float meteorFrequency, gbuffer::SkyDraw& draw) const

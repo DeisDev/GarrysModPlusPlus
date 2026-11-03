@@ -48,6 +48,17 @@ struct NightSkyConstants
     float twinkleStrength;
     float twinkleSpeed;
     float milkyWayBrightness;
+    // The Moon of day maps (MoonDisc): its direction and irradiance in the atmosphere's units (0 without one); how much
+    // of the sky its light shows (the procedural sky adds the clear sky it lights times this); the moonless night's floor
+    // (times the sky with the map's sun); the irradiance of the map's own sun in the atmosphere's units (1, or the full
+    // Moon's on night maps); and how much darker the sun's sky counts for the night sky's gain (Settings::earlierStars),
+    // for shaders/sky_atmosphere.hlsl's step 4.
+    float3 moonDirection;
+    float moonIrradiance;
+    float moonScale;
+    float moonlessFloor;
+    float mapLight;
+    float starTwilight;
     // Satellites: their directions (xyz) and irradiance (w).
     float4 satellites[8];
     // Meteors (MeteorStreak): the direction each started from (xyz) and its head's angle along its path (w); the axis its
@@ -344,6 +355,46 @@ float MoonAlbedo(float2 offset)
 {
     float maria = smoothstep(0.5, 0.62, FractalNoise(float3(offset, 0.37), 1.6));
     return lerp(1.0, 0.55, maria);
+}
+
+// The Moon's angular radius (1896 arcseconds across at opposition, NASA's Moon fact sheet): its surface is as bright as
+// its light over a disc this size, whatever size it is drawn at.
+static const float kMoonAngularRadius = 4.596e-3;
+
+// The Moon of day maps toward a direction, after the tonemap scale, drawn as wide as the sun's disc, and `coverage`, the
+// share of a footprint `edge` radians wide inside it (it hides the stars behind it). The sun lights the sphere at its
+// phase (Lommel-Seeliger, so a full Moon is even to its edge) and the maria (MoonAlbedo). Its surface is as bright as
+// the real Moon's (its irradiance over the lit share of its disc) at the gain the sky there is shown with (`logGain`),
+// as bright as the target holds at most: pale by day, bright at night. The air colours it, and the ground hides it.
+float3 MoonDisc(NightSkyConstants night, float3 direction, float edge, float logGain, float tonemapScale, Texture2D<float4> transmittance,
+    SamplerState linearClamp, out float coverage)
+{
+    coverage = 0.0;
+    if (night.moonIrradiance <= 0.0)
+        return 0.0;
+    float3 moon = night.moonDirection;
+    float angle = atan2(length(cross(direction, moon)), dot(direction, moon));
+    float3 eye = float3(0.0, 0.0, kGroundRadius + kEyeHeight);
+    if (angle >= night.sunRadius + edge || SphereDistance(eye, direction, kGroundRadius) >= 0.0)
+        return 0.0;
+    coverage = saturate((night.sunRadius - angle) / max(edge, 1e-7) + 0.5);
+    float3 across = abs(moon.z) < 0.999 ? normalize(cross(float3(0.0, 0.0, 1.0), moon)) : float3(1.0, 0.0, 0.0);
+    float3 up = cross(moon, across);
+    float2 offset = float2(dot(direction, across), dot(direction, up)) / night.sunRadius;
+    // The edge's footprint reaches past the disc, where the sphere has no surface: it is shaded as the edge is. There the
+    // shading's terms both go to 0, and a sign flipping between jittered samples made the rim flicker.
+    float2 onSphere = offset * min(1.0, 0.995 / max(length(offset), 1e-6));
+    float towardEye = sqrt(1.0 - dot(onSphere, onSphere));
+    float3 normal = onSphere.x * across + onSphere.y * up - towardEye * moon;
+    float lit = dot(normal, night.sunDirection);
+    // At most as bright as the target holds, as `shown` is.
+    float shade = lit > 0.0 ? min(2.0 * lit / (lit + towardEye), 1.0) : 0.0;
+    float litShare = 0.5 - 0.5 * dot(moon, night.sunDirection);
+    float radiance = night.moonIrradiance / (3.14159265 * kMoonAngularRadius * kMoonAngularRadius * max(litShare, 0.01));
+    float shown = min(radiance * exp2(logGain) * tonemapScale, 1.0);
+    float3 color = AtmosphereTransmittance(transmittance, linearClamp, eye.z, moon.z);
+    color /= max(max(color.r, max(color.g, color.b)), 1e-6);
+    return color * (MoonAlbedo(offset) * shade * shown * coverage);
 }
 
 // The sun's disc toward a direction, after the tonemap scale. It is thousands of times brighter than the sky, so it is

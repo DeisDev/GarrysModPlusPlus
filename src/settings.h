@@ -87,17 +87,22 @@ struct Settings {
     bool volumetricLight = true;
     bool fog = true;
     // A physically based sky in the 2D skybox's colours replaces the skybox, on screen and in the lighting. It darkens to
-    // night as the sun sets, as does the light of the sun and sky, down to nightBrightness of the map's sky.
+    // night as the sun sets, as does the light of the sun and sky: under a full Moon to moonlitNight of the map's sky and
+    // light, without one to moonlessNight.
     bool physicalSky = true;
     MapSun mapSun = MapSun::Auto;
-    float nightBrightness = 0.05f;
+    float moonlitNight = 0.05f;
+    float moonlessNight = 0.01f;
     // What the physical sky shows at night, and how: stars at starAmount times Earth's count, down to visual magnitude
-    // faintestStars, starBrightness times as bright, twinkling twinkleStrength times as strongly and twinkleSpeed times as
-    // fast as by default; the Milky Way milkyWayBrightness times as bright; shooting stars shootingStarFrequency times
-    // as often.
+    // faintestStars (by default 6.5, the naked eye's limit under a dark sky), starBrightness times as bright, twinkling
+    // twinkleStrength times as strongly and twinkleSpeed times as fast as by default; the Milky Way milkyWayBrightness
+    // times as bright; shooting stars shootingStarFrequency times as often.
     bool stars = true;
+    // The night sky (stars, the Milky Way, satellites and meteors) comes out as it would with the sun this many degrees
+    // lower.
+    float earlierStars = 0.0f;
     float starAmount = 1.0f;
-    float faintestStars = 10.0f;
+    float faintestStars = 6.5f;
     float starBrightness = 1.0f;
     bool twinkling = true;
     float twinkleStrength = 1.0f;
@@ -107,6 +112,9 @@ struct Settings {
     bool shootingStars = true;
     float shootingStarFrequency = 1.0f;
     bool satellites = true;
+    // The Moon of day maps, at moonPhase (the share of its disc lit, 1 full) from the sun; it lights the night.
+    bool moon = true;
+    float moonPhase = 1.0f;
     // Our sun disc replaces env_sun's sprite, scaled from the size it has (Lighting::RecordSky).
     bool sunDisc = true;
     float sunSize = 1.0f;

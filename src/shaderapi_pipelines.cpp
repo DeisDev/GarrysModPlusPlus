@@ -1056,7 +1056,7 @@ struct SkyConstants {
     std::uint32_t padding;
     NightSkyConstants night;
 };
-static_assert(sizeof(SkyConstants) == 448);
+static_assert(sizeof(SkyConstants) == 480);
 
 // SkyDrawConstants::target: how a colour target stores colour.
 std::uint32_t TargetEncoding(DXGI_FORMAT format)
