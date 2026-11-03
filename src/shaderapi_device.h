@@ -161,9 +161,11 @@ private:
     Upload Allocate(std::vector<UploadPage>& pages, UINT64 size, UINT64 alignment);
 
     Microsoft::WRL::ComPtr<IDXGIFactory6> m_factory;
+    Microsoft::WRL::ComPtr<IDXGIFactory2> m_swapChainFactory;
     // The frame generator the swap chain is made for (Settings::frameGeneration when the device was created).
     FrameGeneration m_frameGeneration = FrameGeneration::Off;
     Microsoft::WRL::ComPtr<ID3D12Device> m_device;
+    Microsoft::WRL::ComPtr<ID3D12Device> m_queueDevice;
     Microsoft::WRL::ComPtr<ID3D12InfoQueue> m_infoQueue;
     UINT64 m_debugMessages = 0;
     Microsoft::WRL::ComPtr<ID3D12CommandQueue> m_queue;

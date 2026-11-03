@@ -360,6 +360,8 @@ bool Backend::CreateDevice()
     DXGI_ADAPTER_DESC1 adapterDesc = {};
     adapter->GetDesc1(&adapterDesc);
     streamline::SetDevice(m_device.Get(), adapterDesc.AdapterLuid);
+    m_queueDevice = streamline::QueueDevice(m_device.Get());
+    m_swapChainFactory = streamline::SwapChainFactory(m_factory.Get());
     Statistics& statistics = GetStatistics();
     statistics.reflexAvailable = streamline::ReflexAvailable();
     statistics.dlssFrameGenerationAvailable = streamline::FrameGenerationAvailable();
@@ -369,7 +371,7 @@ bool Backend::CreateDevice()
     // The queue comes from Streamline's proxy device, which hooks its creation (sl_hooks.h).
     D3D12_COMMAND_QUEUE_DESC queueDesc = {};
     queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-    if (FAILED(hr = streamline::QueueDevice(m_device.Get())->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&m_queue))) ||
+    if (FAILED(hr = m_queueDevice->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&m_queue))) ||
         FAILED(hr = m_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&m_fence)))) {
         log::Info("Native: creating the queue or fence failed: {:#010x}", Hex(hr));
         return false;
@@ -441,7 +443,7 @@ bool Backend::CreateSwapChain()
         // Else through Streamline's factory, so the swap chain is its proxy (DLSS Frame Generation, Reflex's present
         // markers); a plain DXGI one also when FSR could not make its own (logged), so the game still has a window.
         if (swapChain == nullptr)
-            hr = streamline::SwapChainFactory(m_factory.Get())->CreateSwapChainForHwnd(m_queue.Get(), m_window, &desc, nullptr, nullptr, &swapChain);
+            hr = m_swapChainFactory->CreateSwapChainForHwnd(m_queue.Get(), m_window, &desc, nullptr, nullptr, &swapChain);
         if (FAILED(hr) || FAILED(hr = swapChain.As(&m_swapChain))) {
             log::Info("Native: CreateSwapChainForHwnd failed: {:#010x}", Hex(hr));
             return false;

@@ -24,7 +24,8 @@ bool Active();
 // After the device is created: tells Streamline the device and checks what its adapter supports.
 void SetDevice(ID3D12Device* device, const LUID& adapter);
 // The device to create the queue with and the factory to create the swap chain with: Streamline's proxies, which hook
-// those calls (sl_hooks.h), or the native ones.
+// those calls (sl_hooks.h), or the native ones. Keep them as long as the device: Streamline still uses its proxies after
+// those calls (the swap chain's creation called into a released device proxy).
 Microsoft::WRL::ComPtr<ID3D12Device> QueueDevice(ID3D12Device* device);
 Microsoft::WRL::ComPtr<IDXGIFactory2> SwapChainFactory(IDXGIFactory2* factory);
 
