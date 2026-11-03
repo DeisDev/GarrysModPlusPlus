@@ -41,6 +41,9 @@ struct CopySurface {
 // D3DTEXF_LINEAR does: a plain copy when the sizes and formats allow it, otherwise a draw.
 void StretchRect(const CopySurface& source, const D3D12_RECT& sourceRect, const CopySurface& destination, const D3D12_RECT& destinationRect);
 
+// Grades `rect` of the back buffer by the menu's colour grading (shaders/grade.hlsl), when it is on and changes anything.
+void GradeView(D3D12_RECT rect);
+
 // Starts reading the pipeline library from disk on another thread, so the first draw does not wait for the file.
 void ReadPipelineLibraryInBackground();
 // Saves new pipeline states to the pipeline library on disk: when `now`, on this thread after any save in progress;

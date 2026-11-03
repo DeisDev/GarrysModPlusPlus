@@ -74,7 +74,7 @@ FaceLightmap LoadFace(uint view, uint face)
 // The parts of baked light added up as the sun and sky are now.
 float3 DaylitLight(float3 sun, float3 sky, float3 lamps)
 {
-    return sun * g_frame.bakedSunScale + sky * g_frame.bakedSkyScale + lamps;
+    return sun * g_frame.bakedSunScale + sky * (g_frame.bakedSkyScale * g_frame.bakedSkyTint) + lamps;
 }
 
 // The lightmap samples in each part of a baked light buffer.

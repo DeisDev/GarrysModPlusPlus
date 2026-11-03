@@ -264,6 +264,7 @@ add_shader(shaders/sky.hlsl main cs_6_6 g_skyCS)
 add_shader(shaders/sky_atmosphere.hlsl main cs_6_6 g_skyAtmosphereCS)
 add_shader(shaders/sky_draw.hlsl SkyMain ps_6_6 g_skyDrawPS)
 add_shader(shaders/sky_draw.hlsl DiscMain ps_6_6 g_sunDiscPS)
+add_shader(shaders/grade.hlsl main ps_6_6 g_gradePS)
 add_shader(shaders/translucent_depth.hlsl main cs_6_6 g_translucentDepthCS)
 add_shader(shaders/translucent_depth.hlsl main cs_6_9 g_translucentDepthOmmCS -D OPACITY_MICROMAPS=1)
 add_shader(shaders/caustics.hlsl main cs_6_6 g_causticsCS)
@@ -404,6 +405,7 @@ add_library(gmodpp SHARED
     src/shaderapi_thunks.asm
     src/busy_window.cpp
     src/capture.cpp
+    src/color.cpp
     src/command_line.cpp
     src/log.cpp
     src/module_scan.cpp
@@ -467,7 +469,7 @@ target_include_directories(gmodpp BEFORE PRIVATE "${AGILITY_SDK_DIR}/build/nativ
 target_include_directories(gmodpp PRIVATE "${DXC_DIR}/inc" "${SHADER_OUTPUT_DIR}" "${DLSS_SDK_DIR}/include" "${RTXDI_DIR}/Include")
 # ReSTIRDI.cpp leaves a parameter unused in release builds (its check is an assert).
 set_source_files_properties("${RTXDI_DIR}/Source/ReSTIRDI.cpp" PROPERTIES COMPILE_OPTIONS /wd4100)
-target_link_libraries(gmodpp PRIVATE d3d12 dxgi dxguid dwrite icu lzma_dec dbghelp minhook imgui NRD "${DLSS_SDK_DIR}/lib/Windows_x86_64/x64/nvsdk_ngx_s.lib")
+target_link_libraries(gmodpp PRIVATE d3d12 dxgi dxguid d2d1 dwrite icu lzma_dec dbghelp minhook imgui NRD "${DLSS_SDK_DIR}/lib/Windows_x86_64/x64/nvsdk_ngx_s.lib")
 
 # The mod laid out as the game folder: the loader in the root and everything else in gmodplusplus, with the licences
 # every bundled component requires. deploy copies it into the game and release zips it.

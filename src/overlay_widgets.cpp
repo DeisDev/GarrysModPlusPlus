@@ -1,5 +1,6 @@
 #include "overlay_widgets.h"
 
+#include "color.h"
 #include "log.h"
 #include "overlay_fonts.h"
 #include "text_layout.h"
@@ -9,10 +10,12 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <fstream>
 #include <map>
 #include <string>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace gmodpp::overlay::widgets {
@@ -48,12 +51,33 @@ std::map<std::filesystem::path, std::vector<char>> g_fontData;
 struct Row {
     float top = 0.0f;
     float labelBottom = 0.0f;
+    float labelStart = 0.0f;
+    float labelEnd = 0.0f;
     float controlStart = 0.0f;
     float controlEnd = 0.0f;
     bool enabled = true;
     const char* reason = nullptr;
+    RowMark mark = RowMark::None;
+    const char* markNote = nullptr;
+    const char* resetHint = nullptr;
 };
 Row g_row;
+
+// The card being drawn: whether its table is open, and its left and right edges on screen (0, 0 outside a card).
+struct Card {
+    bool open = false;
+    float min = 0.0f;
+    float max = 0.0f;
+};
+Card g_card;
+
+// A row's horizontal extent for its highlight and mark: the card's, or the window's outside a card.
+std::pair<float, float> RowExtent()
+{
+    if (g_card.max > g_card.min)
+        return {g_card.min, g_card.max};
+    return {ImGui::GetWindowPos().x, ImGui::GetWindowPos().x + ImGui::GetWindowWidth()};
+}
 
 ImVec4 WithAlpha(ImVec4 color, float alpha) { return ImVec4(color.x, color.y, color.z, alpha); }
 
@@ -145,6 +169,7 @@ void SetColors(ImGuiStyle& style)
     colors[ImGuiCol_TextLink] = kAccent;
     colors[ImGuiCol_TextSelectedBg] = WithAlpha(kAccent, 0.35f);
     colors[ImGuiCol_NavCursor] = kAccent;
+    colors[ImGuiCol_ModalWindowDimBg] = ImVec4(0.0f, 0.0f, 0.0f, 0.45f);
 }
 
 void SetSizes(ImGuiStyle& style)
@@ -187,6 +212,50 @@ Line VisualLine(const char* text)
 
 // Where a line `width` wide starts in [start, end]: at the start of the line in the language's direction.
 float AlignedX(float start, float end, float width) { return RightToLeft() ? end - width : start; }
+
+// Text wrapped to `width` from the window position `start`, each line aligned to the start of the line.
+void WrappedText(const char* text, float start, float width)
+{
+    ImFont* font = ImGui::GetFont();
+    width = std::max(width, 1.0f);
+    const float scale = ImGui::GetFontSize() / font->FontSize;
+    for (const std::string& line : ui::VisualLines(text, width, [&](char16_t c) { return font->GetCharAdvance(static_cast<ImWchar>(c)) * scale; })) {
+        ImGui::SetCursorPosX(AlignedX(start, start + width, ImGui::CalcTextSize(line.c_str()).x));
+        ImGui::TextUnformatted(line.c_str());
+    }
+}
+
+float ResetSize() { return std::round(ImGui::GetFrameHeight() * 0.85f); }
+
+// A circular arrow, the reset button's icon.
+void DrawResetIcon(ImDrawList* draw, ImVec2 min, float size, ImU32 color)
+{
+    constexpr float kPi = 3.14159265f;
+    const ImVec2 center(min.x + size * 0.5f, min.y + size * 0.5f);
+    const float radius = size * 0.26f;
+    const float start = -0.5f * kPi;
+    const float end = start + 1.55f * kPi;
+    draw->PathArcTo(center, radius, start, end, 16);
+    draw->PathStroke(color, 0, std::max(1.0f, 1.5f * g_scale));
+    // The arrowhead points along the arc at its end.
+    const ImVec2 radial(std::cos(end), std::sin(end));
+    const ImVec2 tangent(-radial.y, radial.x);
+    const ImVec2 base(center.x + radial.x * radius, center.y + radial.y * radius);
+    const ImVec2 tip(base.x + tangent.x * size * 0.16f, base.y + tangent.y * size * 0.16f);
+    const float half = size * 0.13f;
+    draw->AddTriangleFilled(tip, ImVec2(base.x + radial.x * half, base.y + radial.y * half), ImVec2(base.x - radial.x * half, base.y - radial.y * half), color);
+}
+
+// A black body's colour at `kelvin`, brightest component 1, encoded with gamma 1 / 2.2 like the colours the menu stores.
+std::array<float, 3> BlackbodySwatch(float kelvin)
+{
+    const std::array<float, 3> linear = BlackbodyColor(kelvin);
+    const float brightest = std::max({linear[0], linear[1], linear[2], 1e-6f});
+    std::array<float, 3> color;
+    for (size_t i = 0; i < 3; ++i)
+        color[i] = std::pow(linear[i] / brightest, 1.0f / 2.2f);
+    return color;
+}
 
 template <class T>
 bool SliderOf(const char* id, T* value, T minimum, T maximum, const char* text, float textWidth, float width)
@@ -369,17 +438,7 @@ bool NavItem(const char* label, bool selected)
     return clicked;
 }
 
-void Text(const char* text)
-{
-    ImFont* font = ImGui::GetFont();
-    const float width = std::max(ImGui::GetContentRegionAvail().x, 1.0f);
-    const float start = ImGui::GetCursorPosX();
-    const float scale = ImGui::GetFontSize() / font->FontSize;
-    for (const std::string& line : ui::VisualLines(text, width, [&](char16_t c) { return font->GetCharAdvance(static_cast<ImWchar>(c)) * scale; })) {
-        ImGui::SetCursorPosX(AlignedX(start, start + width, ImGui::CalcTextSize(line.c_str()).x));
-        ImGui::TextUnformatted(line.c_str());
-    }
-}
+void Text(const char* text) { WrappedText(text, ImGui::GetCursorPosX(), ImGui::GetContentRegionAvail().x); }
 
 void Heading(const char* text)
 {
@@ -388,20 +447,32 @@ void Heading(const char* text)
     ImGui::PopFont();
 }
 
+// A card is a one-cell table: it takes its size in the frame its content is drawn, where a child window sizes itself
+// from the frame before (and not at all while scrolled out of view), so pages would settle over a few frames.
 void BeginCard(const char* id, const char* heading)
 {
     if (heading != nullptr)
         Heading(heading);
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, kSurface);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(std::round(10.0f * g_scale), std::round(8.0f * g_scale)));
-    ImGui::BeginChild(id, ImVec2(0.0f, 0.0f), ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding | ImGuiChildFlags_Borders);
+    const ImVec2 padding(std::round(10.0f * g_scale), std::round(8.0f * g_scale));
+    ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, padding);
+    g_card.open = ImGui::BeginTable(id, 1, ImGuiTableFlags_BordersOuter | ImGuiTableFlags_PadOuterX);
     ImGui::PopStyleVar();
-    ImGui::PopStyleColor();
+    g_card.min = ImGui::GetCursorScreenPos().x;
+    g_card.max = g_card.min + ImGui::GetContentRegionAvail().x;
+    if (!g_card.open)
+        return;
+    ImGui::TableNextRow();
+    ImGui::TableSetColumnIndex(0);
+    ImGui::TableSetBgColor(ImGuiTableBgTarget_CellBg, Color(kSurface));
+    g_card.min = ImGui::GetCursorScreenPos().x - padding.x;
+    g_card.max = ImGui::GetCursorScreenPos().x + ImGui::GetContentRegionAvail().x + padding.x;
 }
 
 void EndCard()
 {
-    ImGui::EndChild();
+    if (g_card.open)
+        ImGui::EndTable();
+    g_card = {};
     ImGui::Dummy(ImVec2(0.0f, ImGui::GetStyle().ItemSpacing.y));
 }
 
@@ -417,42 +488,85 @@ bool BeginRows(const char* id)
 
 void EndRows() { ImGui::EndTable(); }
 
-void BeginRow(const char* label, bool enabled, const char* reason)
+void BeginRow(const char* label, bool enabled, const char* reason, RowMark mark, const char* markNote, const char* resetHint)
 {
     // Right to left, the label is in the second column, on the right.
-    const int labelColumn = RightToLeft() ? 1 : 0;
+    const bool rightToLeft = RightToLeft();
+    const int labelColumn = rightToLeft ? 1 : 0;
     ImGui::TableNextRow();
     ImGui::TableSetColumnIndex(labelColumn);
-    g_row = {.top = ImGui::GetCursorScreenPos().y, .enabled = enabled, .reason = reason};
+    g_row = {.top = ImGui::GetCursorScreenPos().y, .enabled = enabled, .reason = reason, .mark = mark, .markNote = markNote, .resetHint = resetHint};
+    const float start = ImGui::GetCursorPosX();
+    const float width = ImGui::GetContentRegionAvail().x;
+    g_row.labelStart = ImGui::GetCursorScreenPos().x;
+    g_row.labelEnd = g_row.labelStart + width;
+    // The reset button sits at the label's end, next to the control.
+    const float reserved = resetHint != nullptr ? ResetSize() + ImGui::GetStyle().ItemInnerSpacing.x : 0.0f;
     ImGui::BeginDisabled(!enabled);
     ImGui::AlignTextToFramePadding();
-    Text(label);
+    WrappedText(label, rightToLeft ? start + reserved : start, width - reserved);
     g_row.labelBottom = ImGui::GetItemRectMax().y;
     ImGui::TableSetColumnIndex(1 - labelColumn);
     g_row.controlStart = ImGui::GetCursorScreenPos().x;
     g_row.controlEnd = g_row.controlStart + ImGui::GetContentRegionAvail().x;
 }
 
-bool EndRow(bool clickableLabel)
+RowClicks EndRow(bool clickableLabel)
 {
     ImGui::EndDisabled();
     const ImGuiStyle& style = ImGui::GetStyle();
-    const ImVec2 min(ImGui::GetWindowPos().x, g_row.top - style.CellPadding.y);
-    const ImVec2 max(ImGui::GetWindowPos().x + ImGui::GetWindowWidth(), std::max(g_row.labelBottom, ImGui::GetItemRectMax().y) + style.CellPadding.y);
+    const bool rightToLeft = RightToLeft();
+    const auto [left, right] = RowExtent();
+    const ImVec2 min(left, g_row.top - style.CellPadding.y);
+    const ImVec2 max(right, std::max(g_row.labelBottom, ImGui::GetItemRectMax().y) + style.CellPadding.y);
+    RowClicks clicks;
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    if (g_row.mark != RowMark::None) {
+        // A bar on the row's starting edge, in the card's padding.
+        const float bar = std::max(2.0f, std::round(3.0f * g_scale));
+        const ImU32 color = Color(g_row.mark == RowMark::Map ? kAccent : WithAlpha(kAccent, 0.4f));
+        draw->PushClipRect(min, max, false);
+        if (rightToLeft)
+            draw->AddRectFilled(ImVec2(max.x - bar, min.y), max, color);
+        else
+            draw->AddRectFilled(min, ImVec2(min.x + bar, max.y), color);
+        draw->PopClipRect();
+    }
+    bool resetHovered = false;
+    if (g_row.resetHint != nullptr) {
+        ImGui::TableSetColumnIndex(rightToLeft ? 1 : 0);
+        const float size = ResetSize();
+        const ImVec2 position(rightToLeft ? g_row.labelStart : g_row.labelEnd - size, std::round(g_row.top + (ImGui::GetFrameHeight() - size) * 0.5f));
+        const ImVec2 cursor = ImGui::GetCursorScreenPos();
+        ImGui::SetCursorScreenPos(position);
+        clicks.reset = ImGui::InvisibleButton("##reset", ImVec2(size, size));
+        resetHovered = ImGui::IsItemHovered();
+        if (resetHovered) {
+            draw->AddRectFilled(position, ImVec2(position.x + size, position.y + size), Color(kFrameHover));
+            ImGui::SetTooltip("%s", ui::Visual(g_row.resetHint).c_str());
+        }
+        DrawResetIcon(draw, position, size, Color(resetHovered ? kText : kTextDim));
+        ImGui::SetCursorScreenPos(cursor);
+    }
     if (!ImGui::IsWindowHovered() || !ImGui::IsMouseHoveringRect(min, max, false))
-        return false;
+        return clicks;
     ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, Color(kRowHover));
+    if (resetHovered)
+        return clicks;
     if (!g_row.enabled) {
         if (g_row.reason != nullptr)
             ImGui::SetTooltip("%s", ui::Visual(g_row.reason).c_str());
-        return false;
+        return clicks;
     }
     const float mouse = ImGui::GetIO().MousePos.x;
-    const bool onLabel = RightToLeft() ? mouse > g_row.controlEnd + style.CellPadding.x : mouse < g_row.controlStart - style.CellPadding.x;
+    const bool onLabel = rightToLeft ? mouse > g_row.controlEnd + style.CellPadding.x : mouse < g_row.controlStart - style.CellPadding.x;
+    if (onLabel && g_row.markNote != nullptr)
+        ImGui::SetTooltip("%s", ui::Visual(g_row.markNote).c_str());
     if (!clickableLabel || !onLabel)
-        return false;
+        return clicks;
     ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-    return ImGui::IsMouseClicked(ImGuiMouseButton_Left);
+    clicks.label = ImGui::IsMouseClicked(ImGuiMouseButton_Left);
+    return clicks;
 }
 
 bool Switch(const char* id, bool* value)
@@ -612,6 +726,136 @@ bool EndButton(const char* label)
     if (!RightToLeft())
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - width);
     return ImGui::Button(text.c_str());
+}
+
+float ButtonWidth(const char* label) { return ImGui::CalcTextSize(ui::Visual(label).c_str()).x + ImGui::GetStyle().FramePadding.x * 2.0f; }
+
+bool Button(const char* label, bool primary, float width)
+{
+    if (primary) {
+        ImGui::PushStyleColor(ImGuiCol_Button, kAccent);
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, kAccentHover);
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, kAccentActive);
+        ImGui::PushStyleColor(ImGuiCol_Text, kOnAccent);
+    }
+    const bool clicked = ImGui::Button(ui::Visual(label).c_str(), ImVec2(width, 0.0f));
+    if (primary)
+        ImGui::PopStyleColor(4);
+    return clicked;
+}
+
+bool TextField(const char* id, char* buffer, size_t size, const char* hint)
+{
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    return ImGui::InputTextWithHint(id, ui::Visual(hint).c_str(), buffer, size, ImGuiInputTextFlags_EnterReturnsTrue);
+}
+
+bool Toggles(const char* id, uint32_t* mask, std::span<const char* const> options)
+{
+    ImGui::PushID(id);
+    const ImGuiStyle& style = ImGui::GetStyle();
+    const bool rightToLeft = RightToLeft();
+    const ImVec2 origin = ImGui::GetCursorScreenPos();
+    const float width = ImGui::GetContentRegionAvail().x;
+    const float height = ImGui::GetFrameHeight();
+    const float segment = width / static_cast<float>(options.size());
+    const float inset = std::max(2.0f, std::round(style.FramePadding.y * 0.5f));
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    draw->AddRectFilled(origin, ImVec2(origin.x + width, origin.y + height), Color(kFrame));
+    bool changed = false;
+    for (size_t i = 0; i < options.size(); ++i) {
+        const uint32_t bit = 1u << i;
+        const size_t slot = rightToLeft ? options.size() - 1 - i : i;
+        const float left = std::round(origin.x + segment * static_cast<float>(slot));
+        const float right = std::round(origin.x + segment * static_cast<float>(slot + 1));
+        ImGui::PushID(static_cast<int>(i));
+        ImGui::SetCursorScreenPos(ImVec2(left, origin.y));
+        if (ImGui::InvisibleButton("##toggle", ImVec2(right - left, height))) {
+            *mask ^= bit;
+            changed = true;
+        }
+        const bool hovered = ImGui::IsItemHovered();
+        ImGui::PopID();
+        const ImVec2 min(left + inset, origin.y + inset);
+        const ImVec2 max(right - inset, origin.y + height - inset);
+        const bool on = (*mask & bit) != 0;
+        if (on)
+            draw->AddRectFilled(min, max, Color(hovered ? kAccentHover : kAccent));
+        else if (hovered)
+            draw->AddRectFilled(min, max, Color(kFrameHover));
+        const Line line = VisualLine(options[i]);
+        const float padding = style.FramePadding.x * 0.5f;
+        const float centred = std::max(min.x + padding, (min.x + max.x - line.width) * 0.5f);
+        const float x = rightToLeft ? std::min(max.x - padding - line.width, centred) : centred;
+        const ImVec4 clip(min.x, min.y, max.x, max.y);
+        draw->AddText(nullptr, 0.0f, ImVec2(std::floor(x), std::floor(origin.y + (height - ImGui::GetFontSize()) * 0.5f)), Color(on ? kOnAccent : kText),
+            line.text.c_str(), nullptr, 0.0f, &clip);
+    }
+    ImGui::SetCursorScreenPos(origin);
+    ImGui::Dummy(ImVec2(width, height));
+    ImGui::PopID();
+    return changed;
+}
+
+bool ColorButton(const char* id, std::array<float, 3>* color, const char* temperatureLabel)
+{
+    ImGui::PushID(id);
+    const ImGuiStyle& style = ImGui::GetStyle();
+    const bool rightToLeft = RightToLeft();
+    const ImVec2 origin = ImGui::GetCursorScreenPos();
+    const float width = ImGui::GetContentRegionAvail().x;
+    const float height = ImGui::GetFrameHeight();
+    if (ImGui::InvisibleButton("##swatch", ImVec2(width, height)))
+        ImGui::OpenPopup("##picker");
+    const bool hovered = ImGui::IsItemHovered();
+    const bool open = ImGui::IsPopupOpen("##picker");
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    const ImVec2 end(origin.x + width, origin.y + height);
+    draw->AddRectFilled(origin, end, Color(open ? kFrameActive : hovered ? kFrameHover : kFrame));
+    // The colour fills a block at the start of the line and its hex code follows it.
+    const float inset = std::max(2.0f, std::round(style.FramePadding.y * 0.6f));
+    const float block = std::round(height * 2.4f);
+    const ImVec2 blockMin(rightToLeft ? end.x - inset - block : origin.x + inset, origin.y + inset);
+    const ImVec2 blockMax(blockMin.x + block, end.y - inset);
+    draw->AddRectFilled(blockMin, blockMax, ImGui::ColorConvertFloat4ToU32(ImVec4((*color)[0], (*color)[1], (*color)[2], 1.0f)));
+    draw->AddRect(blockMin, blockMax, Color(kBorder));
+    char hex[8];
+    std::snprintf(hex, sizeof(hex), "#%02X%02X%02X", static_cast<int>(std::lround((*color)[0] * 255.0f)), static_cast<int>(std::lround((*color)[1] * 255.0f)),
+        static_cast<int>(std::lround((*color)[2] * 255.0f)));
+    const float hexWidth = ImGui::CalcTextSize(hex).x;
+    const float hexX = rightToLeft ? blockMin.x - style.ItemInnerSpacing.x * 1.5f - hexWidth : blockMax.x + style.ItemInnerSpacing.x * 1.5f;
+    draw->AddText(ImVec2(std::floor(hexX), std::floor(origin.y + style.FramePadding.y)), ImGui::GetColorU32(ImGuiCol_Text), hex);
+
+    bool changed = false;
+    ImGui::SetNextWindowPos(ImVec2(rightToLeft ? end.x : origin.x, end.y), ImGuiCond_Always, ImVec2(rightToLeft ? 1.0f : 0.0f, 0.0f));
+    if (ImGui::BeginPopup("##picker", ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove)) {
+        const float pickerWidth = std::round(ImGui::GetFontSize() * 14.0f);
+        ImGui::SetNextItemWidth(pickerWidth);
+        constexpr ImGuiColorEditFlags kFlags = ImGuiColorEditFlags_NoSidePreview | ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoAlpha |
+            ImGuiColorEditFlags_NoLabel | ImGuiColorEditFlags_PickerHueBar;
+        changed = ImGui::ColorPicker3("##colour", color->data(), kFlags);
+        if (temperatureLabel != nullptr) {
+            // The temperature is the slider's own: picking a colour by hand leaves it where it was.
+            ImGuiStorage* storage = ImGui::GetStateStorage();
+            const ImGuiID key = ImGui::GetID("##kelvin");
+            float kelvin = storage->GetFloat(key, 6500.0f);
+            ImGui::Spacing();
+            Text(temperatureLabel);
+            const std::string value = ui::Format("menu.kelvin", {{"value", ui::Number(kelvin, 0)}});
+            const float valueWidth = ImGui::CalcTextSize(ui::Format("menu.kelvin", {{"value", ui::Number(12000.0, 0)}}).c_str()).x;
+            if (Slider("##temperature", &kelvin, 1700.0f, 12000.0f, value.c_str(), valueWidth, pickerWidth)) {
+                kelvin = std::round(kelvin / 50.0f) * 50.0f;
+                *color = BlackbodySwatch(kelvin);
+                changed = true;
+            }
+            storage->SetFloat(key, kelvin);
+        }
+        ImGui::EndPopup();
+    }
+    ImGui::SetCursorScreenPos(origin);
+    ImGui::Dummy(ImVec2(width, height));
+    ImGui::PopID();
+    return changed;
 }
 
 void Note(const char* text)

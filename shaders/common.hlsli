@@ -198,6 +198,15 @@ struct FrameConstants
     // directions to last view's, for the directions within skyMotionDisc.w (a cosine) of skyMotionDisc.xyz.
     float4 skyMotion[3];
     float4 skyMotionDisc;
+    // Map lights' colour (the menu's lamp tint, linear), and how strongly glowing surfaces light others (HitEmission).
+    float3 lightTint;
+    float emissiveScale;
+    // The baked bounce light's sky part per colour channel, with bakedSkyScale: the sky's colour now over the map's.
+    float3 bakedSkyTint;
+    // The sun's angular radius for soft shadows (SunDiscDirectionAt), and 1 - its cosine.
+    float sunAngularRadius;
+    float sunConeSpan;
+    uint3 padding6;
     uint4 lightWarpViews[16];
 };
 

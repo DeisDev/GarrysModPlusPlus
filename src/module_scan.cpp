@@ -135,6 +135,16 @@ std::vector<const std::byte*> FindCodePattern(HMODULE module, std::string_view p
     return matches;
 }
 
+void* FindFunctionWithPattern(HMODULE module, std::string_view pattern)
+{
+    const std::vector<const std::byte*> matches = FindCodePattern(module, pattern);
+    if (matches.size() != 1) {
+        log::Info("Scan: pattern '{}' matched {} time(s)", pattern, matches.size());
+        return nullptr;
+    }
+    return reinterpret_cast<void*>(PrimaryFunctionStart(reinterpret_cast<DWORD64>(matches.front())));
+}
+
 // MSVC's x64 RTTI (rttidata.h, ehdata_forceinclude.h in MSVC 14.51): a TypeDescriptor is { vftable, spare, name },
 // and a complete object locator { signature = COL_SIG_REV1, offset, cdOffset, then image-relative pTypeDescriptor,
 // pClassDescriptor, pSelf } is referenced by the slot before each vtable of the class.

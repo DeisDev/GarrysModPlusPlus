@@ -62,7 +62,7 @@ void main(uint3 id : SV_DispatchThreadID)
             light = SunVisibilityFrom(shadowOrigin, WaterBodyAt(shadowOrigin), direction, g_frame.sunShadowMask, rayFlags);
         }
     }
-    penumbra[pixel] = SIGMA_FrontEnd_PackPenumbra(occluder, kSunAngularRadius);
+    penumbra[pixel] = SIGMA_FrontEnd_PackPenumbra(occluder, g_frame.sunAngularRadius);
     translucency[pixel] = SIGMA_FrontEnd_PackTranslucency(occluder, light);
     viewDepth[pixel] = dot(position - g_frame.eyePosition, normalize(g_frame.viewProj[3].xyz));
     normalRoughness[pixel] = NRD_FrontEnd_PackNormalAndRoughness(normal, 1.0, 0.0);

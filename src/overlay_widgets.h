@@ -2,6 +2,8 @@
 
 #include <imgui.h>
 
+#include <array>
+#include <cstdint>
 #include <filesystem>
 #include <span>
 
@@ -37,13 +39,24 @@ void Heading(const char* text);
 void BeginCard(const char* id, const char* heading = nullptr);
 void EndCard();
 
+// How a setting row is marked: not at all, as set by the current map (while editing the map's settings), or as set
+// differently on the current map (while editing the settings of all maps), which `markNote` explains on hover.
+enum class RowMark { None, Map, MapElsewhere };
+
+// What was clicked in a row: its label (which counts as a click on its control) or its reset button.
+struct RowClicks {
+    bool label = false;
+    bool reset = false;
+};
+
 // Setting rows: the label at the start of the line, the control after it. BeginRow leaves the cursor in the control
-// column; a row that is not `enabled` is greyed out and shows `reason` when hovered. EndRow returns true when the label
-// side of an enabled `clickableLabel` row was clicked, which counts as a click on its control.
+// column; a row that is not `enabled` is greyed out and shows `reason` when hovered. A row with a `resetHint` has a reset
+// button after its label, which works in greyed-out rows too and shows the hint on hover.
 bool BeginRows(const char* id);
 void EndRows();
-void BeginRow(const char* label, bool enabled = true, const char* reason = nullptr);
-bool EndRow(bool clickableLabel = false);
+void BeginRow(const char* label, bool enabled = true, const char* reason = nullptr, RowMark mark = RowMark::None, const char* markNote = nullptr,
+    const char* resetHint = nullptr);
+RowClicks EndRow(bool clickableLabel = false);
 
 // An on/off switch.
 bool Switch(const char* id, bool* value);
@@ -59,6 +72,17 @@ bool Slider(const char* id, float* value, float minimum, float maximum, const ch
 bool Slider(const char* id, int* value, int minimum, int maximum, const char* text, float textWidth, float width = 0.0f);
 // A button at the end of the line.
 bool EndButton(const char* label);
+// A button `width` wide (0: as wide as its text); a primary one is filled with the accent colour.
+bool Button(const char* label, bool primary = false, float width = 0.0f);
+// The width Button gives `label`.
+float ButtonWidth(const char* label);
+// A single-line text field across the available width, showing `hint` while empty. Returns true when Enter is pressed.
+bool TextField(const char* id, char* buffer, size_t size, const char* hint);
+// One button per option in a full-width row, each turning its bit of `mask` on and off.
+bool Toggles(const char* id, uint32_t* mask, std::span<const char* const> options);
+// A colour swatch across the available width that opens a colour picker; with `temperatureLabel`, the picker also sets
+// the colour of a black body's light from a temperature slider labelled with it.
+bool ColorButton(const char* id, std::array<float, 3>* color, const char* temperatureLabel = nullptr);
 
 // Dimmed text wrapped to the available width.
 void Note(const char* text);

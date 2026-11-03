@@ -136,7 +136,7 @@ constexpr float kSkySunMoved = 0.9999985f;
 // The sun's disc (shaders/sky_draw.hlsl) is as wide as env_sun's sprite looks: its half size m_nSize at 100 units
 // (CGlowOverlay::CalcBasis), times the radius at which the default sprite's texture (sprites/light_glow02, 128x128,
 // read as sRGB) falls to half its centre's brightness, 0.12 of the sprite's half size. Maps without env_sun get three
-// times the real sun's angular radius (kSunAngularRadius in shaders/scene.hlsli), which the shadows keep.
+// times the real sun's angular radius, which the shadows keep (times Settings::sunShadowSoftness).
 constexpr float kSunSpriteDistance = 100.0f;
 constexpr float kSunSpriteHalfBrightness = 0.12f;
 constexpr float kRealSunRadius = 0.00465f;
@@ -441,9 +441,34 @@ std::optional<std::array<float, 3>> MapSunDirection(const Scene& scene)
     return std::array<float, 3>{sun.direction.x / length, sun.direction.y / length, sun.direction.z / length};
 }
 
-// The sun the sky shows: env_sun's, else the one GMod's painted sky draws, else the map's.
+// The direction to the sun the menu's sun direction override puts it at.
+std::array<float, 3> OverrideSunDirection(const Settings& settings)
+{
+    constexpr float kRadians = 3.14159265f / 180.0f;
+    const float elevation = settings.sunElevation * kRadians;
+    const float azimuth = settings.sunAzimuth * kRadians;
+    return {std::cos(elevation) * std::cos(azimuth), std::cos(elevation) * std::sin(azimuth), std::sin(elevation)};
+}
+
+// 1 - cos(angle), without the cancellation of subtracting a cosine this close to 1.
+float ConeSpan(float angle)
+{
+    const float half = std::sin(0.5f * angle);
+    return 2.0f * half * half;
+}
+
+// A colour picked in the menu as linear light, by Source's GammaToLinear as VRAD reads light_environment's colours.
+std::array<float, 3> LinearColor(const Color& color)
+{
+    return {std::pow(color[0], 2.2f), std::pow(color[1], 2.2f), std::pow(color[2], 2.2f)};
+}
+
+// The sun the sky shows: the menu's override, else env_sun's, else the one GMod's painted sky draws, else the map's.
 std::optional<std::array<float, 3>> SkySun(const ViewInputs& inputs, const Scene& scene)
 {
+    const Settings& settings = GetSettings();
+    if (settings.sunDirectionOverride)
+        return OverrideSunDirection(settings);
     if (inputs.envSun)
         return inputs.envSun->direction;
     return inputs.paintedSun ? inputs.paintedSun : MapSunDirection(scene);
@@ -1833,6 +1858,13 @@ void Lighting::FillSceneConstants(FrameConstants& constants, const Scene& scene)
     constants.skyColor[0] = sun.ambient.x;
     constants.skyColor[1] = sun.ambient.y;
     constants.skyColor[2] = sun.ambient.z;
+    for (int i = 0; i < 3; ++i) {
+        constants.lightTint[i] = 1.0f;
+        constants.bakedSkyTint[i] = 1.0f;
+    }
+    constants.emissiveScale = 1.0f;
+    constants.sunAngularRadius = kRealSunRadius;
+    constants.sunConeSpan = ConeSpan(kRealSunRadius);
     constants.skyCameraX = sun.skyCameraOrigin.x;
     constants.skyCameraY = sun.skyCameraOrigin.y;
     constants.skyCameraZ = sun.skyCameraOrigin.z;
@@ -1903,6 +1935,44 @@ bool Lighting::FillConstants(FrameConstants& constants, const Scene& scene, cons
         if (constants.sunDirection[2] <= 0.0f)
             constants.sunEnabled = 0.0f;
     }
+    if (inputs.kind == gbuffer::ViewKind::Main) {
+        Statistics& statistics = GetStatistics();
+        std::copy_n(constants.sunDirection, 3, statistics.sunDirection.begin());
+        std::copy_n(constants.sunColor, 3, statistics.mapSunColor.begin());
+        std::copy_n(constants.skyColor, 3, statistics.mapSkyColor.begin());
+        statistics.mapHasSun = sun.present;
+    }
+    // The menu's overrides of the map's light. A sun put below the horizon lights nothing, as env_sun's does.
+    if (settings.sunDirectionOverride && sun.present) {
+        const std::array<float, 3> direction = OverrideSunDirection(settings);
+        std::copy(direction.begin(), direction.end(), constants.sunDirection);
+        constants.sunEnabled = direction[2] > 0.0f ? 1.0f : 0.0f;
+    }
+    // Baked bounce light holds the map's colours; these carry it to the overrides' colours channel by channel.
+    std::array<float, 3> sunRecolor = {1.0f, 1.0f, 1.0f};
+    if (settings.sunColorOverride) {
+        const std::array<float, 3> hue = LinearColor(settings.sunColor);
+        const float hueLuminance = Luminance(hue.data());
+        const float brightness = Luminance(constants.sunColor);
+        for (size_t i = 0; i < 3; ++i) {
+            const float color = hueLuminance > 0.0f ? hue[i] * brightness / hueLuminance : 0.0f;
+            sunRecolor[i] = constants.sunColor[i] > 0.0f ? color / constants.sunColor[i] : 0.0f;
+            constants.sunColor[i] = color;
+        }
+    }
+    if (settings.skyLightOverride) {
+        const std::array<float, 3> color = LinearColor(settings.skyLightColor);
+        for (size_t i = 0; i < 3; ++i) {
+            const float sky = color[i] * settings.skyLightBrightness / 255.0f;
+            constants.bakedSkyTint[i] = constants.skyColor[i] > 0.0f ? sky / constants.skyColor[i] : 0.0f;
+            constants.skyColor[i] = sky;
+        }
+    }
+    const std::array<float, 3> lightTint = LinearColor(settings.lightTint);
+    std::copy(lightTint.begin(), lightTint.end(), constants.lightTint);
+    constants.emissiveScale = settings.emissiveIntensity;
+    constants.sunAngularRadius = kRealSunRadius * settings.sunShadowSoftness;
+    constants.sunConeSpan = ConeSpan(constants.sunAngularRadius);
     const float sunStyle = scene.LightStyle(sun.style);
     const float skyStyle = scene.LightStyle(sun.ambientStyle);
     const Daylight daylight = DaylightFor(constants, inputs, scene).value_or(Daylight{});
@@ -1914,7 +1984,7 @@ bool Lighting::FillConstants(FrameConstants& constants, const Scene& scene, cons
         constants.sunColor[i] *= settings.sun ? settings.sunIntensity * sunStyle * daylight.sun[i] : 0.0f;
         constants.skyColor[i] *= settings.skyIntensity * skyStyle * daylight.sky;
         // BakeStep bakes the map's sun and sky as they are in the map.
-        constants.bakedSunScale[i] = constants.sunEnabled != 0.0f && settings.sun ? settings.sunIntensity * sunStyle * daylight.sun[i] : 0.0f;
+        constants.bakedSunScale[i] = constants.sunEnabled != 0.0f && settings.sun ? settings.sunIntensity * sunStyle * daylight.sun[i] * sunRecolor[i] : 0.0f;
     }
     constants.bakedSkyScale = settings.skyIntensity * skyStyle * daylight.sky;
     constants.lightScale = settings.lightIntensity;

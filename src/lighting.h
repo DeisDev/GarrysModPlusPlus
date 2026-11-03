@@ -189,6 +189,15 @@ struct FrameConstants {
     // skyMotionDisc's direction.
     float skyMotion[3][4];
     float skyMotionDisc[4];
+    // Map lights' colour (Settings::lightTint, linear), and how strongly glowing surfaces light others.
+    float lightTint[3];
+    float emissiveScale;
+    // The baked bounce light's sky part per colour channel, with bakedSkyScale: the sky's colour now over the map's.
+    float bakedSkyTint[3];
+    // The sun's angular radius for soft shadows, and 1 - its cosine.
+    float sunAngularRadius;
+    float sunConeSpan;
+    uint32_t padding6[3];
     uint32_t lightWarpViews[64];
 };
 

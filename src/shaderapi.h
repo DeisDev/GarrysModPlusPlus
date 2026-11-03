@@ -113,6 +113,20 @@ int HdrType();
 // The dynamic state a new device starts with (IShaderAPI::ResetRenderState).
 void ResetDynamicState();
 
+// The scene's fog as IShaderAPI's SceneFogMode, SceneFogColor3ub (gamma-space bytes), FogStart, FogEnd and
+// FogMaxDensity set it; mode is a MaterialFogMode_t.
+struct SceneFog {
+    int mode = 0;
+    std::array<unsigned char, 3> color = {};
+    float start = 0;
+    float end = 0;
+    float maxDensity = 1;
+};
+constexpr int kFogNone = 0;
+constexpr int kFogLinear = 1;
+SceneFog CurrentFog();
+void SetFog(const SceneFog& fog);
+
 // CShaderAPIDx8::DrawMesh (GMod's IShaderAPIDX8 slot 266, shaderapidx9.dll 0x1800152c0): commits the transforms and
 // hands the mesh to the bound material, whose passes call BeginPass and RenderPass.
 void DrawMesh(const MeshDraw& mesh);

@@ -25,6 +25,8 @@ bool Ready();
 std::optional<std::pair<size_t, size_t>> LightingPipelineProgress();
 // Whether the loaded map has water, as far as its scene tells (false without one).
 bool LevelHasWater();
+// The loaded map's 3D skybox scale (its sky_camera's), or 0 without one or before the map's scene has loaded.
+float SkyboxScale();
 void WaitForGpu();
 
 // Once per presented frame, with the size of the main view: installs the engine hooks, follows the settings file,

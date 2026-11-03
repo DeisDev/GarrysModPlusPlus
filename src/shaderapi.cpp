@@ -1678,6 +1678,21 @@ bool EyeBelowHeightClip()
 }
 
 void ResetDynamicState() { ResetRenderState(ShaderApi(), true); }
+
+SceneFog CurrentFog()
+{
+    return { g_api.fogMode, { g_api.fogColor[0], g_api.fogColor[1], g_api.fogColor[2] }, g_api.fogStart, g_api.fogEnd, g_api.fogMaxDensity };
+}
+
+void SetFog(const SceneFog& fog)
+{
+    SceneFogMode(nullptr, fog.mode);
+    SceneFogColor3ub(nullptr, fog.color[0], fog.color[1], fog.color[2]);
+    FogStart(nullptr, fog.start);
+    FogEnd(nullptr, fog.end);
+    FogMaxDensity(nullptr, fog.maxDensity);
+}
+
 void* BoundMaterial() { return g_api.material; }
 
 const char* BoundMaterialName()

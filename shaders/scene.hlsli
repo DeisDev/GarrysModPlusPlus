@@ -567,7 +567,8 @@ float3 HitEmission(HitSurface surface, HitInfo hit, float distance, bool lightin
     float blend;
     if (!HitMaterial(hit, material, uv, uvPerUnit, blend) || material.selfIllumMask == kMaskOff || (lighting && (material.flags & kMaterialLightTexture) != 0))
         return 0.0;
-    return material.selfIllumTint * surface.albedo * MaskValue(material.selfIllumMask, uv, uvPerUnit * max(distance, 1.0) * kHitMaskFootprint);
+    float3 emission = material.selfIllumTint * surface.albedo * MaskValue(material.selfIllumMask, uv, uvPerUnit * max(distance, 1.0) * kHitMaskFootprint);
+    return lighting ? emission * g_frame.emissiveScale : emission;
 }
 
 // The glow an indirect ray meets at a hit, which lights the surface the ray left (EmissiveLighting): none when off,
@@ -824,15 +825,11 @@ float3 HitSunVisibility(float3 origin, uint water, uint mask, bool traced)
     return SunVisibilityFrom(origin, water, g_frame.sunDirection, mask);
 }
 
-// The real sun's angular radius (its disc is about 0.53 degrees across), and 1 - its cosine.
-static const float kSunAngularRadius = 0.00465;
-static const float kSunConeSpan = 1.081e-5;
-
 // The direction to the point of the sun's disc that two numbers in [0, 1) pick: the first the share of the disc's area
 // inside the point's ring, the second its angle.
 float3 SunDiscDirectionAt(float2 coordinates)
 {
-    float cosine = 1.0 - coordinates.x * kSunConeSpan;
+    float cosine = 1.0 - coordinates.x * g_frame.sunConeSpan;
     float sine = sqrt(saturate(1.0 - cosine * cosine));
     float phi = 6.28318530718 * coordinates.y;
     float3 t, b;
@@ -1352,7 +1349,7 @@ float3 LightIrradiance(Light light, float3 position, float3 normal, out float3 t
         falloff = saturate(-dot(toLight, light.normal)) / distanceSquared;
     else
         falloff = light.referenceScale / max(distanceSquared, light.size * light.size) * SpotFactor(light, toLight, distance);
-    return light.intensity * (lambert * falloff) * g_frame.lightScale;
+    return light.intensity * g_frame.lightTint * (lambert * falloff * g_frame.lightScale);
 }
 
 Projector LoadProjector(uint index)

@@ -60,8 +60,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - The menu and loading screen follow GMod's language setting. Their text is in `gmodplusplus\localization`, so they can be translated; only English exists so far.
 - The menu draws characters its own fonts lack with the fonts the game uses for them (Tahoma and the fonts Windows links to it), so translations in any script the game shows display correctly.
 - Right-to-left languages such as Hebrew read correctly: text runs right to left, and the menu's layout is mirrored.
+- More lighting settings on the Lighting page: set the sun's direction and colour (with a colour temperature slider), soften or sharpen sun shadows, set the sky light's colour and brightness, tint map lights, set how much light glowing surfaces cast, and set the fog's colour, distances and density (also on maps without fog). The sky, sun disc, day and night and stars follow a sun you move.
+- Colour grading on the Image page: exposure, contrast, saturation, warmth and tint for the 3D view. The HUD is not changed.
+- Settings for one map: pick "This map" at the top of a settings page, and what you change there applies to that map only. Marked settings show what the map sets for itself, and their reset button goes back to the setting for all maps.
+- Presets and sharing on the new Profiles page: save the current settings as a named preset (choosing which pages it holds), apply, rename and delete presets, and copy settings to the clipboard or export them to a file, then paste or import them elsewhere.
+- A performance overlay that stays on screen, with four levels of detail (Minimal, Normal, Full, Extra) and a choice of corner. Turn it on on the General page.
+- Settings rows show a reset button when they differ from their default.
 
 ### Changed
+
+- The sky and night sky settings moved to their own Sky page.
+- The window shown while the game waits for shaders looks like the in-game notice: dark, see-through and in the game's font, instead of a plain Windows window.
 
 - The first frame of a map denoised by NRD, and changing the resolution with it, pause for a shorter time: its pipeline states are created on several threads.
 - The game reaches its main menu sooner: the ray tracing pipeline states are created on several threads in the background instead of one by one before the game window responds. A map opened before they are ready waits for the rest on its loading screen ("Preparing ray tracing shaders...").
@@ -133,6 +142,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- The settings menu no longer shows the game's mouse cursor next to its own.
+- Switching pages in the settings menu no longer makes the page's content jump around for a few frames.
 - Maps with water no longer stutter the first time you look at water: the vertex shaders the water's reflection and refraction views draw with (with a clip plane) are compiled while the map loads.
 - Saving the pipeline library (`gmodplusplus\cache\pipelines.bin`), which happens every 30 seconds while new pipeline states are being made, no longer pauses the game: it is written on another thread. It is also read in the background while the game starts.
 - Smooth gradients, such as the sky and fog, no longer break into bands of colour.

@@ -418,7 +418,7 @@ float LightPower(uint index)
 {
     if (index < g_restir.mapLights) {
         Light light = LoadRestirMapLight(index, false);
-        float intensity = Luminance(max(light.intensity, 0.0)) * g_frame.lightScale;
+        float intensity = Luminance(max(light.intensity, 0.0) * g_frame.lightTint) * g_frame.lightScale;
         if (light.type == kLightSurface)
             return intensity * 3.14159265;
         float power = intensity * light.referenceScale * 12.5663706;
@@ -488,7 +488,7 @@ float RAB_GetLightTargetPdfForVolume(RAB_LightInfo info, float3 centre, float ra
         float3 delta = centre - light.origin;
         float distance = length(delta);
         float nearest = max(distance - radius, 0.0);
-        float intensity = Luminance(max(light.intensity, 0.0)) * g_frame.lightScale;
+        float intensity = Luminance(max(light.intensity, 0.0) * g_frame.lightTint) * g_frame.lightScale;
         float bound;
         if (light.type == kLightSurface) {
             if (dot(delta, light.normal) < -radius)

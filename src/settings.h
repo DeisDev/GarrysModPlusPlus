@@ -2,9 +2,17 @@
 
 #include <array>
 #include <cstdint>
-#include <filesystem>
+#include <optional>
+#include <span>
+#include <string>
+#include <string_view>
+#include <variant>
+#include <vector>
 
 namespace gmodpp {
+
+// A colour picked in the menu: sRGB components from 0 to 1.
+using Color = std::array<float, 3>;
 
 enum class DebugView : uint32_t {
     Final = 0,
@@ -64,6 +72,10 @@ enum class LightSampling : uint32_t { Legacy = 0, Ris, Restir, Auto, Count };
 // or NVIDIA NRD's RELAX or REBLUR.
 enum class DenoiserType : uint32_t { BuiltIn = 0, Relax, Reblur, Count };
 
+// How much the performance overlay shows, and the corner of the screen it sits in.
+enum class OverlayDetail : uint32_t { Minimal = 0, Normal, Full, Extra, Count };
+enum class OverlayCorner : uint32_t { TopLeft = 0, TopRight, BottomLeft, BottomRight, Count };
+
 // Options shown in the in-game menu. Read on the render thread; the menu edits them on the same thread.
 struct Settings {
     bool realtimeLighting = true;
@@ -71,7 +83,26 @@ struct Settings {
     bool sun = true;
     // The sun shines from env_sun's direction, which the sun editor turns, instead of light_environment's.
     bool sunFollowsEnvSun = true;
+    // The sun shines from sunElevation degrees above the horizon and sunAzimuth degrees around it (Hammer's yaw: 0 along
+    // +x, 90 along +y), whatever the map says; the sky, the sun disc and the night follow it.
+    bool sunDirectionOverride = false;
+    float sunElevation = 45.0f;
+    float sunAzimuth = 0.0f;
+    // The sun takes sunColor's hue at the map sun's brightness.
+    bool sunColorOverride = false;
+    Color sunColor = {1.0f, 1.0f, 1.0f};
+    // The sun's disc for soft shadows, times the real sun's.
+    float sunShadowSoftness = 1.0f;
+    // The sky's light is skyLightColor at skyLightBrightness, as light_environment's _ambient gives them (Hammer's
+    // brightness: the linear colour times brightness / 255), in place of the map's.
+    bool skyLightOverride = false;
+    Color skyLightColor = {0.6f, 0.7f, 0.9f};
+    float skyLightBrightness = 50.0f;
     bool mapLights = true;
+    // Map lights' colour is multiplied by this.
+    Color lightTint = {1.0f, 1.0f, 1.0f};
+    // The light glowing surfaces cast on others, times this; their own look stays.
+    float emissiveIntensity = 1.0f;
     bool dynamicLights = true;
     bool projectedLights = true;
     bool indirectLight = true;
@@ -86,6 +117,12 @@ struct Settings {
     bool renderTargetLighting = false;
     bool volumetricLight = true;
     bool fog = true;
+    // The map's fog in the open air (not water's) takes this colour, distances and density, also where the map has none.
+    bool fogOverride = false;
+    Color fogColor = {0.6f, 0.65f, 0.7f};
+    float fogStart = 500.0f;
+    float fogEnd = 8000.0f;
+    float fogMaxDensity = 1.0f;
     // A physically based sky in the 2D skybox's colours replaces the skybox, on screen and in the lighting. It darkens to
     // night as the sun sets, as does the light of the sun and sky: under a full Moon to moonlitNight of the map's sky and
     // light, without one to moonlessNight.
@@ -134,6 +171,19 @@ struct Settings {
     // Share of the reprojected history kept each frame; higher is smoother but slower to react.
     float taaHistoryWeight = 0.9f;
     float sharpening = 0.3f;
+    // Colour grading of the 3D view after the game's post-processing, before the HUD: exposure in stops, contrast
+    // around middle grey, saturation, and white balance (warmth toward a warmer light's colour, tint toward magenta).
+    bool grading = false;
+    float exposure = 0.0f;
+    float contrast = 1.0f;
+    float saturation = 1.0f;
+    float warmth = 0.0f;
+    float tint = 0.0f;
+
+    // The always-visible performance overlay.
+    bool performanceOverlay = false;
+    OverlayDetail overlayDetail = OverlayDetail::Normal;
+    OverlayCorner overlayCorner = OverlayCorner::TopRight;
 
     // Ray tracing quality (ApplyPreset); the defaults are QualityPreset::High.
     QualityPreset qualityPreset = QualityPreset::High;
@@ -170,9 +220,11 @@ struct Settings {
 // Sets the ray tracing detail settings (the menu's Quality page) to a preset's values; QualityPreset::Custom leaves them.
 void ApplyPreset(Settings& settings, QualityPreset preset);
 
-Settings& GetSettings();
+// The settings in effect: the global ones with the current map's overrides (config namespace). Read-only: the menu
+// changes settings through config::Commit.
+const Settings& GetSettings();
 
-// The range the menu's slider offers for a float setting; values read from the settings file are clamped to it.
+// The range the menu's slider offers for a float setting; values read from files are clamped to it.
 struct SettingRange {
     float minimum;
     float maximum;
@@ -180,13 +232,79 @@ struct SettingRange {
 SettingRange RangeOf(float Settings::* field);
 SettingRange RangeOf(int Settings::* field);
 
-// Plain key=value text; unknown keys are ignored and missing ones keep their current value.
-bool LoadSettings(const std::filesystem::path& path, Settings& settings);
-void SaveSettings(const std::filesystem::path& path, const Settings& settings);
+// What settings are grouped by: the menu's pages and what a preset or an exported file holds.
+enum class Section : uint32_t { General = 0, Lighting, Sky, Quality, Image, Overlay, Count };
+using SectionMask = uint32_t;
+constexpr SectionMask SectionBit(Section section) { return 1u << static_cast<uint32_t>(section); }
+// The sections presets and exported files can hold; General and the overlay belong to this computer.
+constexpr SectionMask kShareableSections =
+    SectionBit(Section::Lighting) | SectionBit(Section::Sky) | SectionBit(Section::Quality) | SectionBit(Section::Image);
 
-// Saves pending menu changes, or reloads the file when something else changed it. Call periodically.
-void SyncSettingsFile(const std::filesystem::path& path);
-void MarkSettingsChanged();
+using SettingMember = std::variant<bool Settings::*, float Settings::*, int Settings::*, Color Settings::*, DebugView Settings::*, AntiAliasing Settings::*,
+    UpscalingMode Settings::*, QualityPreset Settings::*, FoliageShadows Settings::*, IndirectLighting Settings::*, EmissiveLighting Settings::*,
+    LightSampling Settings::*, DenoiserType Settings::*, MapSun Settings::*, OverlayDetail Settings::*, OverlayCorner Settings::*>;
+
+// A setting's place in the settings table (kFields in settings.cpp).
+using FieldId = uint16_t;
+inline constexpr FieldId kNoField = 0xFFFF;
+FieldId FieldOf(SettingMember member);
+// Whether `field` holds the same value in both settings.
+bool SameValue(const Settings& a, const Settings& b, FieldId field);
+// The fields of `sections`, in table order.
+std::vector<FieldId> FieldsIn(SectionMask sections);
+
+// Settings live in gmodplusplus: settings.ini holds the global ones, maps\<map>.ini only what a map sets differently,
+// and presets\<name>.ini the sections a preset was saved with. All are key=value text; unknown keys are ignored.
+namespace config {
+
+// Global: the settings of every map. Map: what applies on the current map, where a change sets the map's own value.
+enum class Scope { Global, Map };
+
+// Follows the level `levelName` (the engine's "maps/<map>.bsp", empty outside a map) to its map's settings, saves
+// pending changes and reloads files changed outside the game. Call periodically and when a level starts loading.
+void Sync(std::string_view levelName);
+
+// The current map ("gm_construct"), or empty outside a map.
+const std::string& MapName();
+const Settings& Global();
+// Whether the current map sets `field`, and how many fields it sets.
+bool MapSets(FieldId field);
+size_t MapSetCount();
+// Whether a field may differ between maps; the display, debug view and the overlay can't.
+bool PerMap(FieldId field);
+Section SectionOf(FieldId field);
+
+// The settings as `scope` shows them: the global ones, or those in effect on the map.
+Settings View(Scope scope);
+// Records the fields that differ between `before` and `after` (both views of `scope`) in `scope`.
+void Commit(Scope scope, const Settings& before, const Settings& after);
+// Puts fields back: globally to their defaults, on the map to the global value.
+void Reset(Scope scope, std::span<const FieldId> fields);
+void ResetSections(Scope scope, SectionMask sections);
+
+// The `sections` of what `scope` shows in the settings files' format, under a comment line naming the mod.
+std::string Export(Scope scope, SectionMask sections);
+// Applies the settings `text` holds to `scope`. Returns the sections it held, or nothing when it held no setting.
+std::optional<SectionMask> Import(Scope scope, std::string_view text);
+// The sections a settings text holds, or 0.
+SectionMask SectionsIn(std::string_view text);
+
+// Saved presets by name (UTF-8), sorted.
+std::vector<std::string> Presets();
+// Whether `name` can name a preset file.
+bool ValidPresetName(std::string_view name);
+bool SavePreset(std::string_view name, Scope scope, SectionMask sections);
+// The sections the preset holds, or nothing when it can't be read.
+std::optional<SectionMask> PresetSections(std::string_view name);
+std::optional<SectionMask> LoadPreset(std::string_view name, Scope scope);
+bool RenamePreset(std::string_view from, std::string_view to);
+bool DeletePreset(std::string_view name);
+
+// Reads and writes a settings file chosen by the player (export and import).
+bool WriteTextFile(const std::wstring& path, std::string_view text);
+std::optional<std::string> ReadTextFile(const std::wstring& path);
+
+}
 
 enum class GpuPass : uint32_t {
     SceneUpdate,
@@ -237,6 +355,19 @@ struct Statistics {
     uint32_t micromapTriangles = 0;
     uint32_t micromaps = 0;
     RealtimeBlock realtimeBlock = RealtimeBlock::None;
+    // The map's light before the menu's overrides, from the last main view, for the overrides to start from: the
+    // direction to the sun (env_sun's or light_environment's), the sun's and sky's linear colours, and whether the map
+    // has a sun.
+    std::array<float, 3> sunDirection = {0.0f, 0.0f, 1.0f};
+    std::array<float, 3> mapSunColor = {};
+    std::array<float, 3> mapSkyColor = {};
+    bool mapHasSun = false;
+    // The game's fog in the open air before the fog override: sRGB colour, start, end and maximum density.
+    Color gameFogColor = {};
+    float gameFogStart = 0.0f;
+    float gameFogEnd = 0.0f;
+    float gameFogMaxDensity = 1.0f;
+    bool gameFogKnown = false;
 };
 
 Statistics& GetStatistics();

@@ -1373,6 +1373,8 @@ std::optional<std::string> PendingLevel()
     }
     if (level == g_state.scene.Name() || level == g_state.failedMap)
         return std::nullopt;
+    // The map's own settings apply from its first frame, the bake included.
+    config::Sync(level);
     // With real-time lighting off the game lights itself; the map's scene loads once it is turned on.
     if (!GetSettings().realtimeLighting) {
         if (g_state.scene.Ready()) {
@@ -1791,6 +1793,8 @@ std::optional<std::pair<size_t, size_t>> LightingPipelineProgress()
 
 bool LevelHasWater() { return Ready() && !g_state.scene.WaterBodies().empty(); }
 
+float SkyboxScale() { return Ready() ? g_state.scene.Sun().skyCameraScale : 0.0f; }
+
 void WaitForGpu()
 {
     if (g_state.lighting)
@@ -1808,7 +1812,7 @@ void OnPresent(UINT width, UINT height, bool consoleRequests)
     light_queries::TryInstall();
     entities::TryInitialize();
     if (g_state.frame % kMapPollInterval == 0)
-        SyncSettingsFile(ModDirectory() / L"settings.ini");
+        config::Sync(engine::LevelName());
     if (g_state.lighting && g_state.frame % kMapPollInterval == 0 && !g_state.preparing && !loading::Active()) {
         UpdateScene();
         RunConsoleRequests(consoleRequests);
@@ -1839,7 +1843,7 @@ void PrepareLevel(const LoadProgress& progress)
         return;
     engine::TryInitialize();
     g_state.preparing = true;
-    SyncSettingsFile(ModDirectory() / L"settings.ini");
+    config::Sync(engine::LevelName());
     // The scene's share of the bar; with baked indirect light, the bake of a map not cached yet fills the rest.
     const bool bake = GetSettings().indirectLighting == IndirectLighting::Baked;
     const float sceneShare = bake ? 0.7f : 1.0f;

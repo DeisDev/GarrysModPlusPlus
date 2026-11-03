@@ -17,6 +17,8 @@ std::vector<const std::byte*> FindStringReferences(HMODULE module, std::string_v
 
 // Every match in the module's code of `pattern`: hex bytes separated by spaces, "??" for any byte.
 std::vector<const std::byte*> FindCodePattern(HMODULE module, std::string_view pattern);
+// The function holding the only match of `pattern` (as FindCodePattern takes it), or nullptr without exactly one.
+void* FindFunctionWithPattern(HMODULE module, std::string_view pattern);
 
 // The virtual function table of the class with the RTTI name `decoratedName` (".?AVCMeshDX8@@") for its subobject at
 // `offset`, or nullptr when the module has no unique one.
