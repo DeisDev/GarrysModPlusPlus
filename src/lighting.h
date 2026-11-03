@@ -794,6 +794,8 @@ private:
     float m_cloudShadowU[4] = {};
     float m_cloudShadowV[4] = {};
     bool m_cloudShadowReady = false;
+    // The shadow map holds this placement's transmittance in every row (so later frames may refresh half of them).
+    bool m_cloudShadowValid = false;
     Texture m_cloudLight;
     std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, kSlots> m_cloudReadback;
     std::array<bool, kSlots> m_cloudReadbackPending = {};

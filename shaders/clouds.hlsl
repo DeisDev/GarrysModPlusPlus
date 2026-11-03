@@ -22,7 +22,8 @@
 // 1: the detail noise (output0, kDetailSize cubed): Worley noise of three octaves at three frequencies.
 // 2: the weather (output0, kWeatherSize square): coverage by region, cloud type, and the cirrus' bands (two noises mixed).
 // 3: the cloud shadow map (output0, two square cascades side by side; FrameConstants::cloudShadowU and on): the sun's
-//    transmittance through the clouds along the line through each texel.
+//    transmittance through the clouds along the line through each texel; with input1 = 1 or 2 only the even or odd rows,
+//    0 all of them.
 // 4: the clouds' light (output0, kLightTexels x 1, one group) from the procedural sky (CloudConstants::skyView), last
 //    frame's cloud cube (input1, the faces, or kNoView), the shadow map (input2, or kNoView) and the colour bands.
 // 5: the cloud cube (output0, its faces) with the light (input1): the texels of each 4 x 4 block at traceOffset, blended
@@ -1098,8 +1099,9 @@ void main(uint3 id : SV_DispatchThreadID, uint index : SV_GroupIndex)
         RWTexture2D<float> output = ResourceDescriptorHeap[g_pass.output0];
         uint width, height;
         output.GetDimensions(width, height);
-        if (all(id.xy < uint2(width, height)))
-            output[id.xy] = ShadowTransmittance(clouds, id.xy, height);
+        uint2 texel = g_pass.input1 == 0 ? id.xy : uint2(id.x, id.y * 2 + g_pass.input1 - 1);
+        if (all(texel < uint2(width, height)))
+            output[texel] = ShadowTransmittance(clouds, texel, height);
         return;
     }
     if (g_pass.step == 4) {

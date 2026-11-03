@@ -1495,6 +1495,7 @@ void Lighting::RecordClouds(FrameConstants& constants, const ViewInputs& inputs,
     const auto none = [&] {
         m_cloudsReady = false;
         m_cloudShadowReady = false;
+        m_cloudShadowValid = false;
         m_cloudCubeValid = false;
         m_cloudHistoryValid = false;
         m_cloudSkyFactor = 1.0f;
@@ -1725,6 +1726,7 @@ void Lighting::RecordClouds(FrameConstants& constants, const ViewInputs& inputs,
     clouds.traceBlock = traceBlock;
     clouds.windStep[0] = windStep[0];
     clouds.windStep[1] = windStep[1];
+    bool shadowPlaced = false;
 
     // The shadow map over the plane across the sun the map's light comes from, centred on the eye in whole texels of the
     // coarse cascade, so it does not crawl as the eye moves.
@@ -1742,12 +1744,14 @@ void Lighting::RecordClouds(FrameConstants& constants, const ViewInputs& inputs,
         const float texel = kCloudShadowCoarseWidth / static_cast<float>(kCloudShadowSize);
         const float centreU = std::round(Dot(constants.eyePosition, u) / texel) * texel;
         const float centreV = std::round(Dot(constants.eyePosition, v) / texel) * texel;
-        for (size_t i = 0; i < 3; ++i) {
-            m_cloudShadowU[i] = u[i];
-            m_cloudShadowV[i] = v[i];
-        }
-        m_cloudShadowU[3] = -centreU;
-        m_cloudShadowV[3] = -centreV;
+        const float placedU[4] = {u[0], u[1], u[2], -centreU};
+        const float placedV[4] = {v[0], v[1], v[2], -centreV};
+        shadowPlaced = m_cloudShadowValid && std::equal(std::begin(placedU), std::end(placedU), m_cloudShadowU) &&
+            std::equal(std::begin(placedV), std::end(placedV), m_cloudShadowV);
+        std::copy(std::begin(placedU), std::end(placedU), m_cloudShadowU);
+        std::copy(std::begin(placedV), std::end(placedV), m_cloudShadowV);
+    } else {
+        m_cloudShadowValid = false;
     }
     std::memcpy(m_cloudConstantsMapped + slot * sizeof(CloudConstants), &clouds, sizeof(clouds));
     const UINT cloudView = m_cloudConstantViews[slot];
@@ -1756,7 +1760,12 @@ void Lighting::RecordClouds(FrameConstants& constants, const ViewInputs& inputs,
     SetCloudConstants(constants);
     if (m_cloudShadowReady) {
         Use(m_cloudShadow, write);
-        DispatchGroups(Pass::Clouds, {.input0 = cloudView, .output0 = m_cloudShadow.uav, .step = 3}, 2 * kCloudShadowSize / 8, kCloudShadowSize / 8, 1);
+        // Half its rows a frame, as the clouds move centimetres a frame; all of them where it was placed anew (the eye moved
+        // a coarse texel, the sun turned) or first made. Its rows of every frame cost 0.4 ms on gm_construct (2026-11-03).
+        const UINT rows = shadowPlaced ? 1u + (m_cloudFrame & 1u) : 0u;
+        DispatchGroups(Pass::Clouds, {.input0 = cloudView, .input1 = rows, .output0 = m_cloudShadow.uav, .step = 3}, 2 * kCloudShadowSize / 8,
+            (rows == 0 ? kCloudShadowSize : kCloudShadowSize / 2) / 8, 1);
+        m_cloudShadowValid = true;
         Use(m_cloudShadow, kVolumeRead);
     }
 
