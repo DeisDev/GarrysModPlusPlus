@@ -149,6 +149,9 @@ public:
     void Prepare(ID3D12GraphicsCommandList* list, const Inputs& inputs, const PostView& post);
     // Right before Present: turns generation off for a frame Prepare did not see, and counts the frame.
     void BeforePresent();
+    // After each present: the frames presented since the last call, generated ones included; 1 for a frame generation
+    // was off for.
+    uint32_t PresentedFrames();
     // Before the swap chain's buffers are resized (the GPU idle): generation's context is made again at the new size.
     void ReleaseContext();
 

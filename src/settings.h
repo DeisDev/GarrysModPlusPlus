@@ -457,8 +457,10 @@ enum class RealtimeBlock : uint8_t { None, Unsupported, OtherThread };
 struct Statistics {
     static constexpr size_t kFrameHistory = 1000;
 
-    // Wall-clock time between presents, oldest first once the ring has wrapped.
+    // Wall-clock time between presents, oldest first once the ring has wrapped, and the frames each present put on
+    // screen: 1, or with frame generation those it presented, generated ones included.
     std::array<float, kFrameHistory> frameMs = {};
+    std::array<uint8_t, kFrameHistory> shownFrames = {};
     size_t frameCount = 0;
     size_t nextFrame = 0;
     // All views; passMs are the main view's passes and otherViewsMs the 3D skybox's and viewmodel's whole runs.
@@ -515,7 +517,7 @@ struct Statistics {
 };
 
 Statistics& GetStatistics();
-// Records the time since the last call as a frame's; call once per presented frame.
-void RecordFrameInterval();
+// Records the time since the last call as a frame's; call once per present, with the frames it put on screen.
+void RecordFrameInterval(uint32_t shownFrames);
 
 }

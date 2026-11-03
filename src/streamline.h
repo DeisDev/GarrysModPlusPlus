@@ -35,6 +35,9 @@ Microsoft::WRL::ComPtr<IDXGIFactory2> SwapChainFactory(IDXGIFactory2* factory);
 void BeginFrame();
 void MarkRenderStart();
 void MarkPresent(bool end);
+// After each present: the frames Frame Generation presented since the last call, generated ones included; 1 while it
+// is off.
+uint32_t PresentedFrames();
 
 // DLSS Frame Generation's inputs for the frame, recorded into `list`: the main view's device depth (R32_FLOAT) and motion
 // in its pixels toward last frame's position, both the view's size, and the back buffer before the HUD, all in `state`

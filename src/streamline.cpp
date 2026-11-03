@@ -267,6 +267,18 @@ void MarkPresent(bool end)
     Mark(sl::PCLMarker::ePresentStart);
 }
 
+// Called after each present, the count is per rendered frame (ProgrammingGuideDLSS_G.md, numFramesActuallyPresented);
+// without options the query is cheapest.
+uint32_t PresentedFrames()
+{
+    if (!g_state.active || !g_state.appliedGeneration || g_state.appliedGeneration->first != sl::DLSSGMode::eOn)
+        return 1;
+    sl::DLSSGState state = {};
+    if (slDLSSGGetState(kViewport, state, nullptr) != sl::Result::eOk)
+        return 1;
+    return state.numFramesActuallyPresented;
+}
+
 bool FrameGenerationWanted() { return g_state.active && g_state.frameGeneration && GetSettings().frameGeneration == FrameGeneration::Dlss; }
 
 void TagFrame(ID3D12GraphicsCommandList* list, const FrameInputs& inputs, const PostView& post)

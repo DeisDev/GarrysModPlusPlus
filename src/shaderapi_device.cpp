@@ -664,6 +664,7 @@ void Backend::Present()
     streamline::MarkPresent(false);
     const HRESULT hr = m_swapChain->Present(m_vsync ? 1 : 0, !m_vsync && m_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0);
     streamline::MarkPresent(true);
+    RecordFrameInterval(m_fsrFrameGeneration.Active() ? m_fsrFrameGeneration.PresentedFrames() : streamline::PresentedFrames());
     if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) {
         if (!m_deviceLost) {
             m_deviceLost = true;

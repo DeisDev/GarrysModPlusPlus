@@ -191,7 +191,6 @@ void OnPresent()
     capture::EndForward();
     if (!std::exchange(g_state.mainLit, false))
         capture::SetSky(std::nullopt);
-    RecordFrameInterval();
     GetStatistics().realtimeBlock = g_state.block;
     overlay::EnsureWindowHook();
     video_menu::TryInstall();

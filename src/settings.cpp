@@ -831,7 +831,7 @@ std::optional<std::string> ReadTextFile(const std::wstring& path) { return ReadF
 
 }
 
-void RecordFrameInterval()
+void RecordFrameInterval(uint32_t shownFrames)
 {
     static std::optional<std::chrono::steady_clock::time_point> previous;
     const auto now = std::chrono::steady_clock::now();
@@ -840,6 +840,7 @@ void RecordFrameInterval()
         return;
     Statistics& statistics = GetStatistics();
     statistics.frameMs[statistics.nextFrame] = std::chrono::duration<float, std::milli>(now - *last).count();
+    statistics.shownFrames[statistics.nextFrame] = static_cast<uint8_t>(std::min<uint32_t>(shownFrames, UINT8_MAX));
     statistics.nextFrame = (statistics.nextFrame + 1) % Statistics::kFrameHistory;
     statistics.frameCount = std::min(statistics.frameCount + 1, Statistics::kFrameHistory);
 }

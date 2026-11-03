@@ -84,6 +84,7 @@ enum class Dialog { None, DeletePreset, OverwritePreset, RenamePreset, ClearMap 
 // The performance overlay's figures as last shown.
 struct OverlayFigures {
     double fps = 0.0;
+    std::optional<double> renderedFps;
     double frameMs = 0.0;
     double low1 = 0.0;
     double low01 = 0.0;
@@ -1204,7 +1205,8 @@ void EndAligned(const std::string& text)
     ImGui::TextUnformatted(visual.c_str());
 }
 
-// Frame rate figures over the recorded history. Lows average the slowest 1% / 0.1% of frames; "now" the last 30.
+// Frame rate figures over the recorded history of frames shown on screen, generated ones included. Lows average the
+// slowest 1% / 0.1% of them; "now" the last 30 rendered frames.
 struct FrameRates {
     std::vector<float> chronological;
     std::vector<float> sorted;
@@ -1216,18 +1218,33 @@ struct FrameRates {
     double averageMs = 0.0;
     double nowMs = 0.0;
     double p99Ms = 0.0;
+    // The rendered frame rate "now", while frame generation adds frames.
+    std::optional<double> rendered;
 };
 
 std::optional<FrameRates> MeasureFrames(const Statistics& statistics)
 {
-    const size_t count = statistics.frameCount;
+    constexpr size_t kRecent = 30;
+    const size_t frames = statistics.frameCount;
+    const size_t first = frames == Statistics::kFrameHistory ? statistics.nextFrame : 0;
+    auto slot = [&](size_t i) { return (first + i) % Statistics::kFrameHistory; };
+    FrameRates rates;
+    // A rendered frame's time is split evenly over the frames shown for it. Frame generation paces its presents on its
+    // own, so the count one present reports can differ from the next; the mean over the last 30 rendered frames gives
+    // the split.
+    uint32_t windowShown = 0;
+    for (size_t i = 0; i < frames; ++i) {
+        windowShown += statistics.shownFrames[slot(i)];
+        if (i >= kRecent)
+            windowShown -= statistics.shownFrames[slot(i - kRecent)];
+        if (windowShown == 0)
+            continue;
+        const float ms = statistics.frameMs[slot(i)] * static_cast<float>(std::min(i + 1, kRecent)) / static_cast<float>(windowShown);
+        rates.chronological.insert(rates.chronological.end(), statistics.shownFrames[slot(i)], ms);
+    }
+    const size_t count = rates.chronological.size();
     if (count == 0)
         return std::nullopt;
-    FrameRates rates;
-    rates.chronological.resize(count);
-    const size_t first = count == Statistics::kFrameHistory ? statistics.nextFrame : 0;
-    for (size_t i = 0; i < count; ++i)
-        rates.chronological[i] = statistics.frameMs[(first + i) % Statistics::kFrameHistory];
     rates.sorted = rates.chronological;
     std::sort(rates.sorted.begin(), rates.sorted.end());
     double total = 0.0;
@@ -1241,18 +1258,23 @@ std::optional<FrameRates> MeasureFrames(const Statistics& statistics)
         return sum / static_cast<double>(n);
     };
     auto fps = [](double ms) { return ms > 0.0 ? 1000.0 / ms : 0.0; };
-    const size_t recent = std::min<size_t>(count, 30);
-    double recentTotal = 0.0;
-    for (size_t i = count - recent; i < count; ++i)
-        recentTotal += rates.chronological[i];
+    const size_t recent = std::min(frames, kRecent);
+    double recentMs = 0.0;
+    uint32_t recentShown = 0;
+    for (size_t i = frames - recent; i < frames; ++i) {
+        recentMs += statistics.frameMs[slot(i)];
+        recentShown += statistics.shownFrames[slot(i)];
+    }
     rates.averageMs = total / static_cast<double>(count);
-    rates.nowMs = recentTotal / static_cast<double>(recent);
+    rates.nowMs = recentShown > 0 ? recentMs / static_cast<double>(recentShown) : 0.0;
     rates.p99Ms = rates.sorted[std::min(count - 1, count * 99 / 100)];
     rates.now = fps(rates.nowMs);
     rates.average = fps(rates.averageMs);
     rates.median = fps(rates.sorted[count / 2]);
     rates.low1 = fps(slowestAverage(0.01));
     rates.low01 = fps(slowestAverage(0.001));
+    if (recentShown != recent)
+        rates.rendered = fps(recentMs / static_cast<double>(recent));
     return rates;
 }
 
@@ -1735,6 +1757,7 @@ void UpdateFigures(const Statistics& statistics)
         return;
     OverlayFigures& figures = g_state.figures;
     figures.fps = rates->now;
+    figures.renderedFps = rates->rendered;
     figures.frameMs = rates->nowMs;
     figures.low1 = rates->low1;
     figures.low01 = rates->low01;
@@ -1764,7 +1787,10 @@ float DrawPerformanceOverlay(const Settings& settings)
     float height = 0.0f;
     if (ImGui::Begin("###gmodpp_performance", nullptr, kInfoBoxFlags)) {
         ImGui::PushFont(widgets::GetFonts().strong);
-        Line(ui::Format("overlay.fps", {{"value", ui::Number(figures.fps, 0)}}));
+        if (figures.renderedFps)
+            Line(ui::Format("overlay.fps_generated", {{"value", ui::Number(figures.fps, 0)}, {"rendered", ui::Number(*figures.renderedFps, 0)}}));
+        else
+            Line(ui::Format("overlay.fps", {{"value", ui::Number(figures.fps, 0)}}));
         ImGui::PopFont();
         if (detail >= OverlayDetail::Normal) {
             Line(Milliseconds(figures.frameMs));

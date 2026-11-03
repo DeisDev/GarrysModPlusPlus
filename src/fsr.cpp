@@ -15,6 +15,7 @@
 #include <ffx_framegeneration.h>
 #include <ffx_upscale.h>
 
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -354,10 +355,15 @@ void AddTransition(D3D12_RESOURCE_BARRIER* barriers, UINT& count, ID3D12Resource
     barrier.Transition.StateAfter = after;
 }
 
-// Each presented frame, rendered or generated, on FSR's present thread: the frame into the swap chain's buffer as FSR's
-// own composition does without a callback (there is no separate UI to compose), and its kind to Anti-Lag 2.
+// Frames the present callback has seen since the render thread last took the count.
+std::atomic<uint32_t> g_presentedFrames = 0;
+
+// Each presented frame, rendered or generated, on FSR's present thread (frame-interpolation-swap-chain.md, UI
+// Composition): the frame into the swap chain's buffer as FSR's own composition does without a callback (there is no
+// separate UI to compose), its kind to Anti-Lag 2, and the count.
 ffxReturnCode_t PresentFrame(ffxCallbackDescFrameGenerationPresent* params, void*)
 {
+    g_presentedFrames.fetch_add(1, std::memory_order_relaxed);
     anti_lag::SetFrameType(params->isGeneratedFrame);
     auto* list = static_cast<ID3D12GraphicsCommandList*>(params->commandList);
     auto* source = static_cast<ID3D12Resource*>(params->currentBackBuffer.resource);
@@ -542,6 +548,12 @@ void FsrFrameGeneration::BeforePresent()
     m_preparedLast = m_prepared;
     m_prepared = false;
     ++m_frameId;
+}
+
+uint32_t FsrFrameGeneration::PresentedFrames()
+{
+    const uint32_t presented = g_presentedFrames.exchange(0, std::memory_order_relaxed);
+    return m_preparedLast ? presented : 1;
 }
 
 // Generation is turned off first, which waits for the swap chain's work that uses the context (Shutdown).
