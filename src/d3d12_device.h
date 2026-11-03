@@ -9,7 +9,7 @@ namespace gmodpp {
 
 // A device factory that loads the Agility SDK's D3D12Core.dll from `runtimeDirectory` for this process's devices
 // alone (independent devices; no developer mode or exported SDK version needed), or nothing where the system's D3D12
-// cannot do that.
+// cannot do that. Made on the first call, which names the directory; the launch check and the backend share it.
 Microsoft::WRL::ComPtr<ID3D12DeviceFactory> AgilityDeviceFactory(const std::filesystem::path& runtimeDirectory);
 
 struct RaytracingSupport {

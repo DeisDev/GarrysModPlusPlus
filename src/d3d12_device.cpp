@@ -21,9 +21,7 @@ std::string RelativeToExecutable(const std::filesystem::path& directory)
     return error ? std::string() : relative.string() + "\\";
 }
 
-}
-
-ComPtr<ID3D12DeviceFactory> AgilityDeviceFactory(const std::filesystem::path& runtimeDirectory)
+ComPtr<ID3D12DeviceFactory> CreateAgilityFactory(const std::filesystem::path& runtimeDirectory)
 {
     ComPtr<ID3D12SDKConfiguration1> configuration;
     HRESULT hr = D3D12GetInterface(CLSID_D3D12SDKConfiguration, IID_PPV_ARGS(&configuration));
@@ -40,6 +38,14 @@ ComPtr<ID3D12DeviceFactory> AgilityDeviceFactory(const std::filesystem::path& ru
         return nullptr;
     }
     log::Info("Agility SDK {} runtime loaded from '{}'", D3D12_SDK_VERSION, path);
+    return factory;
+}
+
+}
+
+ComPtr<ID3D12DeviceFactory> AgilityDeviceFactory(const std::filesystem::path& runtimeDirectory)
+{
+    static const ComPtr<ID3D12DeviceFactory> factory = CreateAgilityFactory(runtimeDirectory);
     return factory;
 }
 

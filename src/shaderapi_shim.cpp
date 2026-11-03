@@ -1,5 +1,6 @@
 #include "capture.h"
 #include "command_line.h"
+#include "hardware_check.h"
 #include "log.h"
 #include "module_scan.h"
 #include "options.h"
@@ -927,7 +928,7 @@ Shim* LoadShim()
     shim->mainThread = GetCurrentThreadId();
     g_shim = shim;
 
-    if (!HasArgument(L"-gmodpp_vanilla")) {
+    if (!HasArgument(L"-gmodpp_vanilla") && hardware_check::NativeRendererChosen()) {
         log::Info("Native Direct3D 12 shader API");
         shim->gameCreateInterface = &native::CreateInterface;
     } else {

@@ -672,6 +672,27 @@ void DrawGeneralPage(Settings& settings)
         widgets::Text(Text(kBlocks[static_cast<size_t>(block)]));
     widgets::EndCard();
 
+    const Statistics& statistics = GetStatistics();
+    widgets::BeginCard("##latency", Text("general.section_latency"));
+    if (widgets::BeginRows("latency")) {
+        constexpr const char* kReflex[] = {"general.reflex_off", "general.reflex_on", "general.reflex_boost"};
+        static_assert(std::size(kReflex) == static_cast<size_t>(ReflexMode::Count));
+        ComboRow("general.reflex", &Settings::reflex, kReflex, statistics.reflexAvailable, Text("general.reflex_reason"));
+        constexpr const char* kGeneration[] = {"general.frame_generation_off", "general.frame_generation_dlss", "general.frame_generation_fsr"};
+        static_assert(std::size(kGeneration) == static_cast<size_t>(FrameGeneration::Count));
+        // Streamline is not loaded when the game starts with FSR's swap chain, so DLSS's support is then unknown.
+        const bool available[] = {true, statistics.dlssFrameGenerationAvailable || statistics.startedFrameGeneration == FrameGeneration::Fsr,
+            statistics.fsrFrameGenerationAvailable};
+        SegmentRow("general.frame_generation", &Settings::frameGeneration, kGeneration, available);
+        SliderRow("general.generated_frames", &Settings::generatedFrames,
+            settings.frameGeneration == FrameGeneration::Dlss && statistics.generatedFramesMax > 1, Text("general.generated_frames_reason"));
+        SwitchRow("general.anti_lag", &Settings::antiLag, statistics.antiLagAvailable, Text("general.anti_lag_reason"));
+        widgets::EndRows();
+    }
+    const bool restart = (settings.frameGeneration == FrameGeneration::Fsr) != (statistics.startedFrameGeneration == FrameGeneration::Fsr);
+    widgets::Note(Text(restart ? "general.frame_generation_restart" : "general.frame_generation_note"));
+    widgets::EndCard();
+
     widgets::BeginCard("##overlay", Text("general.section_overlay"));
     if (widgets::BeginRows("overlay")) {
         SwitchRow("general.overlay", &Settings::performanceOverlay);
@@ -1043,14 +1064,15 @@ void DrawImagePage(Settings& settings)
     const bool rayReconstruction = settings.antiAliasing == AntiAliasing::RayReconstruction;
     widgets::BeginCard("##antialiasing", Text("image.section_anti_aliasing"));
     if (widgets::BeginRows("antialiasing")) {
-        constexpr const char* kModes[] = {"image.anti_aliasing_off", "image.anti_aliasing_taa", "image.anti_aliasing_dlss"};
+        constexpr const char* kModes[] = {"image.anti_aliasing_off", "image.anti_aliasing_taa", "image.anti_aliasing_dlss", "image.anti_aliasing_fsr"};
         static_assert(std::size(kModes) == static_cast<size_t>(AntiAliasing::Count));
-        const bool available[] = {true, true, statistics.rayReconstructionAvailable};
+        const bool available[] = {true, true, statistics.rayReconstructionAvailable, statistics.fsrAvailable};
         SegmentRow("image.anti_aliasing", &Settings::antiAliasing, kModes, available);
         constexpr const char* kUpscaling[] = {"image.upscaling_native", "image.upscaling_quality", "image.upscaling_balanced", "image.upscaling_performance",
             "image.upscaling_ultra_performance"};
         static_assert(std::size(kUpscaling) == static_cast<size_t>(UpscalingMode::Count));
-        ComboRow("image.upscaling", &Settings::upscaling, kUpscaling, rayReconstruction, Text("image.upscaling_reason"));
+        const bool upscaling = rayReconstruction || settings.antiAliasing == AntiAliasing::Fsr;
+        ComboRow("image.upscaling", &Settings::upscaling, kUpscaling, upscaling, Text("image.upscaling_reason"));
         const bool temporal = settings.antiAliasing == AntiAliasing::Temporal;
         SliderRow("image.history_weight", &Settings::taaHistoryWeight, temporal, Text("image.taa_reason"));
         SliderRow("image.sharpening", &Settings::sharpening, temporal, Text("image.taa_reason"));
@@ -1062,18 +1084,22 @@ void DrawImagePage(Settings& settings)
     }
     if (!statistics.rayReconstructionAvailable)
         widgets::Note(Text("image.dlss_unavailable"));
+    if (!statistics.fsrAvailable)
+        widgets::Note(Text("image.fsr_unavailable"));
     widgets::EndCard();
 
     widgets::BeginCard("##denoiser", Text("image.section_denoiser"));
     if (widgets::BeginRows("denoiser")) {
         SwitchRow("image.denoiser", &Settings::denoiser);
-        constexpr const char* kDenoisers[] = {"image.denoiser_built_in", "image.denoiser_relax", "image.denoiser_reblur"};
+        constexpr const char* kDenoisers[] = {"image.denoiser_built_in", "image.denoiser_relax", "image.denoiser_reblur", "image.denoiser_ray_regeneration"};
         static_assert(std::size(kDenoisers) == static_cast<size_t>(DenoiserType::Count));
         // DLSS Ray Reconstruction denoises by itself.
         ComboRow("image.denoiser_type", &Settings::denoiserType, kDenoisers, settings.denoiser && !rayReconstruction,
             Text(rayReconstruction ? "image.denoiser_type_dlss_reason" : "image.denoiser_type_reason"));
         widgets::EndRows();
     }
+    if (settings.denoiserType == DenoiserType::RayRegeneration && !statistics.rayRegenerationAvailable)
+        widgets::Note(Text("image.ray_regeneration_unavailable"));
     widgets::EndCard();
 
     widgets::BeginCard("##grading", Text("image.section_grading"));

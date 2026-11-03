@@ -16,6 +16,8 @@
 #include <g_causticsOmmCS.h>
 #include <g_flareVisibilityCS.h>
 #include <g_flareVisibilityOmmCS.h>
+#include <g_regenInputsCS.h>
+#include <g_regenResolveCS.h>
 #include <g_deferredLightingCacheOmmCS.h>
 #include <g_deferredLightingOmmCS.h>
 #include <g_translucentDepthOmmCS.h>
@@ -567,7 +569,7 @@ HRESULT Lighting::CreatePipelines(std::stop_token stop)
         g_swayCS, g_translucentDepthCS, g_viewRectCS, g_bakedBounceCS, g_skyCS, cache ? std::span<const BYTE>(g_sharcUpdateCS) : none,
         cache ? std::span<const BYTE>(g_sharcResolveCS) : none, g_directSunCS, g_restirPdfCS, g_restirPresampleCS, g_restirRegirCS, g_restirInitialCS,
         g_restirTemporalCS, g_restirSpatialCS, g_restirShadeCS, g_nrdInputsCS, g_nrdResolveCS, g_sunShadowCS, g_causticsCS, g_skinCS,
-        g_skyAtmosphereCS, g_flareVisibilityCS, g_cloudsCS};
+        g_skyAtmosphereCS, g_flareVisibilityCS, g_cloudsCS, g_regenInputsCS, g_regenResolveCS};
     static_assert(std::size(shaders) == static_cast<size_t>(Pass::Count));
     for (size_t i = 0; i < m_pipelines.size(); ++i)
         compute(shaders[i], m_pipelines[i]);
@@ -854,6 +856,8 @@ bool Lighting::Initialize(ID3D12Device5* device, ID3D12CommandQueue* queue, Desc
     for (UINT i = 0; i < RrInputCount; ++i)
         m_rrInputs[i].uav = m_rrInputUavs + i;
     GetStatistics().rayReconstructionAvailable = m_rayReconstruction.Initialize(m_device, dlssDirectory, ModDirectory() / L"logs");
+    GetStatistics().fsrAvailable = m_fsr.Initialize(m_device, dlssDirectory);
+    GetStatistics().rayRegenerationAvailable = m_rayRegeneration.Initialize(m_device, dlssDirectory);
     GetStatistics().opacityMicromapsAvailable = micromaps;
     GetStatistics().radianceCacheAvailable = cache;
     m_restirAvailable = m_restir.Initialize(m_device, *m_descriptors);
@@ -1817,6 +1821,7 @@ bool Lighting::EnsureTargets(UINT width, UINT height)
         ok = ok && CreateTarget(texture, width, height, DXGI_FORMAT_R32G32B32A32_FLOAT);
     ok = ok && CreateTarget(m_visibility, width, height, DXGI_FORMAT_R32G32B32A32_UINT);
     ok = ok && CreateTarget(m_motion, width, height, DXGI_FORMAT_R16G16_FLOAT);
+    ok = ok && CreateTarget(m_postMotion, width, height, DXGI_FORMAT_R16G16_FLOAT);
     ok = ok && CreateTarget(m_previousDistance, width, height, DXGI_FORMAT_R32_FLOAT);
     ok = ok && CreateTarget(m_pixelFlags, width, height, DXGI_FORMAT_R8_UINT);
     ok = ok && CreateTarget(m_geometricNormal, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT);
@@ -1843,6 +1848,8 @@ bool Lighting::EnsureTargets(UINT width, UINT height)
     for (Texture* texture : {&m_nrdDiffuse, &m_nrdSpecular, &m_nrdDiffuseOut, &m_nrdSpecularOut})
         ok = ok && CreateTarget(*texture, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT);
     ok = ok && CreateTarget(m_nrdValidation, width, height, DXGI_FORMAT_R8G8B8A8_UNORM);
+    ok = ok && CreateTarget(m_regenMotion, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT);
+    ok = ok && CreateTarget(m_regenNormals, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT);
     ok = ok && CreateTarget(m_sunPenumbra, width, height, DXGI_FORMAT_R16_FLOAT);
     ok = ok && CreateTarget(m_sunTranslucency, width, height, DXGI_FORMAT_R8G8B8A8_UNORM);
     ok = ok && CreateTarget(m_sunShadow, width, height, DXGI_FORMAT_R8G8B8A8_UNORM);
@@ -1872,6 +1879,8 @@ bool Lighting::EnsureTargets(UINT width, UINT height)
     ok = ok && CreateTarget(m_rrHitDistance, width, height, DXGI_FORMAT_R16_FLOAT);
     ok = ok && CreateTarget(m_rrOutput, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT);
     m_rayReconstruction.ReleaseFeature();
+    m_fsr.Release();
+    m_rayRegeneration.Release();
     m_width = width;
     m_height = height;
     m_historyValid = false;
@@ -1996,15 +2005,20 @@ nrd::CommonSettings Lighting::NrdCommonSettings(const FrameConstants& constants,
     std::memcpy(common.viewToClipMatrix, viewToClip, sizeof(viewToClip));
     std::memcpy(common.worldToViewMatrixPrev, restart ? worldToView : history.worldToView, sizeof(worldToView));
     std::memcpy(common.viewToClipMatrixPrev, restart ? viewToClip : history.viewToClip, sizeof(viewToClip));
-    common.motionVectorScale[0] = 1.0f / static_cast<float>(m_width);
-    common.motionVectorScale[1] = 1.0f / static_cast<float>(m_height);
+    common.motionVectorScale[0] = 1.0f / static_cast<float>(m_gridWidth);
+    common.motionVectorScale[1] = 1.0f / static_cast<float>(m_gridHeight);
     common.motionVectorScale[2] = 0.0f;
     common.cameraJitter[0] = inputs.jitterX;
     common.cameraJitter[1] = inputs.jitterY;
     common.cameraJitterPrev[0] = restart ? inputs.jitterX : history.jitter[0];
     common.cameraJitterPrev[1] = restart ? inputs.jitterY : history.jitter[1];
-    common.resourceSize[0] = common.resourceSizePrev[0] = common.rectSize[0] = common.rectSizePrev[0] = static_cast<uint16_t>(m_width);
-    common.resourceSize[1] = common.resourceSizePrev[1] = common.rectSize[1] = common.rectSizePrev[1] = static_cast<uint16_t>(m_height);
+    // Under FSR the passes run over the render size's corner of output-sized textures (NRD's dynamic resolution).
+    common.resourceSize[0] = common.resourceSizePrev[0] = static_cast<uint16_t>(m_width);
+    common.resourceSize[1] = common.resourceSizePrev[1] = static_cast<uint16_t>(m_height);
+    common.rectSize[0] = static_cast<uint16_t>(m_gridWidth);
+    common.rectSize[1] = static_cast<uint16_t>(m_gridHeight);
+    common.rectSizePrev[0] = restart ? common.rectSize[0] : history.rectSize[0];
+    common.rectSizePrev[1] = restart ? common.rectSize[1] : history.rectSize[1];
     common.frameIndex = history.frame++;
     common.accumulationMode = restart ? nrd::AccumulationMode::RESTART : nrd::AccumulationMode::CONTINUE;
     history.valid = true;
@@ -2012,6 +2026,8 @@ nrd::CommonSettings Lighting::NrdCommonSettings(const FrameConstants& constants,
     std::memcpy(history.viewToClip, viewToClip, sizeof(viewToClip));
     history.jitter[0] = inputs.jitterX;
     history.jitter[1] = inputs.jitterY;
+    history.rectSize[0] = common.rectSize[0];
+    history.rectSize[1] = common.rectSize[1];
     return common;
 }
 
@@ -2099,6 +2115,50 @@ bool Lighting::RecordNrd(const FrameConstants& constants, const ViewInputs& inpu
     Use(m_reflectionHistory[current], read);
     if (common.enableValidation)
         Use(m_nrdValidation, read);
+    return true;
+}
+
+bool Lighting::RecordRayRegeneration(const FrameConstants& constants, const ViewInputs& inputs, ID3D12Resource* albedo, UINT slot, UINT current,
+    D3D12_GPU_VIRTUAL_ADDRESS frameConstants, D3D12_GPU_VIRTUAL_ADDRESS scene)
+{
+    const D3D12_RESOURCE_STATES read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    const D3D12_RESOURCE_STATES write = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    Texture* prepared[] = {&m_nrdViewZ, &m_regenNormals, &m_nrdDiffuse, &m_nrdSpecular, &m_regenMotion};
+    for (Texture* texture : prepared)
+        Use(*texture, write);
+    for (Texture* texture : {&m_giRaw, &m_reflections, &m_rrRoughness, &m_rrSpecularAlbedo, &m_previousDistance, &m_motion})
+        Use(*texture, read);
+    Dispatch(Pass::RegenInputs, {.input0 = m_giRaw.srv, .input1 = m_reflections.srv, .input2 = m_rrRoughness.srv, .input3 = m_rrSpecularAlbedo.srv,
+        .input4 = m_previousDistance.srv, .output0 = m_nrdViewZ.uav, .output1 = m_regenNormals.uav, .output2 = m_nrdDiffuse.uav,
+        .output3 = m_nrdSpecular.uav, .output4 = m_regenMotion.uav});
+    for (Texture* texture : prepared)
+        Use(*texture, read);
+    Use(m_nrdDiffuseOut, write);
+    Use(m_nrdSpecularOut, write);
+
+    float worldToView[16];
+    float viewToClip[16];
+    SplitViewProjection(constants.viewProj, constants.eyePosition, worldToView, viewToClip);
+    const bool reset = constants.historyValid == 0;
+    m_regenFrame = reset ? 0 : m_regenFrame + 1;
+    FsrRayRegeneration::Inputs regen = {m_nrdViewZ.resource.Get(), m_regenMotion.resource.Get(), m_regenNormals.resource.Get(), albedo,
+        m_rrSpecularAlbedo.resource.Get(), m_nrdDiffuse.resource.Get(), m_nrdSpecular.resource.Get(), m_nrdDiffuseOut.resource.Get(),
+        m_nrdSpecularOut.resource.Get(), worldToView, viewToClip, inputs.jitterX, inputs.jitterY,
+        {m_prevEye[0] - constants.eyePosition[0], m_prevEye[1] - constants.eyePosition[1], m_prevEye[2] - constants.eyePosition[2]}, 65536.0f, m_gridWidth,
+        m_gridHeight, m_width, m_height, m_regenFrame, reset};
+    const bool denoised = m_rayRegeneration.Evaluate(m_list.Get(), regen);
+    // FSR leaves its own descriptor heaps bound.
+    BindCompute(frameConstants, scene, slot);
+    if (!denoised)
+        return false;
+    Use(m_nrdDiffuseOut, read);
+    Use(m_nrdSpecularOut, read);
+    Use(m_giFiltered[0], write);
+    Use(m_reflectionHistory[current], write);
+    Dispatch(Pass::RegenResolve, {.input0 = m_nrdDiffuseOut.srv, .input1 = m_nrdSpecularOut.srv, .input2 = m_rrSpecularAlbedo.srv,
+        .output0 = m_giFiltered[0].uav, .output1 = m_reflectionHistory[current].uav});
+    Use(m_giFiltered[0], read);
+    Use(m_reflectionHistory[current], read);
     return true;
 }
 
@@ -2704,24 +2764,34 @@ void Lighting::FinishBake(Scene& scene)
 AntiAliasing Lighting::AntiAliasingMode() const
 {
     const AntiAliasing chosen = GetSettings().antiAliasing;
-    return chosen == AntiAliasing::RayReconstruction && !m_rayReconstruction.Usable() ? AntiAliasing::Temporal : chosen;
+    if ((chosen == AntiAliasing::RayReconstruction && !m_rayReconstruction.Usable()) || (chosen == AntiAliasing::Fsr && !m_fsr.Usable()))
+        return AntiAliasing::Temporal;
+    return chosen;
 }
 
-bool Lighting::RayReconstructionSize(UINT outputWidth, UINT outputHeight, UINT& width, UINT& height)
+Lighting::Upscaler Lighting::RenderSize(UINT outputWidth, UINT outputHeight, UINT& width, UINT& height)
 {
     const Settings& settings = GetSettings();
-    if (settings.antiAliasing != AntiAliasing::RayReconstruction || settings.debugView != DebugView::Final || !m_rayReconstruction.Usable())
-        return false;
-    if (m_rrSizeMode != settings.upscaling || m_rrSize[0] != outputWidth || m_rrSize[1] != outputHeight) {
-        if (!m_rayReconstruction.RenderSize(settings.upscaling, outputWidth, outputHeight, m_rrSize[2], m_rrSize[3]))
-            return false;
-        m_rrSizeMode = settings.upscaling;
-        m_rrSize[0] = outputWidth;
-        m_rrSize[1] = outputHeight;
+    if (settings.debugView != DebugView::Final)
+        return Upscaler::None;
+    const AntiAliasing mode = AntiAliasingMode();
+    const bool dlss = mode == AntiAliasing::RayReconstruction;
+    if (!dlss && mode != AntiAliasing::Fsr)
+        return Upscaler::None;
+    UpscalingMode& sizeMode = dlss ? m_rrSizeMode : m_fsrSizeMode;
+    UINT* size = dlss ? m_rrSize : m_fsrSize;
+    if (sizeMode != settings.upscaling || size[0] != outputWidth || size[1] != outputHeight) {
+        const bool found = dlss ? m_rayReconstruction.RenderSize(settings.upscaling, outputWidth, outputHeight, size[2], size[3])
+                                : m_fsr.RenderSize(settings.upscaling, outputWidth, outputHeight, size[2], size[3]);
+        if (!found)
+            return Upscaler::None;
+        sizeMode = settings.upscaling;
+        size[0] = outputWidth;
+        size[1] = outputHeight;
     }
-    width = m_rrSize[2];
-    height = m_rrSize[3];
-    return true;
+    width = size[2];
+    height = size[3];
+    return dlss ? Upscaler::Dlss : Upscaler::Fsr;
 }
 
 void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const SceneInstance> dynamic, const std::vector<SkinnedEntity>& skinned)
@@ -2815,14 +2885,21 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     const bool main = inputs.kind == gbuffer::ViewKind::Main;
     UINT renderWidth = m_width;
     UINT renderHeight = m_height;
-    const bool rayReconstruction = main && scene.Ready() && RayReconstructionSize(m_width, m_height, renderWidth, renderHeight);
+    const Upscaler upscaler = main && scene.Ready() ? RenderSize(m_width, m_height, renderWidth, renderHeight) : Upscaler::None;
+    // Ray Reconstruction denoises and upscales; FSR upscales what the usual denoisers left at render resolution.
+    const bool rayReconstruction = upscaler == Upscaler::Dlss;
+    const bool upscaled = upscaler != Upscaler::None;
+    if (upscaler == Upscaler::None) {
+        renderWidth = m_width;
+        renderHeight = m_height;
+    }
     if (main) {
-        // Histories made at another resolution or by the other pipeline cannot be reused.
-        if (rayReconstruction != m_lastMainUsedRr) {
+        // Histories made at another resolution or by another pipeline cannot be reused.
+        if (upscaler != m_lastMainUpscaler) {
             m_historyValid = false;
             m_taaHistoryValid = false;
         }
-        m_lastMainUsedRr = rayReconstruction;
+        m_lastMainUpscaler = upscaler;
         Statistics& statistics = GetStatistics();
         statistics.renderWidth = renderWidth;
         statistics.renderHeight = renderHeight;
@@ -3134,18 +3211,20 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     m_gridHeight = m_height;
     // Additive draws (glows, sprites) skip the temporal resolve, which would jitter them and, with Ray Reconstruction,
     // denoise them at render resolution as if they were lit surfaces.
-    const bool temporalResolve = rayReconstruction || (main && AntiAliasingMode() == AntiAliasing::Temporal);
+    const bool temporalResolve = upscaled || (main && AntiAliasingMode() == AntiAliasing::Temporal);
     constants.additiveAfterResolve = temporalResolve ? 1u : 0u;
     // The jitter's image shift in output pixels.
-    const float jitterScale = rayReconstruction ? static_cast<float>(m_width) / static_cast<float>(renderWidth) : 1.0f;
+    const float jitterScale = upscaled ? static_cast<float>(m_width) / static_cast<float>(renderWidth) : 1.0f;
     const UINT shiftX = std::bit_cast<UINT>(inputs.jitterX * jitterScale);
     const UINT shiftY = std::bit_cast<UINT>(inputs.jitterY * jitterScale);
 
     const D3D12_RESOURCE_STATES read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     const D3D12_RESOURCE_STATES write = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     auto mark = [&] { m_list->EndQuery(m_timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, marker++); };
-    if (rayReconstruction) {
-        // The passes before Ray Reconstruction run at render resolution on copies of the G-buffer.
+    // The frame constants the passes bind: the render size's under an upscaler.
+    const D3D12_GPU_VIRTUAL_ADDRESS passConstantsGpu = upscaled ? slotConstantsGpu + kConstantsStride : slotConstantsGpu;
+    if (upscaled) {
+        // The passes before the upscaler run at render resolution on copies of the G-buffer.
         for (Texture& texture : m_rrInputs)
             Use(texture, write);
         Dispatch(Pass::DlssInputs, {.input0 = renderWidth, .input1 = renderHeight, .output0 = m_rrInputUavs});
@@ -3165,7 +3244,7 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
         render.albedoView = m_rrInputs[RrAlbedo].srv;
         render.emissiveView = m_rrInputs[RrEmissive].srv;
         render.outputLinear = 1;
-        m_list->SetComputeRootConstantBufferView(0, slotConstantsGpu + kConstantsStride);
+        m_list->SetComputeRootConstantBufferView(0, passConstantsGpu);
         m_gridWidth = renderWidth;
         m_gridHeight = renderHeight;
     }
@@ -3284,7 +3363,7 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
             constants.probeRedView = m_probeIndirect[0].srv;
             constants.probeGreenView = m_probeIndirect[1].srv;
             constants.probeBlueView = m_probeIndirect[2].srv;
-            if (rayReconstruction) {
+            if (upscaled) {
                 FrameConstants& render = *reinterpret_cast<FrameConstants*>(slotConstants + kConstantsStride);
                 render.probeRedView = constants.probeRedView;
                 render.probeGreenView = constants.probeGreenView;
@@ -3319,7 +3398,7 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     // centre in the direct pass.
     std::pair<UINT, UINT> sunShadow = {kInvalidView, 0};
     if (main && constants.traceMask != 0 && constants.sunEnabled != 0.0f)
-        sunShadow = RecordSunShadow(constants, inputs, !rayReconstruction, slot, slotConstantsGpu, frame.tlas);
+        sunShadow = RecordSunShadow(constants, inputs, !rayReconstruction, slot, passConstantsGpu, frame.tlas);
     else if (main)
         m_sigmaHistory.valid = false;
     const bool wideLightSets = constants.exactLights > 4 || constants.sampledLightRays > 2;
@@ -3344,7 +3423,7 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
         RecordRestir(restirMode, restirDebug);
     }
     constants.restirDebugView = restirDebug && restirLights.Total() != 0 ? m_restirDebug.srv : kInvalidView;
-    if (rayReconstruction)
+    if (upscaled)
         reinterpret_cast<FrameConstants*>(slotConstants + kConstantsStride)->restirDebugView = constants.restirDebugView;
     Use(m_specular, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     Use(direct, read);
@@ -3360,7 +3439,7 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
         Dispatch(Pass::Ao, {.input0 = m_aoHistory[current].srv, .output0 = m_ao.uav, .step = 1});
         Use(m_ao, read);
         constants.aoView = m_ao.srv;
-        if (rayReconstruction)
+        if (upscaled)
             reinterpret_cast<FrameConstants*>(slotConstants + kConstantsStride)->aoView = m_ao.srv;
     }
     mark();
@@ -3370,8 +3449,12 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     const bool traced = constants.traceMask != 0 && inputs.kind != gbuffer::ViewKind::Skybox;
     // Without Ray Reconstruction NVIDIA NRD denoises the main view's indirect light and reflections, unless the built-in
     // denoiser is chosen.
-    const bool nrd = main && traced && !rayReconstruction && GetSettings().denoiser && GetSettings().denoiserType != DenoiserType::BuiltIn &&
-        EnsureNrd(GetSettings().denoiserType);
+    // AMD FSR Ray Regeneration where chosen and it runs, otherwise NRD RELAX in its place.
+    const DenoiserType denoiserType = GetSettings().denoiserType;
+    const bool regen = main && traced && !rayReconstruction && GetSettings().denoiser && denoiserType == DenoiserType::RayRegeneration &&
+        m_rayRegeneration.Usable();
+    const bool nrd = main && traced && !rayReconstruction && !regen && GetSettings().denoiser && denoiserType != DenoiserType::BuiltIn &&
+        EnsureNrd(denoiserType == DenoiserType::RayRegeneration ? DenoiserType::Relax : denoiserType);
     if (traced) {
         if (!main) {
             if (constants.probeRedView != kInvalidView) {
@@ -3394,7 +3477,7 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     // Reflections and their guides (Ray Reconstruction's and NRD's). Their fade by the pixel's light takes the main view's
     // denoised light of last frame, as this frame's is denoised with the reflections.
     UINT reflections = kInvalidView;
-    const bool reflectionGuides = rayReconstruction || nrd;
+    const bool reflectionGuides = rayReconstruction || nrd || regen;
     if (constants.traceMask != 0) {
         Use(m_reflections, write);
         Use(m_selfIllum, write);
@@ -3418,7 +3501,7 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
         reflections = m_reflections.srv;
         constants.selfIllumView = m_selfIllum.srv;
         // Ray Reconstruction takes the raw reflections with their guides, and NRD denoises them below.
-        if (main && !rayReconstruction && !nrd) {
+        if (main && !rayReconstruction && !nrd && !regen) {
             Use(m_reflectionHistory[previous], read);
             Use(m_reflectionHistory[current], write);
             Dispatch(Pass::ReflectionTemporal, {.input0 = m_reflections.srv, .input1 = m_reflectionHistory[previous].srv,
@@ -3428,7 +3511,7 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
         }
     }
     if (main)
-        m_reflectionHistoryValid = reflections != kInvalidView && !rayReconstruction && !nrd;
+        m_reflectionHistoryValid = reflections != kInvalidView && !rayReconstruction && !nrd && !regen;
     mark();
     // Accumulation and denoising of the indirect light (with NRD, also of the reflections).
     if (traced && main && !nrd) {
@@ -3452,8 +3535,17 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
             source = target;
         }
         indirect = source;
+    } else if (traced && regen) {
+        ID3D12Resource* passAlbedo = upscaled ? m_rrInputs[RrAlbedo].resource.Get() : albedo;
+        if (RecordRayRegeneration(constants, inputs, passAlbedo, slot, current, passConstantsGpu, frame.tlas)) {
+            indirect = &m_giFiltered[0];
+            reflections = m_reflectionHistory[current].srv;
+        } else {
+            // This frame keeps the raw light; the next uses NRD.
+            indirect = &m_giRaw;
+        }
     } else if (traced && nrd) {
-        if (RecordNrd(constants, inputs, slot, current, slotConstantsGpu, frame.tlas)) {
+        if (RecordNrd(constants, inputs, slot, current, passConstantsGpu, frame.tlas)) {
             indirect = &m_giFiltered[0];
             reflections = m_reflectionHistory[current].srv;
             if (constants.debugView == static_cast<uint32_t>(DebugView::DenoiserValidation))
@@ -3477,7 +3569,7 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     }
     if (main && !nrd)
         m_nrdHistory.valid = false;
-    if (rayReconstruction) {
+    if (upscaled) {
         FrameConstants& render = *reinterpret_cast<FrameConstants*>(slotConstants + kConstantsStride);
         render.selfIllumView = constants.selfIllumView;
         render.nrdValidationView = constants.nrdValidationView;
@@ -3542,7 +3634,7 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
             };
             const std::array<float, 3> jitter = main ? std::array<float, 3>{halton(m_mainRuns % 1024, 2), halton(m_mainRuns % 1024, 3), halton(m_mainRuns % 1024, 5)}
                                                      : std::array<float, 3>{0.5f, 0.5f, 0.5f};
-            FrameConstants* blocks[] = {&constants, rayReconstruction ? reinterpret_cast<FrameConstants*>(slotConstants + kConstantsStride) : nullptr};
+            FrameConstants* blocks[] = {&constants, upscaled ? reinterpret_cast<FrameConstants*>(slotConstants + kConstantsStride) : nullptr};
             for (FrameConstants* block : blocks) {
                 if (block == nullptr)
                     continue;
@@ -3655,6 +3747,42 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
             Dispatch(Pass::DlssResolve, {.input0 = m_rrOutput.srv, .input1 = shiftX, .input2 = shiftY, .output0 = m_resolved.uav});
             output = &m_resolved;
         }
+    } else if (upscaler == Upscaler::Fsr) {
+        Use(m_lit, read);
+        Use(m_rrOutput, write);
+        const auto now = std::chrono::steady_clock::now();
+        const float frameMs = m_lastMainTime.time_since_epoch().count() != 0
+            ? static_cast<float>(std::chrono::duration<double, std::milli>(now - m_lastMainTime).count())
+            : 16.7f;
+        m_lastMainTime = now;
+        // Source's projection (c8-c11): the w row is the view's forward axis and the z row maps view depth z to device
+        // depth a + b / z, which gives the near and far planes; the y row's part across the forward axis is the
+        // vertical scale, 1 / tan(half the vertical field of view).
+        const float(*m)[4] = constants.viewProj;
+        const auto dot3 = [](const float* x, const float* y) { return x[0] * y[0] + x[1] * y[1] + x[2] * y[2]; };
+        const float forward = std::sqrt(dot3(m[3], m[3]));
+        const float a = dot3(m[2], m[3]) / std::max(forward * forward, 1e-12f);
+        const float b = (m[2][3] - a * m[3][3]) / std::max(forward, 1e-12f);
+        const float along = dot3(m[1], m[3]) / std::max(forward, 1e-12f);
+        const float across = std::sqrt(std::max(dot3(m[1], m[1]) - along * along, 1e-12f));
+        const bool reversed = b > 0.0f;
+        // d = a + b / z: 0 (or 1 reversed) at the near plane, 1 (or 0) at the far one.
+        const float nearPlane = std::fabs(b / ((reversed ? 1.0f : 0.0f) - a));
+        const float farPlane = std::fabs(b / ((reversed ? 0.0f : 1.0f) - a));
+        const FsrUpscaler::Inputs fsr{m_lit.resource.Get(), m_rrInputs[RrDepth].resource.Get(), m_motion.resource.Get(), m_rrOutput.resource.Get(),
+            renderWidth, renderHeight, m_width, m_height, inputs.jitterX, inputs.jitterY, frameMs, nearPlane, farPlane, 2.0f * std::atan(1.0f / across),
+            reversed, !m_historyValid};
+        const bool upscaledLight = m_fsr.Evaluate(m_list.Get(), fsr);
+        // FSR leaves its own descriptor heaps bound.
+        BindCompute(slotConstantsGpu, frame.tlas, slot);
+        m_gridWidth = m_width;
+        m_gridHeight = m_height;
+        if (upscaledLight) {
+            Use(m_rrOutput, read);
+            Use(m_resolved, write);
+            Dispatch(Pass::DlssResolve, {.input0 = m_rrOutput.srv, .input1 = shiftX, .input2 = shiftY, .output0 = m_resolved.uav});
+            output = &m_resolved;
+        }
     } else if (main && AntiAliasingMode() == AntiAliasing::Temporal) {
         Use(m_lit, read);
         Use(m_taaHistory[previous], read);
@@ -3666,7 +3794,7 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
         Dispatch(Pass::Sharpen, {.input0 = m_taaHistory[current].srv, .input1 = shiftX, .input2 = shiftY, .output0 = m_resolved.uav});
         output = &m_resolved;
     }
-    m_taaHistoryValid = main ? output == &m_resolved && !rayReconstruction : m_taaHistoryValid;
+    m_taaHistoryValid = main ? output == &m_resolved && !upscaled : m_taaHistoryValid;
     // The game draws the view's translucent surfaces next, tested against this depth, which edges keep jittered.
     const D3D12_RESOURCE_DESC depthDesc = depth->GetDesc();
     const bool stableDepth = main && output == &m_resolved && (depthDesc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) != 0 &&
@@ -3751,9 +3879,16 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
         m_forwardFrame = m_forwardConstants->GetGPUVirtualAddress() + slot * kConstantsStride;
         m_forwardScene = frame.tlas;
     }
-    // The camera effects read the motion vectors in the game's command list (PostView).
-    Use(m_motion, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     if (main) {
+        // The camera effects read the main view's motion in the game's command list (PostView), after the viewmodel's
+        // run has written its own over part of m_motion.
+        Use(m_motion, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        Use(m_postMotion, D3D12_RESOURCE_STATE_COPY_DEST);
+        D3D12_TEXTURE_COPY_LOCATION to = {m_postMotion.resource.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+        D3D12_TEXTURE_COPY_LOCATION from = {m_motion.resource.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+        const D3D12_BOX box = {0, 0, 0, renderWidth, renderHeight, 1};
+        m_list->CopyTextureRegion(&to, 0, 0, 0, &from, &box);
+        Use(m_postMotion, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         PostView& post = m_postView.emplace();
         post.frame = inputs.frame;
         post.viewProj = inputs.viewProj;
@@ -3762,7 +3897,10 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
         for (size_t i = 0; i < 3; ++i)
             post.lightColor[i] = constants.sunColor[i] * constants.tonemapScale;
         post.lightRadius = flareRadius;
-        post.motionView = m_motion.srv;
+        post.motionView = m_postMotion.srv;
+        std::copy_n(constants.eyePosition, 3, post.eye);
+        SplitViewProjection(constants.viewProj, constants.eyePosition, post.worldToView, post.viewToClip);
+        post.motionScale = {static_cast<float>(renderWidth) / static_cast<float>(m_width), static_cast<float>(renderHeight) / static_cast<float>(m_height)};
         post.flareVisibilityView = flareLight ? m_flareVisibility.srv : kInvalidView;
     }
     m_list->ResolveQueryData(m_timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, slot * kMarkers, kMarkers, m_timestampReadback.Get(),
@@ -3809,7 +3947,7 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
         std::memcpy(m_prevViewProj, constants.viewProj, sizeof(m_prevViewProj));
         std::memcpy(m_prevEye, constants.eyePosition, sizeof(m_prevEye));
         m_historyValid = constants.traceMask != 0;
-        m_taaHistoryValid = !rayReconstruction && (m_taaHistoryValid && constants.historyValid != 0 ? true : output == &m_resolved);
+        m_taaHistoryValid = !upscaled && (m_taaHistoryValid && constants.historyValid != 0 ? true : output == &m_resolved);
         m_lastMainFrame = inputs.frame;
         ++m_mainRuns;
     }

@@ -1,6 +1,6 @@
 // The lens and film stages of the camera effects (src/post_effects.cpp) with AMD FidelityFX Lens 1.1's models (FidelityFX
-// SDK 1.1.4, MIT): its chromatic aberration's dispersion, vignetting and film grain. FfxLens itself is not used: it
-// samples blue at pixel corners, half a pixel off red and green.
+// SDK 1.1.4, MIT): its chromatic aberration's dispersion and film grain. FfxLens itself is not used: it samples blue at
+// pixel corners, half a pixel off red and green, and its effects do not follow the field of view.
 
 #include "../post/flare.hlsli"
 #include "../dither.hlsli"
@@ -63,8 +63,10 @@ FfxUInt32 GrainSeed()
 
 #include "lens/ffx_lens.h"
 
-// input0: the view (linear); output0: the view through the lens: radially distorted, each colour magnified by its
-// refraction (lateral chromatic aberration, relative to blue), with the lens flare and vignetting.
+// input0: the view (linear); output0: the view through the lens, by each pixel's field angle (its tangent from the
+// centre over the focal length): radially distorted, each colour magnified by its refraction relative to blue (lateral
+// chromatic aberration, which grows with the angle like the distortion), with the lens flare and the cos^4 law's
+// vignetting.
 [RootSignature(POST_ROOT_SIGNATURE)]
 [numthreads(8, 8, 1)]
 void LensMain(uint2 pixel : SV_DispatchThreadID)
@@ -76,20 +78,22 @@ void LensMain(uint2 pixel : SV_DispatchThreadID)
     float2 size = float2(g_post.size);
     float2 centre = 0.5 * size;
     float2 position = float2(pixel) + 0.5;
-    float2 fromCentre = (position - centre) / size.y;
-    float2 seen = centre + (position - centre) * ((1.0 + g_post.distortion * dot(fromCentre, fromCentre)) * g_post.distortionScale);
+    float2 field = (position - centre) / g_post.focalPixels;
+    float fieldSquared = dot(field, field);
+    float2 seen = centre + (position - centre) * ((1.0 + g_post.distortion * fieldSquared) * g_post.distortionScale);
     float4 base = source.SampleLevel(g_postLinear, seen * g_post.invSize, 0);
     float3 color = base.rgb;
     if (g_post.chromaticAberration > 0.0) {
-        float2 magnification = FfxLensGetRGMag(g_post.chromaticAberration);
+        float2 magnification = 1.0 + (FfxLensGetRGMag(g_post.chromaticAberration) - 1.0) * fieldSquared;
         color.r = source.SampleLevel(g_postLinear, (centre + (seen - centre) * magnification.x) * g_post.invSize, 0).r;
         color.g = source.SampleLevel(g_postLinear, (centre + (seen - centre) * magnification.y) * g_post.invSize, 0).g;
     }
     float3 light = FlareLight();
     if (any(light > 0.0))
         color += LensFlare(position, light);
+    // cos^4 of the field angle is (1 / (1 + tan^2))^2.
     if (g_post.vignette > 0.0)
-        FfxLensApplyVignette(FfxInt32x2(pixel), FfxInt32x2(centre), color, g_post.vignette);
+        color *= pow(1.0 / (1.0 + fieldSquared), 2.0 * g_post.vignette);
     output[pixel] = float4(color, base.a);
 }
 

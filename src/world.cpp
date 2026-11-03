@@ -1884,14 +1884,15 @@ std::array<float, 2> ViewJitter(UINT width, UINT height)
     g_state.pixelOffset[0] = g_state.pixelOffset[1] = 0.0f;
     UINT renderWidth = 0;
     UINT renderHeight = 0;
-    if (g_state.lighting && g_state.lighting->RayReconstructionSize(width, height, renderWidth, renderHeight)) {
-        // Ray Reconstruction wants many phases, more as the upscale grows (DLSS programming guide 3.7.1).
+    if (g_state.lighting && g_state.lighting->RenderSize(width, height, renderWidth, renderHeight) != Lighting::Upscaler::None) {
+        // Upscalers want many phases, more as the upscale grows: 8 times its square (DLSS programming guide 3.7.1; FSR's
+        // super-resolution-upscaler.md, Camera jitter).
         const float ratio = static_cast<float>(width) / static_cast<float>(renderWidth);
         const uint32_t phases = std::max(kRayReconstructionPhases, static_cast<uint32_t>(std::ceil(8.0f * ratio * ratio)));
         const uint32_t sample = static_cast<uint32_t>(g_state.frame % phases) + 1;
         g_state.pixelOffset[0] = Halton(sample, 2) - 0.5f;
         g_state.pixelOffset[1] = Halton(sample, 3) - 0.5f;
-        // DLSS takes the image shift itself, as NVIDIA's Donut samples pass it (PlanarView pixel offset).
+        // DLSS and FSR take the image shift themselves, as NVIDIA's Donut samples pass it (PlanarView pixel offset).
         return {g_state.pixelOffset[0] * 2.0f / static_cast<float>(renderWidth), -g_state.pixelOffset[1] * 2.0f / static_cast<float>(renderHeight)};
     }
     if ((g_state.lighting ? g_state.lighting->AntiAliasingMode() : GetSettings().antiAliasing) == AntiAliasing::Temporal) {

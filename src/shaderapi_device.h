@@ -1,6 +1,8 @@
 #pragma once
 
 #include "descriptor_heap.h"
+#include "fsr.h"
+#include "settings.h"
 #include "shaderapi_native.h"
 #include "shaderapi_types.h"
 
@@ -47,6 +49,8 @@ struct DisplayInfo {
     bool primary;
 };
 std::vector<DisplayInfo> Displays();
+// The DXGI adapter of the engine's display adapter `index` (Direct3D 9 numbers one per display output), or null.
+Microsoft::WRL::ComPtr<IDXGIAdapter1> AdapterOfDisplay(int index);
 
 // The Direct3D 12 device, the game window's flip-model swap chain and the frame's command list. Commands are recorded
 // into one list per frame, which Present submits; the backend keeps kFrames frames in flight.
@@ -100,6 +104,11 @@ public:
     UINT BackBufferTexture() const { return m_backBufferTextures[m_swapChain->GetCurrentBackBufferIndex()]; }
     TrackedResource& DepthBuffer() { return m_depthBuffer; }
     D3D12_CPU_DESCRIPTOR_HANDLE DepthBufferView() const { return m_depthView; }
+    // FSR's frame generation while its swap chain presents and the menu wants it, else null.
+    FsrFrameGeneration* FsrFrameGenerator()
+    {
+        return m_fsrFrameGeneration.Active() && GetSettings().frameGeneration == FrameGeneration::Fsr ? &m_fsrFrameGeneration : nullptr;
+    }
 
     // CPU-written memory the frame's commands can read until the frame completes.
     Upload AllocateUpload(UINT64 size, UINT64 alignment);
@@ -152,11 +161,16 @@ private:
     Upload Allocate(std::vector<UploadPage>& pages, UINT64 size, UINT64 alignment);
 
     Microsoft::WRL::ComPtr<IDXGIFactory6> m_factory;
+    Microsoft::WRL::ComPtr<IDXGIFactory2> m_swapChainFactory;
+    // The frame generator the swap chain is made for (Settings::frameGeneration when the device was created).
+    FrameGeneration m_frameGeneration = FrameGeneration::Off;
     Microsoft::WRL::ComPtr<ID3D12Device> m_device;
+    Microsoft::WRL::ComPtr<ID3D12Device> m_queueDevice;
     Microsoft::WRL::ComPtr<ID3D12InfoQueue> m_infoQueue;
     UINT64 m_debugMessages = 0;
     Microsoft::WRL::ComPtr<ID3D12CommandQueue> m_queue;
     Microsoft::WRL::ComPtr<IDXGISwapChain3> m_swapChain;
+    FsrFrameGeneration m_fsrFrameGeneration;
     std::array<TrackedResource, kBackBuffers> m_backBuffers;
     std::array<D3D12_CPU_DESCRIPTOR_HANDLE, kBackBuffers * 2> m_backBufferViews = {};
     std::array<UINT, kBackBuffers> m_backBufferTextures = { DescriptorHeap::kInvalid, DescriptorHeap::kInvalid, DescriptorHeap::kInvalid };

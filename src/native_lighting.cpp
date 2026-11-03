@@ -11,6 +11,7 @@
 #include "shaderapi_capture.h"
 #include "shaderapi_device.h"
 #include "shaderapi_textures.h"
+#include "streamline.h"
 #include "video_menu.h"
 #include "view_events.h"
 #include "world.h"
@@ -206,6 +207,7 @@ namespace gmodpp::effects {
 void OnViewOpaqueBegin()
 {
     using namespace native;
+    streamline::MarkRenderStart();
     if (realtime::CanLightRenderTargetView()) {
         capture::BeginForward(*realtime::g_state.forward, false);
         return;
