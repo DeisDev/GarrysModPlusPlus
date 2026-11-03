@@ -135,8 +135,10 @@ void OnDeviceReady()
         return;
     }
     const RaytracingSupport support = QueryRaytracing(device.Get());
-    log::Info("Real-time lighting: raytracing tier {:#x}, shader model {:#x}, inline raytracing {}, opacity micromaps {}, radiance cache {}",
-        static_cast<int>(support.tier), static_cast<int>(support.shaderModel), support.inlineRaytracing ? "available" : "unavailable",
+    log::Info("Real-time lighting: raytracing tier {:#x}, shader model {:#x}, resource binding tier 3 {}, typed UAV loads {}, inline raytracing {}, "
+              "opacity micromaps {}, radiance cache {}",
+        static_cast<int>(support.tier), static_cast<int>(support.shaderModel), support.bindingTier3 ? "yes" : "no", support.typedUavLoads ? "yes" : "no",
+        support.inlineRaytracing ? "available" : "unavailable",
         support.opacityMicromaps ? "available" : "unavailable", support.radianceCache ? "available" : "unavailable");
     if (!support.inlineRaytracing) {
         g_state.block = RealtimeBlock::Unsupported;

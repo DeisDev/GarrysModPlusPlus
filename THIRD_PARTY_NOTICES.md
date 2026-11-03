@@ -27,10 +27,13 @@ These are not in the repository. CMake downloads them, pinned by version and has
 | NVIDIA NRD | 4.18.0 | NVIDIA RTX SDKs License | Static library in `gmodpp.dll`. Not distributed as source. |
 | MathLib | 11 | MIT | Built into NRD |
 | ShaderMake | commit `3f01623a` | MIT | Its `ShaderMakeBlob` is built into NRD; the tool compiles NRD's shaders at build time and is not shipped |
+| AMD FidelityFX SDK (Depth of Field, CAS, Lens) | 1.1.4 (commit `c6efa6bf`) | MIT | Compiled into `gmodpp.dll`'s post effect shaders |
 
 This software contains source code provided by NVIDIA Corporation.
 
 NVIDIA, NVIDIA RTX, DLSS and NVIDIA DLSS are trademarks of NVIDIA Corporation. GarrysMod++ uses NVIDIA DLSS Ray Reconstruction, NVIDIA SHaRC, NVIDIA RTXDI and NVIDIA NRD.
+
+AMD and FidelityFX are trademarks of Advanced Micro Devices, Inc.
 
 ## Releases
 

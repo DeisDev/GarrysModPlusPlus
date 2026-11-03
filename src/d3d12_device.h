@@ -15,8 +15,11 @@ Microsoft::WRL::ComPtr<ID3D12DeviceFactory> AgilityDeviceFactory(const std::file
 struct RaytracingSupport {
     D3D12_RAYTRACING_TIER tier = D3D12_RAYTRACING_TIER_NOT_SUPPORTED;
     D3D_SHADER_MODEL shaderModel = D3D_SHADER_MODEL_5_1;
-    // Inline ray tracing in Shader Model 6.6, which the lighting needs.
+    // Inline ray tracing in Shader Model 6.6, which the lighting needs, with what its passes rely on besides:
+    // ResourceDescriptorHeap (resource binding tier 3) and typed UAV loads of RGBA16F (the additional formats).
     bool inlineRaytracing = false;
+    bool bindingTier3 = false;
+    bool typedUavLoads = false;
     // Raytracing tier 1.2 and Shader Model 6.9, through the Agility SDK runtime.
     bool opacityMicromaps = false;
     // The radiance cache (NVIDIA SHaRC) needs native 16-bit shader types and 64-bit integer shader operations; its

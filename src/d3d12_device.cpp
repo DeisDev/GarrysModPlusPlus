@@ -57,7 +57,13 @@ RaytracingSupport QueryRaytracing(ID3D12Device* device)
             break;
         }
     }
-    support.inlineRaytracing = support.tier >= D3D12_RAYTRACING_TIER_1_1 && support.shaderModel >= D3D_SHADER_MODEL_6_6;
+    D3D12_FEATURE_DATA_D3D12_OPTIONS options = {};
+    if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options)))) {
+        support.bindingTier3 = options.ResourceBindingTier >= D3D12_RESOURCE_BINDING_TIER_3;
+        support.typedUavLoads = options.TypedUAVLoadAdditionalFormats != FALSE;
+    }
+    support.inlineRaytracing = support.tier >= D3D12_RAYTRACING_TIER_1_1 && support.shaderModel >= D3D_SHADER_MODEL_6_6 && support.bindingTier3 &&
+        support.typedUavLoads;
     support.opacityMicromaps = support.tier >= D3D12_RAYTRACING_TIER_1_2 && support.shaderModel >= D3D_SHADER_MODEL_6_9;
     D3D12_FEATURE_DATA_D3D12_OPTIONS1 options1 = {};
     D3D12_FEATURE_DATA_D3D12_OPTIONS4 options4 = {};

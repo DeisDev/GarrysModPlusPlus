@@ -108,6 +108,8 @@ constexpr int kHdrInteger = 1;
 constexpr int kHdrFloat = 2;
 // IMaterialSystemHardwareConfig::GetHDRType.
 int HdrType();
+// The tone mapping scale last set (IShaderAPI::SetToneMappingScaleLinear), which pixel c30.x holds.
+float ToneMappingScale();
 // The dynamic state a new device starts with (IShaderAPI::ResetRenderState).
 void ResetDynamicState();
 

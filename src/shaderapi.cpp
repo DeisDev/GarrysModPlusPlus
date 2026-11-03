@@ -880,6 +880,12 @@ void SetToneMappingScaleLinear(NativeObject* self, const float* scale)
 
 const float* GetToneMappingScaleLinear(NativeObject*) { return g_api.lightScale; }
 
+}
+
+float ToneMappingScale() { return g_api.lightScale[0]; }
+
+namespace {
+
 void SetIntRenderingParameter(NativeObject*, int parameter, int value)
 {
     if (parameter >= 0 && parameter < kRenderParameters)

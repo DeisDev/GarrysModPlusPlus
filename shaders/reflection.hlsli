@@ -22,7 +22,7 @@ float3 SkyBeyond(float3 direction, float coneSpread, bool night, bool disc)
     NightSkyConstants beyond = constants[0];
     Texture2D<float4> transmittance = ResourceDescriptorHeap[beyond.transmittanceView];
     float logGain = 0.0;
-    if (night && (beyond.parts != 0 || beyond.moonIrradiance > 0.0)) {
+    if (night && g_frame.skyCubeView != kNoView && (beyond.parts != 0 || beyond.moonIrradiance > 0.0)) {
         TextureCube<float4> sky = ResourceDescriptorHeap[g_frame.skyCubeView];
         logGain = sky.SampleLevel(g_linearClamp, direction, 0.0).a;
     }

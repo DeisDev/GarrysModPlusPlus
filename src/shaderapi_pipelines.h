@@ -41,8 +41,12 @@ struct CopySurface {
 // D3DTEXF_LINEAR does: a plain copy when the sizes and formats allow it, otherwise a draw.
 void StretchRect(const CopySurface& source, const D3D12_RECT& sourceRect, const CopySurface& destination, const D3D12_RECT& destinationRect);
 
-// Grades `rect` of the back buffer by the menu's colour grading (shaders/grade.hlsl), when it is on and changes anything.
-void GradeView(D3D12_RECT rect);
+// Copies `size` bytes to memory the frame's commands can read as a constant buffer, and returns its address (0 when
+// there is no room).
+D3D12_GPU_VIRTUAL_ADDRESS UploadConstants(const void* data, UINT size);
+// Makes the next draw bind the descriptor heaps, the root signature and its pipeline again, after commands recorded
+// elsewhere (post_effects.cpp) changed them.
+void ForgetBindings();
 
 // Starts reading the pipeline library from disk on another thread, so the first draw does not wait for the file.
 void ReadPipelineLibraryInBackground();

@@ -1894,7 +1894,7 @@ std::array<float, 2> ViewJitter(UINT width, UINT height)
         // DLSS takes the image shift itself, as NVIDIA's Donut samples pass it (PlanarView pixel offset).
         return {g_state.pixelOffset[0] * 2.0f / static_cast<float>(renderWidth), -g_state.pixelOffset[1] * 2.0f / static_cast<float>(renderHeight)};
     }
-    if (GetSettings().antiAliasing == AntiAliasing::Temporal) {
+    if ((g_state.lighting ? g_state.lighting->AntiAliasingMode() : GetSettings().antiAliasing) == AntiAliasing::Temporal) {
         const uint32_t sample = static_cast<uint32_t>(g_state.frame % kJitterSamples) + 1;
         g_state.pixelOffset[0] = Halton(sample, 2) - 0.5f;
         g_state.pixelOffset[1] = Halton(sample, 3) - 0.5f;
@@ -1947,6 +1947,16 @@ void LightView(ViewInputs& inputs)
                 probe->drawnWaterNormal[1], probe->drawnWaterNormal[2], probe->rebuiltWaterNormal[0], probe->rebuiltWaterNormal[1],
                 probe->rebuiltWaterNormal[2]);
     }
+}
+
+std::optional<PostView> CurrentPostView()
+{
+    if (!g_state.lighting)
+        return std::nullopt;
+    const std::optional<PostView>& post = g_state.lighting->LastPostView();
+    if (!post || post->frame != g_state.frame)
+        return std::nullopt;
+    return post;
 }
 
 std::optional<gbuffer::SkyDraw> SkyDraw()

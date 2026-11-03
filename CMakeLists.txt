@@ -164,10 +164,46 @@ foreach(entry IN LISTS RTXDI_FILES)
     list(APPEND RTXDI_PATHS "${RTXDI_DIR}/${file}")
 endforeach()
 set(RTXDI_SHADER_OPTIONS -D GMODPP_RTXDI=1 -I "${RTXDI_DIR}/Include")
+# AMD FidelityFX SDK 1.1.4 (MIT), its last release with Depth of Field and Lens, pinned by commit and each file by hash:
+# the GPU headers of DoF, CAS and Lens that the post effects' passes include (shaders/amd).
+set(FFX_COMMIT c6efa6bf7f2027b3ec94f28578bb5965eabb9e55)
+set(FFX_DIR "${CMAKE_CURRENT_BINARY_DIR}/_deps/fidelityfx-${FFX_COMMIT}")
+set(FFX_FILES
+    "LICENSE.txt|82cf74fc23885107c7f69249ac3f1dac55898ff68320eb2c753984cae6b2d78a"
+    "sdk/include/FidelityFX/gpu/ffx_core.h|e439aa5f516b2d2ebf070ff1d24561f04fa5f00262a2e4f760764a7d07de7997"
+    "sdk/include/FidelityFX/gpu/ffx_common_types.h|a19560f837c09f0c990e98b5925b731135d908e372af41c5895cbfa70cc9e5c8"
+    "sdk/include/FidelityFX/gpu/ffx_core_hlsl.h|98722d4b1331c437f5aee645e6f12ed722b721f2ffcb0ec523ee817857f394c7"
+    "sdk/include/FidelityFX/gpu/ffx_core_gpu_common.h|0e3c50cb0b4592c051d87e028a1dfa54fbd097942ebb3146964db801dec095d0"
+    "sdk/include/FidelityFX/gpu/ffx_core_gpu_common_half.h|d10466cbf027c8c23858a25f8e8cbbbf521d29f373db663c9354221651e9a498"
+    "sdk/include/FidelityFX/gpu/ffx_core_portability.h|a7c3a1c213ec083bec401181036cffe7a222af2c430c0bab6bd8c14e83e8a567"
+    "sdk/include/FidelityFX/gpu/dof/ffx_dof_common.h|7df8bba17643097d40bcec033756ae203ae4a3c646e57cf23c171cd4115fa8e8"
+    "sdk/include/FidelityFX/gpu/dof/ffx_dof_resources.h|f23eb5492808c2f2cbf94177938fcce305045788803b60266c9a92a6ac930ead"
+    "sdk/include/FidelityFX/gpu/dof/ffx_dof_downsample_depth.h|73eadc0f237003757014c8621d3e40656db089a57be5ea4ba4096a353c8a1d46"
+    "sdk/include/FidelityFX/gpu/dof/ffx_dof_downsample_color.h|3d38d0b638ff7a9561c417cba1a33efbfeb253faf39baf339ff5286ddd4b5061"
+    "sdk/include/FidelityFX/gpu/dof/ffx_dof_dilate_depth.h|38ddd1d21ba032855f7cd0c838973451eadd8128e67e030261fcd569c547d1ae"
+    "sdk/include/FidelityFX/gpu/dof/ffx_dof_blur.h|533e0846268e484f4d1f8341536e73f703f4065d03be2bf25c5fbe172c8ae408"
+    "sdk/include/FidelityFX/gpu/dof/ffx_dof_composite.h|91f5148f43ef6b73253d2ab58052a23c74b004161065aa8269d95f2abb4591fb"
+    "sdk/include/FidelityFX/gpu/spd/ffx_spd.h|d276f32ee18948cb053c991f3c8821f9664c93f12cb2483dd2978f333bca67b2"
+    "sdk/include/FidelityFX/gpu/cas/ffx_cas.h|5d8a93b77128895f7aef4647ec1da55c44999f10603508fb7eaa6ec8f74c9067"
+    "sdk/include/FidelityFX/gpu/lens/ffx_lens.h|4dc1d49808b3f1ad7379f914925aa4fd931f597d3879a827db2ac62f63a2aacd"
+)
+set(FFX_PATHS "")
+foreach(entry IN LISTS FFX_FILES)
+    string(REPLACE "|" ";" parts "${entry}")
+    list(GET parts 0 file)
+    list(GET parts 1 hash)
+    file(DOWNLOAD "https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/${FFX_COMMIT}/${file}" "${FFX_DIR}/${file}"
+        EXPECTED_HASH SHA256=${hash} TLS_VERIFY ON)
+    list(APPEND FFX_PATHS "${FFX_DIR}/${file}")
+endforeach()
+set(FFX_SHADER_OPTIONS -D FFX_GPU=1 -D FFX_HLSL=1 -D FFX_HLSL_SM=66 -D FFX_HALF=0 -I "${FFX_DIR}/sdk/include/FidelityFX/gpu"
+    -I "${FFX_DIR}/sdk/include/FidelityFX/gpu/dof" -Wno-ambig-lit-shift)
 
 # Lighting passes built with the radiance cache: DXC options and the files they read.
 set(SHARC_SHADER_OPTIONS -D GMODPP_SHARC=1 -I "${SHARC_DIR}/include" -enable-16bit-types)
 file(GLOB NVIDIA_SHADER_HEADERS CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/nvidia/*.hlsli")
+file(GLOB AMD_SHADER_HEADERS CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/amd/*.hlsli")
+file(GLOB POST_SHADER_HEADERS CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/post/*.hlsli")
 file(GLOB SHADER_INCLUDES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/*.hlsli")
 
 # Extra arguments are dxc options.
@@ -176,7 +212,8 @@ function(add_shader source entry profile variable)
     add_custom_command(
         OUTPUT "${output}"
         COMMAND "${DXC_EXECUTABLE}" -nologo -T ${profile} -E ${entry} -O3 -HV 2021 ${ARGN} -Fh "${output}" -Vn ${variable} "${CMAKE_CURRENT_SOURCE_DIR}/${source}"
-        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/${source}" ${SHADER_INCLUDES} ${NVIDIA_SHADER_HEADERS} ${SHARC_PATHS} ${RTXDI_PATHS}
+        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/${source}" ${SHADER_INCLUDES} ${NVIDIA_SHADER_HEADERS} ${AMD_SHADER_HEADERS} ${POST_SHADER_HEADERS} ${SHARC_PATHS} ${RTXDI_PATHS}
+            ${FFX_PATHS}
             "${nrd_SOURCE_DIR}/Shaders/NRD.hlsli" "${nrd_SOURCE_DIR}/Shaders/NRDConfig.hlsli"
         COMMENT "Compiling ${source} (${entry})"
         VERBATIM
@@ -264,11 +301,24 @@ add_shader(shaders/sky.hlsl main cs_6_6 g_skyCS)
 add_shader(shaders/sky_atmosphere.hlsl main cs_6_6 g_skyAtmosphereCS)
 add_shader(shaders/sky_draw.hlsl SkyMain ps_6_6 g_skyDrawPS)
 add_shader(shaders/sky_draw.hlsl DiscMain ps_6_6 g_sunDiscPS)
-add_shader(shaders/grade.hlsl main ps_6_6 g_gradePS)
 add_shader(shaders/translucent_depth.hlsl main cs_6_6 g_translucentDepthCS)
 add_shader(shaders/translucent_depth.hlsl main cs_6_9 g_translucentDepthOmmCS -D OPACITY_MICROMAPS=1)
 add_shader(shaders/caustics.hlsl main cs_6_6 g_causticsCS)
 add_shader(shaders/caustics.hlsl main cs_6_9 g_causticsOmmCS -D OPACITY_MICROMAPS=1)
+add_shader(shaders/flare_visibility.hlsl main cs_6_6 g_flareVisibilityCS)
+add_shader(shaders/flare_visibility.hlsl main cs_6_9 g_flareVisibilityOmmCS -D OPACITY_MICROMAPS=1)
+# The camera effects after the game's post-processing (src/post_effects.cpp): our passes, and AMD FidelityFX's.
+add_shader(shaders/post/post.hlsl VSMain vs_6_6 g_postVS)
+foreach(entry Prepare Camera TileMax NeighborMax MotionBlur)
+    add_shader(shaders/post/post.hlsl ${entry}Main cs_6_6 g_post${entry}CS)
+endforeach()
+foreach(pass 0 1 2 3 4)
+    add_shader(shaders/amd/dof.hlsl main cs_6_6 g_dof${pass}CS -D DOF_PASS=${pass} ${FFX_SHADER_OPTIONS})
+endforeach()
+add_shader(shaders/amd/dof.hlsl main cs_6_6 g_dof0ReverseCS -D DOF_PASS=0 -D FFX_DOF_OPTION_REVERSE_DEPTH=1 ${FFX_SHADER_OPTIONS})
+add_shader(shaders/amd/cas.hlsl main cs_6_6 g_casCS ${FFX_SHADER_OPTIONS})
+add_shader(shaders/amd/lens.hlsl LensMain cs_6_6 g_lensCS ${FFX_SHADER_OPTIONS})
+add_shader(shaders/amd/lens.hlsl FinalMain ps_6_6 g_postFinalPS ${FFX_SHADER_OPTIONS})
 add_d3d9_shader(shaders/forward_snippet.hlsl main g_forwardSnippetPS)
 add_d3d9_shader(shaders/forward_snippet.hlsl main g_forwardSnippetPS2 PROFILE ps_2_b /D FORWARD_PS2=1)
 add_d3d9_shader(shaders/water_surface.hlsl main g_waterSurfacePS PROFILE ps_2_b)
@@ -426,6 +476,8 @@ add_library(gmodpp SHARED
     src/shaderapi_native.cpp
     src/shaderapi_meshes.cpp
     src/shaderapi_pipelines.cpp
+    src/post_effects.cpp
+    src/exposure.cpp
     src/shaderapi_shadow.cpp
     src/shaderapi_textures.cpp
     src/shaderapi_capture.cpp
@@ -497,6 +549,7 @@ add_custom_target(stage
     COMMAND ${CMAKE_COMMAND} -E copy "${DLSS_SDK_DIR}/LICENSE.txt" "${STAGE_LICENSES}/NVIDIA-DLSS-SDK.txt"
     COMMAND ${CMAKE_COMMAND} -E copy "${SHARC_DIR}/License.md" "${STAGE_LICENSES}/NVIDIA-SHaRC.txt"
     COMMAND ${CMAKE_COMMAND} -E copy "${RTXDI_DIR}/LICENSE.txt" "${STAGE_LICENSES}/NVIDIA-RTXDI.txt"
+    COMMAND ${CMAKE_COMMAND} -E copy "${FFX_DIR}/LICENSE.txt" "${STAGE_LICENSES}/AMD-FidelityFX-SDK.txt"
     COMMAND ${CMAKE_COMMAND} -E copy "${nrd_SOURCE_DIR}/LICENSE.txt" "${STAGE_LICENSES}/NVIDIA-NRD.txt"
     COMMAND ${CMAKE_COMMAND} -E copy "${MATHLIB_SOURCE_DIR}/LICENSE.txt" "${STAGE_LICENSES}/MathLib.txt"
     COMMAND ${CMAKE_COMMAND} -E copy "${SHADERMAKE_SOURCE_DIR}/LICENSE.txt" "${STAGE_LICENSES}/ShaderMake.txt"

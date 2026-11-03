@@ -14,6 +14,8 @@
 #include <g_aoOmmCS.h>
 #include <g_bakedBounceOmmCS.h>
 #include <g_causticsOmmCS.h>
+#include <g_flareVisibilityCS.h>
+#include <g_flareVisibilityOmmCS.h>
 #include <g_deferredLightingCacheOmmCS.h>
 #include <g_deferredLightingOmmCS.h>
 #include <g_translucentDepthOmmCS.h>
@@ -513,7 +515,7 @@ HRESULT Lighting::CreatePipelines(std::stop_token stop)
         g_swayCS, g_translucentDepthCS, g_viewRectCS, g_bakedBounceCS, g_skyCS, cache ? std::span<const BYTE>(g_sharcUpdateCS) : none,
         cache ? std::span<const BYTE>(g_sharcResolveCS) : none, g_directSunCS, g_restirPdfCS, g_restirPresampleCS, g_restirRegirCS, g_restirInitialCS,
         g_restirTemporalCS, g_restirSpatialCS, g_restirShadeCS, g_nrdInputsCS, g_nrdResolveCS, g_sunShadowCS, g_causticsCS, g_skinCS,
-        g_skyAtmosphereCS};
+        g_skyAtmosphereCS, g_flareVisibilityCS};
     static_assert(std::size(shaders) == static_cast<size_t>(Pass::Count));
     for (size_t i = 0; i < m_pipelines.size(); ++i)
         compute(shaders[i], m_pipelines[i]);
@@ -525,7 +527,8 @@ HRESULT Lighting::CreatePipelines(std::stop_token stop)
         {Pass::SharcUpdate, cache ? std::span<const BYTE>(g_sharcUpdateOmmCS) : none}, {Pass::DirectSun, g_directSunOmmCS},
         {Pass::RestirInitial, g_restirInitialOmmCS}, {Pass::RestirShade, g_restirShadeOmmCS}, {Pass::SunShadow, g_sunShadowOmmCS},
         {Pass::Lighting, cache ? std::span<const BYTE>(g_deferredLightingCacheOmmCS) : g_deferredLightingOmmCS},
-        {Pass::TranslucentDepth, g_translucentDepthOmmCS}, {Pass::Baked, g_bakedBounceOmmCS}, {Pass::Caustics, g_causticsOmmCS}};
+        {Pass::TranslucentDepth, g_translucentDepthOmmCS}, {Pass::Baked, g_bakedBounceOmmCS}, {Pass::Caustics, g_causticsOmmCS},
+        {Pass::FlareVisibility, g_flareVisibilityOmmCS}};
     for (size_t i = 0; i < std::size(micromapShaders) && micromaps; ++i)
         compute(micromapShaders[i].second, m_micromapPipelines[static_cast<size_t>(micromapShaders[i].first)]);
     for (const bool covered : {false, true}) {
@@ -788,6 +791,10 @@ bool Lighting::Initialize(ID3D12Device5* device, ID3D12CommandQueue* queue, Desc
         m_coarseWaterSun = {};
         log::Info("Lighting: creating the caustics' targets failed; water throws no caustics and its light is unshadowed");
     }
+    if (!CreateTarget(m_flareVisibility, 1, 1, DXGI_FORMAT_R16G16B16A16_FLOAT)) {
+        m_flareVisibility = {};
+        log::Info("Lighting: creating the lens flare's visibility failed; no lens flare");
+    }
     m_fenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     m_rtvIncrement = m_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     m_skinned.Initialize(m_device, *m_descriptors);
@@ -996,9 +1003,10 @@ void Lighting::RecordCaustics(FrameConstants& constants, const Scene& scene)
     Use(m_causticCounts, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     run(coarse, 4, kCoarseCausticsCells, m_coarseWaterSun.resource.Get());
     run(coarse, 5, kCoarseCausticsCells, m_coarseWaterSun.resource.Get());
-    Use(m_caustics, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    Use(m_waterSun, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    Use(m_coarseWaterSun, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    // Forward twins read them in pixel shaders, in the game's command lists (SeenWater).
+    Use(m_caustics, kVolumeRead);
+    Use(m_waterSun, kVolumeRead);
+    Use(m_coarseWaterSun, kVolumeRead);
     SetCausticsConstants(constants);
     m_causticsReady = true;
 }
@@ -2296,6 +2304,12 @@ void Lighting::FinishBake(Scene& scene)
     m_bakeCacheReadback.Reset();
 }
 
+AntiAliasing Lighting::AntiAliasingMode() const
+{
+    const AntiAliasing chosen = GetSettings().antiAliasing;
+    return chosen == AntiAliasing::RayReconstruction && !m_rayReconstruction.Usable() ? AntiAliasing::Temporal : chosen;
+}
+
 bool Lighting::RayReconstructionSize(UINT outputWidth, UINT outputHeight, UINT& width, UINT& height)
 {
     const Settings& settings = GetSettings();
@@ -2695,7 +2709,8 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
         const D3D12_RESOURCE_BARRIER between = {D3D12_RESOURCE_BARRIER_TYPE_UAV, D3D12_RESOURCE_BARRIER_FLAG_NONE, {.UAV = {m_skyLight.resource.Get()}}};
         m_list->ResourceBarrier(1, &between);
         DispatchGroups(Pass::Sky, {.output0 = m_skyLight.uav, .step = 1}, 1, 1, 1);
-        Use(m_skyLight, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        // Forward twins read it in pixel shaders (SkyLight).
+        Use(m_skyLight, kVolumeRead);
         m_skyLightReady = true;
         constants.skyLightView = m_skyLight.srv;
     } else if (main) {
@@ -2703,11 +2718,19 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
         m_skyLightReady = false;
         constants.skyLightView = kInvalidView;
     }
+    // The lens flare's light: the sun, or the Moon in its slot, with its disc as the sky draws it.
+    const bool flareLight = main && m_flareVisibility.resource && constants.traceMask != 0 && constants.sunEnabled != 0.0f;
+    const float flareRadius = m_skyDraw.sunDisc ? m_skyDraw.sunRadius : kRealSunRadius;
+    if (flareLight) {
+        Use(m_flareVisibility, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        DispatchGroups(Pass::FlareVisibility, {.input0 = std::bit_cast<UINT>(flareRadius), .output0 = m_flareVisibility.uav}, 1, 1, 1);
+        Use(m_flareVisibility, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    }
     m_gridWidth = m_width;
     m_gridHeight = m_height;
     // Additive draws (glows, sprites) skip the temporal resolve, which would jitter them and, with Ray Reconstruction,
     // denoise them at render resolution as if they were lit surfaces.
-    const bool temporalResolve = rayReconstruction || (main && GetSettings().antiAliasing == AntiAliasing::Temporal);
+    const bool temporalResolve = rayReconstruction || (main && AntiAliasingMode() == AntiAliasing::Temporal);
     constants.additiveAfterResolve = temporalResolve ? 1u : 0u;
     // The jitter's image shift in output pixels.
     const float jitterScale = rayReconstruction ? static_cast<float>(m_width) / static_cast<float>(renderWidth) : 1.0f;
@@ -3228,7 +3251,7 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
             Dispatch(Pass::DlssResolve, {.input0 = m_rrOutput.srv, .input1 = shiftX, .input2 = shiftY, .output0 = m_resolved.uav});
             output = &m_resolved;
         }
-    } else if (main && GetSettings().antiAliasing == AntiAliasing::Temporal) {
+    } else if (main && AntiAliasingMode() == AntiAliasing::Temporal) {
         Use(m_lit, read);
         Use(m_taaHistory[previous], read);
         Use(m_taaHistory[current], write);
@@ -3323,6 +3346,20 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
         forward.probeBlueView = m_probeIndirect[2].srv;
         m_forwardFrame = m_forwardConstants->GetGPUVirtualAddress() + slot * kConstantsStride;
         m_forwardScene = frame.tlas;
+    }
+    // The camera effects read the motion vectors in the game's command list (PostView).
+    Use(m_motion, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    if (main) {
+        PostView& post = m_postView.emplace();
+        post.frame = inputs.frame;
+        post.viewProj = inputs.viewProj;
+        post.light = flareLight;
+        std::copy_n(constants.sunDirection, 3, post.lightDirection.begin());
+        for (size_t i = 0; i < 3; ++i)
+            post.lightColor[i] = constants.sunColor[i] * constants.tonemapScale;
+        post.lightRadius = flareRadius;
+        post.motionView = m_motion.srv;
+        post.flareVisibilityView = flareLight ? m_flareVisibility.srv : kInvalidView;
     }
     m_list->ResolveQueryData(m_timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, slot * kMarkers, kMarkers, m_timestampReadback.Get(),
         slot * kMarkers * sizeof(uint64_t));

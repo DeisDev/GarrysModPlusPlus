@@ -1,7 +1,6 @@
 #include "shaderapi_pipelines.h"
 
 #include "busy_window.h"
-#include "color.h"
 #include "command_line.h"
 #include "log.h"
 #include "night_sky.h"
@@ -17,7 +16,6 @@
 
 #include <d3d9types.h>
 
-#include <g_gradePS.h>
 #include <g_skyDrawPS.h>
 #include <g_sunDiscPS.h>
 
@@ -235,11 +233,6 @@ struct PipelineCache {
     std::unordered_map<std::uint64_t, ComPtr<ID3D12PipelineState>> blitPipelines;
     std::vector<unsigned char> blitVertexShader;
     std::vector<unsigned char> blitPixelShader;
-    // Colour grading (GradeView): its pipeline, and the copy of the back buffer it reads, with that copy's view.
-    ComPtr<ID3D12PipelineState> gradePipeline;
-    bool gradeFailed = false;
-    TrackedResource gradeSource;
-    UINT gradeSourceView = 0;
     // The pixel shaders the 2D sky's faces are drawn with in place of the game's (shaders/sky_draw.hlsl).
     CompiledShader skyShader;
     CompiledShader discShader;
@@ -599,6 +592,8 @@ ID3D12PipelineState* Pipeline(PipelineKey& key)
     return result;
 }
 
+}
+
 D3D12_GPU_VIRTUAL_ADDRESS UploadConstants(const void* data, UINT size)
 {
     Backend::Upload upload = GetBackend().AllocateUpload(std::max(size, 16u), kConstantAlignment);
@@ -607,6 +602,14 @@ D3D12_GPU_VIRTUAL_ADDRESS UploadConstants(const void* data, UINT size)
     std::memcpy(upload.data, data, size);
     return upload.buffer->GetGPUVirtualAddress() + upload.offset;
 }
+
+void ForgetBindings()
+{
+    g_cache.boundGeneration = ~0ull;
+    g_cache.boundPipeline = nullptr;
+}
+
+namespace {
 
 // gmodpp_state (register b1) of shader_translator.cpp.
 struct StateBuffer {
@@ -827,147 +830,6 @@ void StretchRect(const CopySurface& source, const D3D12_RECT& sourceRect, const 
         static_cast<float>(destinationRect.right - destinationRect.left), static_cast<float>(destinationRect.bottom - destinationRect.top), 0, 1 };
     commands->RSSetViewports(1, &viewport);
     commands->RSSetScissorRects(1, &destinationRect);
-    commands->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    commands->DrawInstanced(3, 1, 0, 0);
-}
-
-namespace {
-
-// Mirrors GradeConstants in shaders/grade.hlsl.
-struct GradeConstants {
-    float gain[3];
-    float contrast;
-    float saturation;
-    std::uint32_t source;
-    std::uint32_t padding[2];
-};
-
-float Luminance(const std::array<float, 3>& color) { return 0.2126f * color[0] + 0.7152f * color[1] + 0.0722f * color[2]; }
-
-// The per-channel gain of exposure and white balance: warmth recolours the view as if lit by a black body of
-// 6500 K x 2^-warmth rather than 6500 K (the sRGB white), tint shifts it between green and magenta; neither changes
-// its luminance.
-std::array<float, 3> GradeGain(const Settings& settings)
-{
-    constexpr float kNeutralKelvin = 6500.0f;
-    constexpr float kTintStrength = 0.2f;
-    const std::array<float, 3> neutral = BlackbodyColor(kNeutralKelvin);
-    const std::array<float, 3> light = BlackbodyColor(kNeutralKelvin * std::exp2(-settings.warmth));
-    std::array<float, 3> balance;
-    for (size_t i = 0; i < 3; ++i)
-        balance[i] = light[i] / std::max(neutral[i], 1e-6f);
-    const float tint = settings.tint * kTintStrength;
-    const std::array<float, 3> shift = { 1.0f + tint, 1.0f - tint, 1.0f + tint };
-    for (size_t i = 0; i < 3; ++i)
-        balance[i] *= shift[i];
-    const float scale = std::exp2(settings.exposure) / std::max(Luminance(balance), 1e-6f);
-    for (float& gain : balance)
-        gain *= scale;
-    return balance;
-}
-
-bool GradingChanges(const Settings& settings)
-{
-    return settings.grading && (settings.exposure != 0.0f || settings.contrast != 1.0f || settings.saturation != 1.0f || settings.warmth != 0.0f
-        || settings.tint != 0.0f);
-}
-
-// The copy of the back buffer GradeView reads, made again when the back buffer's size or format changes.
-bool PrepareGradeSource(const D3D12_RESOURCE_DESC& backBuffer)
-{
-    Backend& backend = GetBackend();
-    if (g_cache.gradeSource.resource) {
-        const D3D12_RESOURCE_DESC desc = g_cache.gradeSource.resource->GetDesc();
-        if (desc.Width == backBuffer.Width && desc.Height == backBuffer.Height && desc.Format == backBuffer.Format)
-            return true;
-        backend.Retire(std::move(g_cache.gradeSource.resource));
-        backend.RetireDescriptor(g_cache.gradeSourceView);
-        g_cache.gradeSource = {};
-    }
-    D3D12_RESOURCE_DESC desc = {};
-    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    desc.Width = backBuffer.Width;
-    desc.Height = backBuffer.Height;
-    desc.DepthOrArraySize = 1;
-    desc.MipLevels = 1;
-    desc.Format = backBuffer.Format;
-    desc.SampleDesc.Count = 1;
-    const D3D12_HEAP_PROPERTIES heap = { D3D12_HEAP_TYPE_DEFAULT };
-    const HRESULT hr = backend.Device()->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
-        IID_PPV_ARGS(&g_cache.gradeSource.resource));
-    if (FAILED(hr)) {
-        log::Info("Native: creating the colour grading copy failed: {:#010x}", static_cast<unsigned>(hr));
-        return false;
-    }
-    g_cache.gradeSource.state = D3D12_RESOURCE_STATE_COMMON;
-    g_cache.gradeSourceView = backend.Descriptors().Allocate();
-    D3D12_SHADER_RESOURCE_VIEW_DESC view = {};
-    view.Format = Backend::kBackBufferFormat;
-    view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    view.Texture2D.MipLevels = 1;
-    backend.Device()->CreateShaderResourceView(g_cache.gradeSource.resource.Get(), &view, backend.Descriptors().Cpu(g_cache.gradeSourceView));
-    return true;
-}
-
-}
-
-void GradeView(D3D12_RECT rect)
-{
-    const Settings& settings = GetSettings();
-    if (!GradingChanges(settings) || g_cache.gradeFailed)
-        return;
-    if (Dynamic().colorTargets[0] != kDefaultTarget) {
-        static bool logged = false;
-        if (!std::exchange(logged, true))
-            log::Info("Native: colour grading skipped a view drawn outside the back buffer");
-        return;
-    }
-    if (!Initialize() || !CompileBlitShaders())
-        return;
-    if (!g_cache.gradePipeline) {
-        g_cache.gradePipeline = CreateFullscreenPipeline(g_gradePS, Backend::kBackBufferFormat);
-        if (!g_cache.gradePipeline) {
-            g_cache.gradeFailed = true;
-            return;
-        }
-    }
-    Backend& backend = GetBackend();
-    TrackedResource& backBuffer = backend.BackBuffer();
-    const D3D12_RESOURCE_DESC desc = backBuffer.resource->GetDesc();
-    rect.left = std::max(rect.left, LONG(0));
-    rect.top = std::max(rect.top, LONG(0));
-    rect.right = std::min(rect.right, static_cast<LONG>(desc.Width));
-    rect.bottom = std::min(rect.bottom, static_cast<LONG>(desc.Height));
-    if (rect.right <= rect.left || rect.bottom <= rect.top || !PrepareGradeSource(desc))
-        return;
-
-    ID3D12GraphicsCommandList* commands = backend.Commands();
-    backend.Transition(backBuffer, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    backend.Transition(g_cache.gradeSource, D3D12_RESOURCE_STATE_COPY_DEST);
-    D3D12_TEXTURE_COPY_LOCATION to = {};
-    to.pResource = g_cache.gradeSource.resource.Get();
-    to.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    D3D12_TEXTURE_COPY_LOCATION from = {};
-    from.pResource = backBuffer.resource.Get();
-    from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    const D3D12_BOX box = { static_cast<UINT>(rect.left), static_cast<UINT>(rect.top), 0, static_cast<UINT>(rect.right), static_cast<UINT>(rect.bottom), 1 };
-    commands->CopyTextureRegion(&to, static_cast<UINT>(rect.left), static_cast<UINT>(rect.top), 0, &from, &box);
-    backend.Transition(g_cache.gradeSource, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    backend.Transition(backBuffer, D3D12_RESOURCE_STATE_RENDER_TARGET);
-
-    BindRoot(backend, commands);
-    commands->SetPipelineState(g_cache.gradePipeline.Get());
-    g_cache.boundPipeline = g_cache.gradePipeline.Get();
-    const std::array<float, 3> gain = GradeGain(settings);
-    const GradeConstants constants = { { gain[0], gain[1], gain[2] }, settings.contrast, settings.saturation, g_cache.gradeSourceView, {} };
-    commands->SetGraphicsRootConstantBufferView(2, UploadConstants(&constants, sizeof(constants)));
-    const D3D12_CPU_DESCRIPTOR_HANDLE target = backend.BackBufferView(false);
-    commands->OMSetRenderTargets(1, &target, FALSE, nullptr);
-    const D3D12_VIEWPORT viewport = { static_cast<float>(rect.left), static_cast<float>(rect.top), static_cast<float>(rect.right - rect.left),
-        static_cast<float>(rect.bottom - rect.top), 0, 1 };
-    commands->RSSetViewports(1, &viewport);
-    commands->RSSetScissorRects(1, &rect);
     commands->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     commands->DrawInstanced(3, 1, 0, 0);
 }

@@ -56,6 +56,9 @@ void LightView(ViewInputs& inputs);
 // What the forward-lit translucent surfaces of the main view read, once its irradiance volume is ready.
 std::optional<gbuffer::ForwardConstants> ForwardLighting(const ViewInputs& inputs);
 
+// The main view's camera, light and motion vectors for the camera effects, when it was lit this frame.
+std::optional<PostView> CurrentPostView();
+
 // What the game's 2D sky draws show, as the last main view lit made it (Lighting::SkyDraw).
 std::optional<gbuffer::SkyDraw> SkyDraw();
 

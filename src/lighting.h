@@ -305,6 +305,23 @@ struct ViewInputs {
     std::optional<std::array<float, 3>> paintedSun;
 };
 
+// What the camera effects (src/post_effects.cpp) read of a main view in the game's command list, which follows its
+// lighting on the queue: its camera and light, its motion vectors and the light's traced visibility, both left in
+// D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE until the next view is lit.
+struct PostView {
+    uint64_t frame = 0;
+    // Source's view-projection rows (c8-c11) without the jitter.
+    gbuffer::Matrix4 viewProj = {};
+    // The light the sky shows (the sun, or the Moon in its place) and its disc's angular radius; its colour is its
+    // irradiance as the lighting takes it times the tonemap scale, so a white surface facing it shows that bright.
+    bool light = false;
+    std::array<float, 3> lightDirection = {};
+    std::array<float, 3> lightColor = {};
+    float lightRadius = 0.0f;
+    UINT motionView = DescriptorHeap::kInvalid;
+    UINT flareVisibilityView = DescriptorHeap::kInvalid;
+};
+
 // Lights a view's G-buffer on the D3D12 queue the game shares and writes the result back into its colour
 // target: traced sun and local lights, plus one-bounce traced indirect light that is accumulated over
 // frames and denoised. The 3D skybox is lit without tracing.
@@ -339,6 +356,9 @@ public:
     // The resolution the main view's ray tracing runs at when DLSS Ray Reconstruction is in use; false when the
     // view is lit at the output resolution instead.
     bool RayReconstructionSize(UINT outputWidth, UINT outputHeight, UINT& width, UINT& height);
+    // The anti-aliasing the main view gets: DLSS Ray Reconstruction falls back to TAA where it cannot run (no NVIDIA
+    // RTX GPU, or NGX failed), as settings files and presets made elsewhere may still choose it.
+    AntiAliasing AntiAliasingMode() const;
     void WaitForGpu();
     // Forgets everything learnt about the scene: frame histories and the radiance cache (a new map).
     void InvalidateHistory()
@@ -365,6 +385,8 @@ public:
     std::array<int, 3> VolumeOrigin() const { return m_probeOrigin; }
     // What the game's 2D sky draws show, as the last main view made it.
     const gbuffer::SkyDraw& SkyDraw() const { return m_skyDraw; }
+    // What the camera effects (src/post_effects.cpp) read of the last main view, or nothing before one was lit.
+    const std::optional<PostView>& LastPostView() const { return m_postView; }
     // Developer tool: the next main view reports what blocks the sun at a pixel (TakeProbe).
     void RequestProbe(UINT x, UINT y)
     {
@@ -420,6 +442,7 @@ private:
         Caustics,
         Skin,
         SkyAtmosphere,
+        FlareVisibility,
         Count
     };
     // Mirrors PassConstants in shaders/common.hlsli: descriptor indices (none by default) and a parameter.
@@ -724,6 +747,9 @@ private:
     // Written by shaders/primary.hlsl.
     Texture m_visibility;
     Texture m_motion;
+    // How much of the sun's or Moon's disc the eye sees (shaders/flare_visibility.hlsl), for the lens flare.
+    Texture m_flareVisibility;
+    std::optional<PostView> m_postView;
     Texture m_previousDistance;
     Texture m_pixelFlags;
     // The face normal of each pixel's triangle (shaders/primary.hlsl), which ray origins and directions keep to.

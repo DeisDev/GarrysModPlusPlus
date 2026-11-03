@@ -1,10 +1,11 @@
 #include "client_hooks.h"
 
+#include "exposure.h"
 #include "log.h"
 #include "module_scan.h"
 #include "settings.h"
 #include "shaderapi.h"
-#include "shaderapi_pipelines.h"
+#include "post_effects.h"
 #include "view_events.h"
 #include "world.h"
 
@@ -38,7 +39,7 @@ constexpr char kEnable3dSkyboxFogPattern[] = "BA 97 00 00 00 E8 ?? ?? ?? ?? 84 C
 // DoEnginePostProcessing(int x, int y, int w, int h, bool bFlashlightIsOn, bool bPostVGui) (client.dll+0x300540, REA
 // 2026-11-03), the only function that loads "EnginePost", the name of its render target dump. CViewRender::RenderView
 // calls it for views with bloom and tone mapping after their viewmodel and fade, before the screen-space effects and
-// the HUD.
+// the HUD; the camera effects and colour grading follow it.
 constexpr char kDoEnginePostProcessingLabel[] = "EnginePost";
 
 using DrawWorldFn = void(__fastcall*)(void* view, float waterZAdjust);
@@ -117,7 +118,7 @@ void __fastcall HookEnable3dSkyboxFog(void* view)
 void __fastcall HookDoEnginePostProcessing(int x, int y, int w, int h, bool flashlightOn, bool postVGui)
 {
     g_doEnginePostProcessing(x, y, w, h, flashlightOn, postVGui);
-    native::GradeView({x, y, x + w, y + h});
+    native::PostProcessView({x, y, x + w, y + h});
 }
 
 bool Hook(HMODULE clientModule, void* target, const char* name, void* hook, void** original)
@@ -158,7 +159,8 @@ void TryInstall()
         log::Info("MinHook initialization failed: {}", MH_StatusToString(status));
         return;
     }
-    // The fog override and colour grading each need only their own hook.
+    exposure::TryInstall();
+    // The fog override and the camera effects each need only their own hook.
     if (!Hook(clientModule, FindFunctionWithPattern(clientModule, kEnableWorldFogPattern), "EnableWorldFog", reinterpret_cast<void*>(&HookEnableWorldFog),
             reinterpret_cast<void**>(&g_enableWorldFog)))
         log::Info("client.dll: the fog override is unavailable");
@@ -167,7 +169,7 @@ void TryInstall()
         log::Info("client.dll: the fog override leaves the 3D skybox's fog");
     if (!Install(clientModule, kDoEnginePostProcessingLabel, "DoEnginePostProcessing", reinterpret_cast<void*>(&HookDoEnginePostProcessing),
             reinterpret_cast<void**>(&g_doEnginePostProcessing)))
-        log::Info("client.dll: colour grading is unavailable");
+        log::Info("client.dll: the camera effects and colour grading are unavailable");
     // Both hooks are needed: a capture started by DrawWorld must always be finished by the translucent pass.
     if (!Install(clientModule, kDrawTranslucentRenderablesLabel, "DrawTranslucentRenderables", reinterpret_cast<void*>(&HookDrawTranslucentRenderables),
             reinterpret_cast<void**>(&g_drawTranslucentRenderables))) {

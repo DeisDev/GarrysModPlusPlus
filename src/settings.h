@@ -73,6 +73,8 @@ enum class LightSampling : uint32_t { Legacy = 0, Ris, Restir, Auto, Count };
 enum class DenoiserType : uint32_t { BuiltIn = 0, Relax, Reblur, Count };
 
 // How much the performance overlay shows, and the corner of the screen it sits in.
+// Where depth of field focuses: on what the crosshair points at, or at Settings::dofFocusDistance.
+enum class DofFocus : uint32_t { Auto = 0, Manual, Count };
 enum class OverlayDetail : uint32_t { Minimal = 0, Normal, Full, Extra, Count };
 enum class OverlayCorner : uint32_t { TopLeft = 0, TopRight, BottomLeft, BottomRight, Count };
 
@@ -179,6 +181,48 @@ struct Settings {
     float saturation = 1.0f;
     float warmth = 0.0f;
     float tint = 0.0f;
+    // Camera effects on the 3D view after the game's post-processing, before the HUD (post_effects.cpp). Depth of field
+    // (AMD FidelityFX DoF) follows a thin lens: focused on what the crosshair points at, settling over dofFocusTime
+    // seconds, or at dofFocusDistance units; at f-number dofAperture on a sensor dofSensorSize times as tall as a
+    // full-frame one (the view's field of view sets the focal length); blurring at most dofMaxBlur of the screen's
+    // height, gathered over dofRings rings of samples.
+    bool depthOfField = false;
+    DofFocus dofFocus = DofFocus::Auto;
+    float dofFocusDistance = 256.0f;
+    float dofFocusTime = 0.25f;
+    float dofAperture = 2.8f;
+    float dofSensorSize = 1.0f;
+    float dofMaxBlur = 0.03f;
+    int dofRings = 8;
+    // Motion blur of a shutter open 1 / motionBlurShutter seconds.
+    bool motionBlur = false;
+    float motionBlurShutter = 60.0f;
+    // Lens flare from the sun or the Moon, and the starburst of glare around it.
+    bool lensFlare = false;
+    float lensFlareIntensity = 1.0f;
+    float lensFlareStarburst = 1.0f;
+    // Lens effects: chromatic aberration (FidelityFX Lens's dispersion), barrel (negative) or pincushion (positive)
+    // distortion, vignetting, film grain grainSize pixels across at 1080p, and contrast adaptive sharpening (FidelityFX
+    // CAS).
+    bool chromaticAberration = false;
+    float chromaticAberrationStrength = 1.0f;
+    bool lensDistortion = false;
+    float lensDistortionAmount = -0.15f;
+    bool vignette = false;
+    float vignetteAmount = 0.6f;
+    bool filmGrain = false;
+    float grainAmount = 0.35f;
+    float grainSize = 1.0f;
+    bool contrastSharpening = false;
+    float contrastSharpness = 0.5f;
+    // Source's auto exposure on HDR maps (exposure.cpp): its goal biased by exposureBias stops and kept between
+    // exposureMinimum and exposureMaximum (within Source's own range, which it clamps to first), approached over
+    // exposureTime seconds (a third of that when darkening) in place of its frame-rate-bound step.
+    bool exposureAdaptation = false;
+    float exposureBias = 0.0f;
+    float exposureMinimum = 0.0f;
+    float exposureMaximum = 16.0f;
+    float exposureTime = 1.0f;
 
     // The always-visible performance overlay.
     bool performanceOverlay = false;
@@ -234,16 +278,16 @@ SettingRange RangeOf(float Settings::* field);
 SettingRange RangeOf(int Settings::* field);
 
 // What settings are grouped by: the menu's pages and what a preset or an exported file holds.
-enum class Section : uint32_t { General = 0, Lighting, Sky, Quality, Image, Overlay, Count };
+enum class Section : uint32_t { General = 0, Lighting, Sky, Quality, Image, Overlay, Camera, Count };
 using SectionMask = uint32_t;
 constexpr SectionMask SectionBit(Section section) { return 1u << static_cast<uint32_t>(section); }
 // The sections presets and exported files can hold; General and the overlay belong to this computer.
 constexpr SectionMask kShareableSections =
-    SectionBit(Section::Lighting) | SectionBit(Section::Sky) | SectionBit(Section::Quality) | SectionBit(Section::Image);
+    SectionBit(Section::Lighting) | SectionBit(Section::Sky) | SectionBit(Section::Quality) | SectionBit(Section::Image) | SectionBit(Section::Camera);
 
 using SettingMember = std::variant<bool Settings::*, float Settings::*, int Settings::*, Color Settings::*, DebugView Settings::*, AntiAliasing Settings::*,
     UpscalingMode Settings::*, QualityPreset Settings::*, FoliageShadows Settings::*, IndirectLighting Settings::*, EmissiveLighting Settings::*,
-    LightSampling Settings::*, DenoiserType Settings::*, MapSun Settings::*, OverlayDetail Settings::*, OverlayCorner Settings::*>;
+    LightSampling Settings::*, DenoiserType Settings::*, MapSun Settings::*, OverlayDetail Settings::*, OverlayCorner Settings::*, DofFocus Settings::*>;
 
 // A setting's place in the settings table (kFields in settings.cpp).
 using FieldId = uint16_t;

@@ -67,6 +67,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Presets and sharing on the new Profiles page: save the current settings as a named preset (choosing which pages it holds), apply, rename and delete presets, and copy settings to the clipboard or export them to a file, then paste or import them elsewhere.
 - A performance overlay that stays on screen, with four levels of detail (Minimal, Normal, Full, Extra) and a choice of corner. Turn it on on the General page.
 - Settings rows show a reset button when they differ from their default.
+- Camera effects on the new Camera page, all off by default: depth of field (AMD FidelityFX Depth of Field) that focuses where you aim or at a set distance, motion blur, lens flare from the sun and Moon, chromatic aberration, lens distortion, vignette, film grain and sharpening (AMD FidelityFX CAS). Depth of field, motion blur and lens flare need real-time lighting. The held weapon stays sharp.
+- Auto exposure settings on the Camera page tune the game's own auto exposure on HDR maps: a bias, tighter limits and how fast it adapts.
 
 ### Changed
 
@@ -145,6 +147,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Choosing DLSS on a GPU without it (such as AMD and Intel GPUs), for example through a preset made on another PC, now gives TAA instead of no anti-aliasing.
 - Fixed fog staying as bright at night as by day: it now darkens with the sun and sky, takes the colour of the sunset, and follows the sun and sky strength settings. Water's own glow does too.
 - Fixed particles far from the player glowing with the map's baked daytime light, such as smoke at night; they now take the nearest real-time light.
 - The settings menu no longer shows the game's mouse cursor next to its own.

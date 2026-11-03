@@ -54,7 +54,7 @@ constexpr auto kOverlayRefresh = std::chrono::milliseconds(250);
 constexpr auto kMemoryRefresh = std::chrono::milliseconds(500);
 constexpr auto kStatusTime = std::chrono::seconds(8);
 
-enum class Page { General, Lighting, Sky, Quality, Image, Performance, Profiles, Count };
+enum class Page { General, Lighting, Sky, Quality, Image, Camera, Performance, Profiles, Count };
 
 using SetCursorPosFn = BOOL(WINAPI*)(int, int);
 using SetCursorFn = HCURSOR(WINAPI*)(HCURSOR);
@@ -117,8 +117,8 @@ struct State {
     // The Profiles page: the preset name being typed, the sections a saved preset and an export hold, the open dialog
     // and the preset it is about, the new name while renaming, and the last action's outcome.
     char presetName[96] = {};
-    uint32_t presetSections = 0xF;
-    uint32_t shareSections = 0xF;
+    uint32_t presetSections = 0x1F;
+    uint32_t shareSections = 0x1F;
     Dialog dialog = Dialog::None;
     // Set when a dialog is asked for, until DrawDialog opens it where it is drawn.
     bool dialogRequested = false;
@@ -887,7 +887,8 @@ void DrawQualityPage(Settings& settings)
         // The direct light pass that uses these runs for Legacy, which Auto picks with DLSS Ray Reconstruction
         // (Lighting::Run).
         const bool directPass = settings.lightSampling == LightSampling::Legacy ||
-            (settings.lightSampling == LightSampling::Auto && settings.antiAliasing == AntiAliasing::RayReconstruction);
+            (settings.lightSampling == LightSampling::Auto && settings.antiAliasing == AntiAliasing::RayReconstruction &&
+                GetStatistics().rayReconstructionAvailable);
         const char* directReason = Text("quality.direct_pass_reason");
         SliderRow("quality.exact_lights", &Settings::exactLights, directPass, directReason);
         SliderRow("quality.sampled_light_rays", &Settings::sampledLightRays, directPass, directReason);
@@ -1000,6 +1001,81 @@ void DrawImagePage(Settings& settings)
         widgets::EndRows();
     }
     widgets::Note(Text("image.grading_note"));
+    widgets::EndCard();
+}
+
+void DrawCameraPage(Settings& settings)
+{
+    // Depth of field, motion blur and lens flare take the main view's camera, motion and the sun's visibility from the
+    // real-time lighting; the lens effects work without it.
+    const bool lit = settings.realtimeLighting && GetStatistics().realtimeBlock != RealtimeBlock::Unsupported;
+    const char* litReason = Text("camera.realtime_reason");
+
+    widgets::BeginCard("##dof", Text("camera.section_dof"));
+    if (widgets::BeginRows("dof")) {
+        SwitchRow("camera.depth_of_field", &Settings::depthOfField, lit, litReason);
+        const bool dof = lit && settings.depthOfField;
+        const char* reason = lit ? Text("camera.dof_reason") : litReason;
+        constexpr const char* kFocus[] = {"camera.dof_focus_auto", "camera.dof_focus_manual"};
+        static_assert(std::size(kFocus) == static_cast<size_t>(DofFocus::Count));
+        SegmentRow("camera.dof_focus", &Settings::dofFocus, kFocus, {}, dof, reason);
+        const bool manual = settings.dofFocus == DofFocus::Manual;
+        SliderRow("camera.dof_focus_distance", &Settings::dofFocusDistance, dof && manual, dof ? Text("camera.dof_manual_reason") : reason, 0);
+        SliderRow("camera.dof_focus_time", &Settings::dofFocusTime, dof && !manual, dof ? Text("camera.dof_auto_reason") : reason);
+        SliderRow("camera.dof_aperture", &Settings::dofAperture, dof, reason, 1);
+        SliderRow("camera.dof_sensor_size", &Settings::dofSensorSize, dof, reason);
+        SliderRow("camera.dof_max_blur", &Settings::dofMaxBlur, dof, reason, 3);
+        SliderRow("camera.dof_rings", &Settings::dofRings, dof, reason);
+        widgets::EndRows();
+    }
+    widgets::Note(Text("camera.dof_note"));
+    widgets::EndCard();
+
+    widgets::BeginCard("##motion_blur", Text("camera.section_motion_blur"));
+    if (widgets::BeginRows("motion_blur")) {
+        SwitchRow("camera.motion_blur", &Settings::motionBlur, lit, litReason);
+        SliderRow("camera.motion_blur_shutter", &Settings::motionBlurShutter, lit && settings.motionBlur, lit ? Text("camera.motion_blur_reason") : litReason,
+            0);
+        widgets::EndRows();
+    }
+    widgets::Note(Text("camera.motion_blur_note"));
+    widgets::EndCard();
+
+    widgets::BeginCard("##lens_flare", Text("camera.section_lens_flare"));
+    if (widgets::BeginRows("lens_flare")) {
+        StrengthRow("camera.lens_flare", &Settings::lensFlare, &Settings::lensFlareIntensity, lit, litReason);
+        SliderRow("camera.lens_flare_starburst", &Settings::lensFlareStarburst, lit && settings.lensFlare,
+            lit ? Text("camera.lens_flare_reason") : litReason);
+        widgets::EndRows();
+    }
+    widgets::Note(Text("camera.lens_flare_note"));
+    widgets::EndCard();
+
+    widgets::BeginCard("##lens", Text("camera.section_lens"));
+    if (widgets::BeginRows("lens")) {
+        StrengthRow("camera.chromatic_aberration", &Settings::chromaticAberration, &Settings::chromaticAberrationStrength);
+        StrengthRow("camera.lens_distortion", &Settings::lensDistortion, &Settings::lensDistortionAmount);
+        StrengthRow("camera.vignette", &Settings::vignette, &Settings::vignetteAmount);
+        StrengthRow("camera.film_grain", &Settings::filmGrain, &Settings::grainAmount);
+        SliderRow("camera.grain_size", &Settings::grainSize, settings.filmGrain, Text("camera.grain_reason"));
+        StrengthRow("camera.sharpening", &Settings::contrastSharpening, &Settings::contrastSharpness);
+        widgets::EndRows();
+    }
+    widgets::Note(Text("camera.lens_note"));
+    widgets::EndCard();
+
+    widgets::BeginCard("##exposure", Text("camera.section_exposure"));
+    if (widgets::BeginRows("exposure")) {
+        SwitchRow("camera.exposure_adaptation", &Settings::exposureAdaptation);
+        const bool exposure = settings.exposureAdaptation;
+        const char* reason = Text("camera.exposure_reason");
+        SliderRow("camera.exposure_bias", &Settings::exposureBias, exposure, reason);
+        SliderRow("camera.exposure_minimum", &Settings::exposureMinimum, exposure, reason);
+        SliderRow("camera.exposure_maximum", &Settings::exposureMaximum, exposure, reason);
+        SliderRow("camera.exposure_time", &Settings::exposureTime, exposure, reason);
+        widgets::EndRows();
+    }
+    widgets::Note(Text("camera.exposure_note"));
     widgets::EndCard();
 }
 
@@ -1156,8 +1232,8 @@ void DrawPerformancePage()
 }
 
 // The sections presets and exports offer, in the order of the Toggles' bits.
-constexpr Section kShareSections[] = {Section::Lighting, Section::Sky, Section::Quality, Section::Image};
-constexpr const char* kShareSectionNames[] = {"page.lighting", "page.sky", "page.quality", "page.image"};
+constexpr Section kShareSections[] = {Section::Lighting, Section::Sky, Section::Quality, Section::Image, Section::Camera};
+constexpr const char* kShareSectionNames[] = {"page.lighting", "page.sky", "page.quality", "page.image", "page.camera"};
 
 SectionMask SectionsOf(uint32_t toggles)
 {
@@ -1452,6 +1528,7 @@ constexpr PageInfo kPages[] = {
     {"page.sky", &DrawSkyPage, SectionBit(Section::Sky), true},
     {"page.quality", &DrawQualityPage, SectionBit(Section::Quality), true},
     {"page.image", &DrawImagePage, SectionBit(Section::Image), true},
+    {"page.camera", &DrawCameraPage, SectionBit(Section::Camera), true},
     {"page.performance", [](Settings&) { DrawPerformancePage(); }, 0, false},
     {"page.profiles", &DrawProfilesPage, 0, true},
 };
