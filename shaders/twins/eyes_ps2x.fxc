@@ -58,8 +58,9 @@ GBufferTwinOutput main( PS_INPUT i )
 	twin.normal = float4( 0, 0, 0, baseSample.a );
 	twin.emissive = float4( glintSample.rgb * fGlintDamping, 0 );
 #if FORWARD_TWIN
-	// shaders/forward_twin.hlsli lights the draw at its world position.
+	// shaders/forward_twin.hlsli lights the draw at its world position; eyes reflect no traced cubemap (normal alpha 0).
 	twin.flags = float4( i.worldPos_projPosZ.xyz, baseSample.a );
+	twin.normal.a = 0.0f;
 #else
 	twin.flags = float4( 1, 1, 1, baseSample.a );
 #endif
