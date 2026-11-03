@@ -5,7 +5,7 @@
 
 // A lens flare from the sun or the Moon, added to the view: ghosts (images of the six-bladed aperture reflected between
 // the lens elements, along the line from the light through the centre), a halo ring around the centre on the light's
-// side, and a starburst (the aperture's diffraction spikes and glare) around the light.
+// side, and a starburst (Starburst) around the light.
 
 static const uint kGhostCount = 6;
 // Per ghost: its place on the line (0 the light, 1 the centre, 2 the light mirrored), radius (share of the height) and
@@ -40,6 +40,41 @@ float3 FlareLight()
     return g_post.flareColor * visibility * fade;
 }
 
+float FlareHash(uint x)
+{
+    x ^= x >> 16;
+    x *= 0x7feb352du;
+    x ^= x >> 15;
+    x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return float(x) * (1.0 / 4294967296.0);
+}
+
+static const uint kCoronaStreaks = 120;
+
+// The glare around the light, `toLight` pixels from it: the six-bladed aperture's diffraction spikes, a thin line each
+// that fades with distance and spreads each colour in proportion to its wavelength (red reaches furthest); fine streaks
+// of uneven length all around (the ciliary corona, Ritschel et al., "Temporal Glare", 2009); and the glow.
+float3 Starburst(float2 toLight, float height)
+{
+    float r = length(toLight);
+    float angle = atan2(toLight.y, toLight.x) - kApertureRotation;
+    const float sector = 1.0471976;
+    float across = r * abs(sin(angle - sector * round(angle / sector)));
+    float width = 1.0 + 0.004 * r;
+    float3 reach = 0.05 * height * float3(1.2, 1.0, 0.8);
+    float3 spikes = 0.35 * exp(-across * across / (width * width)) * exp(-r / reach);
+    float turns = (angle / 6.2831853 + 0.5) * float(kCoronaStreaks);
+    uint streak = uint(floor(turns)) % kCoronaStreaks;
+    float centre = (float(streak) + 0.2 + 0.6 * FlareHash(streak * 3u + 1u)) / float(kCoronaStreaks) * 6.2831853 - 3.1415927;
+    float streakAcross = r * abs(sin(angle - centre));
+    float strength = pow(FlareHash(streak * 3u), 6.0);
+    float streakReach = (0.01 + 0.03 * FlareHash(streak * 3u + 2u)) * height;
+    float corona = 0.25 * strength * exp(-streakAcross * streakAcross) * exp(-r / streakReach);
+    float glow = exp(-r / (0.004 * height)) + 0.12 * exp(-r / (0.025 * height)) + 0.02 * exp(-r / (0.12 * height));
+    return spikes + corona + glow;
+}
+
 float3 LensFlare(float2 pixel, float3 light)
 {
     float height = float(g_post.size.y);
@@ -63,13 +98,7 @@ float3 LensFlare(float2 pixel, float3 light)
     float3 ringOffset = (distance - radius) / (0.012 * height);
     float3 ring = exp(-ringOffset * ringOffset);
     flare += ring * (0.06 * facing * facing * saturate(lightDistance / (0.5 * height)));
-    // The starburst: six diffraction spikes (a six-bladed aperture), six fainter ones between, and the glare's glow.
-    float2 toLight = pixel - g_post.flarePosition;
-    float r = length(toLight);
-    float angle = atan2(toLight.y, toLight.x) + kApertureRotation;
-    float spikes = pow(abs(cos(3.0 * angle)), 400.0) + 0.3 * pow(abs(sin(3.0 * angle)), 600.0);
-    float glow = 0.25 * exp(-r / (0.02 * height)) + exp(-r / (0.004 * height));
-    flare += g_post.flareStarburst * (spikes * exp(-r / (0.12 * height)) + glow);
+    flare += g_post.flareStarburst * Starburst(pixel - g_post.flarePosition, height);
     return flare * light;
 }
 

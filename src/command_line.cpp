@@ -12,21 +12,41 @@ bool EqualsNoCase(std::wstring_view a, std::wstring_view b)
     return a.size() == b.size() && CompareStringOrdinal(a.data(), static_cast<int>(a.size()), b.data(), static_cast<int>(b.size()), TRUE) == CSTR_EQUAL;
 }
 
+namespace {
+
+// The command line's next whitespace-separated word from `pos`, which moves past it; empty at the end.
+std::wstring_view NextWord(std::wstring_view commandLine, size_t& pos)
+{
+    while (pos < commandLine.size() && std::iswspace(commandLine[pos]))
+        ++pos;
+    const size_t start = pos;
+    while (pos < commandLine.size() && !std::iswspace(commandLine[pos]))
+        ++pos;
+    return commandLine.substr(start, pos - start);
+}
+
+}
+
 bool HasArgument(std::wstring_view argument)
 {
-    std::wstring_view commandLine = GetCommandLineW();
+    const std::wstring_view commandLine = GetCommandLineW();
     size_t pos = 0;
     while (pos < commandLine.size()) {
-        while (pos < commandLine.size() && std::iswspace(commandLine[pos]))
-            ++pos;
-        size_t end = pos;
-        while (end < commandLine.size() && !std::iswspace(commandLine[end]))
-            ++end;
-        if (EqualsNoCase(commandLine.substr(pos, end - pos), argument))
+        if (EqualsNoCase(NextWord(commandLine, pos), argument))
             return true;
-        pos = end;
     }
     return false;
+}
+
+std::wstring ArgumentValue(std::wstring_view argument)
+{
+    const std::wstring_view commandLine = GetCommandLineW();
+    size_t pos = 0;
+    while (pos < commandLine.size()) {
+        if (EqualsNoCase(NextWord(commandLine, pos), argument))
+            return std::wstring(NextWord(commandLine, pos));
+    }
+    return {};
 }
 
 std::filesystem::path ExecutablePath()

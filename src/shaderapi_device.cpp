@@ -1,5 +1,6 @@
 #include "shaderapi_device.h"
 
+#include "anti_lag.h"
 #include "busy_window.h"
 #include "command_line.h"
 #include "d3d12_device.h"
@@ -13,6 +14,7 @@
 #include "shaderapi.h"
 #include "shaderapi_meshes.h"
 #include "shaderapi_pipelines.h"
+#include "streamline.h"
 
 #include <algorithm>
 #include <chrono>
@@ -302,6 +304,14 @@ void SetHardwareGammaRamp(NativeObject*, float, float, float, float, bool) {}
 
 }
 
+ComPtr<IDXGIAdapter1> AdapterOfDisplay(int index)
+{
+    const std::vector<DisplayAdapter>& adapters = DisplayAdapters();
+    if (index < 0 || index >= static_cast<int>(adapters.size()))
+        return nullptr;
+    return adapters[static_cast<size_t>(index)].adapter;
+}
+
 bool Backend::CreateDevice()
 {
     const std::filesystem::path runtime = ModDirectory() / L"D3D12";
@@ -316,6 +326,12 @@ bool Backend::CreateDevice()
             log::Info("Native: the D3D12 debug layer is unavailable ({:#010x})", Hex(hr));
         }
     }
+    // Streamline must be initialized before the DXGI calls it hooks; FSR's frame generation makes its own swap chain
+    // instead (ffx_framegeneration.h), with which Streamline's cannot share.
+    m_frameGeneration = GetSettings().frameGeneration;
+    GetStatistics().startedFrameGeneration = m_frameGeneration;
+    if (m_frameGeneration != FrameGeneration::Fsr)
+        streamline::Initialize(ModDirectory());
     HRESULT hr = CreateDXGIFactory2(0, IID_PPV_ARGS(&m_factory));
     if (FAILED(hr)) {
         log::Info("Native: CreateDXGIFactory2 failed: {:#010x}", Hex(hr));
@@ -341,9 +357,20 @@ bool Backend::CreateDevice()
         filter.DenyList.pSeverityList = hidden;
         m_infoQueue->PushStorageFilter(&filter);
     }
+    DXGI_ADAPTER_DESC1 adapterDesc = {};
+    adapter->GetDesc1(&adapterDesc);
+    streamline::SetDevice(m_device.Get(), adapterDesc.AdapterLuid);
+    Statistics& statistics = GetStatistics();
+    statistics.reflexAvailable = streamline::ReflexAvailable();
+    statistics.dlssFrameGenerationAvailable = streamline::FrameGenerationAvailable();
+    statistics.generatedFramesMax = streamline::MaxGeneratedFrames();
+    statistics.fsrFrameGenerationAvailable = fsr::FrameGenerationSupported(m_device.Get(), ModDirectory());
+    statistics.antiLagAvailable = anti_lag::Initialize(m_device.Get());
+    // The queue comes from Streamline's proxy device, which hooks its creation (sl_hooks.h).
     D3D12_COMMAND_QUEUE_DESC queueDesc = {};
     queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-    if (FAILED(hr = m_device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&m_queue))) || FAILED(hr = m_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&m_fence)))) {
+    if (FAILED(hr = streamline::QueueDevice(m_device.Get())->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&m_queue))) ||
+        FAILED(hr = m_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&m_fence)))) {
         log::Info("Native: creating the queue or fence failed: {:#010x}", Hex(hr));
         return false;
     }
@@ -390,6 +417,7 @@ bool Backend::CreateSwapChain()
         WaitForGpu();
         for (TrackedResource& buffer : m_backBuffers)
             buffer = {};
+        m_fsrFrameGeneration.ReleaseContext();
         HRESULT hr = m_swapChain->ResizeBuffers(kBackBuffers, m_width, m_height, DXGI_FORMAT_B8G8R8A8_UNORM, m_tearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0);
         if (FAILED(hr)) {
             log::Info("Native: ResizeBuffers failed: {:#010x}", Hex(hr));
@@ -407,7 +435,13 @@ bool Backend::CreateSwapChain()
         desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
         desc.Flags = m_tearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
         ComPtr<IDXGISwapChain1> swapChain;
-        HRESULT hr = m_factory->CreateSwapChainForHwnd(m_queue.Get(), m_window, &desc, nullptr, nullptr, &swapChain);
+        if (m_frameGeneration == FrameGeneration::Fsr && GetStatistics().fsrFrameGenerationAvailable)
+            swapChain = m_fsrFrameGeneration.CreateSwapChain(m_device.Get(), m_factory.Get(), m_queue.Get(), m_window, desc);
+        HRESULT hr = S_OK;
+        // Else through Streamline's factory, so the swap chain is its proxy (DLSS Frame Generation, Reflex's present
+        // markers); a plain DXGI one also when FSR could not make its own (logged), so the game still has a window.
+        if (swapChain == nullptr)
+            hr = streamline::SwapChainFactory(m_factory.Get())->CreateSwapChainForHwnd(m_queue.Get(), m_window, &desc, nullptr, nullptr, &swapChain);
         if (FAILED(hr) || FAILED(hr = swapChain.As(&m_swapChain))) {
             log::Info("Native: CreateSwapChainForHwnd failed: {:#010x}", Hex(hr));
             return false;
@@ -623,7 +657,11 @@ void Backend::Present()
     m_recording = false;
     ID3D12CommandList* lists[] = { m_commandList.Get() };
     m_queue->ExecuteCommandLists(1, lists);
+    anti_lag::MarkEndOfFrameRendering();
+    m_fsrFrameGeneration.BeforePresent();
+    streamline::MarkPresent(false);
     const HRESULT hr = m_swapChain->Present(m_vsync ? 1 : 0, !m_vsync && m_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0);
+    streamline::MarkPresent(true);
     if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) {
         if (!m_deviceLost) {
             m_deviceLost = true;
@@ -637,6 +675,9 @@ void Backend::Present()
     DrainDebugMessages();
     m_frame = (m_frame + 1) % kFrames;
     BeginFrame();
+    // The next frame starts: Reflex and Anti-Lag 2 wait here, before the game reads input for it.
+    streamline::BeginFrame();
+    anti_lag::Update();
 }
 
 // Logs the debug layer's errors (at most kMaxDebugMessages in all).

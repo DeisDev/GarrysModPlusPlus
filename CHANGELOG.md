@@ -69,6 +69,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Settings rows show a reset button when they differ from their default.
 - Camera effects on the new Camera page, all off by default: depth of field (AMD FidelityFX Depth of Field) that focuses where you aim or at a set distance, motion blur, lens flare from the sun and Moon, chromatic aberration, lens distortion, vignette, film grain and sharpening (AMD FidelityFX CAS). Depth of field, motion blur and lens flare need real-time lighting. The held weapon stays sharp.
 - Auto exposure settings on the Camera page tune the game's own auto exposure on HDR maps: a bias, tighter limits and how fast it adapts.
+- AMD FSR as an anti-aliasing option, with the same upscaling modes as DLSS: FSR 4 on Radeon RX 9000 GPUs, FSR 3.1 on other GPUs.
+- AMD FSR Ray Regeneration as a denoiser option on Radeon RX 9000 GPUs.
+- Frame generation on the General page, off by default: NVIDIA DLSS Frame Generation (RTX 40 and newer; more than one generated frame on RTX 50) or AMD FSR Frame Generation (any GPU). Switching between DLSS and FSR needs a restart.
+- NVIDIA Reflex (On, On + Boost) and AMD Anti-Lag 2 on the General page lower input lag. DLSS Frame Generation turns Reflex on.
+- A hardware check at launch. If the graphics card can't run GarrysMod++, a window says what it is missing and lets you play with the game's own graphics or quit. If it only lacks ray tracing, the window says so and the mod uses the map's baked lighting. "Don't show this again" turns the window off (`hardware_warning=1` in `settings.ini` turns it back on).
 
 ### Changed
 

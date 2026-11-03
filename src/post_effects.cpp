@@ -6,6 +6,7 @@
 #include "shaderapi.h"
 #include "shaderapi_device.h"
 #include "shaderapi_pipelines.h"
+#include "streamline.h"
 #include "world.h"
 
 #include <wrl/client.h>
@@ -19,6 +20,7 @@
 #include <g_dof4CS.h>
 #include <g_lensCS.h>
 #include <g_postCameraCS.h>
+#include <g_postFrameMotionCS.h>
 #include <g_postFinalPS.h>
 #include <g_postMotionBlurCS.h>
 #include <g_postNeighborMaxCS.h>
@@ -98,7 +100,8 @@ struct PostConstants {
     float gradeGain[3];
     float gradeContrast;
     float gradeSaturation;
-    std::uint32_t padding[3];
+    float motionScale[2];
+    float focalPixels;
 };
 static_assert(sizeof(PostConstants) == 17 * 16);
 
@@ -115,10 +118,11 @@ struct PostPass {
 };
 static_assert(sizeof(PostPass) == 8 * sizeof(UINT));
 
-enum class Compute { Prepare, Camera, TileMax, NeighborMax, MotionBlur, DofTiles, DofTilesReverse, DofColor, DofDilate, DofBlur, DofComposite, Cas, Lens, Count };
+enum class Compute { Prepare, Camera, TileMax, NeighborMax, MotionBlur, DofTiles, DofTilesReverse, DofColor, DofDilate, DofBlur, DofComposite, Cas, Lens,
+    FrameMotion, Count };
 
 constexpr std::span<const unsigned char> kComputeShaders[] = {g_postPrepareCS, g_postCameraCS, g_postTileMaxCS, g_postNeighborMaxCS, g_postMotionBlurCS,
-    g_dof0CS, g_dof0ReverseCS, g_dof1CS, g_dof2CS, g_dof3CS, g_dof4CS, g_casCS, g_lensCS};
+    g_dof0CS, g_dof0ReverseCS, g_dof1CS, g_dof2CS, g_dof3CS, g_dof4CS, g_casCS, g_lensCS, g_postFrameMotionCS};
 static_assert(std::size(kComputeShaders) == static_cast<size_t>(Compute::Count));
 
 // FidelityFX DoF's half-resolution colour has 4 mips (FFX_DOF_INTERNAL_BILAT_MIP_COUNT in ffx_dof_resources.h).
@@ -131,6 +135,11 @@ constexpr float kFullFrameHeight = 24.0f;
 constexpr float kUnitMillimetres = 25.4f;
 // Film runs at 24 frames a second; its grain changes with each frame.
 constexpr double kGrainRate = 24.0;
+// The lens effects' field of view without the lighting's camera: GMod's default (fov_desired 75, horizontal at 4:3).
+constexpr float kDefaultTanHalfHeight = 0.5754f;
+// FidelityFX Lens's dispersion strength per unit of the chromatic aberration setting: red is magnified 0.25% less than
+// blue at tan^2 of the field angle 1 (FfxLensGetRGMag: 1 - redMag is about 0.0174 per unit of strength).
+constexpr float kDispersionPerUnit = 0.144f;
 
 struct Target {
     TrackedResource texture;
@@ -158,6 +167,11 @@ struct State {
     Target tileMax;
     Target neighborMax;
     UINT blurTile = 0;
+    // Frame generation's inputs: the main view's motion and depth at its resolution, and the back buffer before the HUD.
+    Target frameMotion;
+    Target frameDepth;
+    TrackedResource hudless;
+    UINT hudlessSize[2] = {};
     // The camera's state across frames (CameraMain in shaders/post/post.hlsl).
     Target camera;
     ID3D12Resource* depthResource = nullptr;
@@ -286,7 +300,7 @@ void ReleaseTargets()
     for (Target& target : g_state.scene)
         Release(target);
     for (Target* target : {&g_state.bilateral, &g_state.tileRadius, &g_state.dilated, &g_state.nearField, &g_state.farField, &g_state.globals,
-             &g_state.tileMax, &g_state.neighborMax})
+             &g_state.tileMax, &g_state.neighborMax, &g_state.frameMotion, &g_state.frameDepth})
         Release(*target);
     for (UINT& mip : g_state.bilateralMips) {
         if (mip != kInvalid)
@@ -319,7 +333,9 @@ bool EnsureTargets(UINT width, UINT height)
         CreateTexture(g_state.nearField, halfWidth, halfHeight, DXGI_FORMAT_R16G16B16A16_FLOAT) &&
         CreateTexture(g_state.farField, halfWidth, halfHeight, DXGI_FORMAT_R16G16B16A16_FLOAT) && CreateBuffer(g_state.globals, 4, 1) &&
         CreateTexture(g_state.tileMax, blurTilesX, blurTilesY, DXGI_FORMAT_R16G16_FLOAT) &&
-        CreateTexture(g_state.neighborMax, blurTilesX, blurTilesY, DXGI_FORMAT_R16G16_FLOAT);
+        CreateTexture(g_state.neighborMax, blurTilesX, blurTilesY, DXGI_FORMAT_R16G16_FLOAT) &&
+        CreateTexture(g_state.frameMotion, width, height, DXGI_FORMAT_R16G16_FLOAT) &&
+        CreateTexture(g_state.frameDepth, width, height, DXGI_FORMAT_R32_FLOAT);
     for (UINT mip = 0; ok && mip < kDofMips; ++mip) {
         g_state.bilateralMips[mip] = backend.Descriptors().Allocate();
         ok = g_state.bilateralMips[mip] != kInvalid;
@@ -338,6 +354,37 @@ bool EnsureTargets(UINT width, UINT height)
     }
     g_state.width = width;
     g_state.height = height;
+    return true;
+}
+
+// The copy of the back buffer frame generation takes as the view without the HUD, made again when the back buffer's size
+// changes.
+bool EnsureHudless(const D3D12_RESOURCE_DESC& backBuffer)
+{
+    if (g_state.hudless.resource && g_state.hudlessSize[0] == backBuffer.Width && g_state.hudlessSize[1] == backBuffer.Height)
+        return true;
+    Backend& backend = GetBackend();
+    if (g_state.hudless.resource)
+        backend.Retire(std::move(g_state.hudless.resource));
+    g_state.hudless = {};
+    D3D12_RESOURCE_DESC desc = {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = backBuffer.Width;
+    desc.Height = backBuffer.Height;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = backBuffer.Format;
+    desc.SampleDesc.Count = 1;
+    const D3D12_HEAP_PROPERTIES heap = {D3D12_HEAP_TYPE_DEFAULT};
+    const HRESULT hr = backend.Device()->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+        IID_PPV_ARGS(&g_state.hudless.resource));
+    if (FAILED(hr)) {
+        log::Info("Post effects: creating frame generation's copy of the view failed: {:#010x}", static_cast<unsigned>(hr));
+        return false;
+    }
+    g_state.hudless.state = D3D12_RESOURCE_STATE_COMMON;
+    g_state.hudlessSize[0] = static_cast<UINT>(backBuffer.Width);
+    g_state.hudlessSize[1] = backBuffer.Height;
     return true;
 }
 
@@ -496,7 +543,11 @@ void PostProcessView(D3D12_RECT rect)
     const bool lens = aberration > 0.0f || distortion != 0.0f || vignette > 0.0f || flare;
     const bool grain = settings.filmGrain && settings.grainAmount > 0.0f;
     const bool grade = GradingChanges(settings);
-    if (!depthOfField && !motionBlur && !lens && !settings.contrastSharpening && !grain && !grade)
+    const bool effects = depthOfField || motionBlur || lens || settings.contrastSharpening || grain || grade;
+    // Frame generation takes the main view's depth, motion and the view without the HUD from here.
+    FsrFrameGeneration* fsrGeneration = GetBackend().FsrFrameGenerator();
+    const bool frameGeneration = camera && post->motionView != kInvalid && (streamline::FrameGenerationWanted() || fsrGeneration != nullptr);
+    if (!effects && !frameGeneration)
         return;
     if (Dynamic().colorTargets[0] != kDefaultTarget) {
         if (!std::exchange(g_state.loggedTarget, true))
@@ -533,7 +584,9 @@ void PostProcessView(D3D12_RECT rect)
     c.invDepthSize[0] = 1.0f / static_cast<float>(depthDesc.Width);
     c.invDepthSize[1] = 1.0f / static_cast<float>(depthDesc.Height);
     c.depthView = g_state.depthView;
-    c.motionView = motionBlur ? post->motionView : kInvalid;
+    c.motionView = post ? post->motionView : kInvalid;
+    c.motionScale[0] = post ? post->motionScale[0] : 1.0f;
+    c.motionScale[1] = post ? post->motionScale[1] : 1.0f;
     c.frameSeconds = static_cast<float>(std::clamp(frameSeconds, 1e-3, 0.25));
     c.cameraView = g_state.camera.uav;
     if (camera) {
@@ -590,11 +643,13 @@ void PostProcessView(D3D12_RECT rect)
             c.flareVisibilityView = post->flareVisibilityView;
         }
     }
-    c.chromaticAberration = aberration;
+    c.chromaticAberration = aberration * kDispersionPerUnit;
     c.distortion = distortion;
+    c.focalPixels = 0.5f * static_cast<float>(height) / (camera ? camera->tanHalfHeight : kDefaultTanHalfHeight);
     // Pincushion distortion samples beyond the view's corners; the image is scaled so they stay inside.
-    const float aspect = static_cast<float>(width) / static_cast<float>(height);
-    c.distortionScale = distortion > 0.0f ? 1.0f / (1.0f + distortion * (0.25f * aspect * aspect + 0.25f)) : 1.0f;
+    const float cornerSquared = (0.25f * static_cast<float>(width) * static_cast<float>(width) + 0.25f * static_cast<float>(height) * static_cast<float>(height)) /
+        (c.focalPixels * c.focalPixels);
+    c.distortionScale = distortion > 0.0f ? 1.0f / (1.0f + distortion * cornerSquared) : 1.0f;
     c.vignette = vignette;
     c.grainAmount = grain ? settings.grainAmount : 0.0f;
     c.grainScale = settings.grainSize * static_cast<float>(height) / 1080.0f;
@@ -623,8 +678,40 @@ void PostProcessView(D3D12_RECT rect)
         ~Rebind() { ForgetBindings(); }
     } rebind;
 
-    backend.Transition(backBuffer, read);
     backend.Transition(backend.DepthBuffer(), D3D12_RESOURCE_STATE_DEPTH_READ | read);
+    if (frameGeneration) {
+        Use(g_state.frameMotion, write);
+        Use(g_state.frameDepth, write);
+        if (!Dispatch(Compute::FrameMotion, {.output0 = g_state.frameMotion.uav, .output1 = g_state.frameDepth.uav}, Groups(width, 8), Groups(height, 8)))
+            return;
+        Use(g_state.frameMotion, read);
+        Use(g_state.frameDepth, read);
+    }
+    // Frame generation's view without the HUD: the back buffer once the effects are in it, kept until the present.
+    const auto tagFrame = [&] {
+        if (!frameGeneration || !EnsureHudless(desc))
+            return;
+        backend.Transition(backBuffer, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        backend.Transition(g_state.hudless, D3D12_RESOURCE_STATE_COPY_DEST);
+        commands->CopyResource(g_state.hudless.resource.Get(), backBuffer.resource.Get());
+        backend.Transition(g_state.hudless, read);
+        backend.Transition(backBuffer, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        ID3D12Resource* depth = g_state.frameDepth.texture.resource.Get();
+        ID3D12Resource* motion = g_state.frameMotion.texture.resource.Get();
+        ID3D12Resource* hudless = g_state.hudless.resource.Get();
+        if (fsrGeneration != nullptr) {
+            const FsrFrameGeneration::Inputs inputs = {depth, motion, hudless, rect, static_cast<UINT>(desc.Width), desc.Height,
+                static_cast<float>(frameSeconds * 1000.0)};
+            fsrGeneration->Prepare(commands, inputs, *post);
+        } else {
+            streamline::TagFrame(commands, {depth, motion, hudless, read, rect}, *post);
+        }
+    };
+    if (!effects) {
+        tagFrame();
+        return;
+    }
+    backend.Transition(backBuffer, read);
     size_t current = 0;
     Use(g_state.scene[current], write);
     if (!Dispatch(Compute::Prepare, {.input0 = backend.BackBufferTexture(), .output0 = g_state.scene[current].uav}, Groups(width, 8), Groups(height, 8)))
@@ -710,6 +797,7 @@ void PostProcessView(D3D12_RECT rect)
     commands->RSSetScissorRects(1, &rect);
     commands->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     commands->DrawInstanced(3, 1, 0, 0);
+    tagFrame();
 }
 
 }

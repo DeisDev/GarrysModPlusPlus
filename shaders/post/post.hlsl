@@ -96,17 +96,40 @@ void CameraMain()
 // 2012): each tile's longest motion over the exposure, then each tile's neighbourhood's, which the reconstruction gathers
 // along.
 
-// The motion the shutter sees at a pixel, in pixels, at most a tile long; none on the held weapon, which moves with the
-// camera.
+// The motion the shutter sees at a pixel, in the view's pixels, at most a tile long; none on the held weapon, which moves
+// with the camera. Upscaled lighting leaves motion at its render resolution.
 float2 ExposedMotion(int2 pixel)
 {
     if (IsViewmodelDepth(DeviceDepth(pixel)))
         return 0.0;
     Texture2D<float2> motion = ResourceDescriptorHeap[g_post.motionView];
-    float2 m = motion.Load(int3(pixel + g_post.origin, 0)) * g_post.shutterShare;
+    int2 at = int2((float2(pixel + g_post.origin) + 0.5) * g_post.motionScale);
+    float2 m = motion.Load(int3(at, 0)) / g_post.motionScale * g_post.shutterShare;
     float speed = sqrt(dot(m, m));
     float limit = float(g_post.blurTile);
     return speed > limit ? m * (limit / speed) : m;
+}
+
+// Frame generation's inputs (src/streamline.h, src/fsr.h) at the view's resolution: output0 the main view's motion in its
+// pixels toward last frame's position, none on the held weapon; output1 the device depth as a float, which FSR cannot
+// read from the 24-bit depth buffer.
+[RootSignature(POST_ROOT_SIGNATURE)]
+[numthreads(8, 8, 1)]
+void FrameMotionMain(uint2 pixel : SV_DispatchThreadID)
+{
+    if (any(pixel >= g_post.size))
+        return;
+    RWTexture2D<float2> output = ResourceDescriptorHeap[g_postPass.output0];
+    RWTexture2D<float> depthOutput = ResourceDescriptorHeap[g_postPass.output1];
+    float depth = DeviceDepth(int2(pixel));
+    depthOutput[pixel] = depth;
+    if (IsViewmodelDepth(depth)) {
+        output[pixel] = 0.0;
+        return;
+    }
+    Texture2D<float2> motion = ResourceDescriptorHeap[g_post.motionView];
+    int2 at = int2((float2(int2(pixel) + g_post.origin) + 0.5) * g_post.motionScale);
+    output[pixel] = motion.Load(int3(at, 0)) / g_post.motionScale;
 }
 
 groupshared float3 g_longest[64];

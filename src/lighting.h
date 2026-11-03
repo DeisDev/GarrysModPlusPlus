@@ -2,6 +2,7 @@
 
 #include "d3d12_device.h"
 #include "dlss.h"
+#include "fsr.h"
 #include "night_sky.h"
 #include "nrd_denoiser.h"
 #include "restir.h"
@@ -16,6 +17,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <functional>
 #include <optional>
@@ -306,8 +308,9 @@ struct ViewInputs {
 };
 
 // What the camera effects (src/post_effects.cpp) read of a main view in the game's command list, which follows its
-// lighting on the queue: its camera and light, its motion vectors and the light's traced visibility, both left in
-// D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE until the next view is lit.
+// lighting on the queue: its camera and light, a copy of its motion vectors (which the viewmodel's run overwrites in
+// part) and the light's traced visibility, both left in D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE until the next
+// main view is lit.
 struct PostView {
     uint64_t frame = 0;
     // Source's view-projection rows (c8-c11) without the jitter.
@@ -318,7 +321,14 @@ struct PostView {
     std::array<float, 3> lightDirection = {};
     std::array<float, 3> lightColor = {};
     float lightRadius = 0.0f;
+    // The main view's motion (render pixels toward last frame's position) from the view's corner, and the render
+    // resolution over the output's (below 1 when upscaled).
     UINT motionView = DescriptorHeap::kInvalid;
+    std::array<float, 2> motionScale = {1.0f, 1.0f};
+    // The eye, and the camera as world-to-view and view-to-clip, row-major for row vectors (SplitViewProjection).
+    float eye[3] = {};
+    float worldToView[16] = {};
+    float viewToClip[16] = {};
     UINT flareVisibilityView = DescriptorHeap::kInvalid;
 };
 
@@ -353,11 +363,14 @@ public:
     uint64_t FenceValue() const { return m_fenceValue; }
     SkinnedCasters& Skinned() { return m_skinned; }
     SwayingProps& Sway() { return m_sway; }
-    // The resolution the main view's ray tracing runs at when DLSS Ray Reconstruction is in use; false when the
-    // view is lit at the output resolution instead.
-    bool RayReconstructionSize(UINT outputWidth, UINT outputHeight, UINT& width, UINT& height);
-    // The anti-aliasing the main view gets: DLSS Ray Reconstruction falls back to TAA where it cannot run (no NVIDIA
-    // RTX GPU, or NGX failed), as settings files and presets made elsewhere may still choose it.
+    // What upscales the main view's light to the output: DLSS Ray Reconstruction (which also denoises) or AMD FSR.
+    enum class Upscaler { None, Dlss, Fsr };
+    // The upscaler the main view uses at this output size and the resolution its lighting then runs at; Upscaler::None
+    // when it is lit at the output resolution.
+    Upscaler RenderSize(UINT outputWidth, UINT outputHeight, UINT& width, UINT& height);
+    // The anti-aliasing the main view gets: DLSS Ray Reconstruction and AMD FSR fall back to TAA where they cannot run
+    // (DLSS without an NVIDIA RTX GPU, either after failing), as settings files and presets made elsewhere may still
+    // choose them.
     AntiAliasing AntiAliasingMode() const;
     void WaitForGpu();
     // Forgets everything learnt about the scene: frame histories and the radiance cache (a new map).
@@ -443,6 +456,8 @@ private:
         Skin,
         SkyAtmosphere,
         FlareVisibility,
+        RegenInputs,
+        RegenResolve,
         Count
     };
     // Mirrors PassConstants in shaders/common.hlsli: descriptor indices (none by default) and a parameter.
@@ -481,6 +496,10 @@ private:
     // leaving them unwritten.
     bool RecordNrd(const FrameConstants& constants, const ViewInputs& inputs, UINT slot, UINT current, D3D12_GPU_VIRTUAL_ADDRESS frameConstants,
         D3D12_GPU_VIRTUAL_ADDRESS scene);
+    // The same through AMD FSR Ray Regeneration (shaders/ray_regeneration.hlsl); `albedo` is the G-buffer's albedo at the
+    // passes' size. False when it failed, leaving them unwritten.
+    bool RecordRayRegeneration(const FrameConstants& constants, const ViewInputs& inputs, ID3D12Resource* albedo, UINT slot, UINT current,
+        D3D12_GPU_VIRTUAL_ADDRESS frameConstants, D3D12_GPU_VIRTUAL_ADDRESS scene);
     // The camera an NRD denoiser saw in its last frame.
     struct NrdHistory {
         bool valid = false;
@@ -488,6 +507,7 @@ private:
         float worldToView[16] = {};
         float viewToClip[16] = {};
         float jitter[2] = {};
+        uint16_t rectSize[2] = {};
     };
     // NRD's settings for the main view, restarting without `history` (or the view's), which this frame's camera becomes.
     nrd::CommonSettings NrdCommonSettings(const FrameConstants& constants, const ViewInputs& inputs, NrdHistory& history);
@@ -747,6 +767,8 @@ private:
     // Written by shaders/primary.hlsl.
     Texture m_visibility;
     Texture m_motion;
+    // The main view's motion for the camera effects (PostView).
+    Texture m_postMotion;
     // How much of the sun's or Moon's disc the eye sees (shaders/flare_visibility.hlsl), for the lens flare.
     Texture m_flareVisibility;
     std::optional<PostView> m_postView;
@@ -826,9 +848,20 @@ private:
     float m_viewToClip[16] = {};
     Texture m_rrOutput;
     RayReconstruction m_rayReconstruction;
+    FsrUpscaler m_fsr;
+    FsrRayRegeneration m_rayRegeneration;
+    // Ray Regeneration's motion and normals (shaders/ray_regeneration.hlsl), and its frame count.
+    Texture m_regenMotion;
+    Texture m_regenNormals;
+    uint32_t m_regenFrame = 0;
+    // The render size each upscaler last gave for a mode and output size (output width and height, render width and
+    // height).
     UpscalingMode m_rrSizeMode = UpscalingMode::Count;
     UINT m_rrSize[4] = {};
-    bool m_lastMainUsedRr = false;
+    UpscalingMode m_fsrSizeMode = UpscalingMode::Count;
+    UINT m_fsrSize[4] = {};
+    Upscaler m_lastMainUpscaler = Upscaler::None;
+    std::chrono::steady_clock::time_point m_lastMainTime;
     UINT m_width = 0;
     UINT m_height = 0;
     // The size compute passes run over: the output size, or the render size for Ray Reconstruction.

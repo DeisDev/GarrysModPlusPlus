@@ -71,9 +71,10 @@ struct PostConstants
     float flareStarburst;
     uint flareVisibilityView;
     float flareRadius;
-    // Lens: lateral chromatic aberration (FidelityFX Lens's dispersion strength), radial distortion and the scale that
-    // keeps the corners filled, vignetting (FidelityFX Lens's amount), film grain, contrast adaptive sharpening
-    // (FidelityFX CAS).
+    // Lens, by each pixel's field angle (focalPixels is the focal length in pixels): lateral chromatic aberration
+    // (FidelityFX Lens's dispersion strength), radial distortion (the coefficient of tan^2 of the angle) and the scale
+    // that keeps the corners filled, vignetting (times the cos^4 law's exponent), film grain, contrast adaptive
+    // sharpening (FidelityFX CAS).
     float chromaticAberration;
     float distortion;
     float distortionScale;
@@ -88,9 +89,9 @@ struct PostConstants
     float3 gradeGain;
     float gradeContrast;
     float gradeSaturation;
-    uint padding1;
-    uint padding2;
-    uint padding3;
+    // The motion vectors' resolution over the view's (below 1 when the lighting was upscaled).
+    float2 motionScale;
+    float focalPixels;
 };
 
 // Per pass: descriptor indices and a parameter.

@@ -28,12 +28,17 @@ These are not in the repository. CMake downloads them, pinned by version and has
 | MathLib | 11 | MIT | Built into NRD |
 | ShaderMake | commit `3f01623a` | MIT | Its `ShaderMakeBlob` is built into NRD; the tool compiles NRD's shaders at build time and is not shipped |
 | AMD FidelityFX SDK (Depth of Field, CAS, Lens) | 1.1.4 (commit `c6efa6bf`) | MIT | Compiled into `gmodpp.dll`'s post effect shaders |
+| AMD FSR SDK (FSR API, upscaling, Ray Regeneration, frame generation) | 2.4.0 (commit `7539ae8b`) | MIT | Its headers in `gmodpp.dll`; AMD's signed `amd_fidelityfx_loader_dx12.dll`, `amd_fidelityfx_upscaler_dx12.dll`, `amd_fidelityfx_denoiser_dx12.dll` and `amd_fidelityfx_framegeneration_dx12.dll` |
+| AMD Anti-Lag 2 SDK | from FSR SDK 2.4.0 | MIT | Its header in `gmodpp.dll` |
+| NVIDIA Streamline | 2.14.16 | MIT | Its headers and import library in `gmodpp.dll`; NVIDIA's signed `sl.interposer.dll`, `sl.common.dll`, `sl.reflex.dll`, `sl.pcl.dll` and `sl.dlss_g.dll` |
+| NVIDIA DLSS Frame Generation | from Streamline 2.14.16 | NVIDIA DLSS licence (`nvngx_dlss.license.txt`) | `nvngx_dlssg.dll`. Not to be distributed on its own. |
+| NVIDIA Reflex | from Streamline 2.14.16 | NVIDIA Reflex licence (`reflex.license.txt`) | Through `sl.reflex.dll` |
 
 This software contains source code provided by NVIDIA Corporation.
 
-NVIDIA, NVIDIA RTX, DLSS and NVIDIA DLSS are trademarks of NVIDIA Corporation. GarrysMod++ uses NVIDIA DLSS Ray Reconstruction, NVIDIA SHaRC, NVIDIA RTXDI and NVIDIA NRD.
+NVIDIA, NVIDIA RTX, DLSS and NVIDIA DLSS are trademarks of NVIDIA Corporation. GarrysMod++ uses NVIDIA DLSS Ray Reconstruction, NVIDIA DLSS Frame Generation, NVIDIA Reflex, NVIDIA Streamline, NVIDIA SHaRC, NVIDIA RTXDI and NVIDIA NRD.
 
-AMD and FidelityFX are trademarks of Advanced Micro Devices, Inc.
+AMD, FidelityFX, FSR and Radeon are trademarks of Advanced Micro Devices, Inc.
 
 ## Releases
 

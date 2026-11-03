@@ -37,7 +37,7 @@ enum class DebugView : uint32_t {
     Count
 };
 
-enum class AntiAliasing : uint32_t { Off = 0, Temporal = 1, RayReconstruction = 2, Count };
+enum class AntiAliasing : uint32_t { Off = 0, Temporal = 1, RayReconstruction = 2, Fsr = 3, Count };
 
 // Upscaling modes of the anti-aliasing upscaler (DLSS today), from native resolution (DLAA) to the lowest render
 // resolution.
@@ -70,9 +70,13 @@ enum class LightSampling : uint32_t { Legacy = 0, Ris, Restir, Auto, Count };
 
 // What denoises the main view's indirect light and reflections without DLSS Ray Reconstruction: the built-in filters,
 // or NVIDIA NRD's RELAX or REBLUR.
-enum class DenoiserType : uint32_t { BuiltIn = 0, Relax, Reblur, Count };
+enum class DenoiserType : uint32_t { BuiltIn = 0, Relax, Reblur, RayRegeneration, Count };
 
 // How much the performance overlay shows, and the corner of the screen it sits in.
+// NVIDIA Reflex's low latency mode (src/streamline.h).
+enum class ReflexMode : uint32_t { Off = 0, On, Boost, Count };
+// What generates frames between rendered ones: DLSS Frame Generation (Streamline) or AMD FSR Frame Generation.
+enum class FrameGeneration : uint32_t { Off = 0, Dlss, Fsr, Count };
 // Where depth of field focuses: on what the crosshair points at, or at Settings::dofFocusDistance.
 enum class DofFocus : uint32_t { Auto = 0, Manual, Count };
 enum class OverlayDetail : uint32_t { Minimal = 0, Normal, Full, Extra, Count };
@@ -201,17 +205,19 @@ struct Settings {
     bool lensFlare = false;
     float lensFlareIntensity = 1.0f;
     float lensFlareStarburst = 1.0f;
-    // Lens effects: chromatic aberration (FidelityFX Lens's dispersion), barrel (negative) or pincushion (positive)
-    // distortion, vignetting, film grain grainSize pixels across at 1080p, and contrast adaptive sharpening (FidelityFX
-    // CAS).
+    // Lens effects, by the field angle the view's field of view gives each pixel: radial distortion (lensDistortionAmount
+    // is the coefficient of tan^2 of the angle, negative for barrel), lateral chromatic aberration (each colour
+    // magnified differently by FidelityFX Lens's dispersion, growing with the angle like the distortion), vignetting
+    // (vignetteAmount times the cos^4 law's exponent), film grain grainSize pixels across at 1080p, and contrast adaptive
+    // sharpening (FidelityFX CAS).
     bool chromaticAberration = false;
-    float chromaticAberrationStrength = 1.0f;
+    float chromaticAberrationStrength = 0.5f;
     bool lensDistortion = false;
-    float lensDistortionAmount = -0.15f;
+    float lensDistortionAmount = -0.02f;
     bool vignette = false;
-    float vignetteAmount = 0.6f;
+    float vignetteAmount = 0.35f;
     bool filmGrain = false;
-    float grainAmount = 0.35f;
+    float grainAmount = 0.08f;
     float grainSize = 1.0f;
     bool contrastSharpening = false;
     float contrastSharpness = 0.5f;
@@ -255,6 +261,16 @@ struct Settings {
     LightSampling lightSampling = LightSampling::Auto;
     DenoiserType denoiserType = DenoiserType::Relax;
     bool opacityMicromaps = true;
+    // Latency and frame generation (this computer's): NVIDIA Reflex, the frame generator (DLSS or FSR, chosen when the
+    // game starts as it makes the swap chain) with generatedFrames frames between rendered ones for DLSS, and AMD
+    // Anti-Lag 2.
+    ReflexMode reflex = ReflexMode::Off;
+    FrameGeneration frameGeneration = FrameGeneration::Off;
+    int generatedFrames = 1;
+    bool antiLag = false;
+    // The launch check's warning about a GPU that can't run the mod or its ray tracing (hardware_check.cpp); its
+    // "Don't show this again" turns it off.
+    bool hardwareWarning = true;
     // The display the game window goes on, 1-based in the order Displays() lists them; 0 leaves it where the game
     // puts it (the primary display).
     int display = 0;
@@ -287,7 +303,8 @@ constexpr SectionMask kShareableSections =
 
 using SettingMember = std::variant<bool Settings::*, float Settings::*, int Settings::*, Color Settings::*, DebugView Settings::*, AntiAliasing Settings::*,
     UpscalingMode Settings::*, QualityPreset Settings::*, FoliageShadows Settings::*, IndirectLighting Settings::*, EmissiveLighting Settings::*,
-    LightSampling Settings::*, DenoiserType Settings::*, MapSun Settings::*, OverlayDetail Settings::*, OverlayCorner Settings::*, DofFocus Settings::*>;
+    LightSampling Settings::*, DenoiserType Settings::*, MapSun Settings::*, OverlayDetail Settings::*, OverlayCorner Settings::*, DofFocus Settings::*,
+    ReflexMode Settings::*, FrameGeneration Settings::*>;
 
 // A setting's place in the settings table (kFields in settings.cpp).
 using FieldId = uint16_t;
@@ -388,6 +405,19 @@ struct Statistics {
     uint32_t projectedLights = 0;
     uint32_t sceneInstances = 0;
     bool rayReconstructionAvailable = false;
+    // AMD FSR upscaling can run (src/fsr.h).
+    bool fsrAvailable = false;
+    // AMD FSR Ray Regeneration can run (Radeon RX 9000).
+    bool rayRegenerationAvailable = false;
+    // NVIDIA Reflex and DLSS Frame Generation can run (src/streamline.h), and how many frames the latter can generate.
+    bool reflexAvailable = false;
+    bool dlssFrameGenerationAvailable = false;
+    uint32_t generatedFramesMax = 0;
+    // AMD FSR Frame Generation and Anti-Lag 2 can run.
+    bool fsrFrameGenerationAvailable = false;
+    bool antiLagAvailable = false;
+    // The frame generator the swap chain was made for when the game started.
+    FrameGeneration startedFrameGeneration = FrameGeneration::Off;
     // Resolution the ray-traced passes ran at in the last main view.
     uint32_t renderWidth = 0;
     uint32_t renderHeight = 0;

@@ -196,6 +196,38 @@ foreach(entry IN LISTS FFX_FILES)
         EXPECTED_HASH SHA256=${hash} TLS_VERIFY ON)
     list(APPEND FFX_PATHS "${FFX_DIR}/${file}")
 endforeach()
+# AMD FSR SDK 2.4.0 (MIT), pinned by commit and each file by hash: the FSR API's headers (upscaling, Ray Regeneration,
+# frame generation) and AMD's signed DLLs, which the FSR API must be used through: the loader, loaded at runtime from
+# gmodplusplus, finds the effect DLLs beside it. Anti-Lag 2's header comes with it.
+set(FSR_COMMIT 7539ae8b6568ad29ed78a753404351daf3b5cca7)
+set(FSR_DIR "${CMAKE_CURRENT_BINARY_DIR}/_deps/fsr-${FSR_COMMIT}")
+set(FSR_FILES
+    "Kits/FidelityFX/docs/license.md|32357259b965d6a8001e9e508ba60eda6034027c5923a7d226ffbaff813c2bfb"
+    "Kits/FidelityFX/api/include/ffx_api.h|4d9dcf243ef5efbf03340a02f16b51a22053243a22e8a9a0b3ce91c26982b4bf"
+    "Kits/FidelityFX/api/include/ffx_api_types.h|53f07c113a9ba493f297656e4481b6539aed0afc9f3cc8da682aa477d270c46c"
+    "Kits/FidelityFX/api/include/ffx_api_loader.h|18d1901dbbc881e8131b91c65ad44bb3b4a1de6c31435d5b75236f16727ba80e"
+    "Kits/FidelityFX/api/include/dx12/ffx_api_dx12.h|c9afbc3c4c673723e9e5369a666f0ff54560543b5a93537f8ff453bf1c3bf530"
+    "Kits/FidelityFX/upscalers/include/ffx_upscale.h|13091e7fe5fd9c82b1fb7c044b9f08f664d9653f599d2ea500738709236fca4d"
+    "Kits/FidelityFX/denoisers/include/ffx_denoiser.h|64deddd5482a302903b06d1a319b83e66d1792f493447204a2356de2d48f3ca5"
+    "Kits/FidelityFX/framegeneration/include/ffx_framegeneration.h|bc78a18aa95f5157b4699b0602700592b624788c5bc55d1762cb46a1b6557ca1"
+    "Kits/FidelityFX/framegeneration/include/ffx_framegeneration_api_types.h|396596af3df63310674e8036abd2ad0fcd061e61334e7a2c76653a2be3c686b4"
+    "Kits/FidelityFX/framegeneration/include/dx12/ffx_api_framegeneration_dx12.h|8ddb1cb78f83caf3598509df4968e84c851504cd6c00d9923261a5fc2c7ef0ed"
+    "Kits/OpenSource/amd/antilag2/ffx_antilag2_dx12.h|a4bea0c4e8c3d800a3cf4f1e9690bf927aa7b9b7f02ffa2bece28d9aac60b4a6"
+    "Kits/OpenSource/amd/antilag2/LICENSE.txt|b516b8fe7e52d5afe96045f43266c6d2fd4c10963cb624bcf1142b615d3ad4a7"
+    "Kits/FidelityFX/signedbin/amd_fidelityfx_loader_dx12.dll|e2191d3c0828be45eb8affd4e3ec0378f2293adc345b772a7170edcf3b021ecb"
+    "Kits/FidelityFX/signedbin/amd_fidelityfx_upscaler_dx12.dll|aad4fccccb29084a655f9a4f9f613bd22c8c03fb4a0f8840148cc6543b4ccace"
+    "Kits/FidelityFX/signedbin/amd_fidelityfx_framegeneration_dx12.dll|e6843252f58b0341a0d80f6a20bc0d840643ee95bc48c22cac08745344577bb6"
+    "Kits/FidelityFX/signedbin/amd_fidelityfx_denoiser_dx12.dll|4ca5182d5c8a855441e0c82673716e4776f9afcfadfdb4225d2fc6113b0f853c"
+)
+foreach(entry IN LISTS FSR_FILES)
+    string(REPLACE "|" ";" parts "${entry}")
+    list(GET parts 0 file)
+    list(GET parts 1 hash)
+    file(DOWNLOAD "https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/${FSR_COMMIT}/${file}" "${FSR_DIR}/${file}"
+        EXPECTED_HASH SHA256=${hash} TLS_VERIFY ON)
+endforeach()
+set(FSR_DLLS "${FSR_DIR}/Kits/FidelityFX/signedbin/amd_fidelityfx_loader_dx12.dll" "${FSR_DIR}/Kits/FidelityFX/signedbin/amd_fidelityfx_upscaler_dx12.dll"
+    "${FSR_DIR}/Kits/FidelityFX/signedbin/amd_fidelityfx_framegeneration_dx12.dll" "${FSR_DIR}/Kits/FidelityFX/signedbin/amd_fidelityfx_denoiser_dx12.dll")
 set(FFX_SHADER_OPTIONS -D FFX_GPU=1 -D FFX_HLSL=1 -D FFX_HLSL_SM=66 -D FFX_HALF=0 -I "${FFX_DIR}/sdk/include/FidelityFX/gpu"
     -I "${FFX_DIR}/sdk/include/FidelityFX/gpu/dof" -Wno-ambig-lit-shift)
 
@@ -273,6 +305,9 @@ endforeach()
 # NVIDIA NRD's inputs and outputs (its own shaders are embedded in the NRD library).
 add_shader(shaders/nrd.hlsl InputsMain cs_6_6 g_nrdInputsCS -I "${nrd_SOURCE_DIR}/Shaders")
 add_shader(shaders/nrd.hlsl ResolveMain cs_6_6 g_nrdResolveCS -I "${nrd_SOURCE_DIR}/Shaders")
+# AMD FSR Ray Regeneration's inputs and outputs.
+add_shader(shaders/ray_regeneration.hlsl InputsMain cs_6_6 g_regenInputsCS)
+add_shader(shaders/ray_regeneration.hlsl ResolveMain cs_6_6 g_regenResolveCS)
 # The main view's sun shadows, traced to the sun's disc for NRD's SIGMA.
 add_shader(shaders/sun_shadow.hlsl main cs_6_6 g_sunShadowCS -I "${nrd_SOURCE_DIR}/Shaders")
 add_shader(shaders/sun_shadow.hlsl main cs_6_9 g_sunShadowOmmCS -D OPACITY_MICROMAPS=1 -I "${nrd_SOURCE_DIR}/Shaders")
@@ -309,7 +344,7 @@ add_shader(shaders/flare_visibility.hlsl main cs_6_6 g_flareVisibilityCS)
 add_shader(shaders/flare_visibility.hlsl main cs_6_9 g_flareVisibilityOmmCS -D OPACITY_MICROMAPS=1)
 # The camera effects after the game's post-processing (src/post_effects.cpp): our passes, and AMD FidelityFX's.
 add_shader(shaders/post/post.hlsl VSMain vs_6_6 g_postVS)
-foreach(entry Prepare Camera TileMax NeighborMax MotionBlur)
+foreach(entry Prepare Camera TileMax NeighborMax MotionBlur FrameMotion)
     add_shader(shaders/post/post.hlsl ${entry}Main cs_6_6 g_post${entry}CS)
 endforeach()
 foreach(pass 0 1 2 3 4)
@@ -359,6 +394,23 @@ foreach(entry IN LISTS DLSS_SDK_FILES)
         EXPECTED_HASH SHA256=${hash} TLS_VERIFY ON)
 endforeach()
 set(DLSS_FEATURE_DLL "${DLSS_SDK_DIR}/lib/Windows_x86_64/rel/nvngx_dlssd.dll")
+
+# NVIDIA Streamline 2.14.16 (MIT; its prebuilt plugins under their own licences), the release package pinned by hash:
+# the headers, the interposer's import library (delay-loaded, so gmodpp.dll loads without it) and NVIDIA's signed
+# production DLLs for Reflex, PC latency markers and DLSS Frame Generation. Like nvngx_dlssd.dll, nvngx_dlssg.dll is
+# distributed only inside the release zip.
+set(STREAMLINE_VERSION v2.14.16)
+set(STREAMLINE_DIR "${CMAKE_CURRENT_BINARY_DIR}/_deps/streamline-${STREAMLINE_VERSION}")
+if(NOT EXISTS "${STREAMLINE_DIR}/include/sl.h")
+    file(DOWNLOAD "https://github.com/NVIDIA-RTX/Streamline/releases/download/${STREAMLINE_VERSION}/streamline-sdk-${STREAMLINE_VERSION}.zip"
+        "${STREAMLINE_DIR}.zip" EXPECTED_HASH SHA256=32041e51db0cab709a271b72a352281b690c2abbd669a827809401a5dd23956b TLS_VERIFY ON)
+    file(ARCHIVE_EXTRACT INPUT "${STREAMLINE_DIR}.zip" DESTINATION "${STREAMLINE_DIR}"
+        PATTERNS "include/*" "lib/x64/sl.interposer.lib" "bin/x64/sl.interposer.dll" "bin/x64/sl.common.dll" "bin/x64/sl.reflex.dll"
+        "bin/x64/sl.pcl.dll" "bin/x64/sl.dlss_g.dll" "bin/x64/nvngx_dlssg.dll" "bin/x64/nvngx_dlss.license.txt" "bin/x64/reflex.license.txt" "license.txt")
+    file(REMOVE "${STREAMLINE_DIR}.zip")
+endif()
+set(STREAMLINE_DLLS "${STREAMLINE_DIR}/bin/x64/sl.interposer.dll" "${STREAMLINE_DIR}/bin/x64/sl.common.dll" "${STREAMLINE_DIR}/bin/x64/sl.reflex.dll"
+    "${STREAMLINE_DIR}/bin/x64/sl.pcl.dll" "${STREAMLINE_DIR}/bin/x64/sl.dlss_g.dll" "${STREAMLINE_DIR}/bin/x64/nvngx_dlssg.dll")
 
 # LZMA SDK decoder (public domain) for maps with compressed lumps, each file pinned by hash.
 set(LZMA_SDK_VERSION 26.04)
@@ -478,6 +530,10 @@ add_library(gmodpp SHARED
     src/shaderapi_pipelines.cpp
     src/post_effects.cpp
     src/exposure.cpp
+    src/fsr.cpp
+    src/anti_lag.cpp
+    src/hardware_check.cpp
+    src/streamline.cpp
     src/shaderapi_shadow.cpp
     src/shaderapi_textures.cpp
     src/shaderapi_capture.cpp
@@ -518,10 +574,15 @@ add_library(gmodpp SHARED
 target_compile_definitions(gmodpp PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
 target_compile_options(gmodpp PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4 /permissive- /utf-8>)
 target_include_directories(gmodpp BEFORE PRIVATE "${AGILITY_SDK_DIR}/build/native/include")
-target_include_directories(gmodpp PRIVATE "${DXC_DIR}/inc" "${SHADER_OUTPUT_DIR}" "${DLSS_SDK_DIR}/include" "${RTXDI_DIR}/Include")
+target_include_directories(gmodpp PRIVATE "${DXC_DIR}/inc" "${SHADER_OUTPUT_DIR}" "${DLSS_SDK_DIR}/include" "${RTXDI_DIR}/Include"
+    "${FSR_DIR}/Kits/FidelityFX/api/include" "${FSR_DIR}/Kits/FidelityFX/upscalers/include" "${FSR_DIR}/Kits/FidelityFX/denoisers/include"
+    "${FSR_DIR}/Kits/FidelityFX/framegeneration/include" "${FSR_DIR}/Kits/OpenSource/amd/antilag2" "${STREAMLINE_DIR}/include")
 # ReSTIRDI.cpp leaves a parameter unused in release builds (its check is an assert).
 set_source_files_properties("${RTXDI_DIR}/Source/ReSTIRDI.cpp" PROPERTIES COMPILE_OPTIONS /wd4100)
-target_link_libraries(gmodpp PRIVATE d3d12 dxgi dxguid d2d1 dwrite icu lzma_dec dbghelp minhook imgui NRD "${DLSS_SDK_DIR}/lib/Windows_x86_64/x64/nvsdk_ngx_s.lib")
+target_link_libraries(gmodpp PRIVATE d3d12 dxgi dxguid d2d1 dwrite icu lzma_dec dbghelp minhook imgui NRD "${DLSS_SDK_DIR}/lib/Windows_x86_64/x64/nvsdk_ngx_s.lib"
+    "${STREAMLINE_DIR}/lib/x64/sl.interposer.lib" delayimp)
+# Streamline's interposer is loaded by its full path once its signature is checked (src/streamline.cpp).
+target_link_options(gmodpp PRIVATE /DELAYLOAD:sl.interposer.dll)
 
 # The mod laid out as the game folder: the loader in the root and everything else in gmodplusplus, with the licences
 # every bundled component requires. deploy copies it into the game and release zips it.
@@ -532,7 +593,7 @@ add_custom_target(stage
     COMMAND ${CMAKE_COMMAND} -E rm -rf "${STAGE_DIR}"
     COMMAND ${CMAKE_COMMAND} -E make_directory "${STAGE_MOD}/D3D12" "${STAGE_MOD}/hlsl" "${STAGE_MOD}/twins" "${STAGE_LICENSES}"
     COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:gmodpp_loader> "${STAGE_DIR}/winmm.dll"
-    COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:gmodpp> "${DXC_DIR}/bin/x64/dxcompiler.dll" "${DLSS_FEATURE_DLL}" "${STAGE_MOD}/"
+    COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:gmodpp> "${DXC_DIR}/bin/x64/dxcompiler.dll" "${DLSS_FEATURE_DLL}" ${FSR_DLLS} ${STREAMLINE_DLLS} "${STAGE_MOD}/"
     COMMAND ${CMAKE_COMMAND} -E copy "${AGILITY_RUNTIME_DIR}/D3D12Core.dll" "${AGILITY_RUNTIME_DIR}/d3d12SDKLayers.dll" "${STAGE_MOD}/D3D12/"
     COMMAND ${CMAKE_COMMAND} -E copy ${LIGHTING_HEADERS} "${STAGE_MOD}/hlsl/"
     COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_CURRENT_SOURCE_DIR}/localization" "${STAGE_MOD}/localization"
@@ -550,6 +611,11 @@ add_custom_target(stage
     COMMAND ${CMAKE_COMMAND} -E copy "${SHARC_DIR}/License.md" "${STAGE_LICENSES}/NVIDIA-SHaRC.txt"
     COMMAND ${CMAKE_COMMAND} -E copy "${RTXDI_DIR}/LICENSE.txt" "${STAGE_LICENSES}/NVIDIA-RTXDI.txt"
     COMMAND ${CMAKE_COMMAND} -E copy "${FFX_DIR}/LICENSE.txt" "${STAGE_LICENSES}/AMD-FidelityFX-SDK.txt"
+    COMMAND ${CMAKE_COMMAND} -E copy "${FSR_DIR}/Kits/FidelityFX/docs/license.md" "${STAGE_LICENSES}/AMD-FSR-SDK.md"
+    COMMAND ${CMAKE_COMMAND} -E copy "${FSR_DIR}/Kits/OpenSource/amd/antilag2/LICENSE.txt" "${STAGE_LICENSES}/AMD-Anti-Lag-2-SDK.txt"
+    COMMAND ${CMAKE_COMMAND} -E copy "${STREAMLINE_DIR}/license.txt" "${STAGE_LICENSES}/NVIDIA-Streamline.txt"
+    COMMAND ${CMAKE_COMMAND} -E copy "${STREAMLINE_DIR}/bin/x64/nvngx_dlss.license.txt" "${STAGE_LICENSES}/NVIDIA-DLSS-Frame-Generation.txt"
+    COMMAND ${CMAKE_COMMAND} -E copy "${STREAMLINE_DIR}/bin/x64/reflex.license.txt" "${STAGE_LICENSES}/NVIDIA-Reflex.txt"
     COMMAND ${CMAKE_COMMAND} -E copy "${nrd_SOURCE_DIR}/LICENSE.txt" "${STAGE_LICENSES}/NVIDIA-NRD.txt"
     COMMAND ${CMAKE_COMMAND} -E copy "${MATHLIB_SOURCE_DIR}/LICENSE.txt" "${STAGE_LICENSES}/MathLib.txt"
     COMMAND ${CMAKE_COMMAND} -E copy "${SHADERMAKE_SOURCE_DIR}/LICENSE.txt" "${STAGE_LICENSES}/ShaderMake.txt"
