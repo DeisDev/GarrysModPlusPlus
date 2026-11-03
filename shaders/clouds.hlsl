@@ -180,6 +180,9 @@ static const float kIceAsymmetry = 0.75;
 // samples more than the stride's.
 static const float kStepDepth = 0.5;
 static const float kMinStep = 0.003;
+// Behind this much of the view's transmittance a sample shows at most that share of the pixel, and its light is marched in
+// half the steps without the fine detail (our choice: some 60% of a dense cloud's samples lie behind it).
+static const float kCheapLight = 0.1;
 static const uint kEmptyRun = 10;
 static const uint kFineSamples = 64;
 static const float kCubeBlend = 0.5;
@@ -643,9 +646,10 @@ float3 LightAt(CloudConstants clouds, CloudLight light, float3 p, Texture2D<floa
     return light.irradiance * AtmosphereTransmittance(transmittance, g_linearClamp, r, dot(p, clouds.lightDirection) / r);
 }
 
-// The optical depth from `p` toward the light through its layer, to where the light enters it or kLightDistance, in steps
-// that lengthen away from `p` (Hillaire 2016, 5.5.2), here by a constant ratio from kFirstLightStep, jittered within them.
-float LightDepth(CloudConstants clouds, CloudLayer layer, float3 p, float jitter, bool detail)
+// The optical depth from `p` toward the light through its layer, to where the light enters it or kLightDistance, in
+// `steps` steps that lengthen away from `p` (Hillaire 2016, 5.5.2), here by a constant ratio from kFirstLightStep,
+// jittered within them.
+float LightDepth(CloudConstants clouds, CloudLayer layer, float3 p, float jitter, uint steps, bool detail)
 {
     float3 direction = clouds.lightDirection;
     float nearest, farthest;
@@ -655,7 +659,6 @@ float LightDepth(CloudConstants clouds, CloudLayer layer, float3 p, float jitter
         span = min(span, nearest);
     if (span <= 0.0)
         return 0.0;
-    uint steps = clouds.lightSteps;
     float from = 0.0;
     float to = min(kFirstLightStep, span / steps);
     float ratio = pow(span / to, 1.0 / max(float(steps) - 1.0, 1.0));
@@ -735,7 +738,8 @@ void MarchLayer(CloudConstants clouds, CloudLayer layer, CloudLight light, float
         empty = 0;
         float extinction = density * layer.extinction;
         float ds = clamp(kStepDepth / extinction, kMinStep, stride);
-        float depth = LightDepth(clouds, layer, p, lightJitter, t < kDetailDistance);
+        bool skin = trace.transmittance > kCheapLight;
+        float depth = LightDepth(clouds, layer, p, lightJitter, skin ? clouds.lightSteps : max(clouds.lightSteps / 2, 2u), skin && t < kDetailDistance);
         // Ambient light: half the sphere sees the sky through the cloud above, half the ground.
         float3 radiance = LightAt(clouds, light, p, transmittance) * OctaveLight(octaves, depth, 1.0 - exp(-extinction * kMultipleScatteringLength)) +
             0.5 * (light.sky * SkyVisibility(clouds, layer, octaves, p) + light.ground);
