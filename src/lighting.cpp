@@ -1592,11 +1592,11 @@ void Lighting::RecordClouds(FrameConstants& constants, const ViewInputs& inputs,
     const float share = settings.cloudResolution == CloudResolution::Full ? 1.0f : settings.cloudResolution == CloudResolution::Half ? 0.5f : 0.25f;
     const std::array<UINT, 2> historySize = {static_cast<UINT>(std::ceil(static_cast<float>(m_width) * share * (1.0f + 2.0f * kCloudOverscan))),
         static_cast<UINT>(std::ceil(static_cast<float>(m_height) * share * (1.0f + 2.0f * kCloudOverscan)))};
-    // A texel of each block is traced a frame: a full-sized history in 4 x 4 blocks costs what a half-sized one does in
-    // 2 x 2 (one sixteenth of the screen's pixels), and stays sharp.
-    const UINT traceBlock = settings.cloudResolution == CloudResolution::Full ? 4 : 2;
-    const std::array<UINT, 2> traceSize = {(historySize[0] + traceBlock - 1) / traceBlock, (historySize[1] + traceBlock - 1) / traceBlock};
-    if (historySize != m_cloudHistorySize || traceSize != m_cloudTraceSize) {
+    // A texel of each 2 x 2 block is traced a frame. 4 x 4 blocks of a full-sized history, which cost what a half-sized one
+    // in 2 x 2 does, left a lattice on bright clouds: each texel of a block took the light of a different moment and noise
+    // (2026-11-03).
+    const std::array<UINT, 2> traceSize = {(historySize[0] + 1) / 2, (historySize[1] + 1) / 2};
+    if (historySize != m_cloudHistorySize) {
         // Frames in flight may still draw the sky with the old history.
         WaitForGpu();
         const bool created = CreateTarget(m_cloudTrace, traceSize[0], traceSize[1], DXGI_FORMAT_R16G16B16A16_FLOAT) &&
@@ -1608,7 +1608,6 @@ void Lighting::RecordClouds(FrameConstants& constants, const ViewInputs& inputs,
             return fail("creating the clouds' history failed");
         }
         m_cloudHistorySize = historySize;
-        m_cloudTraceSize = traceSize;
         m_cloudHistoryValid = false;
     }
 
@@ -1716,22 +1715,18 @@ void Lighting::RecordClouds(FrameConstants& constants, const ViewInputs& inputs,
     clouds.overscan = kCloudOverscan;
     clouds.historyValid = m_cloudHistoryValid ? 1u : 0u;
     // A texel of each 2 x 2 block a frame, all four in turn.
-    // A texel of each 4 x 4 block a frame, all sixteen in turn, the 2 x 2 blocks within them each four frames.
     constexpr UINT kTraceOrder[4][2] = {{0, 0}, {1, 1}, {1, 0}, {0, 1}};
-    const UINT* fine = kTraceOrder[m_cloudFrame % 4];
-    const UINT* coarse = kTraceOrder[(m_cloudFrame / 4) % 4];
-    ++m_cloudFrame;
-    clouds.traceOffset[0] = fine[0] + 2 * coarse[0];
-    clouds.traceOffset[1] = fine[1] + 2 * coarse[1];
-    clouds.traceBlock = traceBlock;
+    const UINT* offset = kTraceOrder[m_cloudFrame++ % 4];
+    clouds.traceOffset[0] = offset[0];
+    clouds.traceOffset[1] = offset[1];
     clouds.windStep[0] = windStep[0];
     clouds.windStep[1] = windStep[1];
-    bool shadowPlaced = false;
 
     // The shadow map over the plane across the sun the map's light comes from, centred on the eye in whole texels of the
     // coarse cascade, so it does not crawl as the eye moves.
     const float* toSun = constants.sunDirection;
     m_cloudShadowReady = constants.sunEnabled != 0.0f && clouds.shadowStrength > 0.0f && (clouds.layerMask != 0);
+    bool shadowPlaced = false;
     if (m_cloudShadowReady) {
         // Any axis across the sun: x, or y for a sun along x, with its share along the sun taken out.
         const float axis[3] = {std::fabs(toSun[0]) < 0.9f ? 1.0f : 0.0f, std::fabs(toSun[0]) < 0.9f ? 0.0f : 1.0f, 0.0f};
@@ -1781,9 +1776,9 @@ void Lighting::RecordClouds(FrameConstants& constants, const ViewInputs& inputs,
     m_list->CopyTextureRegion(&destination, 0, 0, 0, &source, &texels);
     m_cloudReadbackPending[slot] = true;
 
-    // The cube: a texel of each 4 x 4 block (it changes slowly), or all of it the first time.
+    // The cube: a texel of each 2 x 2 block, or all of it the first time.
     const bool everyTexel = !m_cloudCubeValid;
-    const UINT cubeTexels = everyTexel ? kCloudCubeSize : kCloudCubeSize / 4;
+    const UINT cubeTexels = everyTexel ? kCloudCubeSize : kCloudCubeSize / 2;
     Use(m_cloudCube, write);
     DispatchGroups(Pass::Clouds, {.input0 = cloudView, .input1 = m_cloudLight.srv, .input2 = everyTexel ? 1u : 0u, .output0 = m_cloudCube.uav, .step = 5},
         cubeTexels / 8, cubeTexels / 8, 6);

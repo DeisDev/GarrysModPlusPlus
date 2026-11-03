@@ -67,7 +67,7 @@ struct CloudConstants {
     uint32_t cirrusView;
     float cirrusStrandFrequency;
     uint32_t shapesView;
-    uint32_t traceBlock;
+    float padding;
 };
 static_assert(sizeof(CloudConstants) == 512);
 

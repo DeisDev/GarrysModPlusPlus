@@ -809,7 +809,6 @@ private:
     std::array<Texture, 2> m_cloudHistory;
     UINT m_cloudHistoryCurrent = 0;
     std::array<UINT, 2> m_cloudHistorySize = {};
-    std::array<UINT, 2> m_cloudTraceSize = {};
     bool m_cloudHistoryValid = false;
     float m_cloudViewProj[4][4] = {};
     Microsoft::WRL::ComPtr<ID3D12Resource> m_cloudConstants;
