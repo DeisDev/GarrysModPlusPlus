@@ -188,7 +188,7 @@ struct Settings {
     float cloudAltitude = 1200.0f;
     float cloudThickness = 900.0f;
     float cloudDropletSize = 20.0f;
-    float cloudMultipleScattering = 0.7f;
+    float cloudMultipleScattering = 0.5f;
     bool cloudShadows = true;
     float cloudShadowStrength = 1.0f;
     // The wind carries the clouds windSpeed metres a second toward windDirection degrees (Hammer's yaw), higher layers
@@ -307,7 +307,7 @@ struct Settings {
     bool opacityMicromaps = true;
     // The main view's clouds at cloudResolution, marched in cloudSteps steps straight up (twice as many toward the
     // horizon) and cloudLightSteps toward the light from each.
-    CloudResolution cloudResolution = CloudResolution::Half;
+    CloudResolution cloudResolution = CloudResolution::Full;
     int cloudSteps = 64;
     int cloudLightSteps = 6;
     // Latency and frame generation (this computer's): NVIDIA Reflex, the frame generator (DLSS or FSR, chosen when the

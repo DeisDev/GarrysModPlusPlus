@@ -1589,8 +1589,11 @@ void Lighting::RecordClouds(FrameConstants& constants, const ViewInputs& inputs,
     const float share = settings.cloudResolution == CloudResolution::Full ? 1.0f : settings.cloudResolution == CloudResolution::Half ? 0.5f : 0.25f;
     const std::array<UINT, 2> historySize = {static_cast<UINT>(std::ceil(static_cast<float>(m_width) * share * (1.0f + 2.0f * kCloudOverscan))),
         static_cast<UINT>(std::ceil(static_cast<float>(m_height) * share * (1.0f + 2.0f * kCloudOverscan)))};
-    const std::array<UINT, 2> traceSize = {(historySize[0] + 1) / 2, (historySize[1] + 1) / 2};
-    if (historySize != m_cloudHistorySize) {
+    // A texel of each block is traced a frame: a full-sized history in 4 x 4 blocks costs what a half-sized one does in
+    // 2 x 2 (one sixteenth of the screen's pixels), and stays sharp.
+    const UINT traceBlock = settings.cloudResolution == CloudResolution::Full ? 4 : 2;
+    const std::array<UINT, 2> traceSize = {(historySize[0] + traceBlock - 1) / traceBlock, (historySize[1] + traceBlock - 1) / traceBlock};
+    if (historySize != m_cloudHistorySize || traceSize != m_cloudTraceSize) {
         // Frames in flight may still draw the sky with the old history.
         WaitForGpu();
         const bool created = CreateTarget(m_cloudTrace, traceSize[0], traceSize[1], DXGI_FORMAT_R16G16B16A16_FLOAT) &&
@@ -1602,6 +1605,7 @@ void Lighting::RecordClouds(FrameConstants& constants, const ViewInputs& inputs,
             return fail("creating the clouds' history failed");
         }
         m_cloudHistorySize = historySize;
+        m_cloudTraceSize = traceSize;
         m_cloudHistoryValid = false;
     }
 
@@ -1709,10 +1713,14 @@ void Lighting::RecordClouds(FrameConstants& constants, const ViewInputs& inputs,
     clouds.overscan = kCloudOverscan;
     clouds.historyValid = m_cloudHistoryValid ? 1u : 0u;
     // A texel of each 2 x 2 block a frame, all four in turn.
+    // A texel of each 4 x 4 block a frame, all sixteen in turn, the 2 x 2 blocks within them each four frames.
     constexpr UINT kTraceOrder[4][2] = {{0, 0}, {1, 1}, {1, 0}, {0, 1}};
-    const UINT* offset = kTraceOrder[m_cloudFrame++ % 4];
-    clouds.traceOffset[0] = offset[0];
-    clouds.traceOffset[1] = offset[1];
+    const UINT* fine = kTraceOrder[m_cloudFrame % 4];
+    const UINT* coarse = kTraceOrder[(m_cloudFrame / 4) % 4];
+    ++m_cloudFrame;
+    clouds.traceOffset[0] = fine[0] + 2 * coarse[0];
+    clouds.traceOffset[1] = fine[1] + 2 * coarse[1];
+    clouds.traceBlock = traceBlock;
     clouds.windStep[0] = windStep[0];
     clouds.windStep[1] = windStep[1];
 
@@ -1762,9 +1770,9 @@ void Lighting::RecordClouds(FrameConstants& constants, const ViewInputs& inputs,
     m_list->CopyTextureRegion(&destination, 0, 0, 0, &source, &texels);
     m_cloudReadbackPending[slot] = true;
 
-    // The cube: a texel of each 2 x 2 block, or all of it the first time.
+    // The cube: a texel of each 4 x 4 block (it changes slowly), or all of it the first time.
     const bool everyTexel = !m_cloudCubeValid;
-    const UINT cubeTexels = everyTexel ? kCloudCubeSize : kCloudCubeSize / 2;
+    const UINT cubeTexels = everyTexel ? kCloudCubeSize : kCloudCubeSize / 4;
     Use(m_cloudCube, write);
     DispatchGroups(Pass::Clouds, {.input0 = cloudView, .input1 = m_cloudLight.srv, .input2 = everyTexel ? 1u : 0u, .output0 = m_cloudCube.uav, .step = 5},
         cubeTexels / 8, cubeTexels / 8, 6);
@@ -3217,6 +3225,9 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     const float jitterScale = upscaled ? static_cast<float>(m_width) / static_cast<float>(renderWidth) : 1.0f;
     const UINT shiftX = std::bit_cast<UINT>(inputs.jitterX * jitterScale);
     const UINT shiftY = std::bit_cast<UINT>(inputs.jitterY * jitterScale);
+    // The upscalers' resolve tells the 3D skybox's pixels from the open sky's by its distances (shaders/dlss_resolve.hlsl).
+    const bool resolveSkyboxDistance = main && m_skyboxDistanceFrame == inputs.frame && m_skyboxDistance.resource;
+    const UINT resolveSkybox = resolveSkyboxDistance ? m_skyboxDistance.srv : kInvalidView;
 
     const D3D12_RESOURCE_STATES read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     const D3D12_RESOURCE_STATES write = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
@@ -3744,7 +3755,9 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
         if (rayReconstructed) {
             Use(m_rrOutput, read);
             Use(m_resolved, write);
-            Dispatch(Pass::DlssResolve, {.input0 = m_rrOutput.srv, .input1 = shiftX, .input2 = shiftY, .output0 = m_resolved.uav});
+            if (resolveSkyboxDistance)
+                Use(m_skyboxDistance, read);
+            Dispatch(Pass::DlssResolve, {.input0 = m_rrOutput.srv, .input1 = shiftX, .input2 = shiftY, .input3 = resolveSkybox, .output0 = m_resolved.uav});
             output = &m_resolved;
         }
     } else if (upscaler == Upscaler::Fsr) {
@@ -3780,7 +3793,9 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
         if (upscaledLight) {
             Use(m_rrOutput, read);
             Use(m_resolved, write);
-            Dispatch(Pass::DlssResolve, {.input0 = m_rrOutput.srv, .input1 = shiftX, .input2 = shiftY, .output0 = m_resolved.uav});
+            if (resolveSkyboxDistance)
+                Use(m_skyboxDistance, read);
+            Dispatch(Pass::DlssResolve, {.input0 = m_rrOutput.srv, .input1 = shiftX, .input2 = shiftY, .input3 = resolveSkybox, .output0 = m_resolved.uav});
             output = &m_resolved;
         }
     } else if (main && AntiAliasingMode() == AntiAliasing::Temporal) {

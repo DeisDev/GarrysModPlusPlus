@@ -157,6 +157,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fixed fog staying as bright at night as by day: it now darkens with the sun and sky, takes the colour of the sunset, and follows the sun and sky strength settings. Water's own glow does too.
 - Fixed particles far from the player glowing with the map's baked daytime light, such as smoke at night; they now take the nearest real-time light.
 - Fixed shadows and reflections in the 3D skybox jittering when zoomed in.
+- With DLSS Ray Reconstruction or FSR upscaling, the sky (clouds, stars, the sun) is no longer blurred.
 - The settings menu no longer shows the game's mouse cursor next to its own.
 - Switching pages in the settings menu no longer makes the page's content jump around for a few frames.
 - Maps with water no longer stutter the first time you look at water: the vertex shaders the water's reflection and refraction views draw with (with a clip plane) are compiled while the map loads.

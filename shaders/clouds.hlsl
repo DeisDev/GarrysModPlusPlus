@@ -25,10 +25,11 @@
 //    transmittance through the clouds along the line through each texel.
 // 4: the clouds' light (output0, kLightTexels x 1, one group) from the procedural sky (CloudConstants::skyView), last
 //    frame's cloud cube (input1, the faces, or kNoView), the shadow map (input2, or kNoView) and the colour bands.
-// 5: the cloud cube (output0, its faces) with the light (input1): the texels of each 2 x 2 block at traceOffset, blended
+// 5: the cloud cube (output0, its faces) with the light (input1): the texels of each 4 x 4 block at traceOffset, blended
 //    into what they held, or with input2 = 1 every texel anew.
 // 6: the main view's trace with the light (input1) and the 3D skybox's distances (input2, or kNoView): one texel of each
-//    2 x 2 block of the history (CloudConstants::historySize) at traceOffset, the clouds seen (output0: their light with
+//    traceBlock-square block of the history (CloudConstants::historySize) at traceOffset modulo traceBlock, the clouds
+//    seen (output0: their light with
 //    the air's in front, rgb, and transmittance, a) and their depth (output1, kilometres; kNoCloud for none, kMasked where
 //    the screen shows no sky around it).
 // 7: the history (output0) from last frame's (input1), moved with the camera and the wind, and the trace (input2, input3):
@@ -109,8 +110,9 @@ struct CloudConstants
     uint cubeTexels;
     // The history's rows from a direction to its clip space (the view's, widened by the overscan), this frame's and the
     // last's, and this frame's back from its clip space (x, y, w = 1) to a direction; the history's size, the overscan
-    // (its share of the screen added on each side), whether last frame's history holds anything, the texel of each 2 x 2
-    // block traced this frame, and where the clouds moved since then in the map's units.
+    // (its share of the screen added on each side), whether last frame's history holds anything, the texel of each 4 x 4
+    // block traced this frame (the history's blocks take it modulo traceBlock), and where the clouds moved since then in the
+    // map's units.
     float4 viewProj[4];
     float4 prevViewProj[4];
     float4 clipToDirection[3];
@@ -123,9 +125,9 @@ struct CloudConstants
     // wind's offset wraps with it.
     uint cirrusView;
     float cirrusStrandFrequency;
-    // The clouds' shapes (steps 10 to 12).
+    // The clouds' shapes (steps 10 to 12), and the side of the history's blocks a texel of which is traced each frame.
     uint shapesView;
-    float padding;
+    uint traceBlock;
 };
 
 static const uint kLayerLow = 1;
@@ -184,21 +186,20 @@ static const float kHistoryBlend = 0.25;
 static const float kHorizonSteps = 2.0;
 // The clouds' shapes (LayerDensity), our choices after Photon's: how far the weather's regional coverage moves a layer's
 // coverage up or down (the middle layer's more, so altocumulus come in patches) and its type field the low layer's type;
-// how strongly cloud forms at the billows' peak and how its strength falls toward the coverage's edge (most clouds low,
-// a few rising to the top); the share of the thickness where height reaches 1 (only the strongest cores rise above it);
+// how strongly cloud forms per standard deviation of the billows above the coverage's edge (Strength); the share of the thickness where height reaches 1 (only the strongest cores rise above it);
 // the width of stratus' edges in the noise; how deeply the middle layer's cells are cut; and the erosion's weights for
-// cumulus and stratus (billows, fine detail) at Detail 1, and the middle layer's fine detail.
+// cumulus and stratus (billows, fine detail) at the default Detail (Photon's, for its noise, times 1 / 0.7: ours erodes
+// less at the same weight), and the middle layer's fine detail.
 static const float kLowRegions = 0.3;
 static const float kMiddleRegions = 0.8;
 static const float kTypeRegions = 0.4;
-static const float kPeak = 0.75;
-static const float kSkew = 2.5;
+static const float kStrength = 0.25;
 static const float kTopShare = 0.8;
 static const float kStratusEdge = 0.1;
 static const float kCellCarve = 1.2;
-static const float2 kCumulusErosion = float2(0.33, 0.4);
-static const float2 kStratusErosion = float2(0.07, 0.1);
-static const float kMiddleErosion = 0.3;
+static const float2 kCumulusErosion = float2(0.47, 0.57);
+static const float2 kStratusErosion = float2(0.1, 0.14);
+static const float kMiddleErosion = 0.43;
 // The shapes' distribution (steps 11 and 12): bins, and every how many texels each way it counts.
 static const uint kHistogramBins = 256;
 static const uint kHistogramStride = 4;
@@ -427,6 +428,24 @@ float Equalised(RWTexture2D<float> distribution, uint channel, float value)
 
 float Linstep(float low, float high, float value) { return saturate((value - low) / (high - low)); }
 
+// A normal distribution's quantile of `value`, by the logistic approximation (scale 1.702).
+float NormalQuantile(float value)
+{
+    value = clamp(value, 1e-4, 1.0 - 1e-4);
+    return log(value / (1.0 - value)) / 1.702;
+}
+
+// How strongly cloud forms where the billows, spread evenly over [0, 1], stand at `billows` and `coverage` of the sky is
+// cloud: by how many standard deviations a normally distributed noise (as Photon's billowy noise is, nearly) would stand
+// above the edge the coverage cuts. It rises steeply from the edge, so outlines are sharp, and slowly in the few strongest
+// places, so most clouds stay low. A power of the evenly spread value rose slowly from the edge and left outlines blurred
+// (2026-11-03).
+float Strength(float billows, float coverage)
+{
+    float edge = 1.0 - coverage;
+    return billows > edge ? saturate(kStrength * (NormalQuantile(billows) - NormalQuantile(edge))) : 0.0;
+}
+
 // x (2 - x): a cheap curve like a square root.
 float Dampen(float value)
 {
@@ -457,7 +476,7 @@ float LayerDensity(CloudConstants clouds, CloudLayer layer, float3 p, float alti
     if (coverage <= 0.0)
         return 0.0;
     float stratus = middle ? 0.0 : saturate(1.0 - layer.type - (weather.g - 0.5) * kTypeRegions);
-    float cloud = kPeak * pow(Linstep(1.0 - coverage, 1.0, middle ? shape.b : shape.r), kSkew);
+    float cloud = Strength(middle ? shape.b : shape.r, coverage);
     if (middle) {
         float cells = shapes.SampleLevel(g_linearWrap, uv * 2.0, 0.0).a;
         cloud -= kCellCarve * (1.0 - cells) * (1.0 - cells) * Dampen(1.0 - cloud);
@@ -808,6 +827,30 @@ bool HistoryUv(float4 rows[4], float3 direction, out float2 uv)
     return clip.w > 0.0;
 }
 
+// `history` at `uv` filtered by a Catmull-Rom spline in five bilinear taps (Jimenez, "Filmic SMAA", SIGGRAPH 2016; the
+// four corner taps' small weights are dropped). The history is reprojected every frame as the wind moves the clouds, and
+// bilinear filtering, applied again each time, blurred their detail away (2026-11-03).
+float4 SampleCatmullRom(Texture2D<float4> history, float2 uv, float2 size)
+{
+    float2 position = uv * size;
+    float2 centre = floor(position - 0.5) + 0.5;
+    float2 f = position - centre;
+    float2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+    float2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+    float2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+    float2 w3 = f * f * (-0.5 + 0.5 * f);
+    float2 w12 = w1 + w2;
+    float2 at0 = (centre - 1.0) / size;
+    float2 at12 = (centre + w2 / w12) / size;
+    float2 at3 = (centre + 2.0) / size;
+    float4 sum = history.SampleLevel(g_linearClamp, float2(at12.x, at0.y), 0.0) * (w12.x * w0.y) +
+        history.SampleLevel(g_linearClamp, float2(at0.x, at12.y), 0.0) * (w0.x * w12.y) +
+        history.SampleLevel(g_linearClamp, at12, 0.0) * (w12.x * w12.y) +
+        history.SampleLevel(g_linearClamp, float2(at3.x, at12.y), 0.0) * (w3.x * w12.y) +
+        history.SampleLevel(g_linearClamp, float2(at12.x, at3.y), 0.0) * (w12.x * w3.y);
+    return max(sum / (w12.x * w0.y + w0.x * w12.y + w12.x * w12.y + w3.x * w12.y + w12.x * w3.y), 0.0);
+}
+
 // Interleaved gradient noise (Jimenez 2014), moved each frame.
 float FrameNoise(uint2 pixel)
 {
@@ -820,8 +863,8 @@ float FrameNoise(uint2 pixel)
 // over the area is checked.
 bool SeesSky(CloudConstants clouds, uint2 texel)
 {
-    float2 low = (float2(texel) - 2.0) / float2(clouds.historySize);
-    float2 high = (float2(texel) + 3.0) / float2(clouds.historySize);
+    float2 low = (float2(texel) - float(clouds.traceBlock)) / float2(clouds.historySize);
+    float2 high = (float2(texel) + float(clouds.traceBlock) + 1.0) / float2(clouds.historySize);
     float2 screenLow = (low * (1.0 + 2.0 * clouds.overscan) - clouds.overscan) * float2(g_frame.size);
     float2 screenHigh = (high * (1.0 + 2.0 * clouds.overscan) - clouds.overscan) * float2(g_frame.size);
     if (any(screenLow < 0.0) || any(screenHigh > float2(g_frame.size)))
@@ -1050,7 +1093,7 @@ void main(uint3 id : SV_DispatchThreadID, uint index : SV_GroupIndex)
     if (g_pass.step == 5) {
         RWTexture2DArray<float4> output = ResourceDescriptorHeap[g_pass.output0];
         bool everyTexel = g_pass.input2 == 1;
-        uint2 texel = everyTexel ? id.xy : id.xy * 2 + clouds.traceOffset;
+        uint2 texel = everyTexel ? id.xy : id.xy * 4 + clouds.traceOffset;
         if (any(texel >= clouds.cubeTexels))
             return;
         float3 direction = normalize(FaceDirection(id.z, (float2(texel) + 0.5) * (2.0 / clouds.cubeTexels) - 1.0));
@@ -1065,7 +1108,7 @@ void main(uint3 id : SV_DispatchThreadID, uint index : SV_GroupIndex)
     if (g_pass.step == 6) {
         RWTexture2D<float4> output = ResourceDescriptorHeap[g_pass.output0];
         RWTexture2D<float> depthOutput = ResourceDescriptorHeap[g_pass.output1];
-        uint2 texel = id.xy * 2 + clouds.traceOffset;
+        uint2 texel = id.xy * clouds.traceBlock + clouds.traceOffset % clouds.traceBlock;
         uint2 size;
         output.GetDimensions(size.x, size.y);
         if (any(id.xy >= size))
@@ -1078,7 +1121,9 @@ void main(uint3 id : SV_DispatchThreadID, uint index : SV_GroupIndex)
         float2 uv = (float2(texel) + 0.5) / float2(clouds.historySize);
         float3 direction = HistoryDirection(clouds, uv);
         float pixelAngle = length(HistoryDirection(clouds, uv + float2(1.0 / clouds.historySize.x, 0.0)) - direction);
-        CloudTrace trace = TraceClouds(clouds, light, eye, direction, FrameNoise(texel), 1.0, pixelAngle, transmittance);
+        // The noise by the trace's own texel: interleaved gradient noise read at every traceBlock-th pixel aliased into
+        // hatching.
+        CloudTrace trace = TraceClouds(clouds, light, eye, direction, FrameNoise(id.xy), 1.0, pixelAngle, transmittance);
         float depth;
         output[id.xy] = SeenClouds(trace, eye, direction, sky.SampleLevel(g_linearClamp, direction, 0.0).rgb, transmittance, depth);
         depthOutput[id.xy] = depth;
@@ -1094,7 +1139,7 @@ void main(uint3 id : SV_DispatchThreadID, uint index : SV_GroupIndex)
     Texture2D<float> traceDepth = ResourceDescriptorHeap[g_pass.input3];
     uint2 traceSize;
     trace.GetDimensions(traceSize.x, traceSize.y);
-    int2 center = int2(texel / 2);
+    int2 center = int2(texel / clouds.traceBlock);
     float4 current = trace.Load(int3(center, 0));
     float depth = traceDepth.Load(int3(center, 0));
     float3 direction = HistoryDirection(clouds, (float2(texel) + 0.5) / float2(clouds.historySize));
@@ -1129,10 +1174,10 @@ void main(uint3 id : SV_DispatchThreadID, uint index : SV_GroupIndex)
     float4 previous = current;
     if (valid) {
         Texture2D<float4> history = ResourceDescriptorHeap[g_pass.input1];
-        previous = history.SampleLevel(g_linearClamp, previousUv, 0.0);
+        previous = SampleCatmullRom(history, previousUv, float2(clouds.historySize));
         if (around)
             previous = clamp(previous, low, high);
     }
-    bool fresh = all((texel & 1) == clouds.traceOffset);
+    bool fresh = all(texel % clouds.traceBlock == clouds.traceOffset % clouds.traceBlock);
     output[texel] = fresh && valid ? lerp(previous, current, kHistoryBlend) : previous;
 }

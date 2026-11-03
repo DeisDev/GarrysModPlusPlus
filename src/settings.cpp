@@ -233,7 +233,7 @@ constexpr PresetValues kPresets[] = {
     {2, 1, 1, 2, 1, 24, 48, 4, FoliageShadows::SunAndIndirect, true, IndirectLighting::RayTraced, EmissiveLighting::Bounce, true, LightSampling::Auto, true,
         CloudResolution::Half, 48, 4},
     {4, 2, 1, 2, 1, 32, 64, 8, FoliageShadows::All, false, IndirectLighting::RayTraced, EmissiveLighting::Full, true, LightSampling::Auto, true,
-        CloudResolution::Half, 64, 6},
+        CloudResolution::Full, 64, 6},
     {8, 4, 2, 3, 2, 64, 96, 16, FoliageShadows::All, false, IndirectLighting::RayTraced, EmissiveLighting::Full, true, LightSampling::Auto, true,
         CloudResolution::Full, 96, 8},
 };
