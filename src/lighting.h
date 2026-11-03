@@ -970,6 +970,8 @@ private:
     // GPU time of the 3D skybox's and viewmodel's runs since the last report, and of the 3D skybox's alone.
     double m_otherViewsMsTotal = 0.0;
     double m_skyboxMsTotal = 0.0;
+    std::array<double, static_cast<size_t>(GpuPass::Count)> m_skyboxPassMsTotal = {};
+    std::array<double, static_cast<size_t>(GpuPass::Count)> m_viewmodelPassMsTotal = {};
     uint32_t m_timingReports = 0;
     uint32_t m_cameraFailures = 0;
     std::array<bool, kSlots> m_slotWasMain = {};

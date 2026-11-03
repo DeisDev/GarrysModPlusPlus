@@ -288,8 +288,10 @@ constexpr UINT kTraceMask = kWorldMask | kStaticPropMask | kShadowlessPropMask |
 // The viewmodel is drawn inside the local player's body, which would shadow it.
 constexpr UINT kViewmodelTraceMask = kTraceMask & ~kLocalPlayerMask;
 constexpr UINT kFilterSteps[] = {1, 2, 4, 8, 16};
-// The viewmodel has no history, so it takes several indirect samples per pixel.
-constexpr UINT kViewmodelIndirectSamples = 8;
+// The viewmodel has no history, so it takes several indirect samples per pixel, stratified over each 2 x 2 block
+// (shaders/gi_trace.hlsl): eight directions a block. Eight a pixel cost 2.4 ms on gm_construct at 2560x1440 (2026-11-03)
+// for light its denoiser blends over some 30 pixels anyway.
+constexpr UINT kViewmodelIndirectSamples = 2;
 constexpr UINT kPassCount = static_cast<UINT>(GpuPass::Count);
 // A timestamp before the first pass and after each one.
 constexpr UINT kMarkers = kPassCount + 1;
@@ -2843,7 +2845,8 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
             m_nightSky.PlaceMoon(*sun, GetSettings().moonPhase);
         }
     }
-    // Timings of the view that last used this slot: the main view's per pass, the others' whole runs.
+    // Timings of the view that last used this slot, per pass: the main view's for the menu, the 3D skybox's and the
+    // viewmodel's for the developer log.
     if (m_slotFenceValues[slot] != 0 && !m_slotWasMain[slot]) {
         const uint64_t* markers = m_timestampValues + slot * kMarkers;
         if (markers[kPassCount] > markers[0]) {
@@ -2851,6 +2854,9 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
             m_otherViewsMsTotal += ms;
             if (m_slotWasSkybox[slot])
                 m_skyboxMsTotal += ms;
+            std::array<double, kPassCount>& passes = m_slotWasSkybox[slot] ? m_skyboxPassMsTotal : m_viewmodelPassMsTotal;
+            for (UINT pass = 0; pass < kPassCount; ++pass)
+                passes[pass] += static_cast<double>(markers[pass + 1] - markers[pass]) * m_timestampPeriodMs;
         }
     }
     if (m_slotFenceValues[slot] != 0 && m_slotWasMain[slot]) {
@@ -2884,7 +2890,18 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
                               "lighting {:.2f}, resolve {:.2f}; 3D skybox and viewmodel {:.2f}, of which 3D skybox {:.2f}); frame time {:.2f} ms, tonemap scale {:.3f}",
                         statistics.lightingMs, m_width, m_height, statistics.renderWidth, statistics.renderHeight, p[0], p[1], p[2], p[3], p[4],
                         p[5], p[6], p[7], p[8], p[9], p[10], p[11], p[12], statistics.otherViewsMs, skyboxMs, frames ? frameMs / frames : 0.0, inputs.tonemapScale);
+                    if (GetOptions().devMode) {
+                        const auto passes = [&](const std::array<double, kPassCount>& totals) {
+                            std::string text;
+                            for (UINT pass = 0; pass < kPassCount; ++pass)
+                                text += std::format("{}{:.2f}", pass ? " " : "", totals[pass] / kTimingSamples);
+                            return text;
+                        };
+                        log::Info("Lighting: per pass as above, 3D skybox ({}), viewmodel ({})", passes(m_skyboxPassMsTotal), passes(m_viewmodelPassMsTotal));
+                    }
                 }
+                m_skyboxPassMsTotal = {};
+                m_viewmodelPassMsTotal = {};
             }
         }
     }

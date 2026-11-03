@@ -119,6 +119,10 @@ void main(uint3 id : SV_DispatchThreadID)
         return;
     }
     uint samples = max(g_pass.step, 1u);
+    // The viewmodel's samples are stratified over each 2 x 2 block of pixels, which its denoiser's first pass blends (on
+    // the same surface): the block takes four times as many directions as each pixel traces.
+    uint strata = g_frame.viewmodel != 0 ? samples * 4 : 1;
+    uint stratum = g_frame.viewmodel != 0 ? ((id.y & 1) * 2 + (id.x & 1)) * samples : 0;
     float3 estimate = 0.0;
     float hitDistance = 0.0;
     for (uint s = 0; s < samples; ++s) {
@@ -127,7 +131,14 @@ void main(uint3 id : SV_DispatchThreadID)
         if (leaf)
             through = Random(seed) < kLeafTransmission;
         float3 side = through ? -geometricNormal : geometricNormal;
-        float3 direction = AboveSurface(CosineSample(through ? -normal : normal, Random(seed), Random(seed)), side);
+        float u = Random(seed);
+        float v = Random(seed);
+        if (strata > 1) {
+            uint k = stratum + s;
+            u = (float(k % 2) + u) * 0.5;
+            v = (float(k / 2) + v) / float(strata / 2);
+        }
+        float3 direction = AboveSurface(CosineSample(through ? -normal : normal, u, v), side);
         HitSurface hit;
         HitInfo hitInfo;
         float3 water;
