@@ -323,6 +323,8 @@ struct Settings {
     // The display the game window goes on, 1-based in the order Displays() lists them; 0 leaves it where the game
     // puts it (the primary display).
     int display = 0;
+    // Turns off GMod's frame rate cap while its window is not focused (engine::CapUnfocusedFrames).
+    bool backgroundFullSpeed = false;
 
     bool operator==(const Settings&) const = default;
 };

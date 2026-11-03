@@ -665,6 +665,7 @@ void DrawGeneralPage(Settings& settings)
     if (widgets::BeginRows("general")) {
         SwitchRow("general.realtime_lighting", &Settings::realtimeLighting);
         DisplayRow();
+        SwitchRow("general.background_full_speed", &Settings::backgroundFullSpeed);
         widgets::EndRows();
     }
     constexpr const char* kBlocks[] = {nullptr, "general.realtime_unsupported", "general.realtime_other_thread"};

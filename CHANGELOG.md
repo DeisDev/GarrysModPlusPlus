@@ -74,6 +74,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - AMD FSR Ray Regeneration as a denoiser option on Radeon RX 9000 GPUs.
 - Frame generation on the General page, off by default: NVIDIA DLSS Frame Generation (RTX 40 and newer; more than one generated frame on RTX 50) or AMD FSR Frame Generation (any GPU). Switching between DLSS and FSR needs a restart.
 - NVIDIA Reflex (On, On + Boost) and AMD Anti-Lag 2 on the General page lower input lag. DLSS Frame Generation turns Reflex on.
+- "Full frame rate in background" on the General page, off by default, turns off GMod's 20 FPS limit while its window isn't focused. GMod saves this in its own config, so turn the option off again to get the limit back when playing without the mod.
 - A hardware check at launch. If the graphics card can't run GarrysMod++, a window says what it is missing and lets you play with the game's own graphics or quit. If it only lacks ray tracing, the window says so and the mod uses the map's baked lighting. "Don't show this again" turns the window off (`hardware_warning=1` in `settings.ini` turns it back on).
 
 ### Changed

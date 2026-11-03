@@ -11,6 +11,7 @@
 #include <cctype>
 #include <unordered_map>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <format>
 #include <string_view>
@@ -81,6 +82,13 @@ constexpr uint32_t kNeverAsString = 0x1000;
 constexpr size_t kConVarParent = 56;
 constexpr size_t kConVarString = 72;
 constexpr size_t kConVarOverride = 120;
+// ConVar::Create (engine.dll+0x2a8070) keeps the default value's string at 64. REA 2026-11-03.
+constexpr size_t kConVarDefault = 64;
+// The frame rate cap while the game window is not the active app (GMod has no engine_no_focus_sleep): engine.dll's
+// frame limiter (+0x229950, called by CEngine::Frame at +0x229c40) caps the rate at fps_max_nofocus, at least 10,
+// while the IGame object's slot 16 (+0x22e7b0, its flag at 0x48) reports the window inactive; 0 turns the cap off.
+// engine.dll registers it (+0x19be0) with "20" and FCVAR_ARCHIVE, so config.cfg keeps it. REA 2026-11-03.
+constexpr const char* kUnfocusedFrameCap = "fps_max_nofocus";
 
 void* g_engineClient = nullptr;
 void* g_fileSystem = nullptr;
@@ -110,6 +118,42 @@ void* CreateFrom(const wchar_t* moduleName, const char* interfaceName, HMODULE& 
         return nullptr;
     int code = 0;
     return create(interfaceName, &code);
+}
+
+// The ConVar that holds the value of the console variable `name`, or null when it is not registered or not a string.
+const std::byte* FindConVar(const char* name)
+{
+    static void* cvar = nullptr;
+    if (cvar == nullptr) {
+        HMODULE module = nullptr;
+        cvar = CreateFrom(L"vstdlib.dll", "VEngineCvar004", module);
+        if (cvar == nullptr)
+            return nullptr;
+    }
+    const std::byte* var = Slot<const std::byte*(__fastcall*)(void*, const char*)>(cvar, kFindVarSlot)(cvar, name);
+    if (var == nullptr)
+        return nullptr;
+    uint32_t flags;
+    std::memcpy(&flags, var + kConVarFlags, sizeof(flags));
+    if ((flags & kNeverAsString) != 0)
+        return nullptr;
+    const std::byte* parent;
+    std::memcpy(&parent, var + kConVarParent, sizeof(parent));
+    return parent;
+}
+
+std::string StringAt(const std::byte* var, size_t offset)
+{
+    const char* text;
+    std::memcpy(&text, var + offset, sizeof(text));
+    return text != nullptr ? std::string(text) : std::string();
+}
+
+// As GMod's ConVar::GetString reads it.
+std::string ConVarValue(const std::byte* var)
+{
+    std::string value = StringAt(var, kConVarOverride);
+    return value.empty() ? StringAt(var, kConVarString) : value;
 }
 
 // The address every match of kLightStylePattern loads, or null when there is no match or they disagree.
@@ -216,27 +260,38 @@ void ExecuteCommand(const std::string& command)
 
 std::string GameLanguage()
 {
-    static void* cvar = nullptr;
-    if (cvar == nullptr) {
-        HMODULE module = nullptr;
-        cvar = CreateFrom(L"vstdlib.dll", "VEngineCvar004", module);
-        if (cvar == nullptr)
-            return {};
-    }
-    const std::byte* var = Slot<const std::byte*(__fastcall*)(void*, const char*)>(cvar, kFindVarSlot)(cvar, "gmod_language");
+    const std::byte* var = FindConVar("gmod_language");
+    return var != nullptr ? ConVarValue(var) : std::string();
+}
+
+void CapUnfocusedFrames(bool cap)
+{
+    // The cap's value from before it was turned off, to put back.
+    static std::optional<std::string> restore;
+    static std::optional<bool> applied;
+    if (applied == cap || !Ready())
+        return;
+    const std::byte* var = FindConVar(kUnfocusedFrameCap);
     if (var == nullptr)
-        return {};
-    uint32_t flags;
-    std::memcpy(&flags, var + kConVarFlags, sizeof(flags));
-    if ((flags & kNeverAsString) != 0)
-        return {};
-    const std::byte* parent;
-    std::memcpy(&parent, var + kConVarParent, sizeof(parent));
-    const char* text;
-    std::memcpy(&text, parent + kConVarOverride, sizeof(text));
-    if (text == nullptr || *text == '\0')
-        std::memcpy(&text, parent + kConVarString, sizeof(text));
-    return text != nullptr ? std::string(text) : std::string();
+        return;
+    const std::string value = ConVarValue(var);
+    // The engine caps only above 0.
+    const bool capped = std::strtof(value.c_str(), nullptr) > 0.0f;
+    if (!cap) {
+        if (capped) {
+            restore = value;
+            ExecuteCommand(std::format("{} 0", kUnfocusedFrameCap));
+        } else if (!applied) {
+            // Off at launch: config.cfg kept it from a session with the cap turned off.
+            restore = StringAt(var, kConVarDefault);
+        }
+    } else if (restore) {
+        // A value set since then by hand stays.
+        if (!capped)
+            ExecuteCommand(std::format("{} \"{}\"", kUnfocusedFrameCap, *restore));
+        restore.reset();
+    }
+    applied = cap;
 }
 
 bool ReadGameFile(const std::string& path, std::vector<std::byte>& data, size_t maxBytes)

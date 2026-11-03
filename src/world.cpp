@@ -1809,6 +1809,7 @@ void OnPresent(UINT width, UINT height, bool consoleRequests)
     client::TryInstall();
     loading::TryInstall();
     engine::TryInitialize();
+    engine::CapUnfocusedFrames(!GetSettings().backgroundFullSpeed);
     light_queries::TryInstall();
     entities::TryInitialize();
     if (g_state.frame % kMapPollInterval == 0)

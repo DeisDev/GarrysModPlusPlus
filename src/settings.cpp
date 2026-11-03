@@ -43,6 +43,7 @@ constexpr NamedField kFields[] = {
     {"realtime_lighting", &Settings::realtimeLighting, General},
     {"debug_view", &Settings::debugView, General, {}, false},
     {"display", &Settings::display, General, {0.0f, 16.0f}, false},
+    {"background_full_speed", &Settings::backgroundFullSpeed, General, {}, false},
     {"reflex", &Settings::reflex, General, {}, false},
     {"frame_generation", &Settings::frameGeneration, General, {}, false},
     {"generated_frames", &Settings::generatedFrames, General, {1.0f, 5.0f}, false},
