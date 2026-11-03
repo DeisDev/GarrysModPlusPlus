@@ -68,6 +68,7 @@
 #include <g_sharcResolveCS.h>
 #include <g_sharcUpdateCS.h>
 #include <g_sharcUpdateOmmCS.h>
+#include <g_cloudsCS.h>
 #include <g_skinCS.h>
 #include <g_skyAtmosphereCS.h>
 #include <g_skyCS.h>
@@ -96,11 +97,12 @@ namespace gmodpp {
 
 namespace {
 
-constexpr UINT kConstantsStride = 5 * D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT;
+constexpr UINT kConstantsStride = 6 * D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT;
 static_assert(sizeof(FrameConstants) <= kConstantsStride);
 static_assert(offsetof(FrameConstants, lightWarpViews) % 16 == 0);
 static_assert(offsetof(FrameConstants, skyboxFogParams) % 16 == 0);
 static_assert(offsetof(FrameConstants, causticsOrigin) % 16 == 0);
+static_assert(offsetof(FrameConstants, cloudShadowU) % 16 == 0);
 // Each slot has the view's constants and a copy for the passes Ray Reconstruction runs at render resolution.
 constexpr UINT kConstantsPerSlot = 2;
 // Per slot: colour copy, depth, G-buffer normal, flags, light, albedo and self-illumination views, then projector cookies.
@@ -155,6 +157,30 @@ constexpr UINT kRestirConstantsOffset = 256;
 static_assert(sizeof(RestirConstants) <= kSamplingStride - kRestirConstantsOffset);
 // The indirect light volume is read by the lighting passes and by the game's forward draws in their own command lists.
 constexpr D3D12_RESOURCE_STATES kVolumeRead = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+// The clouds (shaders/clouds.hlsl): their noise textures' sizes (kShapeSize, kDetailSize, kWeatherSize there), the
+// shadow map's cascades (texels a side, and their widths in units: the fine one 3.25 m a texel over any map Source allows,
+// the coarse one sixteen times as wide over the 3D skybox's), the clouds' light (kLightTexels), the cube (as large as the
+// procedural sky's, so the sky light reads both at the same texels), and the history's overscan, the share of the
+// screen it adds on each side so the sky the next frame turns to is there (the sky is drawn with last frame's clouds).
+constexpr UINT kCloudShapeSize = 128;
+constexpr UINT kCloudDetailSize = 64;
+constexpr UINT kCloudWeatherSize = 512;
+// The clouds' shapes over each layer's weather tile (about 40 m a texel for the low layer at Size 1), and their
+// distribution's bins per channel (kHistogramBins in shaders/clouds.hlsl).
+constexpr UINT kCloudShapesSize = 1024;
+constexpr UINT kCloudShapeBins = 256;
+// The cirrus' strands (kCirrusSize there) and their mips, down to one texel.
+constexpr UINT kCirrusSize = 1024;
+constexpr UINT kCirrusMips = 11;
+constexpr UINT kCloudShadowSize = 512;
+constexpr float kCloudShadowFineWidth = 65536.0f;
+constexpr float kCloudShadowCoarseWidth = 16.0f * kCloudShadowFineWidth;
+constexpr UINT kCloudLightTexels = 3;
+constexpr UINT kCloudCubeSize = kProceduralSkySize;
+constexpr float kCloudOverscan = 0.1f;
+// The clouds are lit by the sun until it is this far below the horizon (sin(4 degrees)), as seen from the ground: clouds
+// up to 15 km high see it a while longer, which the planet's shadow (LightAt in shaders/clouds.hlsl) takes care of.
+constexpr float kCloudSunBelow = -0.0698f;
 // The froxel volume's columns (shaders/volumetrics.hlsl): at least this many pixels wide, at most this many rows, as
 // Frostbite's 8x8 tiles at 900p (Hillaire 2015).
 constexpr UINT kFroxelTile = 8;
@@ -274,10 +300,11 @@ constexpr UINT kMaxGroups = 65535;
 
 unsigned Hex(HRESULT hr) { return static_cast<unsigned>(hr); }
 
-bool Invert(const float m[4][4], float out[4][4])
+template <typename T>
+bool Invert(const T m[4][4], T out[4][4])
 {
-    const float* a = &m[0][0];
-    float inv[16];
+    const T* a = &m[0][0];
+    T inv[16];
     inv[0] = a[5] * a[10] * a[15] - a[5] * a[11] * a[14] - a[9] * a[6] * a[15] + a[9] * a[7] * a[14] + a[13] * a[6] * a[11] - a[13] * a[7] * a[10];
     inv[4] = -a[4] * a[10] * a[15] + a[4] * a[11] * a[14] + a[8] * a[6] * a[15] - a[8] * a[7] * a[14] - a[12] * a[6] * a[11] + a[12] * a[7] * a[10];
     inv[8] = a[4] * a[9] * a[15] - a[4] * a[11] * a[13] - a[8] * a[5] * a[15] + a[8] * a[7] * a[13] + a[12] * a[5] * a[11] - a[12] * a[7] * a[9];
@@ -294,11 +321,36 @@ bool Invert(const float m[4][4], float out[4][4])
     inv[7] = a[0] * a[6] * a[11] - a[0] * a[7] * a[10] - a[4] * a[2] * a[11] + a[4] * a[3] * a[10] + a[8] * a[2] * a[7] - a[8] * a[3] * a[6];
     inv[11] = -a[0] * a[5] * a[11] + a[0] * a[7] * a[9] + a[4] * a[1] * a[11] - a[4] * a[3] * a[9] - a[8] * a[1] * a[7] + a[8] * a[3] * a[5];
     inv[15] = a[0] * a[5] * a[10] - a[0] * a[6] * a[9] - a[4] * a[1] * a[10] + a[4] * a[2] * a[9] + a[8] * a[1] * a[6] - a[8] * a[2] * a[5];
-    float det = a[0] * inv[0] + a[1] * inv[4] + a[2] * inv[8] + a[3] * inv[12];
-    if (std::fabs(det) < 1e-20f)
+    const T det = a[0] * inv[0] + a[1] * inv[4] + a[2] * inv[8] + a[3] * inv[12];
+    if (std::fabs(det) < T(1e-20))
         return false;
     for (int i = 0; i < 16; ++i)
         (&out[0][0])[i] = inv[i] / det;
+    return true;
+}
+
+// Clip space back to points relative to the eye, the point the projection sends to w = 0, worked out in double precision.
+// The whole inverse in single precision put far points units off their surfaces, by roundings that changed with every
+// jittered matrix: in the 3D skybox (a near plane of 2 units, a camera far from the origin) shadows and reflections
+// jumped by many pixels from frame to frame when zoomed in. Relative to the eye nothing large cancels.
+bool ClipToEye(const float viewProj[4][4], float clipToEye[4][4], float eye[3])
+{
+    double m[4][4];
+    for (int r = 0; r < 4; ++r) {
+        for (int c = 0; c < 4; ++c)
+            m[r][c] = viewProj[r][c];
+    }
+    double inverse[4][4];
+    if (!Invert(m, inverse) || std::fabs(inverse[3][2]) < 1e-300)
+        return false;
+    // The inverse maps clip-space (0, 0, 1, 0) to the eye.
+    for (int r = 0; r < 4; ++r) {
+        const double origin = r < 3 ? inverse[r][2] / inverse[3][2] : 0.0;
+        if (r < 3)
+            eye[r] = static_cast<float>(origin);
+        for (int c = 0; c < 4; ++c)
+            clipToEye[r][c] = static_cast<float>(inverse[r][c] - origin * inverse[3][c]);
+    }
     return true;
 }
 
@@ -515,7 +567,7 @@ HRESULT Lighting::CreatePipelines(std::stop_token stop)
         g_swayCS, g_translucentDepthCS, g_viewRectCS, g_bakedBounceCS, g_skyCS, cache ? std::span<const BYTE>(g_sharcUpdateCS) : none,
         cache ? std::span<const BYTE>(g_sharcResolveCS) : none, g_directSunCS, g_restirPdfCS, g_restirPresampleCS, g_restirRegirCS, g_restirInitialCS,
         g_restirTemporalCS, g_restirSpatialCS, g_restirShadeCS, g_nrdInputsCS, g_nrdResolveCS, g_sunShadowCS, g_causticsCS, g_skinCS,
-        g_skyAtmosphereCS, g_flareVisibilityCS};
+        g_skyAtmosphereCS, g_flareVisibilityCS, g_cloudsCS};
     static_assert(std::size(shaders) == static_cast<size_t>(Pass::Count));
     for (size_t i = 0; i < m_pipelines.size(); ++i)
         compute(shaders[i], m_pipelines[i]);
@@ -1341,6 +1393,11 @@ void Lighting::RecordSky(FrameConstants& constants, const ViewInputs& inputs, co
         std::copy(back[row].begin(), back[row].end(), constants.skyMotion[row]);
     std::copy(sun->begin(), sun->end(), constants.skyMotionDisc);
     constants.skyMotionDisc[3] = sky ? -2.0f : std::cos(std::min(1.5f * m_skyDraw.sunRadius + m_nightSky.TurnAngle(), std::numbers::pi_v<float>));
+    // How much of the disc shows through clouds: the real sun's radiance in the procedural sky's units (or the night map's
+    // Moon's, the sky's sun there), its irradiance (the sky's scale times the air's transmittance toward it) over the
+    // solid angle it fills.
+    if (sky && m_skyScale > 0.0f)
+        m_skyDraw.discRadiance = m_skyScale * Luminance(DaylightAt((*sun)[2]).data()) / (std::numbers::pi_v<float> * kRealSunRadius * kRealSunRadius);
     if (!WriteNightSky(slot, constants)) {
         // The procedural sky reads what WriteNightSky writes.
         if (sky) {
@@ -1373,9 +1430,9 @@ void Lighting::RecordSky(FrameConstants& constants, const ViewInputs& inputs, co
     Use(m_mapSky, read);
     Use(m_moonSky, read);
     const UINT floor = std::bit_cast<UINT>(settings.moonlessNight);
-    // The map's sky light before day and night scale it, for a game's sky not drawn above the horizon.
+    // The map's sky light before day and night and the clouds scale it, for a game's sky not drawn above the horizon.
     const std::optional<Daylight> daylight = DaylightFor(constants, inputs, scene);
-    const float mapSkyLight = Luminance(constants.skyColor) / (daylight ? daylight->sky : 1.0f);
+    const float mapSkyLight = Luminance(constants.skyColor) / ((daylight ? daylight->sky : 1.0f) * CloudSkyFactor(inputs, scene));
     Use(m_skyBands, write);
     DispatchGroups(Pass::SkyAtmosphere, {.input0 = inputs.skyFacesView, .input1 = m_mapSkyFaces, .input2 = floor, .input3 = std::bit_cast<UINT>(mapSkyLight),
         .output0 = m_skyBands.uav, .step = 3}, 1, 1, 1);
@@ -1394,6 +1451,348 @@ void Lighting::RecordSky(FrameConstants& constants, const ViewInputs& inputs, co
     Use(m_proceduralSky, kVolumeRead);
     constants.skyCubeView = m_proceduralSky.srv;
     m_proceduralSkyReady = true;
+}
+
+float Lighting::CloudSkyFactor(const ViewInputs& inputs, const Scene& scene) const
+{
+    return GetSettings().clouds && m_cloudsReady && ShowsPhysicalSky(inputs, scene) ? m_cloudSkyFactor : 1.0f;
+}
+
+void Lighting::ReadCloudLight(UINT slot)
+{
+    void* mapped = nullptr;
+    float texels[2][4];
+    const D3D12_RANGE range = {0, sizeof(texels)};
+    if (FAILED(m_cloudReadback[slot]->Map(0, &range, &mapped)))
+        return;
+    std::memcpy(texels, mapped, sizeof(texels));
+    const D3D12_RANGE written = {0, 0};
+    m_cloudReadback[slot]->Unmap(0, &written);
+    m_skyScale = std::isfinite(texels[0][3]) ? std::max(texels[0][3], 0.0f) : 0.0f;
+    m_cloudSkyFactor = std::isfinite(texels[1][3]) && texels[1][3] > 0.0f ? texels[1][3] : 1.0f;
+}
+
+void Lighting::SetCloudConstants(FrameConstants& constants) const
+{
+    constants.cloudCubeView = m_cloudsReady ? m_cloudCube.srv : kInvalidView;
+    constants.cloudShadowView = m_cloudsReady && m_cloudShadowReady ? m_cloudShadow.srv : kInvalidView;
+    std::copy_n(m_cloudShadowU, 4, constants.cloudShadowU);
+    std::copy_n(m_cloudShadowV, 4, constants.cloudShadowV);
+    constants.cloudShadowFineScale = 1.0f / kCloudShadowFineWidth;
+    constants.cloudShadowCoarseScale = 1.0f / kCloudShadowCoarseWidth;
+    constants.cloudShadowEdge = 0.5f / static_cast<float>(kCloudShadowSize);
+}
+
+void Lighting::RecordClouds(FrameConstants& constants, const ViewInputs& inputs, const Scene& scene, UINT slot)
+{
+    const Settings& settings = GetSettings();
+    const auto none = [&] {
+        m_cloudsReady = false;
+        m_cloudShadowReady = false;
+        m_cloudCubeValid = false;
+        m_cloudHistoryValid = false;
+        m_cloudSkyFactor = 1.0f;
+        m_cloudReadbackPending = {};
+        SetCloudConstants(constants);
+    };
+    if (!settings.clouds || !m_proceduralSkyReady || m_cloudsFailed) {
+        none();
+        return;
+    }
+    const auto fail = [&](const char* what) {
+        log::Info("Lighting: {}; the sky stays clear", what);
+        m_cloudsFailed = true;
+        none();
+    };
+    // The cirrus' strands with all their mips: sampled at the pixel's footprint, they do not shimmer far away.
+    const auto createStrands = [&] {
+        static_assert(std::tuple_size_v<decltype(m_cirrusMipViews)> == kCirrusMips && (kCirrusSize >> (kCirrusMips - 1)) == 1);
+        D3D12_HEAP_PROPERTIES heap = {D3D12_HEAP_TYPE_DEFAULT};
+        D3D12_RESOURCE_DESC desc = {};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        desc.Width = kCirrusSize;
+        desc.Height = kCirrusSize;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = kCirrusMips;
+        desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        desc.SampleDesc.Count = 1;
+        desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        if (FAILED(m_device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                IID_PPV_ARGS(&m_cirrusStrands.resource))))
+            return false;
+        m_cirrusStrands.state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        m_cirrusStrands.srv = m_descriptors->Allocate();
+        if (m_cirrusStrands.srv == DescriptorHeap::kInvalid)
+            return false;
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+        srv.Format = desc.Format;
+        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.Texture2D.MipLevels = kCirrusMips;
+        m_device->CreateShaderResourceView(m_cirrusStrands.resource.Get(), &srv, m_descriptors->Cpu(m_cirrusStrands.srv));
+        for (UINT mip = 0; mip < kCirrusMips; ++mip) {
+            m_cirrusMipViews[mip] = m_descriptors->Allocate();
+            if (m_cirrusMipViews[mip] == DescriptorHeap::kInvalid)
+                return false;
+            D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
+            uav.Format = desc.Format;
+            uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+            uav.Texture2D.MipSlice = mip;
+            m_device->CreateUnorderedAccessView(m_cirrusStrands.resource.Get(), nullptr, &uav, m_descriptors->Cpu(m_cirrusMipViews[mip]));
+        }
+        return true;
+    };
+    if (!m_cloudConstants) {
+        const bool created = createStrands() &&
+            CreateTarget(m_cloudShape, kCloudShapeSize, kCloudShapeSize, DXGI_FORMAT_R8G8B8A8_UNORM, kCloudShapeSize) &&
+            CreateTarget(m_cloudDetail, kCloudDetailSize, kCloudDetailSize, DXGI_FORMAT_R8G8B8A8_UNORM, kCloudDetailSize) &&
+            CreateTarget(m_cloudWeatherMap, kCloudWeatherSize, kCloudWeatherSize, DXGI_FORMAT_R8G8B8A8_UNORM) &&
+            CreateTarget(m_cloudShapes, kCloudShapesSize, kCloudShapesSize, DXGI_FORMAT_R16G16B16A16_UNORM) &&
+            CreateTarget(m_cloudShapeDistribution, kCloudShapeBins, 4, DXGI_FORMAT_R32_FLOAT) &&
+            CreateTarget(m_cloudShadow, 2 * kCloudShadowSize, kCloudShadowSize, DXGI_FORMAT_R16_FLOAT) &&
+            CreateTarget(m_cloudLight, kCloudLightTexels, 1, DXGI_FORMAT_R32G32B32A32_FLOAT) &&
+            CreateCube(m_cloudCube, kCloudCubeSize, DXGI_FORMAT_R16G16B16A16_FLOAT, &m_cloudCubeFaces) &&
+            std::ranges::all_of(m_cloudReadback, [&](ComPtr<ID3D12Resource>& readback) {
+                readback = CreateBuffer(m_device, D3D12_HEAP_TYPE_READBACK, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT, D3D12_RESOURCE_STATE_COPY_DEST);
+                return readback != nullptr;
+            });
+        if (!created)
+            return fail("creating the clouds' textures failed");
+        m_cloudConstants = CreateBuffer(m_device, D3D12_HEAP_TYPE_UPLOAD, sizeof(CloudConstants) * kSlots, D3D12_RESOURCE_STATE_GENERIC_READ);
+        void* mapped = nullptr;
+        const D3D12_RANGE nothing = {0, 0};
+        if (!m_cloudConstants || FAILED(m_cloudConstants->Map(0, &nothing, &mapped))) {
+            m_cloudConstants.Reset();
+            return fail("creating the clouds' constants failed");
+        }
+        m_cloudConstantsMapped = static_cast<std::byte*>(mapped);
+        for (UINT s = 0; s < kSlots; ++s) {
+            m_cloudConstantViews[s] = m_descriptors->Allocate();
+            if (m_cloudConstantViews[s] == DescriptorHeap::kInvalid)
+                return fail("no descriptors left for the clouds' constants");
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+            srv.Format = DXGI_FORMAT_UNKNOWN;
+            srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+            srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            srv.Buffer.FirstElement = s;
+            srv.Buffer.NumElements = 1;
+            srv.Buffer.StructureByteStride = sizeof(CloudConstants);
+            m_device->CreateShaderResourceView(m_cloudConstants.Get(), &srv, m_descriptors->Cpu(m_cloudConstantViews[s]));
+        }
+    }
+    // The main view's history at the setting's share of the screen, widened by the overscan; the trace a texel of each
+    // 2 x 2 block of it.
+    const float share = settings.cloudResolution == CloudResolution::Full ? 1.0f : settings.cloudResolution == CloudResolution::Half ? 0.5f : 0.25f;
+    const std::array<UINT, 2> historySize = {static_cast<UINT>(std::ceil(static_cast<float>(m_width) * share * (1.0f + 2.0f * kCloudOverscan))),
+        static_cast<UINT>(std::ceil(static_cast<float>(m_height) * share * (1.0f + 2.0f * kCloudOverscan)))};
+    const std::array<UINT, 2> traceSize = {(historySize[0] + 1) / 2, (historySize[1] + 1) / 2};
+    if (historySize != m_cloudHistorySize) {
+        // Frames in flight may still draw the sky with the old history.
+        WaitForGpu();
+        const bool created = CreateTarget(m_cloudTrace, traceSize[0], traceSize[1], DXGI_FORMAT_R16G16B16A16_FLOAT) &&
+            CreateTarget(m_cloudTraceDepth, traceSize[0], traceSize[1], DXGI_FORMAT_R32_FLOAT) &&
+            CreateTarget(m_cloudHistory[0], historySize[0], historySize[1], DXGI_FORMAT_R16G16B16A16_FLOAT) &&
+            CreateTarget(m_cloudHistory[1], historySize[0], historySize[1], DXGI_FORMAT_R16G16B16A16_FLOAT);
+        if (!created) {
+            m_cloudHistorySize = {};
+            return fail("creating the clouds' history failed");
+        }
+        m_cloudHistorySize = historySize;
+        m_cloudHistoryValid = false;
+    }
+
+    const D3D12_RESOURCE_STATES read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    const D3D12_RESOURCE_STATES write = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    if (!m_cloudNoiseReady) {
+        DispatchGroups(Pass::Clouds, {.output0 = m_cloudShape.uav, .step = 0}, kCloudShapeSize / 8, kCloudShapeSize / 8, kCloudShapeSize);
+        DispatchGroups(Pass::Clouds, {.output0 = m_cloudDetail.uav, .step = 1}, kCloudDetailSize / 8, kCloudDetailSize / 8, kCloudDetailSize);
+        DispatchGroups(Pass::Clouds, {.output0 = m_cloudWeatherMap.uav, .step = 2}, kCloudWeatherSize / 8, kCloudWeatherSize / 8, 1);
+        // The shapes, their distribution, and the shapes spread evenly by it.
+        const D3D12_RESOURCE_BARRIER shapesWritten = {D3D12_RESOURCE_BARRIER_TYPE_UAV, D3D12_RESOURCE_BARRIER_FLAG_NONE, {.UAV = {m_cloudShapes.resource.Get()}}};
+        const D3D12_RESOURCE_BARRIER distributionWritten = {D3D12_RESOURCE_BARRIER_TYPE_UAV, D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            {.UAV = {m_cloudShapeDistribution.resource.Get()}}};
+        DispatchGroups(Pass::Clouds, {.output0 = m_cloudShapes.uav, .step = 10}, kCloudShapesSize / 8, kCloudShapesSize / 8, 1);
+        m_list->ResourceBarrier(1, &shapesWritten);
+        DispatchGroups(Pass::Clouds, {.input1 = m_cloudShapes.uav, .output0 = m_cloudShapeDistribution.uav, .step = 11}, 1, 1, 1);
+        m_list->ResourceBarrier(1, &distributionWritten);
+        DispatchGroups(Pass::Clouds, {.input1 = m_cloudShapeDistribution.uav, .output0 = m_cloudShapes.uav, .step = 12}, kCloudShapesSize / 8,
+            kCloudShapesSize / 8, 1);
+        DispatchGroups(Pass::Clouds, {.output0 = m_cirrusMipViews[0], .step = 8}, kCirrusSize / 8, kCirrusSize / 8, 1);
+        const D3D12_RESOURCE_BARRIER between = {D3D12_RESOURCE_BARRIER_TYPE_UAV, D3D12_RESOURCE_BARRIER_FLAG_NONE, {.UAV = {m_cirrusStrands.resource.Get()}}};
+        for (UINT mip = 1; mip < kCirrusMips; ++mip) {
+            m_list->ResourceBarrier(1, &between);
+            const UINT groups = std::max((kCirrusSize >> mip) / 8, 1u);
+            DispatchGroups(Pass::Clouds, {.input1 = m_cirrusMipViews[mip - 1], .output0 = m_cirrusMipViews[mip], .step = 9}, groups, groups, 1);
+        }
+        for (Texture* texture : {&m_cloudShape, &m_cloudDetail, &m_cloudWeatherMap, &m_cloudShapes, &m_cirrusStrands})
+            Use(*texture, read);
+        m_cloudNoiseReady = true;
+    }
+
+    CloudConstants clouds = {};
+    const std::array<float, 2> windStep = m_cloudWeather.Advance(settings);
+    m_cloudWeather.Write(settings, clouds);
+    Statistics& statistics = GetStatistics();
+    std::tie(statistics.weather, statistics.nextWeather) = m_cloudWeather.Now();
+    if (clouds.layerMask == 0) {
+        none();
+        return;
+    }
+    // The clouds are lit by the sun the sky shows until it has set below them, then by the Moon of day maps at its share
+    // of the night's sky.
+    const std::optional<std::array<float, 3>> sun = SkySun(inputs, scene);
+    std::array<float, 3> light = sun.value_or(std::array<float, 3>{0.0f, 0.0f, 1.0f});
+    clouds.lightScale = 1.0f;
+    if (light[2] < kCloudSunBelow) {
+        const std::optional<MoonState> moon = MoonFor(inputs, scene);
+        clouds.lightScale = moon ? moon->scale : 0.0f;
+        if (moon)
+            light = moon->direction;
+    }
+    std::copy(light.begin(), light.end(), clouds.lightDirection);
+    // In the map's sun's hue, the air's colouring taken out of it: the clouds' light passes through the air on its own.
+    std::array<float, 3> tint = {1.0f, 1.0f, 1.0f};
+    if (constants.sunEnabled != 0.0f) {
+        const std::array<float, 4> toSun = DaylightAt(constants.sunDirection[2]);
+        float color[3];
+        for (size_t i = 0; i < 3; ++i)
+            color[i] = toSun[i] > 1e-6f ? constants.sunColor[i] / toSun[i] : 0.0f;
+        const float luminance = Luminance(color);
+        if (luminance > 0.0f) {
+            for (size_t i = 0; i < 3; ++i)
+                tint[i] = color[i] / luminance;
+        }
+    }
+    std::copy(tint.begin(), tint.end(), clouds.lightTint);
+    clouds.shapeNoiseView = m_cloudShape.srv;
+    clouds.detailNoiseView = m_cloudDetail.srv;
+    clouds.weatherView = m_cloudWeatherMap.srv;
+    clouds.shapesView = m_cloudShapes.srv;
+    clouds.cirrusView = m_cirrusStrands.srv;
+    clouds.transmittanceView = m_transmittance.srv;
+    clouds.skyView = m_proceduralSky.srv;
+    clouds.bandsView = m_skyBands.srv;
+    clouds.cubeTexels = kCloudCubeSize;
+    // The history's clip space: the view's as its G-buffer was drawn (jittered), widened by the overscan; and back from it
+    // to directions in double precision, as the sky's draw finds its directions (ClipToEye in shaderapi_pipelines.cpp).
+    float rows[4][4];
+    std::memcpy(rows, constants.viewProj, sizeof(rows));
+    for (int c = 0; c < 4; ++c) {
+        rows[0][c] = (rows[0][c] + inputs.jitter[0] * rows[3][c]) / (1.0f + 2.0f * kCloudOverscan);
+        rows[1][c] = (rows[1][c] + inputs.jitter[1] * rows[3][c]) / (1.0f + 2.0f * kCloudOverscan);
+    }
+    const double a[3][3] = {{rows[0][0], rows[0][1], rows[0][2]}, {rows[1][0], rows[1][1], rows[1][2]}, {rows[3][0], rows[3][1], rows[3][2]}};
+    const double determinant = a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1]) - a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0]) +
+        a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0]);
+    if (std::fabs(determinant) < 1e-30) {
+        none();
+        return;
+    }
+    for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 3; ++c) {
+            // The inverse's (r, c) is the cofactor of (c, r) over the determinant.
+            const int r1 = (c + 1) % 3;
+            const int r2 = (c + 2) % 3;
+            const int c1 = (r + 1) % 3;
+            const int c2 = (r + 2) % 3;
+            clouds.clipToDirection[r][c] = static_cast<float>((a[r1][c1] * a[r2][c2] - a[r1][c2] * a[r2][c1]) / determinant);
+        }
+    }
+    std::memcpy(clouds.viewProj, rows, sizeof(rows));
+    std::memcpy(clouds.prevViewProj, m_cloudViewProj, sizeof(m_cloudViewProj));
+    clouds.historySize[0] = historySize[0];
+    clouds.historySize[1] = historySize[1];
+    clouds.overscan = kCloudOverscan;
+    clouds.historyValid = m_cloudHistoryValid ? 1u : 0u;
+    // A texel of each 2 x 2 block a frame, all four in turn.
+    constexpr UINT kTraceOrder[4][2] = {{0, 0}, {1, 1}, {1, 0}, {0, 1}};
+    const UINT* offset = kTraceOrder[m_cloudFrame++ % 4];
+    clouds.traceOffset[0] = offset[0];
+    clouds.traceOffset[1] = offset[1];
+    clouds.windStep[0] = windStep[0];
+    clouds.windStep[1] = windStep[1];
+
+    // The shadow map over the plane across the sun the map's light comes from, centred on the eye in whole texels of the
+    // coarse cascade, so it does not crawl as the eye moves.
+    const float* toSun = constants.sunDirection;
+    m_cloudShadowReady = constants.sunEnabled != 0.0f && clouds.shadowStrength > 0.0f && (clouds.layerMask != 0);
+    if (m_cloudShadowReady) {
+        // Any axis across the sun: x, or y for a sun along x, with its share along the sun taken out.
+        const float axis[3] = {std::fabs(toSun[0]) < 0.9f ? 1.0f : 0.0f, std::fabs(toSun[0]) < 0.9f ? 0.0f : 1.0f, 0.0f};
+        const float along = Dot(axis, toSun);
+        float u[3] = {axis[0] - toSun[0] * along, axis[1] - toSun[1] * along, axis[2] - toSun[2] * along};
+        const float length = std::sqrt(Dot(u, u));
+        for (float& component : u)
+            component /= length;
+        const float v[3] = {toSun[1] * u[2] - toSun[2] * u[1], toSun[2] * u[0] - toSun[0] * u[2], toSun[0] * u[1] - toSun[1] * u[0]};
+        const float texel = kCloudShadowCoarseWidth / static_cast<float>(kCloudShadowSize);
+        const float centreU = std::round(Dot(constants.eyePosition, u) / texel) * texel;
+        const float centreV = std::round(Dot(constants.eyePosition, v) / texel) * texel;
+        for (size_t i = 0; i < 3; ++i) {
+            m_cloudShadowU[i] = u[i];
+            m_cloudShadowV[i] = v[i];
+        }
+        m_cloudShadowU[3] = -centreU;
+        m_cloudShadowV[3] = -centreV;
+    }
+    std::memcpy(m_cloudConstantsMapped + slot * sizeof(CloudConstants), &clouds, sizeof(clouds));
+    const UINT cloudView = m_cloudConstantViews[slot];
+    // The shadow map reads its placement from `constants`.
+    m_cloudsReady = true;
+    SetCloudConstants(constants);
+    if (m_cloudShadowReady) {
+        Use(m_cloudShadow, write);
+        DispatchGroups(Pass::Clouds, {.input0 = cloudView, .output0 = m_cloudShadow.uav, .step = 3}, 2 * kCloudShadowSize / 8, kCloudShadowSize / 8, 1);
+        Use(m_cloudShadow, kVolumeRead);
+    }
+
+    // Their light, from last frame's cube; on its way to the CPU for the sky's light and the disc (ReadCloudLight).
+    Use(m_cloudLight, write);
+    DispatchGroups(Pass::Clouds, {.input0 = cloudView, .input1 = m_cloudCubeValid ? m_cloudCubeFaces : kInvalidView,
+        .input2 = m_cloudShadowReady ? m_cloudShadow.srv : kInvalidView, .output0 = m_cloudLight.uav, .step = 4}, 1, 1, 1);
+    Use(m_cloudLight, read | D3D12_RESOURCE_STATE_COPY_SOURCE);
+    const D3D12_TEXTURE_COPY_LOCATION destination = {m_cloudReadback[slot].Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+        {.PlacedFootprint = {0, {DXGI_FORMAT_R32G32B32A32_FLOAT, 2, 1, 1, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT}}}};
+    const D3D12_TEXTURE_COPY_LOCATION source = {m_cloudLight.resource.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {.SubresourceIndex = 0}};
+    const D3D12_BOX texels = {0, 0, 0, 2, 1, 1};
+    m_list->CopyTextureRegion(&destination, 0, 0, 0, &source, &texels);
+    m_cloudReadbackPending[slot] = true;
+
+    // The cube: a texel of each 2 x 2 block, or all of it the first time.
+    const bool everyTexel = !m_cloudCubeValid;
+    const UINT cubeTexels = everyTexel ? kCloudCubeSize : kCloudCubeSize / 2;
+    Use(m_cloudCube, write);
+    DispatchGroups(Pass::Clouds, {.input0 = cloudView, .input1 = m_cloudLight.srv, .input2 = everyTexel ? 1u : 0u, .output0 = m_cloudCube.uav, .step = 5},
+        cubeTexels / 8, cubeTexels / 8, 6);
+    Use(m_cloudCube, kVolumeRead);
+    m_cloudCubeValid = true;
+
+    // The main view's trace and history. The 3D skybox's distances, when its view drew this frame, tell its pixels from
+    // the sky's.
+    const bool skyboxDistance = m_skyboxDistanceFrame == inputs.frame && m_skyboxDistance.resource;
+    if (skyboxDistance)
+        Use(m_skyboxDistance, read);
+    Use(m_cloudTrace, write);
+    Use(m_cloudTraceDepth, write);
+    DispatchGroups(Pass::Clouds, {.input0 = cloudView, .input1 = m_cloudLight.srv, .input2 = skyboxDistance ? m_skyboxDistance.srv : kInvalidView,
+        .output0 = m_cloudTrace.uav, .output1 = m_cloudTraceDepth.uav, .step = 6}, (traceSize[0] + 7) / 8, (traceSize[1] + 7) / 8, 1);
+    Use(m_cloudTrace, read);
+    Use(m_cloudTraceDepth, read);
+    const UINT next = 1 - m_cloudHistoryCurrent;
+    Use(m_cloudHistory[next], write);
+    DispatchGroups(Pass::Clouds, {.input0 = cloudView, .input1 = m_cloudHistory[m_cloudHistoryCurrent].srv, .input2 = m_cloudTrace.srv,
+        .input3 = m_cloudTraceDepth.srv, .output0 = m_cloudHistory[next].uav, .step = 7}, (historySize[0] + 7) / 8, (historySize[1] + 7) / 8, 1);
+    Use(m_cloudHistory[next], kVolumeRead);
+    m_cloudHistoryCurrent = next;
+    m_cloudHistoryValid = true;
+    std::memcpy(m_cloudViewProj, rows, sizeof(rows));
+
+    // The next frame's sky draws show them.
+    m_skyDraw.cloudHistoryView = m_cloudHistory[next].srv;
+    m_skyDraw.cloudCubeView = m_cloudCube.srv;
+    for (size_t r = 0; r < 4; ++r)
+        std::copy(std::begin(rows[r]), std::end(rows[r]), m_skyDraw.cloudViewProj[r].begin());
+    m_skyDraw.cloudOverscan = kCloudOverscan;
 }
 
 bool Lighting::EnsureTargets(UINT width, UINT height)
@@ -1956,14 +2355,8 @@ bool Lighting::FillConstants(FrameConstants& constants, const Scene& scene, cons
         jittered[0][c] += jitter[0] * constants.viewProj[3][c];
         jittered[1][c] += jitter[1] * constants.viewProj[3][c];
     }
-    if (!Invert(jittered, constants.invViewProj))
+    if (!ClipToEye(jittered, constants.clipToEye, constants.eyePosition))
         return false;
-    // The eye is the point the projection sends to w = 0: the inverse maps clip-space (0, 0, 1, 0) to it.
-    const float (*inv)[4] = constants.invViewProj;
-    if (std::fabs(inv[3][2]) < 1e-12f)
-        return false;
-    for (int i = 0; i < 3; ++i)
-        constants.eyePosition[i] = inv[i][2] / inv[3][2];
     FillSceneConstants(constants, scene);
     // The map's own sun and sky, which its fog's colour shows (LitFog in shaders/scene.hlsli).
     float mapSun[3];
@@ -2029,13 +2422,16 @@ bool Lighting::FillConstants(FrameConstants& constants, const Scene& scene, cons
         std::copy(daylight.moonlight->begin(), daylight.moonlight->end(), constants.sunDirection);
         constants.sunEnabled = 1.0f;
     }
+    // The clouds take their share of the sky's light, or add to it, as the cloudy sky lights a surface facing up against
+    // the clear sky; their shadows take the sun's (CloudShadowAt in shaders/scene.hlsli).
+    const float cloudSky = CloudSkyFactor(inputs, scene);
     for (int i = 0; i < 3; ++i) {
         constants.sunColor[i] *= settings.sun ? settings.sunIntensity * sunStyle * daylight.sun[i] : 0.0f;
-        constants.skyColor[i] *= settings.skyIntensity * skyStyle * daylight.sky;
+        constants.skyColor[i] *= settings.skyIntensity * skyStyle * daylight.sky * cloudSky;
         // BakeStep bakes the map's sun and sky as they are in the map.
         constants.bakedSunScale[i] = constants.sunEnabled != 0.0f && settings.sun ? settings.sunIntensity * sunStyle * daylight.sun[i] * sunRecolor[i] : 0.0f;
     }
-    constants.bakedSkyScale = settings.skyIntensity * skyStyle * daylight.sky;
+    constants.bakedSkyScale = settings.skyIntensity * skyStyle * daylight.sky * cloudSky;
     // The fog's light: in open air a quarter of the sun's irradiance and half the sky's, the map's own showing the fog's
     // colour. The sun's share follows the sun's colour channel by channel, so sunsets colour the fog; a channel the map's
     // sun nearly lacks is compared with a tenth of its brightest.
@@ -2104,6 +2500,7 @@ bool Lighting::FillConstants(FrameConstants& constants, const Scene& scene, cons
         constants.skyMotion[row][row] = 1.0f;
     constants.skyMotionDisc[3] = 2.0f;
     constants.skyLightView = m_skyLightReady ? m_skyLight.srv : kInvalidView;
+    SetCloudConstants(constants);
     // The 3D skybox is a scaled-down scene elsewhere in the map: the map's lights do not belong to it.
     const bool skybox = inputs.kind == gbuffer::ViewKind::Skybox;
     if (m_causticsReady && !skybox)
@@ -2194,7 +2591,7 @@ void Lighting::BakeStep(Scene& scene, const SceneFrame& frame, D3D12_GPU_VIRTUAL
     for (uint32_t* view : {&bake.skyCubeView, &bake.skyLightView, &bake.projectorsView, &bake.probeRedView, &bake.probeGreenView, &bake.probeBlueView,
              &bake.aoView, &bake.volumetricView, &bake.dispatchOriginView, &bake.restirDebugView, &bake.selfIllumView, &bake.nrdValidationView,
              &bake.probeView, &bake.bakedTrianglesView, &bake.bakedFacesView, &bake.bakedLightView, &bake.leafAmbientView, &bake.ambientSamplesView,
-             &bake.nightSkyView})
+             &bake.nightSkyView, &bake.cloudCubeView, &bake.cloudShadowView})
         *view = kInvalidView;
     m_list->SetComputeRootConstantBufferView(0, m_bakeConstants->GetGPUVirtualAddress());
     if (baked.tracedLuxels < baked.luxelCount) {
@@ -2356,6 +2753,10 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     if (m_mapSkyReadbackPending[slot]) {
         m_mapSkyReadbackPending[slot] = false;
         ReadMapSky(slot);
+    }
+    if (m_cloudReadbackPending[slot]) {
+        m_cloudReadbackPending[slot] = false;
+        ReadCloudLight(slot);
     }
     // The stars' frame (and the Moon among the stars) turns with the sun the sky shows, once a frame.
     if (inputs.kind == gbuffer::ViewKind::Main) {
@@ -2696,16 +3097,19 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
         constants.indirectMask = constants.traceMask & (kDynamicMask | kLocalPlayerMask);
 
     BindCompute(slotConstantsGpu, frame.tlas, slot);
-    if (main)
+    // The clouds' shadow map comes before everything the sun lights, the caustics' sun maps included.
+    if (main) {
+        RecordSky(constants, inputs, scene, slot);
+        RecordClouds(constants, inputs, scene, slot);
         RecordCaustics(constants, scene);
+    }
     if (bakedIndirect && main && constants.traceMask != 0 && !scene.Baked().Ready())
         BakeStep(scene, frame, slotConstantsGpu);
-    if (main)
-        RecordSky(constants, inputs, scene, slot);
     if (main && inputs.skyCube != nullptr && m_skyLight.resource) {
         Use(m_skyLight, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         const UINT faces = m_proceduralSkyReady ? m_proceduralSkyFaces : inputs.skyFacesView;
-        DispatchGroups(Pass::Sky, {.input0 = faces, .output0 = m_skyLight.uav, .step = 0}, kSkyLightSize, kSkyLightSize, 6);
+        DispatchGroups(Pass::Sky, {.input0 = faces, .input1 = m_cloudsReady ? m_cloudCubeFaces : kInvalidView, .output0 = m_skyLight.uav, .step = 0},
+            kSkyLightSize, kSkyLightSize, 6);
         const D3D12_RESOURCE_BARRIER between = {D3D12_RESOURCE_BARRIER_TYPE_UAV, D3D12_RESOURCE_BARRIER_FLAG_NONE, {.UAV = {m_skyLight.resource.Get()}}};
         m_list->ResourceBarrier(1, &between);
         DispatchGroups(Pass::Sky, {.output0 = m_skyLight.uav, .step = 1}, 1, 1, 1);
@@ -3112,11 +3516,11 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
                         float point[4] = {};
                         for (int r = 0; r < 4; ++r) {
                             for (int c = 0; c < 4; ++c)
-                                point[r] += constants.invViewProj[r][c] * clip[c];
+                                point[r] += constants.clipToEye[r][c] * clip[c];
                         }
                         float offset[3];
                         for (int i = 0; i < 3; ++i)
-                            offset[i] = point[i] / point[3] - constants.eyePosition[i];
+                            offset[i] = point[i] / point[3];
                         const float viewDepth = constants.viewProj[3][0] * offset[0] + constants.viewProj[3][1] * offset[1] + constants.viewProj[3][2] * offset[2];
                         if (viewDepth > 0.0f)
                             cornerScale = std::max(cornerScale, std::sqrt(offset[0] * offset[0] + offset[1] * offset[1] + offset[2] * offset[2]) / viewDepth);

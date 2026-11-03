@@ -26,9 +26,9 @@ float DepthBehind(float2 centre, float depth, bool edge = false)
     if (depth >= 1.0)
         return depth;
     float2 uv = centre * g_frame.invSize;
-    float4 world = mul(g_frame.invViewProj, float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, (depth - g_frame.depthMin) / g_frame.depthScale, 1.0));
-    float3 position = world.xyz / world.w;
-    float3 toPosition = position - g_frame.eyePosition;
+    float4 offset = mul(g_frame.clipToEye, float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, (depth - g_frame.depthMin) / g_frame.depthScale, 1.0));
+    float3 toPosition = offset.xyz / offset.w;
+    float3 position = g_frame.eyePosition + toPosition;
     float distance = length(toPosition);
     position += toPosition / max(distance, 1e-4) * (edge ? 0.25 + distance * 2e-3 : 0.02 + distance * 2e-4);
     float4 clip = mul(g_frame.viewProj, float4(position, 1.0));
@@ -91,8 +91,8 @@ void main(uint3 id : SV_DispatchThreadID)
         return;
     }
     float2 uv = centre * g_frame.invSize;
-    float4 world = mul(g_frame.invViewProj, float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0.5, 1.0));
-    float3 direction = normalize(world.xyz / world.w - g_frame.eyePosition);
+    float4 offset = mul(g_frame.clipToEye, float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0.5, 1.0));
+    float3 direction = normalize(offset.xyz / offset.w);
     float distance = 1e30;
     float traced = 1.0;
     float t;

@@ -103,6 +103,32 @@ constexpr NamedField kFields[] = {
     {"satellites", &Settings::satellites, Sky},
     {"moon", &Settings::moon, Sky},
     {"moon_phase", &Settings::moonPhase, Sky, {0.0f, 1.0f}},
+    {"clouds", &Settings::clouds, Sky},
+    {"changing_weather", &Settings::changingWeather, Sky},
+    {"weather_duration", &Settings::weatherDuration, Sky, {1.0f, 120.0f}},
+    {"weather", &Settings::weather, Sky},
+    {"cloud_coverage", &Settings::cloudCoverage, Sky, {0.0f, 1.0f}},
+    {"cloud_type", &Settings::cloudType, Sky, {0.0f, 1.0f}},
+    {"cloud_density", &Settings::cloudDensity, Sky, {0.05f, 4.0f}},
+    {"cloud_size", &Settings::cloudSize, Sky, {0.25f, 4.0f}},
+    {"cloud_detail", &Settings::cloudDetail, Sky, {0.0f, 1.0f}},
+    {"cloud_altitude", &Settings::cloudAltitude, Sky, {300.0f, 6000.0f}},
+    {"cloud_thickness", &Settings::cloudThickness, Sky, {200.0f, 8000.0f}},
+    {"cloud_droplet_size", &Settings::cloudDropletSize, Sky, {5.0f, 50.0f}},
+    {"cloud_multiple_scattering", &Settings::cloudMultipleScattering, Sky, {0.0f, 0.9f}},
+    {"cloud_shadows", &Settings::cloudShadows, Sky},
+    {"cloud_shadow_strength", &Settings::cloudShadowStrength, Sky, {0.0f, 1.0f}},
+    {"wind_speed", &Settings::windSpeed, Sky, {0.0f, 60.0f}},
+    {"wind_direction", &Settings::windDirection, Sky, {0.0f, 360.0f}},
+    {"cloud_evolution", &Settings::cloudEvolution, Sky, {0.0f, 4.0f}},
+    {"mid_clouds", &Settings::midClouds, Sky},
+    {"mid_cloud_coverage", &Settings::midCloudCoverage, Sky, {0.0f, 1.0f}},
+    {"mid_cloud_altitude", &Settings::midCloudAltitude, Sky, {2000.0f, 9000.0f}},
+    {"mid_cloud_thickness", &Settings::midCloudThickness, Sky, {100.0f, 2000.0f}},
+    {"high_clouds", &Settings::highClouds, Sky},
+    {"high_cloud_coverage", &Settings::highCloudCoverage, Sky, {0.0f, 1.0f}},
+    {"high_cloud_altitude", &Settings::highCloudAltitude, Sky, {5000.0f, 14000.0f}},
+    {"high_cloud_opacity", &Settings::highCloudOpacity, Sky, {0.0f, 2.0f}},
 
     {"quality_preset", &Settings::qualityPreset, Quality},
     {"exact_lights", &Settings::exactLights, Quality, {0.0f, 8.0f}},
@@ -120,6 +146,9 @@ constexpr NamedField kFields[] = {
     {"opacity_micromaps", &Settings::opacityMicromaps, Quality},
     {"radiance_cache", &Settings::radianceCache, Quality},
     {"light_sampling", &Settings::lightSampling, Quality},
+    {"cloud_resolution", &Settings::cloudResolution, Quality},
+    {"cloud_steps", &Settings::cloudSteps, Quality, {16.0f, 256.0f}},
+    {"cloud_light_steps", &Settings::cloudLightSteps, Quality, {2.0f, 16.0f}},
 
     {"anti_aliasing", &Settings::antiAliasing, Image},
     {"upscaling", &Settings::upscaling, Image},
@@ -187,16 +216,40 @@ struct PresetValues {
     bool radianceCache;
     LightSampling lightSampling;
     bool opacityMicromaps;
+    CloudResolution cloudResolution;
+    int cloudSteps;
+    int cloudLightSteps;
 };
 
 // Low, Medium, High (the original quality) and Ultra.
 constexpr PresetValues kPresets[] = {
-    {1, 1, 1, 1, 1, 16, 32, 1, FoliageShadows::Sun, true, IndirectLighting::Baked, EmissiveLighting::Off, false, LightSampling::Auto, true},
-    {2, 1, 1, 2, 1, 24, 48, 4, FoliageShadows::SunAndIndirect, true, IndirectLighting::RayTraced, EmissiveLighting::Bounce, true, LightSampling::Auto, true},
-    {4, 2, 1, 2, 1, 32, 64, 8, FoliageShadows::All, false, IndirectLighting::RayTraced, EmissiveLighting::Full, true, LightSampling::Auto, true},
-    {8, 4, 2, 3, 2, 64, 96, 16, FoliageShadows::All, false, IndirectLighting::RayTraced, EmissiveLighting::Full, true, LightSampling::Auto, true},
+    {1, 1, 1, 1, 1, 16, 32, 1, FoliageShadows::Sun, true, IndirectLighting::Baked, EmissiveLighting::Off, false, LightSampling::Auto, true,
+        CloudResolution::Quarter, 32, 3},
+    {2, 1, 1, 2, 1, 24, 48, 4, FoliageShadows::SunAndIndirect, true, IndirectLighting::RayTraced, EmissiveLighting::Bounce, true, LightSampling::Auto, true,
+        CloudResolution::Half, 48, 4},
+    {4, 2, 1, 2, 1, 32, 64, 8, FoliageShadows::All, false, IndirectLighting::RayTraced, EmissiveLighting::Full, true, LightSampling::Auto, true,
+        CloudResolution::Half, 64, 6},
+    {8, 4, 2, 3, 2, 64, 96, 16, FoliageShadows::All, false, IndirectLighting::RayTraced, EmissiveLighting::Full, true, LightSampling::Auto, true,
+        CloudResolution::Full, 96, 8},
 };
 static_assert(std::size(kPresets) == static_cast<size_t>(QualityPreset::Custom));
+
+// Each weather's layers (our choices). The low layer's thickness is its tallest cloud's depth, after the WMO's
+// International Cloud Atlas: cumulus humilis tens to hundreds of metres deep (fair weather), mediocris up to about 2 km
+// (scattered), congestus sometimes beyond 5 km (towering); a mackerel sky is a middle layer of small altocumulus.
+constexpr WeatherValues kWeathers[] = {
+    // Clear, fair weather, scattered, broken.
+    {0.0f, 1.0f, 1200.0f, 900.0f, 0.0f, 0.0f, 0.0f},
+    {0.2f, 1.0f, 1200.0f, 900.0f, 0.0f, 0.15f, 0.2f},
+    {0.4f, 0.9f, 1200.0f, 2000.0f, 0.1f, 0.25f, 0.3f},
+    {0.7f, 0.6f, 1000.0f, 1200.0f, 0.25f, 0.15f, 0.3f},
+    // Overcast, mackerel sky, cirrus, towering cumulus.
+    {0.95f, 0.3f, 700.0f, 900.0f, 0.4f, 0.1f, 0.3f},
+    {0.05f, 1.0f, 1200.0f, 900.0f, 0.65f, 0.3f, 0.3f},
+    {0.0f, 1.0f, 1200.0f, 900.0f, 0.05f, 0.7f, 0.5f},
+    {0.3f, 1.0f, 1300.0f, 4500.0f, 0.1f, 0.3f, 0.3f},
+};
+static_assert(std::size(kWeathers) == static_cast<size_t>(Weather::Custom));
 
 constexpr char kHeader[] = "# GarrysMod++ settings\n";
 
@@ -356,6 +409,13 @@ std::filesystem::file_time_type WriteTime(const std::filesystem::path& path)
     return error ? std::filesystem::file_time_type{} : time;
 }
 
+// The quality preset and the weather decide the settings they cover.
+void ApplyChoices(Settings& settings)
+{
+    ApplyPreset(settings, settings.qualityPreset);
+    ApplyWeather(settings, settings.weather);
+}
+
 void Recompose()
 {
     Settings settings = g_state.global;
@@ -363,8 +423,8 @@ void Recompose()
         if (g_state.mapSet.test(i))
             Copy(g_state.mapValues, settings, i);
     }
-    // A preset decides the detail settings, so a map that only picks a preset gets all of it.
-    ApplyPreset(settings, settings.qualityPreset);
+    // A preset or weather decides its settings, so a map that only picks one gets all of it.
+    ApplyChoices(settings);
     g_state.effective = settings;
 }
 
@@ -377,7 +437,7 @@ void LoadGlobal()
         return;
     FieldSet set;
     Parse(*text, g_state.global, set);
-    ApplyPreset(g_state.global, g_state.global.qualityPreset);
+    ApplyChoices(g_state.global);
     log::Info("Settings: loaded {}", ToUtf8(path));
 }
 
@@ -518,6 +578,30 @@ void ApplyPreset(Settings& settings, QualityPreset preset)
     settings.radianceCache = values.radianceCache;
     settings.lightSampling = values.lightSampling;
     settings.opacityMicromaps = values.opacityMicromaps;
+    settings.cloudResolution = values.cloudResolution;
+    settings.cloudSteps = values.cloudSteps;
+    settings.cloudLightSteps = values.cloudLightSteps;
+}
+
+WeatherValues WeatherOf(Weather weather, const Settings& settings)
+{
+    if (weather < Weather::Custom)
+        return kWeathers[static_cast<size_t>(weather)];
+    return {settings.cloudCoverage, settings.cloudType, settings.cloudAltitude, settings.cloudThickness, settings.midCloudCoverage,
+        settings.highCloudCoverage, settings.highCloudOpacity};
+}
+
+void ApplyWeather(Settings& settings, Weather weather)
+{
+    settings.weather = weather;
+    const WeatherValues values = WeatherOf(weather, settings);
+    settings.cloudCoverage = values.coverage;
+    settings.cloudType = values.type;
+    settings.cloudAltitude = values.altitude;
+    settings.cloudThickness = values.thickness;
+    settings.midCloudCoverage = values.midCoverage;
+    settings.highCloudCoverage = values.highCoverage;
+    settings.highCloudOpacity = values.highOpacity;
 }
 
 const Settings& GetSettings()
@@ -601,7 +685,7 @@ void Reset(Scope scope, std::span<const FieldId> fields)
             g_state.mapDirty = true;
         }
     }
-    ApplyPreset(g_state.global, g_state.global.qualityPreset);
+    ApplyChoices(g_state.global);
     Recompose();
 }
 
@@ -653,7 +737,7 @@ std::optional<SectionMask> Import(Scope scope, std::string_view text)
     }
     if (sections == 0)
         return std::nullopt;
-    ApplyPreset(g_state.global, g_state.global.qualityPreset);
+    ApplyChoices(g_state.global);
     Recompose();
     return sections;
 }

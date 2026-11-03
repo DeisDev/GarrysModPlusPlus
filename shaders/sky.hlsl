@@ -5,7 +5,9 @@
 // src/shaderapi_capture.cpp's cube of what the game drew, or of the procedural sky that replaces it: radiance before
 // the tonemap scale, -1 where nothing was drawn) averaged down to
 // kSize x kSize texels a face, then scaled so that a surface facing up under open sky gets the map's sky light
-// (g_frame.skyColor), as it did from a uniform sky. Directions the game has not drawn take the sky light itself.
+// (g_frame.skyColor), as it did from a uniform sky. Directions the game has not drawn take the sky light itself. With
+// clouds (input1, the faces of their cube in the procedural sky's size, or kNoView) the sky is seen through them; the
+// map's sky light already holds how much they change its brightness (Lighting::FillConstants).
 // output0: the kSize x kSize x 6 cube.
 // Step 0: a group per output texel averages its block of the drawn sky. Step 1: one group scales the cube.
 
@@ -42,9 +44,16 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_GroupThreadID, uint index 
         float4 sum = 0.0;
         for (uint y = first.y; y < min(first.y + span, block); ++y) {
             for (uint x = first.x; x < min(first.x + span, block); ++x) {
-                float3 radiance = sky.Load(int4(group.xy * block + uint2(x, y), group.z, 0)).rgb;
-                if (all(radiance >= 0.0))
-                    sum += float4(radiance, 1.0);
+                int4 texel = int4(group.xy * block + uint2(x, y), group.z, 0);
+                float3 radiance = sky.Load(texel).rgb;
+                if (!all(radiance >= 0.0))
+                    continue;
+                if (g_pass.input1 != kNoView) {
+                    Texture2DArray<float4> clouds = ResourceDescriptorHeap[g_pass.input1];
+                    float4 seen = clouds.Load(texel);
+                    radiance = radiance * seen.a + seen.rgb;
+                }
+                sum += float4(radiance, 1.0);
             }
         }
         sum = GroupSum(sum, index);

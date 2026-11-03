@@ -860,6 +860,81 @@ void DrawSkyPage(Settings& settings)
         widgets::EndRows();
     }
     widgets::EndCard();
+
+    const bool sky = settings.physicalSky;
+    const char* const skyReason = Text("lighting.physical_sky_reason");
+    const bool clouds = sky && settings.clouds;
+    const char* const cloudsReason = sky ? Text("lighting.clouds_reason") : skyReason;
+    // While the weather changes on its own it sets the settings a weather decides.
+    const bool changing = clouds && settings.changingWeather;
+    const bool chosen = clouds && !settings.changingWeather;
+    const char* const chosenReason = clouds ? Text("lighting.weather_reason") : cloudsReason;
+    constexpr const char* kWeathers[] = {"lighting.weather_clear", "lighting.weather_fair", "lighting.weather_scattered", "lighting.weather_broken",
+        "lighting.weather_overcast", "lighting.weather_mackerel", "lighting.weather_cirrus", "lighting.weather_towering", "lighting.weather_custom"};
+    static_assert(std::size(kWeathers) == static_cast<size_t>(Weather::Count));
+    widgets::BeginCard("##clouds", Text("lighting.section_clouds"));
+    if (widgets::BeginRows("clouds")) {
+        SwitchRow("lighting.clouds", &Settings::clouds, sky, skyReason);
+        SwitchRow("lighting.changing_weather", &Settings::changingWeather, clouds, cloudsReason);
+        SliderRow("lighting.weather_duration", &Settings::weatherDuration, changing, clouds ? Text("lighting.weather_duration_reason") : cloudsReason, 0);
+        if (changing) {
+            const Statistics& statistics = GetStatistics();
+            const char* const now = Text(kWeathers[static_cast<size_t>(statistics.weather)]);
+            ValueRow("lighting.weather_now", statistics.nextWeather == statistics.weather ? std::string(now) :
+                ui::Format("lighting.weather_turning", {{"from", now}, {"to", Text(kWeathers[static_cast<size_t>(statistics.nextWeather)])}}));
+        }
+        const Weather weather = settings.weather;
+        ComboRow("lighting.weather", &Settings::weather, kWeathers, chosen, chosenReason);
+        if (settings.weather != weather)
+            ApplyWeather(settings, settings.weather);
+        SliderRow("lighting.cloud_coverage", &Settings::cloudCoverage, chosen, chosenReason);
+        SliderRow("lighting.cloud_type", &Settings::cloudType, chosen, chosenReason);
+        SliderRow("lighting.cloud_altitude", &Settings::cloudAltitude, chosen, chosenReason, 0);
+        SliderRow("lighting.cloud_thickness", &Settings::cloudThickness, chosen, chosenReason, 0);
+        SliderRow("lighting.cloud_density", &Settings::cloudDensity, clouds, cloudsReason);
+        SliderRow("lighting.cloud_size", &Settings::cloudSize, clouds, cloudsReason);
+        SliderRow("lighting.cloud_detail", &Settings::cloudDetail, clouds, cloudsReason);
+        SliderRow("lighting.cloud_droplet_size", &Settings::cloudDropletSize, clouds, cloudsReason, 1);
+        SliderRow("lighting.cloud_multiple_scattering", &Settings::cloudMultipleScattering, clouds, cloudsReason);
+        StrengthRow("lighting.cloud_shadows", &Settings::cloudShadows, &Settings::cloudShadowStrength, clouds, cloudsReason);
+        widgets::EndRows();
+    }
+    widgets::EndCard();
+
+    widgets::BeginCard("##wind", Text("lighting.section_wind"));
+    if (widgets::BeginRows("wind")) {
+        SliderRow("lighting.wind_speed", &Settings::windSpeed, clouds, cloudsReason, 1);
+        SliderRow("lighting.wind_direction", &Settings::windDirection, clouds, cloudsReason, 0);
+        SliderRow("lighting.cloud_evolution", &Settings::cloudEvolution, clouds, cloudsReason);
+        widgets::EndRows();
+    }
+    widgets::EndCard();
+
+    widgets::BeginCard("##higher_clouds", Text("lighting.section_higher_clouds"));
+    if (widgets::BeginRows("higher_clouds")) {
+        SwitchRow("lighting.mid_clouds", &Settings::midClouds, clouds, cloudsReason);
+        const bool middle = clouds && settings.midClouds;
+        const char* const middleReason = clouds ? Text("lighting.mid_clouds_reason") : cloudsReason;
+        SliderRow("lighting.mid_cloud_coverage", &Settings::midCloudCoverage, middle && chosen, middle ? chosenReason : middleReason);
+        SliderRow("lighting.mid_cloud_altitude", &Settings::midCloudAltitude, middle, middleReason, 0);
+        SliderRow("lighting.mid_cloud_thickness", &Settings::midCloudThickness, middle, middleReason, 0);
+        SwitchRow("lighting.high_clouds", &Settings::highClouds, clouds, cloudsReason);
+        const bool high = clouds && settings.highClouds;
+        const char* const highReason = clouds ? Text("lighting.high_clouds_reason") : cloudsReason;
+        SliderRow("lighting.high_cloud_coverage", &Settings::highCloudCoverage, high && chosen, high ? chosenReason : highReason);
+        SliderRow("lighting.high_cloud_altitude", &Settings::highCloudAltitude, high, highReason, 0);
+        SliderRow("lighting.high_cloud_opacity", &Settings::highCloudOpacity, high && chosen, high ? chosenReason : highReason);
+        widgets::EndRows();
+    }
+    widgets::EndCard();
+
+    // A weather sets its cloud settings, so changing one of them makes it Custom.
+    if (settings.weather != Weather::Custom) {
+        Settings picked = settings;
+        ApplyWeather(picked, settings.weather);
+        if (picked != settings)
+            settings.weather = Weather::Custom;
+    }
 }
 
 // Every setting on this page is set by the quality preset, so changing one makes the preset Custom.
@@ -939,6 +1014,19 @@ void DrawQualityPage(Settings& settings)
     }
     if (!micromapsAvailable)
         widgets::Note(Text("quality.micromaps_unavailable"));
+    widgets::EndCard();
+
+    widgets::BeginCard("##clouds", Text("quality.section_clouds"));
+    if (widgets::BeginRows("clouds")) {
+        const bool clouds = settings.physicalSky && settings.clouds;
+        const char* const cloudsReason = Text("quality.clouds_reason");
+        constexpr const char* kResolutions[] = {"quality.cloud_resolution_quarter", "quality.cloud_resolution_half", "quality.cloud_resolution_full"};
+        static_assert(std::size(kResolutions) == static_cast<size_t>(CloudResolution::Count));
+        SegmentRow("quality.cloud_resolution", &Settings::cloudResolution, kResolutions, {}, clouds, cloudsReason);
+        SliderRow("quality.cloud_steps", &Settings::cloudSteps, clouds, cloudsReason);
+        SliderRow("quality.cloud_light_steps", &Settings::cloudLightSteps, clouds, cloudsReason);
+        widgets::EndRows();
+    }
     widgets::EndCard();
 
     if (settings.qualityPreset != QualityPreset::Custom) {

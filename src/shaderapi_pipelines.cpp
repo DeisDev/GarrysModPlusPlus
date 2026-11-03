@@ -1087,9 +1087,14 @@ struct SkyConstants {
     std::uint32_t skyView;
     std::uint32_t target;
     std::uint32_t padding;
+    std::array<Float4, 4> cloudViewProj;
+    std::uint32_t cloudHistoryView;
+    std::uint32_t cloudCubeView;
+    float cloudOverscan;
+    std::uint32_t cloudPadding;
     NightSkyConstants night;
 };
-static_assert(sizeof(SkyConstants) == 496);
+static_assert(sizeof(SkyConstants) == 576);
 
 // SkyDrawConstants::target: how a colour target stores colour.
 std::uint32_t TargetEncoding(DXGI_FORMAT format)
@@ -1170,6 +1175,11 @@ D3D12_GPU_VIRTUAL_ADDRESS SkyDrawConstants(const gbuffer::SkyDraw& sky, std::spa
     constants.tonemapScale = dynamic.pixelFloats[gbuffer::kLightScaleRegister].v[0];
     constants.skyView = sky.skyView;
     constants.target = TargetEncoding(format);
+    for (size_t r = 0; r < 4; ++r)
+        std::copy(sky.cloudViewProj[r].begin(), sky.cloudViewProj[r].end(), constants.cloudViewProj[r].v);
+    constants.cloudHistoryView = sky.cloudHistoryView;
+    constants.cloudCubeView = sky.cloudCubeView;
+    constants.cloudOverscan = sky.cloudOverscan;
     constants.night = PackNightSky(sky);
     return UploadConstants(&constants, sizeof(constants));
 }

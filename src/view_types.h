@@ -139,6 +139,18 @@ struct SkyDraw {
     uint32_t satelliteCount = 0;
     std::array<Meteor, kMaxMeteors> meteors = {};
     uint32_t meteorCount = 0;
+    // The disc's radiance in the procedural sky's units, which tells how much of it shows through clouds.
+    float discRadiance = kUnknownDiscRadiance;
+    // The clouds over the sky (shaders/clouds.hlsl): the last main view's history, the rows from a direction to its clip
+    // space and its overscan, and the cube of them for other directions; kNoCloudView without clouds.
+    UINT cloudHistoryView = kNoCloudView;
+    UINT cloudCubeView = kNoCloudView;
+    std::array<std::array<float, 4>, 4> cloudViewProj = {};
+    float cloudOverscan = 0.0f;
+
+    static constexpr UINT kNoCloudView = 0xFFFFFFFFu;
+    // A disc whose radiance is not known yet shows through anything but opaque clouds.
+    static constexpr float kUnknownDiscRadiance = 1e30f;
 };
 
 // The irradiance volume that lights what the game draws after the capture (shaders/probes.hlsl): kProbeGrid

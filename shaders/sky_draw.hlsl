@@ -16,8 +16,18 @@ struct SkyDrawConstants
     // How the target stores colour: 0 floating point, 1 8-bit, 2 8-bit sRGB.
     uint target;
     uint padding;
+    // The clouds over the sky (shaders/clouds.hlsl), as (light, transmittance): the last main view's history, whose clip
+    // space a direction reaches through cloudViewProj's rows and which spans the screen widened by cloudOverscan on each
+    // side, and their cube for directions outside it; kNoView without clouds.
+    float4 cloudViewProj[4];
+    uint cloudHistoryView;
+    uint cloudCubeView;
+    float cloudOverscan;
+    uint cloudPadding;
     NightSkyConstants night;
 };
+
+static const uint kNoView = 0xFFFFFFFFu;
 
 ConstantBuffer<SkyDrawConstants> g_sky : register(b0, space1);
 SamplerState g_linearClamp : register(s0, space1);
@@ -70,6 +80,33 @@ float PixelAngle(float2 pixel, float3 direction)
     return sqrt(length(ViewDirection(pixel + float2(1.0, 0.0)) - direction) * length(ViewDirection(pixel + float2(0.0, 1.0)) - direction));
 }
 
+// The clouds toward a direction as (light, transmittance): the main view's history where it holds the direction, fading
+// to the cube over its overscan, else the cube.
+float4 CloudsToward(float3 direction)
+{
+    float4 clouds = float4(0.0, 0.0, 0.0, 1.0);
+    if (g_sky.cloudCubeView == kNoView)
+        return clouds;
+    float inside = 0.0;
+    float2 uv = 0.0;
+    if (g_sky.cloudHistoryView != kNoView) {
+        float4 clip = float4(dot(g_sky.cloudViewProj[0].xyz, direction), dot(g_sky.cloudViewProj[1].xyz, direction), 0.0,
+            dot(g_sky.cloudViewProj[3].xyz, direction));
+        uv = clip.xy / max(clip.w, 1e-6) * float2(0.5, -0.5) + 0.5;
+        float2 edge = min(uv, 1.0 - uv);
+        inside = clip.w > 0.0 ? saturate(min(edge.x, edge.y) * (1.0 + 2.0 * g_sky.cloudOverscan) / max(g_sky.cloudOverscan, 1e-3)) : 0.0;
+    }
+    if (inside < 1.0) {
+        TextureCube<float4> cube = ResourceDescriptorHeap[g_sky.cloudCubeView];
+        clouds = cube.SampleLevel(g_linearClamp, direction, 0.0);
+    }
+    if (inside > 0.0) {
+        Texture2D<float4> history = ResourceDescriptorHeap[g_sky.cloudHistoryView];
+        clouds = lerp(clouds, history.SampleLevel(g_linearClamp, uv, 0.0), inside);
+    }
+    return clouds;
+}
+
 float4 SkyMain(Interpolants input) : SV_Target0
 {
     float3 direction = ViewDirection(input.position.xy);
@@ -77,15 +114,18 @@ float4 SkyMain(Interpolants input) : SV_Target0
     TextureCube<float4> sky = ResourceDescriptorHeap[g_sky.skyView];
     Texture2D<float4> transmittance = ResourceDescriptorHeap[g_sky.night.transmittanceView];
     float4 procedural = sky.SampleLevel(g_linearClamp, direction, 0.0);
+    // The clouds hide what lies beyond them: the night sky and the Moon by its gain, the disc as far as the target shows.
+    float4 clouds = CloudsToward(direction);
+    float logGain = LogGainThroughClouds(procedural.a, clouds.a);
     float moonCoverage;
-    float3 moon = MoonDisc(g_sky.night, direction, pixelAngle, procedural.a, g_sky.tonemapScale, transmittance, g_linearClamp, moonCoverage);
-    float3 color = procedural.rgb;
+    float3 moon = MoonDisc(g_sky.night, direction, pixelAngle, logGain, g_sky.tonemapScale, transmittance, g_linearClamp, moonCoverage);
+    float3 color = procedural.rgb * clouds.a + clouds.rgb;
     if (g_sky.night.parts != 0)
-        color += NightSkyLight(g_sky.night, direction, procedural.a, kPointFootprint * pixelAngle, g_sky.tonemapScale, transmittance, g_linearClamp) *
+        color += NightSkyLight(g_sky.night, direction, logGain, kPointFootprint * pixelAngle, g_sky.tonemapScale, transmittance, g_linearClamp) *
             (1.0 - moonCoverage);
     color = color * g_sky.tonemapScale + moon;
     if (g_sky.night.disc != 0)
-        color += SunDisc(g_sky.night, direction, pixelAngle, transmittance, g_linearClamp);
+        color += SunDisc(g_sky.night, direction, pixelAngle, transmittance, g_linearClamp) * DiscThroughClouds(g_sky.night, clouds.a, g_sky.tonemapScale);
     // An 8-bit target rounds the sky's smooth gradients, after encoding them as sRGB when it does.
     if (g_sky.target != 0) {
         float noise = DitherNoise(uint2(input.position.xy)) / 255.0;

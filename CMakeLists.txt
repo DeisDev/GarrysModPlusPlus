@@ -299,6 +299,7 @@ add_shader(shaders/view_rect.hlsl main cs_6_6 g_viewRectCS)
 add_shader(shaders/sky.hlsl main cs_6_6 g_skyCS)
 # The procedural sky: its atmosphere and colours, and the pixel shaders of the game's 2D sky draws.
 add_shader(shaders/sky_atmosphere.hlsl main cs_6_6 g_skyAtmosphereCS)
+add_shader(shaders/clouds.hlsl main cs_6_6 g_cloudsCS)
 add_shader(shaders/sky_draw.hlsl SkyMain ps_6_6 g_skyDrawPS)
 add_shader(shaders/sky_draw.hlsl DiscMain ps_6_6 g_sunDiscPS)
 add_shader(shaders/translucent_depth.hlsl main cs_6_6 g_translucentDepthCS)
@@ -489,6 +490,7 @@ add_library(gmodpp SHARED
     src/world.cpp
     src/lighting.cpp
     src/night_sky.cpp
+    src/clouds.cpp
     src/gbuffer_shaders.cpp
     src/scene.cpp
     src/bsp.cpp

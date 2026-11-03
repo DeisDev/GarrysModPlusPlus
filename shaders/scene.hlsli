@@ -753,12 +753,34 @@ float3 Transmittance(float3 origin, float3 direction, float tMax, uint mask, uin
     return query.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? 0.0 : transmittance;
 }
 
+// The share of the sun's light the clouds let through to a point (shaders/clouds.hlsl's shadow map), in the 3D skybox's
+// space when `mask` holds kSkyboxMask: the fine cascade where it covers the point, else the coarse one.
+float CloudShadowAt(float3 origin, uint mask)
+{
+    if (g_frame.cloudShadowView == kNoView)
+        return 1.0;
+    float3 position = origin;
+    if ((mask & kSkyboxMask) != 0 && g_frame.worldToSky > 0.0)
+        position = (origin - float3(g_frame.skyCameraX, g_frame.skyCameraY, g_frame.skyCameraZ)) / g_frame.worldToSky;
+    float2 plane = float2(dot(position, g_frame.cloudShadowU.xyz) + g_frame.cloudShadowU.w, dot(position, g_frame.cloudShadowV.xyz) + g_frame.cloudShadowV.w);
+    Texture2D<float> shadow = ResourceDescriptorHeap[g_frame.cloudShadowView];
+    float edge = g_frame.cloudShadowEdge;
+    float2 uv = plane * g_frame.cloudShadowFineScale + 0.5;
+    float cascade = 0.0;
+    if (any(abs(uv - 0.5) > 0.5 - edge)) {
+        uv = plane * g_frame.cloudShadowCoarseScale + 0.5;
+        cascade = 1.0;
+    }
+    uv = clamp(uv, edge, 1.0 - edge);
+    return shadow.SampleLevel(g_linearClamp, float2((uv.x + cascade) * 0.5, uv.y), 0.0);
+}
+
 // `mask` is g_frame.sunShadowMask, or g_frame.bounceMask for the light of indirect bounces. As VRAD did
 // (TestLine_DoesHitSky in src/utils/vrad/trace.cpp), rays from the map that reach the sky go on through the 3D
-// skybox, whose buildings and terrain shadow the map.
+// skybox, whose buildings and terrain shadow the map. The clouds take their share.
 float3 SunVisibilityAlong(float3 origin, float3 direction, uint mask, uint rayFlags)
 {
-    float3 visibility = Transmittance(origin, direction, 65536.0, mask, rayFlags);
+    float3 visibility = Transmittance(origin, direction, 65536.0, mask, rayFlags) * CloudShadowAt(origin, mask);
     if (any(visibility > 0.0) && g_frame.worldToSky > 0.0 && (mask & kSkyboxMask) == 0) {
         float3 camera = float3(g_frame.skyCameraX, g_frame.skyCameraY, g_frame.skyCameraZ);
         visibility *= Transmittance(camera + origin * g_frame.worldToSky, direction, 65536.0, kSkyboxMask);
@@ -890,7 +912,7 @@ float3 SunVisibilityToNearest(float3 origin, float3 direction, uint mask, uint r
         occluder = occluder < length ? occluder : 65536.0;
         return any(under > 0.0) ? UnderwaterSunVisibility(origin, water, direction, mask, rayFlags) : 0.0;
     }
-    float3 visibility = TransmittanceToNearest(origin, direction, 65536.0, mask, rayFlags, occluder);
+    float3 visibility = TransmittanceToNearest(origin, direction, 65536.0, mask, rayFlags, occluder) * CloudShadowAt(origin, mask);
     if (any(visibility > 0.0) && g_frame.worldToSky > 0.0 && (mask & kSkyboxMask) == 0) {
         float3 camera = float3(g_frame.skyCameraX, g_frame.skyCameraY, g_frame.skyCameraZ);
         float skyOccluder;

@@ -15,7 +15,8 @@
 //    scale makes the sky above the horizon as bright as the game's; below it, where the clear sky is only a ground of guessed albedo, a band takes the game's colour and
 //    brightness. Without the game's sky above the horizon the scale makes it as bright as the map's sky light (input3,
 //    float bits: its luminance). Texel kBands: the mean luminance of the game's sky above the horizon where it was drawn
-//    (x, -1 without any), which tells night maps (Lighting::ReadMapSky).
+//    (x, -1 without any), which tells night maps (Lighting::ReadMapSky), and the scale (y), which is how bright sunlight
+//    of irradiance 1 is in the procedural sky's units, as the clouds (shaders/clouds.hlsl) are lit.
 // 4: the procedural sky (output0, a cube's faces): step 2's sky for the sun the sky shows (input0), plus the moonless
 //    night's floor times the sky with the map's sun (input2) and the Moon's share times the sky it lights (input4, step
 //    2's sky for the Moon of day maps), times the multiplier of its elevation (input1), a smooth curve through the bands;
@@ -193,8 +194,8 @@ void ColourBands(uint index)
             }
         }
         RWTexture2D<float4> bands = ResourceDescriptorHeap[g_pass.output0];
-        bands[uint2(kBands, 0)] = float4(drawnWeights > 0.0 ? captured / drawnWeights : -1.0, 0.0, 0.0, 1.0);
         g_scale = captured > 0.0 && drawn > 0.0 ? captured / drawn : asfloat(g_pass.input3) / max(all / weights, 1e-30);
+        bands[uint2(kBands, 0)] = float4(drawnWeights > 0.0 ? captured / drawnWeights : -1.0, g_scale, 0.0, 1.0);
     }
     GroupMemoryBarrierWithGroupSync();
     if (index < kBands) {

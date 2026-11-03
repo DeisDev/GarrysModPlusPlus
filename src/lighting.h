@@ -1,5 +1,6 @@
 #pragma once
 
+#include "clouds.h"
 #include "d3d12_device.h"
 #include "dlss.h"
 #include "night_sky.h"
@@ -29,7 +30,8 @@ namespace gmodpp {
 
 // Mirrors FrameConstants in shaders/common.hlsli.
 struct FrameConstants {
-    float invViewProj[4][4];
+    // The jittered view-projection's inverse relative to the eye: clip space to the point less eyePosition, over w.
+    float clipToEye[4][4];
     float viewProj[4][4];
     float prevViewProj[4][4];
     float eyePosition[3];
@@ -213,8 +215,16 @@ struct FrameConstants {
     float fogSunScale[3];
     float fogSkyScale;
     float fogAirLight;
-    uint32_t padding6[2];
+    // The clouds' cube and shadow map (shaders/clouds.hlsl), and where a point falls on the shadow map's plane.
+    uint32_t cloudCubeView;
+    uint32_t cloudShadowView;
     uint32_t lightWarpViews[64];
+    float cloudShadowU[4];
+    float cloudShadowV[4];
+    float cloudShadowFineScale;
+    float cloudShadowCoarseScale;
+    float cloudShadowEdge;
+    uint32_t padding7;
 };
 
 // Mirrors SamplingConstants in shaders/nvidia/sharc_common.hlsli: the radiance cache's parameters, bound to every pass
@@ -370,6 +380,12 @@ public:
         m_loggedLowMapSun = false;
         m_nightMap.reset();
         m_mapSkyReadbackPending = {};
+        m_cloudReadbackPending = {};
+        m_cloudsReady = false;
+        m_cloudShadowReady = false;
+        m_cloudCubeValid = false;
+        m_cloudHistoryValid = false;
+        m_cloudSkyFactor = 1.0f;
     }
     // Whether the last main view filled the irradiance volume for translucent surfaces, and the volume's first cell.
     bool VolumeReady() const { return m_volumeReady; }
@@ -443,6 +459,7 @@ private:
         Skin,
         SkyAtmosphere,
         FlareVisibility,
+        Clouds,
         Count
     };
     // Mirrors PassConstants in shaders/common.hlsli: descriptor indices (none by default) and a parameter.
@@ -543,6 +560,17 @@ private:
     // in the game's colours, which `constants` then read in place of the game's sky, and its night sky; with the sun's
     // disc, what draws it. Publishes both in m_skyDraw.
     void RecordSky(FrameConstants& constants, const ViewInputs& inputs, const Scene& scene, UINT slot);
+    // How much the clouds change the sky's light (FrameConstants::skyColor): the cloudy sky's irradiance on a surface
+    // facing up over the clear sky's, as the clouds' light last read back (1 without clouds).
+    float CloudSkyFactor(const ViewInputs& inputs, const Scene& scene) const;
+    // Makes the main view's clouds over the procedural sky (shaders/clouds.hlsl), after RecordSky: their shadow map,
+    // light, cube and history; points `constants` at the cube and shadow map and publishes the clouds in m_skyDraw.
+    // Without the physical sky or clouds there are none.
+    void RecordClouds(FrameConstants& constants, const ViewInputs& inputs, const Scene& scene, UINT slot);
+    // Points `constants` at the last clouds RecordClouds made.
+    void SetCloudConstants(FrameConstants& constants) const;
+    // Reads the slot's copy of the clouds' light: the sky's scale and how much the clouds change its light.
+    void ReadCloudLight(UINT slot);
     // Writes each body of water's surface as the game last drew it (the draw whose fog colour is the body's) into the
     // slot's m_waterDraws, with views of their normal maps from `firstView` on, and points `constants` at them.
     void WriteWaterDraws(UINT slot, const ViewInputs& inputs, const Scene& scene, UINT firstView, FrameConstants& constants);
@@ -725,6 +753,49 @@ private:
     gbuffer::SkyDraw m_skyDraw;
     // The stars' frame, satellites and meteors of the physical sky's night.
     NightSky m_nightSky;
+    // The clouds (shaders/clouds.hlsl): their noise (shape and detail volumes, the weather), made once; the sun's
+    // transmittance through them over two cascades side by side (m_cloudShadowU and on place it), their light (on its
+    // way to the CPU per slot: the sky's scale and how much they change the sky's light), the cube of them (faces
+    // m_cloudCubeFaces, valid once traced in full this map), and the main view's trace and history (ping-ponged,
+    // m_cloudHistoryCurrent the last written) at m_cloudHistorySize with its last clip space; and per slot their
+    // constants. Ready once a main view has made them.
+    Texture m_cloudShape;
+    Texture m_cloudDetail;
+    Texture m_cloudWeatherMap;
+    // The clouds' two-dimensional shapes (shaders/clouds.hlsl steps 10 to 12), equalised by their distribution, made once
+    // with the noise.
+    Texture m_cloudShapes;
+    Texture m_cloudShapeDistribution;
+    // The cirrus' strands with every mip (srv), and an unordered access view of each mip.
+    Texture m_cirrusStrands;
+    std::array<UINT, 11> m_cirrusMipViews = {};
+    bool m_cloudNoiseReady = false;
+    Texture m_cloudShadow;
+    float m_cloudShadowU[4] = {};
+    float m_cloudShadowV[4] = {};
+    bool m_cloudShadowReady = false;
+    Texture m_cloudLight;
+    std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, kSlots> m_cloudReadback;
+    std::array<bool, kSlots> m_cloudReadbackPending = {};
+    float m_cloudSkyFactor = 1.0f;
+    float m_skyScale = 0.0f;
+    Texture m_cloudCube;
+    UINT m_cloudCubeFaces = DescriptorHeap::kInvalid;
+    bool m_cloudCubeValid = false;
+    Texture m_cloudTrace;
+    Texture m_cloudTraceDepth;
+    std::array<Texture, 2> m_cloudHistory;
+    UINT m_cloudHistoryCurrent = 0;
+    std::array<UINT, 2> m_cloudHistorySize = {};
+    bool m_cloudHistoryValid = false;
+    float m_cloudViewProj[4][4] = {};
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_cloudConstants;
+    std::byte* m_cloudConstantsMapped = nullptr;
+    std::array<UINT, kSlots> m_cloudConstantViews = {};
+    bool m_cloudsReady = false;
+    bool m_cloudsFailed = false;
+    UINT m_cloudFrame = 0;
+    CloudWeather m_cloudWeather;
     // The main view's caustics and the water's sun maps (shaders/caustics.hlsl): the photon counts, how much the water
     // focuses sunlight over the square from m_causticsOrigin, 1 / m_causticsInvSize across, and the sun maps of that
     // square and of the coarse one that covers the map; ready once a main view has traced them this map.

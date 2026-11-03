@@ -72,6 +72,12 @@ enum class LightSampling : uint32_t { Legacy = 0, Ris, Restir, Auto, Count };
 // or NVIDIA NRD's RELAX or REBLUR.
 enum class DenoiserType : uint32_t { BuiltIn = 0, Relax, Reblur, Count };
 
+// The resolution the main view's clouds are kept at: a quarter, half or all of the screen's across.
+enum class CloudResolution : uint32_t { Quarter = 0, Half, Full, Count };
+
+// A mix of the three cloud layers (WeatherOf); Custom takes the cloud settings as they are.
+enum class Weather : uint32_t { Clear = 0, FairWeather, Scattered, Broken, Overcast, MackerelSky, Cirrus, Towering, Custom, Count };
+
 // How much the performance overlay shows, and the corner of the screen it sits in.
 // Where depth of field focuses: on what the crosshair points at, or at Settings::dofFocusDistance.
 enum class DofFocus : uint32_t { Auto = 0, Manual, Count };
@@ -157,6 +163,44 @@ struct Settings {
     // Our sun disc replaces env_sun's sprite, scaled from the size it has (Lighting::RecordSky).
     bool sunDisc = true;
     float sunSize = 1.0f;
+    // Volumetric clouds in the physical sky (shaders/clouds.hlsl). With changingWeather the weather turns from one to
+    // another on its own (CloudWeather), each holding about weatherDuration minutes; otherwise `weather` sets the
+    // cloudCoverage to highCloudOpacity values (ApplyWeather), and Custom keeps them as they are. The low layer covers
+    // cloudCoverage of the sky (1 overcast) with clouds of cloudType (0 stratus, 0.5 stratocumulus, 1 cumulus) from
+    // cloudAltitude metres above the map, the tallest cloudThickness metres tall, cloudDensity times as dense as a
+    // cumulus, cloudSize times as large, their edges eroded by cloudDetail. Their droplets are cloudDropletSize
+    // micrometres across (their phase function), and each order of scattering passes cloudMultipleScattering of the light
+    // on. They shade the map (cloudShadows) at cloudShadowStrength of their transmittance's effect. The defaults are
+    // Weather::FairWeather's.
+    bool clouds = true;
+    bool changingWeather = true;
+    float weatherDuration = 15.0f;
+    Weather weather = Weather::FairWeather;
+    float cloudCoverage = 0.2f;
+    float cloudType = 1.0f;
+    float cloudDensity = 1.0f;
+    float cloudSize = 1.0f;
+    float cloudDetail = 0.7f;
+    float cloudAltitude = 1200.0f;
+    float cloudThickness = 900.0f;
+    float cloudDropletSize = 20.0f;
+    float cloudMultipleScattering = 0.7f;
+    bool cloudShadows = true;
+    float cloudShadowStrength = 1.0f;
+    // The wind carries the clouds windSpeed metres a second toward windDirection degrees (Hammer's yaw), higher layers
+    // faster, and their shapes change cloudEvolution times as fast as by default.
+    float windSpeed = 8.0f;
+    float windDirection = 30.0f;
+    float cloudEvolution = 1.0f;
+    // A thin middle layer (altocumulus) and a sheet of cirrus above, highCloudOpacity its optical depth where thickest.
+    bool midClouds = true;
+    float midCloudCoverage = 0.0f;
+    float midCloudAltitude = 4500.0f;
+    float midCloudThickness = 600.0f;
+    bool highClouds = true;
+    float highCloudCoverage = 0.15f;
+    float highCloudAltitude = 9000.0f;
+    float highCloudOpacity = 0.2f;
     float sunIntensity = 1.0f;
     float skyIntensity = 1.0f;
     float lightIntensity = 1.0f;
@@ -255,6 +299,11 @@ struct Settings {
     LightSampling lightSampling = LightSampling::Auto;
     DenoiserType denoiserType = DenoiserType::Relax;
     bool opacityMicromaps = true;
+    // The main view's clouds at cloudResolution, marched in cloudSteps steps straight up (twice as many toward the
+    // horizon) and cloudLightSteps toward the light from each.
+    CloudResolution cloudResolution = CloudResolution::Half;
+    int cloudSteps = 64;
+    int cloudLightSteps = 6;
     // The display the game window goes on, 1-based in the order Displays() lists them; 0 leaves it where the game
     // puts it (the primary display).
     int display = 0;
@@ -264,6 +313,22 @@ struct Settings {
 
 // Sets the ray tracing detail settings (the menu's Quality page) to a preset's values; QualityPreset::Custom leaves them.
 void ApplyPreset(Settings& settings, QualityPreset preset);
+
+// What a weather sets: the low layer's coverage, type, altitude and thickness (metres), the middle and high layers'
+// coverage, and the cirrus' optical depth (the Settings members of the same names).
+struct WeatherValues {
+    float coverage;
+    float type;
+    float altitude;
+    float thickness;
+    float midCoverage;
+    float highCoverage;
+    float highOpacity;
+};
+// A weather's values; Custom's are the settings' own.
+WeatherValues WeatherOf(Weather weather, const Settings& settings);
+// Sets the cloud settings a weather decides to its values; Weather::Custom leaves them.
+void ApplyWeather(Settings& settings, Weather weather);
 
 // The settings in effect: the global ones with the current map's overrides (config namespace). Read-only: the menu
 // changes settings through config::Commit.
@@ -287,7 +352,8 @@ constexpr SectionMask kShareableSections =
 
 using SettingMember = std::variant<bool Settings::*, float Settings::*, int Settings::*, Color Settings::*, DebugView Settings::*, AntiAliasing Settings::*,
     UpscalingMode Settings::*, QualityPreset Settings::*, FoliageShadows Settings::*, IndirectLighting Settings::*, EmissiveLighting Settings::*,
-    LightSampling Settings::*, DenoiserType Settings::*, MapSun Settings::*, OverlayDetail Settings::*, OverlayCorner Settings::*, DofFocus Settings::*>;
+    LightSampling Settings::*, DenoiserType Settings::*, MapSun Settings::*, OverlayDetail Settings::*, OverlayCorner Settings::*, DofFocus Settings::*,
+    CloudResolution Settings::*, Weather Settings::*>;
 
 // A setting's place in the settings table (kFields in settings.cpp).
 using FieldId = uint16_t;
@@ -407,6 +473,10 @@ struct Statistics {
     std::array<float, 3> mapSunColor = {};
     std::array<float, 3> mapSkyColor = {};
     bool mapHasSun = false;
+    // The changing weather in the last main view: the weather it shows and the one it is turning to (the same while it
+    // holds).
+    Weather weather = Weather::FairWeather;
+    Weather nextWeather = Weather::FairWeather;
     // The game's fog in the open air before the fog override: sRGB colour, start, end and maximum density.
     Color gameFogColor = {};
     float gameFogStart = 0.0f;

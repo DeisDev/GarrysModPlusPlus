@@ -64,9 +64,10 @@ void main(uint3 id : SV_DispatchThreadID)
         }
     }
     float3 previous = position;
-    // The 2D sky turns with the sun where it shows the stars or the sun's disc (FrameConstants::skyMotion).
+    // The 2D sky turns with the sun where it shows the stars or the sun's disc (FrameConstants::skyMotion), but not where
+    // clouds hide most of it: they stay put as the sun moves.
     float3 toSky = position - g_frame.eyePosition;
-    if (sky && dot(normalize(toSky), g_frame.skyMotionDisc.xyz) >= g_frame.skyMotionDisc.w)
+    if (sky && dot(normalize(toSky), g_frame.skyMotionDisc.xyz) >= g_frame.skyMotionDisc.w && CloudsToward(normalize(toSky)).a >= 0.5)
         previous = g_frame.eyePosition + float3(dot(g_frame.skyMotion[0].xyz, toSky), dot(g_frame.skyMotion[1].xyz, toSky), dot(g_frame.skyMotion[2].xyz, toSky));
     uint4 visible = uint4(kNoView, 0, 0, 0);
     uint pixelFlags = 0;

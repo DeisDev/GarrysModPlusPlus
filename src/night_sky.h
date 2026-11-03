@@ -37,7 +37,7 @@ struct NightSkyConstants {
     float mapLight;
     float starTwilight;
     float mapSunDirection[3];
-    float padding;
+    float discRadiance;
     float satellites[gbuffer::kMaxSatellites][4];
     float meteorStarts[gbuffer::kMaxMeteors][4];
     float meteorAxes[gbuffer::kMaxMeteors][4];

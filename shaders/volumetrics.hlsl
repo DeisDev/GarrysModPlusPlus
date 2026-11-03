@@ -43,8 +43,8 @@ float2 FroxelUv(float2 cell)
 // The eye ray through screen position `uv`: the step along it per unit of view depth.
 float3 FroxelRay(float2 uv)
 {
-    float4 world = mul(g_frame.invViewProj, float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0.5, 1.0));
-    float3 offset = world.xyz / world.w - g_frame.eyePosition;
+    float4 toPoint = mul(g_frame.clipToEye, float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0.5, 1.0));
+    float3 offset = toPoint.xyz / toPoint.w;
     return offset / max(dot(g_frame.viewProj[3].xyz, offset), 1e-6);
 }
 

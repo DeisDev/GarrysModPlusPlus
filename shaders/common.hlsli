@@ -12,7 +12,8 @@
 // Mirrors gmodpp::FrameConstants in src/lighting.h.
 struct FrameConstants
 {
-    row_major float4x4 invViewProj;
+    // The jittered view-projection's inverse relative to the eye: clip space to the point less eyePosition, over w.
+    row_major float4x4 clipToEye;
     row_major float4x4 viewProj;
     row_major float4x4 prevViewProj;
     float3 eyePosition;
@@ -223,8 +224,21 @@ struct FrameConstants
     float3 fogSunScale;
     float fogSkyScale;
     float fogAirLight;
-    uint2 padding6;
+    // The clouds over the procedural sky (shaders/clouds.hlsl), or kNoView: their cube, which reflections and indirect
+    // light see (CloudsToward), and the map of the sun's transmittance through them (CloudShadowAt in
+    // shaders/scene.hlsli), two square cascades side by side over the plane across the sun.
+    uint cloudCubeView;
+    uint cloudShadowView;
     uint4 lightWarpViews[16];
+    // A point's place on the cloud shadow map's plane, in units: (dot(position, cloudShadowU.xyz) + cloudShadowU.w, the
+    // same with V); times each cascade's scale (1 / its width) plus a half, its texture coordinates in the cascade, kept
+    // half a texel (cloudShadowEdge) inside it.
+    float4 cloudShadowU;
+    float4 cloudShadowV;
+    float cloudShadowFineScale;
+    float cloudShadowCoarseScale;
+    float cloudShadowEdge;
+    uint padding7;
 };
 
 // Per-pass descriptor indices and parameters; mirrors Lighting::PassArgs in src/lighting.h.
@@ -330,8 +344,8 @@ float3 WorldPositionFromDepth(int2 pixel, float depth)
 {
     depth = (depth - g_frame.depthMin) / g_frame.depthScale;
     float2 uv = (float2(pixel) + 0.5) * g_frame.invSize;
-    float4 world = mul(g_frame.invViewProj, float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0));
-    return world.xyz / world.w;
+    float4 offset = mul(g_frame.clipToEye, float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0));
+    return g_frame.eyePosition + offset.xyz / offset.w;
 }
 
 float DepthAt(int2 pixel)
@@ -383,15 +397,28 @@ float3 ClampSample(float3 color)
     return luminance > limit ? color * (limit / luminance) : color;
 }
 
-// The 2D sky in a direction as the game draws it (src/shaderapi_capture.cpp draws it again into a cube), before the
-// tonemap scale; the map's sky light where it has not been drawn.
+// The clouds toward a direction (shaders/clouds.hlsl): the light they and the air in front of them add (rgb) and the
+// share of the sky behind they let through (a).
+float4 CloudsToward(float3 direction)
+{
+    if (g_frame.cloudCubeView == kNoView)
+        return float4(0.0, 0.0, 0.0, 1.0);
+    TextureCube<float4> clouds = ResourceDescriptorHeap[g_frame.cloudCubeView];
+    return clouds.SampleLevel(g_linearClamp, direction, 0.0);
+}
+
+// The 2D sky in a direction as the game draws it (src/shaderapi_capture.cpp draws it again into a cube), with the clouds
+// over it, before the tonemap scale; the map's sky light where it has not been drawn.
 float3 SkyRadiance(float3 direction)
 {
     if (g_frame.skyCubeView == kNoView)
         return g_frame.skyColor;
     TextureCube<float4> sky = ResourceDescriptorHeap[g_frame.skyCubeView];
     float3 radiance = sky.SampleLevel(g_linearClamp, direction, 0.0).rgb;
-    return all(radiance >= 0.0) ? radiance : g_frame.skyColor;
+    if (!all(radiance >= 0.0))
+        return g_frame.skyColor;
+    float4 clouds = CloudsToward(direction);
+    return radiance * clouds.a + clouds.rgb;
 }
 
 // Source's range fog (CalcRangeFog and BlendPixelFog in common_ps_fxc.h): the share of the fog colour over a surface at

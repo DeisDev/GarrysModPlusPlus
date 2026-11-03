@@ -25,10 +25,10 @@ GamePixel GamePixelAt(float4 position, float2 viewportSize)
     GamePixel pixel;
     pixel.uv = position.xy / viewportSize;
     float depth = (position.z - g_frame.depthMin) / g_frame.depthScale;
-    float4 world = mul(g_frame.invViewProj, float4(pixel.uv.x * 2.0 - 1.0, 1.0 - pixel.uv.y * 2.0, depth, 1.0));
-    // The inverse view-projection maps clip space over w back to the world point over w.
-    pixel.viewDepth = 1.0 / max(world.w, 1e-6);
-    pixel.distance = length(world.xyz * pixel.viewDepth - g_frame.eyePosition);
+    float4 offset = mul(g_frame.clipToEye, float4(pixel.uv.x * 2.0 - 1.0, 1.0 - pixel.uv.y * 2.0, depth, 1.0));
+    // The inverse view-projection maps clip space over w back to the point (from the eye) over w.
+    pixel.viewDepth = 1.0 / max(offset.w, 1e-6);
+    pixel.distance = length(offset.xyz * pixel.viewDepth);
     return pixel;
 }
 

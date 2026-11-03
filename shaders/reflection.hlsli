@@ -12,7 +12,7 @@ static const float kSkyHitDistance = 65504.0;
 
 // The 2D sky toward a ray whose cone widens by `coneSpread`, before the tonemap scale, with `night` the night sky over it
 // as the sky's draw shows it, and with `disc` the sun's or Moon's disc while the cone is narrower than it: for mirrors no
-// highlight lights (water's glint and Phong highlights already show the sun).
+// highlight lights (water's glint and Phong highlights already show the sun). Clouds hide what lies beyond them.
 float3 SkyBeyond(float3 direction, float coneSpread, bool night, bool disc)
 {
     float3 radiance = SkyRadiance(direction);
@@ -21,10 +21,11 @@ float3 SkyBeyond(float3 direction, float coneSpread, bool night, bool disc)
     StructuredBuffer<NightSkyConstants> constants = ResourceDescriptorHeap[g_frame.nightSkyView];
     NightSkyConstants beyond = constants[0];
     Texture2D<float4> transmittance = ResourceDescriptorHeap[beyond.transmittanceView];
+    float clouds = CloudsToward(direction).a;
     float logGain = 0.0;
     if (night && g_frame.skyCubeView != kNoView && (beyond.parts != 0 || beyond.moonIrradiance > 0.0)) {
         TextureCube<float4> sky = ResourceDescriptorHeap[g_frame.skyCubeView];
-        logGain = sky.SampleLevel(g_linearClamp, direction, 0.0).a;
+        logGain = LogGainThroughClouds(sky.SampleLevel(g_linearClamp, direction, 0.0).a, clouds);
     }
     float moonCoverage = 0.0;
     float narrow = saturate(2.0 - coneSpread / beyond.sunRadius);
@@ -35,7 +36,8 @@ float3 SkyBeyond(float3 direction, float coneSpread, bool night, bool disc)
         radiance += NightSkyLight(beyond, direction, logGain, kPointFootprint * coneSpread, g_frame.tonemapScale, transmittance, g_linearClamp) *
             (1.0 - moonCoverage * narrow);
     if (disc && beyond.disc != 0)
-        radiance += SunDisc(beyond, direction, coneSpread, transmittance, g_linearClamp) * (narrow / g_frame.tonemapScale);
+        radiance += SunDisc(beyond, direction, coneSpread, transmittance, g_linearClamp) *
+            (narrow * DiscThroughClouds(beyond, clouds, g_frame.tonemapScale) / g_frame.tonemapScale);
     return radiance;
 }
 

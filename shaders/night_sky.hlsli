@@ -59,9 +59,10 @@ struct NightSkyConstants
     float moonlessFloor;
     float mapLight;
     float starTwilight;
-    // The map's sun (light_environment's), whose clear sky the moonless floor is.
+    // The map's sun (light_environment's), whose clear sky the moonless floor is, and the disc's radiance in the
+    // procedural sky's units, which tells how much of it shows through clouds (DiscThroughClouds).
     float3 mapSunDirection;
-    float padding;
+    float discRadiance;
     // Satellites: their directions (xyz) and irradiance (w).
     float4 satellites[8];
     // Meteors (MeteorStreak): the direction each started from (xyz) and its head's angle along its path (w); the axis its
@@ -423,6 +424,19 @@ float3 SunDisc(NightSkyConstants night, float3 direction, float edge, Texture2D<
     float r = saturate(angle / night.sunRadius);
     float mu = sqrt(1.0 - r * r);
     return color * ((0.3 + 0.93 * mu - 0.23 * mu * mu) * coverage);
+}
+
+// How much of the disc (SunDisc) shows through clouds that let `transmittance` of it through: shown as bright as the
+// target holds, it dims only where so little of its radiance gets through that the target holds it.
+float DiscThroughClouds(NightSkyConstants night, float transmittance, float tonemapScale)
+{
+    return saturate(transmittance * night.discRadiance * tonemapScale);
+}
+
+// The log2 of the gain the night sky is drawn with (NightSkyLight, MoonDisc) behind clouds that let `transmittance` through.
+float LogGainThroughClouds(float logGain, float transmittance)
+{
+    return logGain + log2(max(transmittance, 1e-30));
 }
 
 // The night sky's light toward a direction above the horizon, before the tonemap scale: its light (in the atmosphere's
