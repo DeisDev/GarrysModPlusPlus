@@ -877,6 +877,9 @@ private:
     Texture m_froxelProjected;
     Texture m_froxelIntegrated;
     std::array<UINT, 3> m_froxelDims = {};
+    // The size the main view's grid asks for, which the other views (lit at other resolutions) share, so the volume is
+    // not made again for each view.
+    std::array<UINT, 3> m_mainFroxelDims = {};
     // A size the volume could not be made in, not tried again.
     std::array<UINT, 3> m_froxelFailedDims = {};
     bool m_volumetricHistoryValid = false;

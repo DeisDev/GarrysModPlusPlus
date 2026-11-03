@@ -1086,7 +1086,7 @@ struct SkyConstants {
     float tonemapScale;
     std::uint32_t skyView;
     std::uint32_t target;
-    std::uint32_t padding;
+    float highlightRolloff;
     std::array<Float4, 4> cloudViewProj;
     std::uint32_t cloudHistoryView;
     std::uint32_t cloudCubeView;
@@ -1175,6 +1175,7 @@ D3D12_GPU_VIRTUAL_ADDRESS SkyDrawConstants(const gbuffer::SkyDraw& sky, std::spa
     constants.tonemapScale = dynamic.pixelFloats[gbuffer::kLightScaleRegister].v[0];
     constants.skyView = sky.skyView;
     constants.target = TargetEncoding(format);
+    constants.highlightRolloff = sky.highlightRolloff;
     for (size_t r = 0; r < 4; ++r)
         std::copy(sky.cloudViewProj[r].begin(), sky.cloudViewProj[r].end(), constants.cloudViewProj[r].v);
     constants.cloudHistoryView = sky.cloudHistoryView;

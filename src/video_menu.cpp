@@ -2,12 +2,14 @@
 
 #include "log.h"
 #include "module_scan.h"
+#include "settings.h"
 
 #include <MinHook.h>
 
 #include <windows.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <optional>
 #include <string_view>
@@ -137,7 +139,21 @@ void TurnOffMsaa(void* dialog)
         CallVirtual<void>(combo, kActivateItemByRow, 0);
 }
 
-// Hides MSAA and the Direct3D 9Ex row, and moves the rows below Direct3D 9Ex up into its place.
+// The label of a row's control: the dialog names two labels "Label8", so it is the one in the control's column.
+std::optional<VPanel> LabelOf(const std::vector<VPanel>& children, std::string_view name, VPanel control)
+{
+    const int column = RectOf(control).x;
+    std::optional<VPanel> found;
+    for (VPanel child : children) {
+        if (NameOf(child) == name && (!found || std::abs(RectOf(child).x - column) < std::abs(RectOf(*found).x - column)))
+            found = child;
+    }
+    return found;
+}
+
+// Hides MSAA and the Direct3D 9Ex row, and moves the rows below Direct3D 9Ex up into its place. With real-time
+// lighting on, Shadow detail is hidden too: the flashlight's shadows and the projected prop shadows it sets are
+// skipped and ray traced instead (shaderapi_capture.cpp).
 bool Trim(void* dialog)
 {
     const VPanel root = VPanelOf(dialog);
@@ -160,6 +176,13 @@ bool Trim(void* dialog)
     CallPanels<void>(kSetSize, root, dialogRect.w, dialogRect.h - step);
     for (VPanel panel : {*msaa, *msaaLabel, *d3d9ex, *d3d9exLabel})
         CallPanels<void>(kSetVisible, panel, false);
+    if (GetSettings().realtimeLighting) {
+        if (const auto shadows = find("ShadowDetail")) {
+            CallPanels<void>(kSetVisible, *shadows, false);
+            if (const auto label = LabelOf(children, "Label8", *shadows))
+                CallPanels<void>(kSetVisible, *label, false);
+        }
+    }
     for (VPanel child : children) {
         if (NameOf(child).starts_with("frame_"))
             continue;

@@ -167,6 +167,11 @@ struct Settings {
     // Our sun disc replaces env_sun's sprite, scaled from the size it has (Lighting::RecordSky).
     bool sunDisc = true;
     float sunSize = 1.0f;
+    // The aerosols' glow around the sun in the physical sky, times this; and how far the drawn sky's highlights (the
+    // glow and the horizon near a low sun, which are far brighter than white) are rolled off toward white instead of
+    // clipped flat (0 clips, 1 the full shoulder).
+    float sunGlow = 1.0f;
+    float skyHighlights = 1.0f;
     // Volumetric clouds in the physical sky (shaders/clouds.hlsl). With changingWeather the weather turns from one to
     // another on its own (CloudWeather), each holding about weatherDuration minutes; otherwise `weather` sets the
     // cloudCoverage to highCloudOpacity values (ApplyWeather), and Custom keeps them as they are. The low layer covers
@@ -278,6 +283,14 @@ struct Settings {
     bool performanceOverlay = false;
     OverlayDetail overlayDetail = OverlayDetail::Normal;
     OverlayCorner overlayCorner = OverlayCorner::TopRight;
+    // Its look: background opacity and colour, text colour, size (times the menu's font), distance from the screen's
+    // edge in font sizes, and whether it has a border.
+    float overlayOpacity = 0.85f;
+    Color overlayBackground = {0.063f, 0.075f, 0.094f};
+    Color overlayText = {0.90f, 0.92f, 0.95f};
+    float overlayScale = 1.0f;
+    float overlayMargin = 1.0f;
+    bool overlayBorder = true;
 
     // Ray tracing quality (ApplyPreset); the defaults are QualityPreset::High.
     QualityPreset qualityPreset = QualityPreset::High;
@@ -323,6 +336,19 @@ struct Settings {
     // The display the game window goes on, 1-based in the order Displays() lists them; 0 leaves it where the game
     // puts it (the primary display).
     int display = 0;
+    // The menu (this computer's): the virtual-key code that opens and closes it (VK_INSERT), whether Escape closes it,
+    // its window's opacity, its size relative to the default for the display, its accent colour, the language of its
+    // text (a localization folder name; empty follows the game's language), and the page it reopens on.
+    int menuKey = 0x2D;
+    bool menuEscapeCloses = true;
+    float menuOpacity = 0.96f;
+    float menuScale = 1.0f;
+    Color menuAccent = {0.180f, 0.608f, 1.0f};
+    std::string menuLanguage;
+    bool menuRememberPage = true;
+    int menuLastPage = 0;
+    // The menu's collapsed cards, as widgets::CollapsedCards lists them.
+    std::string menuCollapsed;
     // Turns off GMod's frame rate cap while its window is not focused (engine::CapUnfocusedFrames).
     bool backgroundFullSpeed = false;
 
@@ -360,15 +386,17 @@ struct SettingRange {
 SettingRange RangeOf(float Settings::* field);
 SettingRange RangeOf(int Settings::* field);
 
-// What settings are grouped by: the menu's pages and what a preset or an exported file holds.
-enum class Section : uint32_t { General = 0, Lighting, Sky, Quality, Image, Overlay, Camera, Count };
+// What settings are grouped by: the menu's pages and what a preset or an exported file holds. General holds the
+// real-time lighting switch; Display, Latency, Overlay, Developer and Menu belong to this computer.
+enum class Section : uint32_t { General = 0, Lighting, Sky, Quality, Image, Overlay, Camera, Display, Latency, Developer, Menu, Count };
 using SectionMask = uint32_t;
 constexpr SectionMask SectionBit(Section section) { return 1u << static_cast<uint32_t>(section); }
-// The sections presets and exported files can hold; General and the overlay belong to this computer.
+// The sections presets and exported files can hold; the others belong to this computer.
 constexpr SectionMask kShareableSections =
     SectionBit(Section::Lighting) | SectionBit(Section::Sky) | SectionBit(Section::Quality) | SectionBit(Section::Image) | SectionBit(Section::Camera);
 
-using SettingMember = std::variant<bool Settings::*, float Settings::*, int Settings::*, Color Settings::*, DebugView Settings::*, AntiAliasing Settings::*,
+using SettingMember = std::variant<bool Settings::*, float Settings::*, int Settings::*, Color Settings::*, std::string Settings::*, DebugView Settings::*,
+    AntiAliasing Settings::*,
     UpscalingMode Settings::*, QualityPreset Settings::*, FoliageShadows Settings::*, IndirectLighting Settings::*, EmissiveLighting Settings::*,
     LightSampling Settings::*, DenoiserType Settings::*, MapSun Settings::*, OverlayDetail Settings::*, OverlayCorner Settings::*, DofFocus Settings::*,
     CloudResolution Settings::*, Weather Settings::*, ReflexMode Settings::*, FrameGeneration Settings::*>;

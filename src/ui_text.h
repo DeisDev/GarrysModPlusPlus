@@ -3,6 +3,7 @@
 #include <initializer_list>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace gmodpp::ui {
 
@@ -14,6 +15,12 @@ void UpdateLanguage();
 
 // The language of the text shown: GMod's, or "en" when it has no file.
 const std::string& Language();
+// Shows the text in `language` (a localization folder name) instead of GMod's language; empty follows GMod again.
+void SetLanguageOverride(std::string language);
+// The languages with a file, sorted, "en" first.
+std::vector<std::string> AvailableLanguages();
+// A language's name in that language ("Deutsch"), from Windows; the code itself when Windows has no name for it.
+std::string LanguageName(const std::string& language);
 // Whether that language is written from right to left.
 bool RightToLeft();
 

@@ -413,6 +413,20 @@ endif()
 set(STREAMLINE_DLLS "${STREAMLINE_DIR}/bin/x64/sl.interposer.dll" "${STREAMLINE_DIR}/bin/x64/sl.common.dll" "${STREAMLINE_DIR}/bin/x64/sl.reflex.dll"
     "${STREAMLINE_DIR}/bin/x64/sl.pcl.dll" "${STREAMLINE_DIR}/bin/x64/sl.dlss_g.dll" "${STREAMLINE_DIR}/bin/x64/nvngx_dlssg.dll")
 
+# Lucide icon font (ISC) for the menu's icons, from the release's font zip, with the repository's licence file.
+set(LUCIDE_VERSION 1.67.0)
+set(LUCIDE_DIR "${CMAKE_CURRENT_BINARY_DIR}/_deps/lucide-${LUCIDE_VERSION}")
+if(NOT EXISTS "${LUCIDE_DIR}/lucide-font/lucide.ttf")
+    file(DOWNLOAD "https://github.com/lucide-icons/lucide/releases/download/${LUCIDE_VERSION}/lucide-font-${LUCIDE_VERSION}.zip"
+        "${LUCIDE_DIR}.zip" EXPECTED_HASH SHA256=db8ed26ed8ec84d7251e2d9c0eb028358db59c3f4bab3532d65e2f4b17e60163 TLS_VERIFY ON)
+    file(ARCHIVE_EXTRACT INPUT "${LUCIDE_DIR}.zip" DESTINATION "${LUCIDE_DIR}" PATTERNS "lucide-font/lucide.ttf" "lucide-font/codepoints.json")
+    file(REMOVE "${LUCIDE_DIR}.zip")
+endif()
+if(NOT EXISTS "${LUCIDE_DIR}/LICENSE")
+    file(DOWNLOAD "https://raw.githubusercontent.com/lucide-icons/lucide/${LUCIDE_VERSION}/LICENSE" "${LUCIDE_DIR}/LICENSE"
+        EXPECTED_HASH SHA256=b495047bd93a9b06913511076f504daba17d5bbeb3e0650f3bb53a4220329c57 TLS_VERIFY ON)
+endif()
+
 # LZMA SDK decoder (public domain) for maps with compressed lumps, each file pinned by hash.
 set(LZMA_SDK_VERSION 26.04)
 set(LZMA_SDK_DIR "${CMAKE_CURRENT_BINARY_DIR}/_deps/lzma-${LZMA_SDK_VERSION}")
@@ -593,7 +607,8 @@ set(STAGE_MOD "${STAGE_DIR}/gmodplusplus")
 set(STAGE_LICENSES "${STAGE_MOD}/licenses")
 add_custom_target(stage
     COMMAND ${CMAKE_COMMAND} -E rm -rf "${STAGE_DIR}"
-    COMMAND ${CMAKE_COMMAND} -E make_directory "${STAGE_MOD}/D3D12" "${STAGE_MOD}/hlsl" "${STAGE_MOD}/twins" "${STAGE_LICENSES}"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${STAGE_MOD}/D3D12" "${STAGE_MOD}/hlsl" "${STAGE_MOD}/twins" "${STAGE_MOD}/fonts" "${STAGE_LICENSES}"
+    COMMAND ${CMAKE_COMMAND} -E copy "${LUCIDE_DIR}/lucide-font/lucide.ttf" "${STAGE_MOD}/fonts/"
     COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:gmodpp_loader> "${STAGE_DIR}/winmm.dll"
     COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:gmodpp> "${DXC_DIR}/bin/x64/dxcompiler.dll" "${DLSS_FEATURE_DLL}" ${FSR_DLLS} ${STREAMLINE_DLLS} "${STAGE_MOD}/"
     COMMAND ${CMAKE_COMMAND} -E copy "${AGILITY_RUNTIME_DIR}/D3D12Core.dll" "${AGILITY_RUNTIME_DIR}/d3d12SDKLayers.dll" "${STAGE_MOD}/D3D12/"
@@ -605,6 +620,7 @@ add_custom_target(stage
         "${STAGE_LICENSES}/"
     COMMAND ${CMAKE_COMMAND} -E copy "${minhook_SOURCE_DIR}/LICENSE.txt" "${STAGE_LICENSES}/MinHook.txt"
     COMMAND ${CMAKE_COMMAND} -E copy "${imgui_SOURCE_DIR}/LICENSE.txt" "${STAGE_LICENSES}/DearImGui.txt"
+    COMMAND ${CMAKE_COMMAND} -E copy "${LUCIDE_DIR}/LICENSE" "${STAGE_LICENSES}/Lucide.txt"
     COMMAND ${CMAKE_COMMAND} -E copy "${DXC_DIR}/LICENSE-LLVM.txt" "${STAGE_LICENSES}/DXC-LLVM.txt"
     COMMAND ${CMAKE_COMMAND} -E copy "${DXC_DIR}/LICENSE-MIT.txt" "${STAGE_LICENSES}/DXC-MIT.txt"
     COMMAND ${CMAKE_COMMAND} -E copy "${DXC_DIR}/LICENSE-MS.txt" "${STAGE_LICENSES}/DXC-Microsoft.txt"

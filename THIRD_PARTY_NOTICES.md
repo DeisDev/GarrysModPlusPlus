@@ -17,6 +17,7 @@ These are not in the repository. CMake downloads them, pinned by version and has
 | --- | --- | --- | --- |
 | MinHook (with Hacker Disassembler Engine) | 1.3.4 | BSD 2-Clause | Built into `winmm.dll` and `gmodpp.dll` |
 | Dear ImGui | 1.91.9b | MIT | Built into `gmodpp.dll` |
+| Lucide icon font | 1.67.0 | ISC | `gmodplusplus/fonts/lucide.ttf`, the menu's icons |
 | LZMA SDK decoder | 26.04 | Public domain | Built into `gmodpp.dll` |
 | Source SDK 2013 shader headers | `7309a5f` | Source 1 SDK License (Valve) | Copied with the twins and compiled at runtime |
 | DirectX Shader Compiler | 1.9.2602 | LLVM Release License, MIT, Microsoft software licence terms | `dxcompiler.dll` |
@@ -44,4 +45,4 @@ AMD, FidelityFX, FSR and Radeon are trademarks of Advanced Micro Devices, Inc.
 
 The `release` build target packages the mod as `build/release/GarrysModPP.zip`. Everything but the loader (`winmm.dll`) goes in the game's `gmodplusplus` folder. Each component's licence text is in `gmodplusplus/licenses`, and Valve's licence files are next to the twins.
 
-Source code: <https://github.com/DeisDev/GarrysMod-->.
+Source code: <https://github.com/DeisDev/GarrysModPlusPlus>.

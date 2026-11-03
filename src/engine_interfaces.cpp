@@ -264,6 +264,14 @@ std::string GameLanguage()
     return var != nullptr ? ConVarValue(var) : std::string();
 }
 
+std::optional<std::string> ConVarString(const char* name)
+{
+    const std::byte* var = FindConVar(name);
+    if (var == nullptr)
+        return std::nullopt;
+    return ConVarValue(var);
+}
+
 void CapUnfocusedFrames(bool cap)
 {
     // The cap's value from before it was turned off, to put back.

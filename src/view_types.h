@@ -106,6 +106,8 @@ struct SkyDraw {
     std::array<float, 3> sunColor = {1.0f, 1.0f, 1.0f};
     // The disc's angular radius in radians.
     float sunRadius = 0.0f;
+    // How far the drawn sky's highlights are rolled off toward white (Settings::skyHighlights).
+    float highlightRolloff = 1.0f;
     // The direction env_sun's sprites are drawn toward (EnvSun::direction), hidden while the disc is drawn; nothing without
     // an env_sun.
     std::optional<std::array<float, 3>> spriteDirection;

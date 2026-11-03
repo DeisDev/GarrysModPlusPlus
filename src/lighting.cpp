@@ -1351,6 +1351,7 @@ void Lighting::RecordSky(FrameConstants& constants, const ViewInputs& inputs, co
     m_skyDraw.sunDisc = disc;
     m_skyDraw.discIsMoon = MapSunIsMoon();
     m_skyDraw.skyView = m_proceduralSky.srv;
+    m_skyDraw.highlightRolloff = GetSettings().skyHighlights;
     m_skyDraw.transmittanceView = m_transmittance.srv;
     m_skyDraw.sunDirection = *sun;
     m_skyDraw.sunRadius = kRealSunRadius * kSunWithoutSprite;
@@ -1453,7 +1454,8 @@ void Lighting::RecordSky(FrameConstants& constants, const ViewInputs& inputs, co
     m_mapSkyReadbackPending[slot] = true;
     Use(m_proceduralSky, write);
     DispatchGroups(Pass::SkyAtmosphere, {.input0 = m_atmosphereSkyFaces, .input1 = m_skyBands.srv, .input2 = m_mapSkyFaces, .input3 = constants.nightSkyView,
-        .input4 = m_moonSkyFaces, .output0 = m_proceduralSky.uav, .step = 4}, kProceduralSkySize / kSkyGroup, kProceduralSkySize / kSkyGroup, 6);
+        .input4 = m_moonSkyFaces, .output0 = m_proceduralSky.uav, .output1 = std::bit_cast<UINT>(GetSettings().sunGlow), .step = 4},
+        kProceduralSkySize / kSkyGroup, kProceduralSkySize / kSkyGroup, 6);
     Use(m_proceduralSky, kVolumeRead);
     constants.skyCubeView = m_proceduralSky.srv;
     m_proceduralSkyReady = true;
@@ -3628,8 +3630,11 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
         // Columns of at least kFroxelTile pixels and at most kFroxelRows rows, so the volume's size stays bounded at
         // high resolutions.
         const UINT tile = std::max(kFroxelTile, (m_gridHeight + kFroxelRows - 1) / kFroxelRows);
-        const std::array<UINT, 3> dims = {(m_gridWidth + tile - 1) / tile, (m_gridHeight + tile - 1) / tile,
-            static_cast<UINT>(GetSettings().volumetricSlices)};
+        std::array<UINT, 3> dims = {(m_gridWidth + tile - 1) / tile, (m_gridHeight + tile - 1) / tile, static_cast<UINT>(GetSettings().volumetricSlices)};
+        if (main)
+            m_mainFroxelDims = dims;
+        else if (m_mainFroxelDims[0] != 0)
+            dims = m_mainFroxelDims;
         froxels = EnsureFroxels(dims);
         if (froxels) {
             // The slices span what the medium covers: the water the eye is in as far as it lets light through (four

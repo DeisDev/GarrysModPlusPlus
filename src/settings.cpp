@@ -43,7 +43,7 @@ constexpr NamedField kFields[] = {
     {"realtime_lighting", &Settings::realtimeLighting, General},
     {"debug_view", &Settings::debugView, General, {}, false},
     {"display", &Settings::display, General, {0.0f, 16.0f}, false},
-    {"background_full_speed", &Settings::backgroundFullSpeed, General, {}, false},
+    {"background_full_speed", &Settings::backgroundFullSpeed, Display, {}, false},
     {"reflex", &Settings::reflex, General, {}, false},
     {"frame_generation", &Settings::frameGeneration, General, {}, false},
     {"generated_frames", &Settings::generatedFrames, General, {1.0f, 5.0f}, false},
@@ -94,6 +94,8 @@ constexpr NamedField kFields[] = {
     {"moonless_night", &Settings::moonlessNight, Sky, {0.001f, 0.25f}},
     {"sun_disc", &Settings::sunDisc, Sky},
     {"sun_size", &Settings::sunSize, Sky, {0.25f, 4.0f}},
+    {"sun_glow", &Settings::sunGlow, Sky, {0.0f, 2.0f}},
+    {"sky_highlights", &Settings::skyHighlights, Sky, {0.0f, 1.0f}},
     {"stars", &Settings::stars, Sky},
     {"earlier_stars", &Settings::earlierStars, Sky, {0.0f, 12.0f}},
     {"star_amount", &Settings::starAmount, Sky, {0.0f, 4.0f}},
@@ -202,6 +204,22 @@ constexpr NamedField kFields[] = {
     {"performance_overlay", &Settings::performanceOverlay, Overlay, {}, false},
     {"overlay_detail", &Settings::overlayDetail, Overlay, {}, false},
     {"overlay_corner", &Settings::overlayCorner, Overlay, {}, false},
+    {"overlay_opacity", &Settings::overlayOpacity, Overlay, {0.0f, 1.0f}, false},
+    {"overlay_background", &Settings::overlayBackground, Overlay, {}, false},
+    {"overlay_text", &Settings::overlayText, Overlay, {}, false},
+    {"overlay_scale", &Settings::overlayScale, Overlay, {0.5f, 2.0f}, false},
+    {"overlay_margin", &Settings::overlayMargin, Overlay, {0.0f, 4.0f}, false},
+    {"overlay_border", &Settings::overlayBorder, Overlay, {}, false},
+
+    {"menu_key", &Settings::menuKey, Menu, {1.0f, 254.0f}, false},
+    {"menu_escape_closes", &Settings::menuEscapeCloses, Menu, {}, false},
+    {"menu_opacity", &Settings::menuOpacity, Menu, {0.3f, 1.0f}, false},
+    {"menu_scale", &Settings::menuScale, Menu, {0.75f, 1.5f}, false},
+    {"menu_accent", &Settings::menuAccent, Menu, {}, false},
+    {"menu_language", &Settings::menuLanguage, Menu, {}, false},
+    {"menu_remember_page", &Settings::menuRememberPage, Menu, {}, false},
+    {"menu_last_page", &Settings::menuLastPage, Menu, {0.0f, 32.0f}, false},
+    {"menu_collapsed", &Settings::menuCollapsed, Menu, {}, false},
 };
 constexpr size_t kFieldCount = std::size(kFields);
 using FieldSet = std::bitset<kFieldCount>;
@@ -342,7 +360,9 @@ void Parse(std::string_view text, Settings& settings, FieldSet& set)
             std::visit(
                 [&](auto member) {
                     using Value = std::remove_cvref_t<decltype(settings.*member)>;
-                    if constexpr (std::is_same_v<Value, bool>)
+                    if constexpr (std::is_same_v<Value, std::string>)
+                        settings.*member = value;
+                    else if constexpr (std::is_same_v<Value, bool>)
                         settings.*member = number != 0.0;
                     else if constexpr (std::is_same_v<Value, float>)
                         settings.*member = std::clamp(static_cast<float>(number), named.range.minimum, named.range.maximum);
@@ -380,6 +400,8 @@ std::string Line(const Settings& settings, size_t field)
                 return std::format("{}={}\n", named.name, value);
             else if constexpr (std::is_same_v<Value, Color>)
                 return std::format("{}={} {} {}\n", named.name, value[0], value[1], value[2]);
+            else if constexpr (std::is_same_v<Value, std::string>)
+                return std::format("{}={}\n", named.name, value);
             else
                 return std::format("{}={}\n", named.name, static_cast<unsigned>(value));
         },

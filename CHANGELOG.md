@@ -8,6 +8,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- The menu is reorganised into Display, Graphics, Image, Lighting, Sky, Camera, Performance, Profiles, Logs, Menu and About pages. Frame generation, Reflex and Anti-Lag sit with anti-aliasing and upscaling on the Image page; the real-time lighting switch is at the top of the Lighting page; the performance overlay and the debug view are on the Performance page.
+- The Display page carries the game's own video settings: display mode (full screen, borderless window, windowed), aspect ratio and resolution with an Apply button, vertical sync, a frame rate limit, field of view and multicore rendering. The Graphics page adds the game's model, texture, shader, water and shadow detail, texture filtering, colour correction and motion blur. Shadow detail is greyed out with real-time lighting on, which ray traces those shadows, and the game's motion blur turns off when the mod's comes on.
+- A Logs page shows the mod's log as it is written, and the other files in the logs folder: a text filter, info, warning and error levels with coloured lines, selectable lines (click, Shift and Ctrl, Ctrl+A, Ctrl+C), copy, export to a file, follow and a button that opens the log folder.
+- A Menu page: the key that opens the menu can be changed, Escape can close it, and its opacity, size, accent colour and language can be set. It can reopen on the last page and reset its window.
+- An About page with the author, links to the GitHub repository and issues, credits and references, and buttons that open the licences and mod folders.
+- A README with installation steps, requirements and how to build from source.
+- The sky's highlights near a low sun roll off toward white instead of clipping to a flat white blob ("Highlight roll-off" on the Sky page), and "Sun glow" scales the haze of light around the sun.
+- The performance overlay's opacity, background and text colours, size, margin and border can be set on the Performance page.
+- Menu cards collapse and expand when their heading is clicked, and stay collapsed between sessions. Explanations moved from text under the cards into a help mark on each heading; the menu's icons come from the Lucide icon font.
+
+### Changed
+
+- The game's Advanced video options hide Shadow detail while real-time lighting is on.
+
 - A window says why the game has stopped responding when it waits more than a second for shaders it needs right away (most often the first launch after an update) or for ray tracing to be prepared, and goes away by itself when the game continues. It replaces the "Preparing shaders" window, without holding up the launch.
 - A notice in the bottom corner of the screen shows shaders being compiled and ray tracing being prepared in the background, with their progress, when the work takes longer than a moment.
 - With real-time lighting, sunlight and shadows follow the map's `env_sun`, so turning it in game (for example with the Sun Editor) moves the shadows. A sun turned below the horizon lights nothing. Turn off "Sun follows env_sun" to use the map's `light_environment` instead.
@@ -153,6 +167,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - The "Game" flashlight option. It made props see-through and left them unlit by the flashlight.
 
 ### Fixed
+- Volumetric light no longer rebuilds its froxel volume twice a frame (and logs it each time) when the held weapon is lit at a different resolution than the main view, as with DLSS or FSR upscaling.
 
 - Choosing DLSS on a GPU without it (such as AMD and Intel GPUs), for example through a preset made on another PC, now gives TAA instead of no anti-aliasing.
 - Fixed fog staying as bright at night as by day: it now darkens with the sun and sky, takes the colour of the sunset, and follows the sun and sky strength settings. Water's own glow does too.

@@ -11,8 +11,10 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <map>
+#include <set>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -33,11 +35,18 @@ constexpr ImVec4 kFrameHover(0.165f, 0.192f, 0.239f, 1.0f);
 constexpr ImVec4 kFrameActive(0.192f, 0.224f, 0.278f, 1.0f);
 constexpr ImVec4 kBorder(1.0f, 1.0f, 1.0f, 0.07f);
 constexpr ImVec4 kRowHover(1.0f, 1.0f, 1.0f, 0.035f);
-constexpr ImVec4 kAccent(0.180f, 0.608f, 1.0f, 1.0f);
-constexpr ImVec4 kAccentHover(0.333f, 0.686f, 1.0f, 1.0f);
-constexpr ImVec4 kAccentActive(0.122f, 0.525f, 0.902f, 1.0f);
 constexpr ImVec4 kKnobOff(0.70f, 0.74f, 0.80f, 1.0f);
 constexpr ImVec4 kTransparent(0.0f, 0.0f, 0.0f, 0.0f);
+constexpr ImVec4 kWarning(0.949f, 0.722f, 0.294f, 1.0f);
+constexpr ImVec4 kError(0.949f, 0.396f, 0.353f, 1.0f);
+// The default accent (GMod blue, #2E9BFF); the Menu page recolours it (SetAccent).
+constexpr ImVec4 kDefaultAccent(0.180f, 0.608f, 1.0f, 1.0f);
+constexpr float kDefaultOpacity = 0.96f;
+
+ImVec4 kAccent = kDefaultAccent;
+ImVec4 kAccentHover(0.333f, 0.686f, 1.0f, 1.0f);
+ImVec4 kAccentActive(0.122f, 0.525f, 0.902f, 1.0f);
+float g_opacity = kDefaultOpacity;
 
 Fonts g_fonts;
 // Font size over the 16 pixels the spacing was designed at.
@@ -66,10 +75,15 @@ Row g_row;
 // The card being drawn: whether its table is open, and its left and right edges on screen (0, 0 outside a card).
 struct Card {
     bool open = false;
+    bool collapsed = false;
     float min = 0.0f;
     float max = 0.0f;
 };
 Card g_card;
+// The cards collapsed by their headings, by ImGui id.
+std::set<ImGuiID> g_collapsed;
+// The icon font's glyph range: Unicode's private use area, where Lucide puts its icons.
+constexpr ImWchar kIconRanges[] = {0xE000, 0xF8FF, 0};
 
 // A row's horizontal extent for its highlight and mark: the card's, or the window's outside a card.
 std::pair<float, float> RowExtent()
@@ -126,7 +140,7 @@ void SetColors(ImGuiStyle& style)
     ImVec4* colors = style.Colors;
     colors[ImGuiCol_Text] = kText;
     colors[ImGuiCol_TextDisabled] = kTextDim;
-    colors[ImGuiCol_WindowBg] = kBackground;
+    colors[ImGuiCol_WindowBg] = WithAlpha(kBackground, g_opacity);
     colors[ImGuiCol_ChildBg] = kTransparent;
     colors[ImGuiCol_PopupBg] = WithAlpha(kSurface, 0.98f);
     colors[ImGuiCol_Border] = kBorder;
@@ -227,25 +241,6 @@ void WrappedText(const char* text, float start, float width)
 
 float ResetSize() { return std::round(ImGui::GetFrameHeight() * 0.85f); }
 
-// A circular arrow, the reset button's icon.
-void DrawResetIcon(ImDrawList* draw, ImVec2 min, float size, ImU32 color)
-{
-    constexpr float kPi = 3.14159265f;
-    const ImVec2 center(min.x + size * 0.5f, min.y + size * 0.5f);
-    const float radius = size * 0.26f;
-    const float start = -0.5f * kPi;
-    const float end = start + 1.55f * kPi;
-    draw->PathArcTo(center, radius, start, end, 16);
-    draw->PathStroke(color, 0, std::max(1.0f, 1.5f * g_scale));
-    // The arrowhead points along the arc at its end.
-    const ImVec2 radial(std::cos(end), std::sin(end));
-    const ImVec2 tangent(-radial.y, radial.x);
-    const ImVec2 base(center.x + radial.x * radius, center.y + radial.y * radius);
-    const ImVec2 tip(base.x + tangent.x * size * 0.16f, base.y + tangent.y * size * 0.16f);
-    const float half = size * 0.13f;
-    draw->AddTriangleFilled(tip, ImVec2(base.x + radial.x * half, base.y + radial.y * half), ImVec2(base.x - radial.x * half, base.y - radial.y * half), color);
-}
-
 // A black body's colour at `kelvin`, brightest component 1, encoded with gamma 1 / 2.2 like the colours the menu stores.
 std::array<float, 3> BlackbodySwatch(float kelvin)
 {
@@ -328,9 +323,9 @@ bool SliderOf(const char* id, T* value, T minimum, T maximum, const char* text, 
 
 }
 
-void LoadTheme(const std::filesystem::path& fontDirectory, int displayHeight)
+void LoadTheme(const std::filesystem::path& fontDirectory, const std::filesystem::path& iconFont, int displayHeight, float scale)
 {
-    const float size = std::clamp(std::round(static_cast<float>(displayHeight) * 15.0f / 1080.0f), 14.0f, 30.0f);
+    const float size = std::clamp(std::round(static_cast<float>(displayHeight) * 15.0f / 1080.0f * scale), 12.0f, 44.0f);
     g_scale = size / 16.0f;
 
     std::u16string characters = ui::DrawnCharacters(ui::AllText());
@@ -341,6 +336,7 @@ void LoadTheme(const std::filesystem::path& fontDirectory, int displayHeight)
         if (c >= 0x20)
             ranges.AddChar(static_cast<ImWchar>(c));
     }
+    g_glyphRanges.clear();
     ranges.BuildRanges(&g_glyphRanges);
 
     ImGuiIO& io = ImGui::GetIO();
@@ -354,6 +350,15 @@ void LoadTheme(const std::filesystem::path& fontDirectory, int displayHeight)
         if (*font == nullptr)
             *font = g_fonts.body;
     }
+    g_fonts.icons = nullptr;
+    const std::vector<char>& iconData = FontData(iconFont);
+    if (!iconData.empty()) {
+        ImFontConfig config;
+        config.FontDataOwnedByAtlas = false;
+        g_fonts.icons = io.Fonts->AddFontFromMemoryTTF(const_cast<char*>(iconData.data()), static_cast<int>(iconData.size()), size, &config, kIconRanges);
+    } else {
+        log::Info("Overlay: the icon font {} is missing; icons are drawn as text", iconFont.string());
+    }
     io.FontDefault = g_fonts.body;
     g_fontData.clear();
 
@@ -366,6 +371,49 @@ void LoadTheme(const std::filesystem::path& fontDirectory, int displayHeight)
 }
 
 const Fonts& GetFonts() { return g_fonts; }
+
+void DrawIcon(ImDrawList* draw, const char* icon, ImVec2 center, ImU32 color, float size)
+{
+    ImFont* font = g_fonts.icons;
+    const char* text = icon;
+    if (font == nullptr) {
+        // Without the icon font, a character that reads about the same.
+        font = g_fonts.strong;
+        text = icon == icons::kRotateCcw ? "R" : icon == icons::kCircleHelp ? "?" : icon == icons::kChevronDown ? "v" : icon == icons::kChevronRight ? ">" : icon == icons::kClose ? "x" : "^";
+    }
+    const ImVec2 extent = font->CalcTextSizeA(size, FLT_MAX, 0.0f, text);
+    draw->AddText(font, size, ImVec2(std::round(center.x - extent.x * 0.5f), std::round(center.y - extent.y * 0.5f)), color, text);
+}
+
+const Palette& GetPalette()
+{
+    static Palette palette;
+    palette = {kText, kTextDim, kSurface, kFrame, kAccent, kWarning, kError};
+    return palette;
+}
+
+void SetAccent(const std::array<float, 3>& color)
+{
+    const ImVec4 accent(color[0], color[1], color[2], 1.0f);
+    if (accent.x == kAccent.x && accent.y == kAccent.y && accent.z == kAccent.z)
+        return;
+    kAccent = accent;
+    // Hover lightens toward white, pressed darkens, as the default accent's do.
+    kAccentHover = Mix(accent, ImVec4(1.0f, 1.0f, 1.0f, 1.0f), 0.19f);
+    kAccentActive = ImVec4(accent.x * 0.88f, accent.y * 0.88f, accent.z * 0.88f, 1.0f);
+    SetColors(ImGui::GetStyle());
+}
+
+void SetOpacity(float opacity)
+{
+    opacity = std::clamp(opacity, 0.0f, 1.0f);
+    if (opacity == g_opacity)
+        return;
+    g_opacity = opacity;
+    ImGui::GetStyle().Colors[ImGuiCol_WindowBg] = WithAlpha(kBackground, g_opacity);
+}
+
+float InfoBoxAlpha() { return std::min(g_opacity, 0.85f * g_opacity / kDefaultOpacity); }
 
 bool RightToLeft() { return ui::RightToLeft(); }
 
@@ -397,11 +445,7 @@ bool Header(const char* title, const char* hint)
     const bool hovered = ImGui::IsItemHovered();
     if (hovered)
         draw->AddRectFilled(closeMin, ImVec2(closeMin.x + close, closeMin.y + close), Color(kFrameHover));
-    const ImVec2 center(closeMin.x + close * 0.5f, closeMin.y + close * 0.5f);
-    const float arm = close * 0.18f;
-    const ImU32 cross = Color(hovered ? kText : kTextDim);
-    draw->AddLine(ImVec2(center.x - arm, center.y - arm), ImVec2(center.x + arm, center.y + arm), cross, 1.6f * g_scale);
-    draw->AddLine(ImVec2(center.x - arm, center.y + arm), ImVec2(center.x + arm, center.y - arm), cross, 1.6f * g_scale);
+    DrawIcon(draw, icons::kClose, ImVec2(closeMin.x + close * 0.5f, closeMin.y + close * 0.5f), Color(hovered ? kText : kTextDim), ImGui::GetFontSize());
 
     ImGui::SetCursorScreenPos(origin);
     ImGui::Dummy(ImVec2(width, height));
@@ -449,10 +493,94 @@ void Heading(const char* text)
 
 // A card is a one-cell table: it takes its size in the frame its content is drawn, where a child window sizes itself
 // from the frame before (and not at all while scrolled out of view), so pages would settle over a few frames.
-void BeginCard(const char* id, const char* heading)
+void Tooltip(const char* text)
 {
-    if (heading != nullptr)
-        Heading(heading);
+    const float width = ImGui::GetFontSize() * 24.0f;
+    ImGui::SetNextWindowSizeConstraints(ImVec2(0.0f, 0.0f), ImVec2(width + ImGui::GetStyle().WindowPadding.x * 2.0f, FLT_MAX));
+    if (!ImGui::BeginTooltip())
+        return;
+    WrappedText(text, ImGui::GetCursorPosX(), width);
+    ImGui::EndTooltip();
+}
+
+float HelpMarkSpan() { return ResetSize() + ImGui::GetStyle().ItemInnerSpacing.x; }
+
+void HelpMark(const char* text)
+{
+    const float size = ResetSize();
+    const float start = ImGui::GetCursorPosX();
+    const float end = start + ImGui::GetContentRegionAvail().x;
+    ImGui::SetCursorPosX(RightToLeft() ? start : end - size);
+    const ImVec2 position = ImGui::GetCursorScreenPos();
+    ImGui::InvisibleButton("##help", ImVec2(size, size));
+    const bool hovered = ImGui::IsItemHovered();
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    const ImVec2 max(position.x + size, position.y + size);
+    if (hovered)
+        draw->AddRectFilled(position, max, Color(kFrameHover));
+    DrawIcon(draw, icons::kCircleHelp, ImVec2(position.x + size * 0.5f, position.y + size * 0.5f), Color(hovered ? kText : kTextDim), ImGui::GetFontSize() * 0.9f);
+    if (hovered)
+        Tooltip(text);
+}
+
+bool BeginCard(const char* id, const char* heading, const char* help)
+{
+    g_card = {};
+    if (heading != nullptr) {
+        // The heading row: a chevron at the start of the line, the heading, and the help mark at the end. Clicking the
+        // row (not the mark) collapses or expands the card.
+        const ImGuiID key = ImGui::GetID(id);
+        const bool collapsed = g_collapsed.contains(key);
+        const ImGuiStyle& style = ImGui::GetStyle();
+        const bool rightToLeft = RightToLeft();
+        const float size = ResetSize();
+        const float height = std::max(ImGui::GetTextLineHeight(), size);
+        const ImVec2 origin = ImGui::GetCursorScreenPos();
+        const float width = ImGui::GetContentRegionAvail().x;
+        const float rowWidth = help != nullptr ? width - HelpMarkSpan() : width;
+        const float rowStart = rightToLeft && help != nullptr ? origin.x + HelpMarkSpan() : origin.x;
+        ImGui::SetCursorScreenPos(ImVec2(rowStart, origin.y));
+        ImGui::PushID(id);
+        const bool clicked = ImGui::InvisibleButton("##heading", ImVec2(std::max(rowWidth, 1.0f), height));
+        const bool hovered = ImGui::IsItemHovered();
+        ImGui::PopID();
+        if (clicked) {
+            if (collapsed)
+                g_collapsed.erase(key);
+            else
+                g_collapsed.insert(key);
+        }
+        if (hovered)
+            ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+        ImDrawList* draw = ImGui::GetWindowDrawList();
+        if (hovered)
+            draw->AddRectFilled(ImVec2(rowStart, origin.y), ImVec2(rowStart + rowWidth, origin.y + height), Color(kRowHover));
+        const bool nowCollapsed = g_collapsed.contains(key);
+        const char* chevron = nowCollapsed ? icons::kChevronRight : icons::kChevronDown;
+        const float chevronX = rightToLeft ? rowStart + rowWidth - size * 0.5f : rowStart + size * 0.5f;
+        DrawIcon(draw, chevron, ImVec2(chevronX, origin.y + height * 0.5f), Color(hovered ? kText : kTextDim), ImGui::GetFontSize() * 0.9f);
+        ImFont* font = g_fonts.strong;
+        const Line line = VisualLine(heading);
+        const float textStart = rightToLeft ? rowStart : rowStart + size + style.ItemInnerSpacing.x;
+        const float textEnd = rightToLeft ? rowStart + rowWidth - size - style.ItemInnerSpacing.x : rowStart + rowWidth;
+        const ImVec4 clip(textStart, origin.y, textEnd, origin.y + height);
+        draw->AddText(font, font->FontSize, ImVec2(std::floor(AlignedX(textStart, textEnd, line.width)), std::floor(origin.y + (height - font->FontSize) * 0.5f)),
+            Color(kText), line.text.c_str(), nullptr, 0.0f, &clip);
+        if (help != nullptr) {
+            ImGui::SameLine(0.0f, 0.0f);
+            ImGui::SetCursorScreenPos(ImVec2(origin.x, origin.y + std::round((height - size) * 0.5f)));
+            // Every card's mark shares the "##help" label, so the card's id tells them apart.
+            ImGui::PushID(id);
+            HelpMark(help);
+            ImGui::PopID();
+        }
+        ImGui::SetCursorScreenPos(origin);
+        ImGui::Dummy(ImVec2(width, height));
+        if (nowCollapsed) {
+            g_card.collapsed = true;
+            return false;
+        }
+    }
     const ImVec2 padding(std::round(10.0f * g_scale), std::round(8.0f * g_scale));
     ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, padding);
     g_card.open = ImGui::BeginTable(id, 1, ImGuiTableFlags_BordersOuter | ImGuiTableFlags_PadOuterX);
@@ -460,12 +588,13 @@ void BeginCard(const char* id, const char* heading)
     g_card.min = ImGui::GetCursorScreenPos().x;
     g_card.max = g_card.min + ImGui::GetContentRegionAvail().x;
     if (!g_card.open)
-        return;
+        return false;
     ImGui::TableNextRow();
     ImGui::TableSetColumnIndex(0);
     ImGui::TableSetBgColor(ImGuiTableBgTarget_CellBg, Color(kSurface));
     g_card.min = ImGui::GetCursorScreenPos().x - padding.x;
     g_card.max = ImGui::GetCursorScreenPos().x + ImGui::GetContentRegionAvail().x + padding.x;
+    return true;
 }
 
 void EndCard()
@@ -474,6 +603,31 @@ void EndCard()
         ImGui::EndTable();
     g_card = {};
     ImGui::Dummy(ImVec2(0.0f, ImGui::GetStyle().ItemSpacing.y));
+}
+
+std::string CollapsedCards()
+{
+    std::string text;
+    for (const ImGuiID key : g_collapsed) {
+        if (!text.empty())
+            text += ',';
+        char hex[16];
+        std::snprintf(hex, sizeof(hex), "%x", key);
+        text += hex;
+    }
+    return text;
+}
+
+void SetCollapsedCards(std::string_view text)
+{
+    g_collapsed.clear();
+    while (!text.empty()) {
+        const size_t comma = text.find(',');
+        const std::string item(text.substr(0, comma));
+        text = comma == std::string_view::npos ? std::string_view() : text.substr(comma + 1);
+        if (!item.empty())
+            g_collapsed.insert(static_cast<ImGuiID>(std::strtoul(item.c_str(), nullptr, 16)));
+    }
 }
 
 bool BeginRows(const char* id)
@@ -543,9 +697,9 @@ RowClicks EndRow(bool clickableLabel)
         resetHovered = ImGui::IsItemHovered();
         if (resetHovered) {
             draw->AddRectFilled(position, ImVec2(position.x + size, position.y + size), Color(kFrameHover));
-            ImGui::SetTooltip("%s", ui::Visual(g_row.resetHint).c_str());
+            Tooltip(g_row.resetHint);
         }
-        DrawResetIcon(draw, position, size, Color(resetHovered ? kText : kTextDim));
+        DrawIcon(draw, icons::kRotateCcw, ImVec2(position.x + size * 0.5f, position.y + size * 0.5f), Color(resetHovered ? kText : kTextDim), ImGui::GetFontSize() * 0.85f);
         ImGui::SetCursorScreenPos(cursor);
     }
     if (!ImGui::IsWindowHovered() || !ImGui::IsMouseHoveringRect(min, max, false))
@@ -555,13 +709,13 @@ RowClicks EndRow(bool clickableLabel)
         return clicks;
     if (!g_row.enabled) {
         if (g_row.reason != nullptr)
-            ImGui::SetTooltip("%s", ui::Visual(g_row.reason).c_str());
+            Tooltip(g_row.reason);
         return clicks;
     }
     const float mouse = ImGui::GetIO().MousePos.x;
     const bool onLabel = rightToLeft ? mouse > g_row.controlEnd + style.CellPadding.x : mouse < g_row.controlStart - style.CellPadding.x;
     if (onLabel && g_row.markNote != nullptr)
-        ImGui::SetTooltip("%s", ui::Visual(g_row.markNote).c_str());
+        Tooltip(g_row.markNote);
     if (!clickableLabel || !onLabel)
         return clicks;
     ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
@@ -779,16 +933,20 @@ bool Toggles(const char* id, uint32_t* mask, std::span<const char* const> option
         const ImVec2 min(left + inset, origin.y + inset);
         const ImVec2 max(right - inset, origin.y + height - inset);
         const bool on = (*mask & bit) != 0;
-        if (on)
-            draw->AddRectFilled(min, max, Color(hovered ? kAccentHover : kAccent));
-        else if (hovered)
+        // An option that is on is a soft accent chip with an accent outline, not a filled button, so a row with every
+        // option on does not read as a row of primary buttons.
+        if (on) {
+            draw->AddRectFilled(min, max, Color(WithAlpha(kAccent, hovered ? 0.28f : 0.18f)));
+            draw->AddRect(min, max, Color(WithAlpha(kAccent, 0.8f)), 0.0f, 0, std::max(1.0f, g_scale));
+        } else if (hovered) {
             draw->AddRectFilled(min, max, Color(kFrameHover));
+        }
         const Line line = VisualLine(options[i]);
         const float padding = style.FramePadding.x * 0.5f;
         const float centred = std::max(min.x + padding, (min.x + max.x - line.width) * 0.5f);
         const float x = rightToLeft ? std::min(max.x - padding - line.width, centred) : centred;
         const ImVec4 clip(min.x, min.y, max.x, max.y);
-        draw->AddText(nullptr, 0.0f, ImVec2(std::floor(x), std::floor(origin.y + (height - ImGui::GetFontSize()) * 0.5f)), Color(on ? kOnAccent : kText),
+        draw->AddText(nullptr, 0.0f, ImVec2(std::floor(x), std::floor(origin.y + (height - ImGui::GetFontSize()) * 0.5f)), Color(on ? kText : kTextDim),
             line.text.c_str(), nullptr, 0.0f, &clip);
     }
     ImGui::SetCursorScreenPos(origin);
@@ -863,6 +1021,27 @@ void Note(const char* text)
     ImGui::PushStyleColor(ImGuiCol_Text, kTextDim);
     Text(text);
     ImGui::PopStyleColor();
+}
+
+bool Link(const char* label)
+{
+    const Line line = VisualLine(label);
+    const ImVec2 origin = ImGui::GetCursorScreenPos();
+    const float width = ImGui::GetContentRegionAvail().x;
+    const float x = AlignedX(origin.x, origin.x + width, line.width);
+    ImGui::SetCursorScreenPos(ImVec2(x, origin.y));
+    const bool clicked = ImGui::InvisibleButton(label, ImVec2(std::max(line.width, 1.0f), ImGui::GetTextLineHeight()));
+    const bool hovered = ImGui::IsItemHovered();
+    if (hovered)
+        ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    const ImU32 color = Color(hovered ? kAccentHover : kAccent);
+    draw->AddText(ImVec2(x, origin.y), color, line.text.c_str());
+    if (hovered) {
+        const float y = origin.y + ImGui::GetTextLineHeight() - 1.0f;
+        draw->AddLine(ImVec2(x, y), ImVec2(x + line.width, y), color, std::max(1.0f, g_scale));
+    }
+    return clicked;
 }
 
 void Tile(const char* figure, const char* label, float width)

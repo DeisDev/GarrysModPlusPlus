@@ -20,6 +20,7 @@
 #include <chrono>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <optional>
 #include <set>
 #include <span>
@@ -532,6 +533,7 @@ bool Backend::SetMode(HWND window, const ShaderDeviceInfo& info)
     // full screen when the mode is the display's.
     if (!info.windowed)
         log::Info("Native: exclusive fullscreen was requested; presenting borderless at {}x{} instead", m_width, m_height);
+    m_windowed = info.windowed;
     m_placedDisplay = -1;
     if (m_device == nullptr) {
         m_renderThread = GetCurrentThreadId();
@@ -542,6 +544,28 @@ bool Backend::SetMode(HWND window, const ShaderDeviceInfo& info)
     if (info.aaSamples > 1)
         log::Info("Native: the game asked for {}x MSAA; drawing without it", info.aaSamples);
     return CreateSwapChain();
+}
+
+VideoMode CurrentVideoMode()
+{
+    const Backend& backend = GetBackend();
+    VideoMode mode;
+    mode.width = static_cast<int>(backend.Width());
+    mode.height = static_cast<int>(backend.Height());
+    mode.windowed = backend.Windowed();
+    // The engine makes a borderless window a popup without a caption, as it makes its full-screen window.
+    mode.borderless = mode.windowed && backend.Window() != nullptr && (GetWindowLongW(backend.Window(), GWL_STYLE) & WS_CAPTION) != WS_CAPTION;
+    return mode;
+}
+
+std::vector<std::pair<int, int>> Resolutions()
+{
+    std::vector<std::pair<int, int>> sizes;
+    for (const ShaderDisplayMode& mode : DisplayModes(static_cast<DeviceManagerObject*>(DeviceManager())->adapter))
+        sizes.emplace_back(mode.width, mode.height);
+    std::sort(sizes.begin(), sizes.end(), std::greater<>());
+    sizes.erase(std::unique(sizes.begin(), sizes.end()), sizes.end());
+    return sizes;
 }
 
 std::vector<DisplayInfo> Displays()

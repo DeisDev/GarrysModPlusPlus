@@ -33,6 +33,8 @@ Table g_text;
 // GMod's language, and the one the text is in.
 std::string g_language;
 std::string g_textLanguage = kSourceLanguage;
+// The language the menu is set to, overriding GMod's while not empty.
+std::string g_override;
 bool g_rightToLeft = false;
 bool g_loaded = false;
 
@@ -169,7 +171,7 @@ NumberFormat& UserNumberFormat()
 
 void UpdateLanguage()
 {
-    std::string language = engine::GameLanguage();
+    std::string language = g_override.empty() ? engine::GameLanguage() : g_override;
     if (!IsLanguageCode(language))
         language = kSourceLanguage;
     if (!g_loaded || language != g_language)
@@ -188,6 +190,39 @@ bool RightToLeft()
     if (!g_loaded)
         UpdateLanguage();
     return g_rightToLeft;
+}
+
+void SetLanguageOverride(std::string language)
+{
+    if (language == g_override)
+        return;
+    g_override = std::move(language);
+    UpdateLanguage();
+}
+
+std::vector<std::string> AvailableLanguages()
+{
+    std::vector<std::string> languages;
+    std::error_code error;
+    for (const std::filesystem::directory_entry& entry : std::filesystem::directory_iterator(LocalizationDirectory(), error)) {
+        const std::string code = entry.path().filename().string();
+        if (entry.is_directory(error) && IsLanguageCode(code) && std::filesystem::exists(entry.path() / kFileName, error))
+            languages.push_back(code);
+    }
+    std::sort(languages.begin(), languages.end());
+    const auto english = std::find(languages.begin(), languages.end(), kSourceLanguage);
+    if (english != languages.end())
+        std::rotate(languages.begin(), english, english + 1);
+    return languages;
+}
+
+std::string LanguageName(const std::string& language)
+{
+    const std::wstring locale(language.begin(), language.end());
+    wchar_t name[LOCALE_NAME_MAX_LENGTH * 2] = {};
+    if (GetLocaleInfoEx(locale.c_str(), LOCALE_SNATIVELANGUAGENAME, name, static_cast<int>(std::size(name))) <= 0)
+        return language;
+    return Utf8(name);
 }
 
 std::string AllText()

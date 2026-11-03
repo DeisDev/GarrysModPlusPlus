@@ -49,6 +49,18 @@ struct DisplayInfo {
     bool primary;
 };
 std::vector<DisplayInfo> Displays();
+
+// The video mode the game last set: the back buffer's size, whether the engine asked for a window (else its borderless
+// full-screen popup) and, for a window, whether it has no frame (GMod's "Windowed (No Border)").
+struct VideoMode {
+    int width = 0;
+    int height = 0;
+    bool windowed = true;
+    bool borderless = false;
+};
+VideoMode CurrentVideoMode();
+// The sizes (width, height) the engine's display adapter offers, largest first, each once.
+std::vector<std::pair<int, int>> Resolutions();
 // The DXGI adapter of the engine's display adapter `index` (Direct3D 9 numbers one per display output), or null.
 Microsoft::WRL::ComPtr<IDXGIAdapter1> AdapterOfDisplay(int index);
 
@@ -91,6 +103,7 @@ public:
     UINT Width() const { return m_width; }
     UINT Height() const { return m_height; }
     HWND Window() const { return m_window; }
+    bool Windowed() const { return m_windowed; }
     // Changes whenever the command list is reset, which loses its bound state.
     std::uint64_t ListGeneration() const { return m_listGeneration; }
     // The fence value the commands recorded so far signal once they complete, and the last one completed.
@@ -211,6 +224,7 @@ private:
     UINT m_width = 0;
     UINT m_height = 0;
     bool m_vsync = true;
+    bool m_windowed = true;
     bool m_tearing = false;
     bool m_deviceLost = false;
 };

@@ -6,6 +6,8 @@
 #include <cstdint>
 #include <filesystem>
 #include <span>
+#include <string>
+#include <string_view>
 
 namespace gmodpp::overlay::widgets {
 
@@ -17,13 +19,46 @@ struct Fonts {
     ImFont* strong = nullptr;
     ImFont* title = nullptr;
     ImFont* figure = nullptr;
+    // The Lucide icon font at the body size, or null when its file is missing (icons then fall back to text).
+    ImFont* icons = nullptr;
 };
+
+// The menu's icons: Lucide glyphs (fonts/lucide.ttf) by the codepoints of the font release's codepoints.json, as UTF-8.
+namespace icons {
+inline constexpr char kRotateCcw[] = "\xEE\x85\x88";
+inline constexpr char kCircleHelp[] = "\xEE\x82\x82";
+inline constexpr char kChevronDown[] = "\xEE\x81\xAD";
+inline constexpr char kChevronRight[] = "\xEE\x81\xAF";
+inline constexpr char kClose[] = "\xEE\x86\xB2";
+inline constexpr char kExternalLink[] = "\xEE\x82\xB9";
+}
 
 // Loads the game's own fonts (Roboto, and Coolvetica for the title) from `fontDirectory`, with the fonts the game falls
 // back to for characters they lack (overlay_fonts.h), for every character of every installed language, sized for a
-// display `displayHeight` pixels tall, and sets the menu's colours and spacing. Call before the first frame.
-void LoadTheme(const std::filesystem::path& fontDirectory, int displayHeight);
+// display `displayHeight` pixels tall times `scale`, and sets the menu's colours and spacing. Call before the first
+// frame, and again (between frames, with the font atlas cleared) to change the scale.
+void LoadTheme(const std::filesystem::path& fontDirectory, const std::filesystem::path& iconFont, int displayHeight, float scale);
 const Fonts& GetFonts();
+// Draws `icon` centred on `center`, `size` pixels tall.
+void DrawIcon(ImDrawList* draw, const char* icon, ImVec2 center, ImU32 color, float size);
+
+// The theme's colours that pages draw with themselves.
+struct Palette {
+    ImVec4 text;
+    ImVec4 textDim;
+    ImVec4 surface;
+    ImVec4 frame;
+    ImVec4 accent;
+    // Log lines that warn or report a failure.
+    ImVec4 warning;
+    ImVec4 error;
+};
+const Palette& GetPalette();
+// Recolours the accent (sRGB components) and the menu window's opacity; cheap to call every frame.
+void SetAccent(const std::array<float, 3>& color);
+void SetOpacity(float opacity);
+// The info boxes' opacity: a little more see-through than the menu's.
+float InfoBoxAlpha();
 
 // Whether the menu is laid out from right to left.
 bool RightToLeft();
@@ -35,9 +70,20 @@ bool NavItem(const char* label, bool selected);
 // Text wrapped to the available width and aligned to the start of the line.
 void Text(const char* text);
 void Heading(const char* text);
-// A panel with an optional heading above it. EndCard must follow every BeginCard.
-void BeginCard(const char* id, const char* heading = nullptr);
+// A panel with an optional heading above it, and with `help` a help mark at the heading's end that explains the card
+// in a tooltip. A card with a heading collapses and expands when the heading is clicked; returns whether its body is
+// shown. EndCard must follow every BeginCard, whatever it returned.
+bool BeginCard(const char* id, const char* heading = nullptr, const char* help = nullptr);
 void EndCard();
+// The collapsed cards as text (their ids in hex, comma-separated), to keep between sessions, and setting them back.
+std::string CollapsedCards();
+void SetCollapsedCards(std::string_view text);
+// A small "?" at the end of the current line that shows `text` in a tooltip when hovered.
+void HelpMark(const char* text);
+// The width a help mark and the gap before it take.
+float HelpMarkSpan();
+// A tooltip of `text`, wrapped to a short paragraph.
+void Tooltip(const char* text);
 
 // How a setting row is marked: not at all, as set by the current map (while editing the map's settings), or as set
 // differently on the current map (while editing the settings of all maps), which `markNote` explains on hover.
@@ -86,6 +132,8 @@ bool ColorButton(const char* id, std::array<float, 3>* color, const char* temper
 
 // Dimmed text wrapped to the available width.
 void Note(const char* text);
+// A link: accent text, underlined when hovered; returns true when clicked.
+bool Link(const char* label);
 // A large figure over a short label, `width` wide.
 void Tile(const char* figure, const char* label, float width);
 // A thin bar filled to `fraction` of the available width from the start of the line.

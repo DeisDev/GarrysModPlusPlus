@@ -28,6 +28,10 @@ void ExecuteCommand(const std::string& command);
 // garrysmod/resource/localization); empty when it is unset or can't be read.
 std::string GameLanguage();
 
+// A console variable's value as text (ConVar::GetString), or nothing when the console is not up yet, the variable does
+// not exist or is never read as a string.
+std::optional<std::string> ConVarString(const char* name);
+
 // GMod's frame rate cap while its window is not focused (fps_max_nofocus, 20 by default), each frame: false sets it to
 // 0, true puts back the value it had. Only changes made here are undone; until the first change it is left alone.
 void CapUnfocusedFrames(bool cap);

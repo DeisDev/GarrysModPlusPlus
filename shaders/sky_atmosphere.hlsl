@@ -248,11 +248,12 @@ void Daylight(uint entry, uint index)
 // its luminance) is sunlight scattered forward, which keeps the colour of the sunlight that makes it (the
 // transmittance toward `sun` from the eye) and takes the band's brightness alone; the rest takes the band's colour.
 // Coloured as a whole, the glow around a night map's Moon turned orange under a skybox greyer than the clear sky.
-float3 Recoloured(float4 clear, float3 sun, float4 multiplier, Texture2D<float4> transmittance)
+// `glowScale` is the Sun glow setting.
+float3 Recoloured(float4 clear, float3 sun, float4 multiplier, Texture2D<float4> transmittance, float glowScale)
 {
     float3 sunlight = AtmosphereTransmittance(transmittance, g_linearClamp, kGroundRadius + kEyeHeight, sun.z);
     float3 glow = min(clear.a * sunlight / max(Luminance(sunlight), 1e-12), clear.rgb);
-    return (clear.rgb - glow) * multiplier.rgb + glow * multiplier.a;
+    return (clear.rgb - glow) * multiplier.rgb + glow * multiplier.a * glowScale;
 }
 
 // Steps 3 and 5 run as groups of kBands x kLanesPerBand threads.
@@ -347,15 +348,16 @@ void main(uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint index :
     for (int k = 0; k < 4; ++k)
         multiplier += weights[k] * bands.Load(int3(clamp(first + k, 0, int(kBands) - 1), 0, 0));
     Texture2D<float4> transmittance = ResourceDescriptorHeap[night.transmittanceView];
+    float glowScale = asfloat(g_pass.output1);
     float4 clear = sky.Load(int4(id, 0));
-    float3 radiance = Recoloured(clear, night.sunDirection, multiplier, transmittance) +
-        night.moonlessFloor * Recoloured(mapSky.Load(int4(id, 0)), night.mapSunDirection, multiplier, transmittance);
+    float3 radiance = Recoloured(clear, night.sunDirection, multiplier, transmittance, glowScale) +
+        night.moonlessFloor * Recoloured(mapSky.Load(int4(id, 0)), night.mapSunDirection, multiplier, transmittance, glowScale);
     float3 moonlit = 0.0;
     if (night.moonIrradiance > 0.0) {
         Texture2DArray<float4> moonSky = ResourceDescriptorHeap[g_pass.input4];
         float4 moonClear = moonSky.Load(int4(id, 0));
         moonlit = moonClear.rgb;
-        radiance += night.moonScale * Recoloured(moonClear, night.moonDirection, multiplier, transmittance);
+        radiance += night.moonScale * Recoloured(moonClear, night.moonDirection, multiplier, transmittance, glowScale);
     }
     radiance = min(radiance, 65504.0);
     float gain = Luminance(radiance) / (Luminance(clear.rgb) * night.mapLight * night.starTwilight + Luminance(moonlit) * night.moonIrradiance + kNightSkyRadiance);
