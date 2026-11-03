@@ -137,8 +137,8 @@ static const uint kShapeSize = 128;
 static const uint kDetailSize = 64;
 static const uint kWeatherSize = 512;
 static const uint kCirrusSize = 1024;
-// How far the flow bends the strands, in tiles per unit of flow: some 300 m, a gentle bend along a veil's few kilometres
-// (our choice).
+// How far the flow bends the cirrus, in tiles per unit of flow: some 300 m across the strands' 10 km tile, a gentle bend
+// along a veil's few kilometres, and 900 m across the weather's 30 km streaks (our choice).
 static const float kCirrusWarp = 0.03;
 // How far above the coverage's cut the cirrus' field reaches full depth (our choice).
 static const float kCirrusEdge = 0.25;
@@ -543,9 +543,10 @@ float DensityAt(CloudConstants clouds, CloudLayer layer, float3 p, bool detail)
 }
 
 // The cirrus' optical depth straight through it above `p`, seen over `footprint` kilometres: the weather's long streaks
-// along the wind and the strands' veils, cut together at its coverage, so few clouds are long wisps along the streaks'
-// crests, thicker along their fibres. Cut apart and multiplied, few clouds broke into short dashes (2026-11-03). The
-// strands' mip follows the footprint, so the fibres average out where a pixel spans many.
+// along the wind, the strands' veils and their fibres, cut together at its coverage, so few clouds are wisps along the
+// streaks' crests with fibrous edges, thicker along their fibres. Cut apart and multiplied, few clouds broke into short
+// dashes; with the streaks weighing most, they ran unbroken like contrails (2026-11-03). The strands' mip follows the
+// footprint, so the fibres average out where a pixel spans many.
 float CirrusDepth(CloudConstants clouds, float3 p, float footprint)
 {
     if (clouds.cirrusCoverage <= 0.0)
@@ -558,8 +559,8 @@ float CirrusDepth(CloudConstants clouds, float3 p, float footprint)
     float lod = log2(max(footprint * clouds.cirrusStrandFrequency * kCirrusSize, 1.0));
     float2 strand = strands.SampleLevel(g_linearWrap, coordinates, lod).rg;
     float cut = 1.0 - clouds.cirrusCoverage;
-    float cover = smoothstep(cut, cut + kCirrusEdge, streaks * 0.7 + strand.r * 0.3);
-    return clouds.cirrusDepth * cover * (0.4 + 0.6 * strand.g);
+    float cover = smoothstep(cut, cut + kCirrusEdge, streaks * 0.5 + strand.r * 0.4 + strand.g * 0.1);
+    return clouds.cirrusDepth * cover * (0.5 + 0.5 * strand.g);
 }
 
 // ---- Light.
@@ -1056,7 +1057,9 @@ void main(uint3 id : SV_DispatchThreadID, uint index : SV_GroupIndex)
         // Coverage and type over a few cells a tile; the cirrus' streaks far longer along x than across it.
         float coverage = GradientFbm(p, int3(4, 4, 1), 5, 0x9e3779b9u);
         float type = GradientFbm(p, int3(3, 3, 1), 4, 0x85ebca6bu);
-        float streaks = GradientFbm(p, int3(2, 24, 1), 5, 0xc2b2ae35u);
+        // The streaks bend along a flow as the strands do: straight, they ran across the sky like contrails (2026-11-03).
+        float2 bent = p.xy + kCirrusWarp * CurlFlow(p.xy, 2, 0x2545f491u);
+        float streaks = GradientFbm(float3(bent, 0.5), int3(2, 24, 1), 5, 0xc2b2ae35u);
         // Spread the sums of octaves, which gather around a half, over the range.
         output[id.xy] = float4(saturate(float3(coverage, type, streaks) * 2.0 - 0.5), 1.0);
         return;
