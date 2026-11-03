@@ -1035,9 +1035,14 @@ const ModelEntry& ModelFor(const std::string& mdlPath, int skin = 0)
 
 // Ray tests of SealedLights: rays from a light stop at triangles within kShellReach, and when all but kSealedEscape of
 // kSealRays directions stop, the light is sealed. A light inside a hollow building prop reaches walls further away.
+// A light its fixture encloses closely (kCloseShellShare of the directions stop at the prop within kCloseShell) is
+// sealed too, open sides or not: the bulbs of atmospherichouse's chandeliers sit in its ceiling cap, which threw
+// magnified, stepped shadows of its arms onto the ceiling an inch away (2026-11-03).
 constexpr int kSealRays = 128;
 constexpr float kShellReach = 64.0f;
 constexpr float kSealedEscape = 0.1f;
+constexpr float kCloseShell = 12.0f;
+constexpr float kCloseShellShare = 0.15f;
 // Props whose bounds come this close to a light may seal it.
 constexpr float kShellMargin = 1.0f;
 
@@ -1190,6 +1195,7 @@ std::vector<MapLightShape> SealedLights(const bsp::WorldGeometry& world, const M
         }
         std::vector<uint32_t> hits(candidate.props.size(), 0);
         int escaped = 0;
+        int closeHits = 0;
         float shellDistance = 0.0f;
         float nearestWorld = kShellReach;
         for (int r = 0; r < kSealRays; ++r) {
@@ -1212,11 +1218,18 @@ std::vector<MapLightShape> SealedLights(const bsp::WorldGeometry& world, const M
             } else if (owner >= 0) {
                 ++hits[owner];
                 shellDistance += nearest;
+                if (nearest <= kCloseShell)
+                    ++closeHits;
             } else {
                 nearestWorld = std::min(nearestWorld, nearest);
             }
         }
-        if (escaped > kSealedEscape * kSealRays)
+        static const bool developer = HasArgument(L"-gmodpp_dev");
+        if (developer) {
+            log::Info("Scene: light {} at ({:.0f} {:.0f} {:.0f}) in {} prop(s): {} of {} rays escape, {} stop at a prop within {} units", candidate.light,
+                origin.x, origin.y, origin.z, candidate.props.size(), escaped, kSealRays, closeHits, kCloseShell);
+        }
+        if (escaped > kSealedEscape * kSealRays && closeHits < kCloseShellShare * kSealRays)
             return;
         uint32_t shellHits = 0;
         for (size_t n = 0; n < hits.size(); ++n) {

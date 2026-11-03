@@ -1525,6 +1525,18 @@ void DrawPass(const ShadowState& shadow, const MeshDraw& mesh)
                     std::format("({} {} {} {})", dynamic.pixelFloats[2].v[0], dynamic.pixelFloats[2].v[1], dynamic.pixelFloats[2].v[2], dynamic.pixelFloats[2].v[3]),
                     std::format("({} {} {} {})", dynamic.pixelFloats[3].v[0], dynamic.pixelFloats[3].v[1], dynamic.pixelFloats[3].v[2], dynamic.pixelFloats[3].v[3]),
                     pixelState.textures[0], pixelState.samplers[0], static_cast<const void*>(pipeline));
+                std::string bound;
+                for (size_t s = 0; s < 8; ++s) {
+                    const Texture* texture = TextureFromHandle(dynamic.textures[s]);
+                    if (texture != nullptr)
+                        bound += std::format(" s{} {} {}x{}", s, texture->name, texture->width, texture->height);
+                }
+                log::Info("DIAG   textures{}", bound.empty() ? " none" : bound);
+                std::string layout;
+                for (UINT e = 0; e < key.elementCount; ++e)
+                    layout += std::format(" {}{} fmt {} slot {} at {}", key.elements[e].SemanticName, key.elements[e].SemanticIndex,
+                        static_cast<int>(key.elements[e].Format), key.elements[e].InputSlot, key.elements[e].AlignedByteOffset);
+                log::Info("DIAG   layout{} stride0 {} integer {:#x}", layout, mesh.streams[0].StrideInBytes, vertexVariant.integerInputs);
             }
         }
     }

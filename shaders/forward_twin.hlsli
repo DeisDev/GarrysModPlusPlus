@@ -205,15 +205,18 @@ void GlassRay(GlassRays rays, uint k, out float3 origin, out float3 direction, o
 // what the pane reflects (GlassTransmission). Snell's law at a flat back face behind the ripples turned oblique views
 // into bands of total internal reflection, where only the reflection showed (ffa_devcqb, 2026-11-03). What comes through
 // is tinted; where the material has a cubemap (`reflectivity`, its mask) the reflection at the front face is traced too.
+// The ripples bend only the rays: the Fresnel shares and the path inside the pane follow the flat pane, as Source's
+// normal map is its screen distortion, not the glass's shape. Taken at the rippled normal, the shares swung with every
+// ripple where a pane was seen edge-on and banded it light and dark (ffa_devcqb's glass box, 2026-11-03).
 // `blur` (Refract's BLUR combo) spreads the refraction over kGlassBlurAngle. The rays' light is before the tonemap scale.
 GlassRays RefractedGlass(float3 tint, float3 bumped, float3 faceNormal, float3 position, float reflectivity, float blur)
 {
     float3 view = normalize(position - g_frame.eyePosition);
     float3 face = dot(faceNormal, view) > 0.0 ? -faceNormal : faceNormal;
     float3 front = dot(bumped, face) < 0.0 ? -bumped : bumped;
-    float cosine = saturate(dot(front, -view));
+    float cosine = saturate(dot(face, -view));
     float fresnel = Fresnel(cosine, kGlassIor);
-    float3 inside = refract(view, front, 1.0 / kGlassIor);
+    float3 inside = refract(view, face, 1.0 / kGlassIor);
     inside = dot(inside, inside) > 0.0 ? normalize(inside) : view;
     float3 tilt = front / max(dot(front, face), 1e-3) - face;
     float3 through = normalize(view - (kGlassIor - 1.0) * tilt);
@@ -225,7 +228,7 @@ GlassRays RefractedGlass(float3 tint, float3 bumped, float3 faceNormal, float3 p
     float3 origin;
     float transmission;
     if (thick) {
-        transmission = (1.0 - fresnel) * (1.0 - Fresnel(saturate(dot(through, -exitNormal)), kGlassIor));
+        transmission = (1.0 - fresnel) * (1.0 - Fresnel(saturate(dot(view, -exitNormal)), kGlassIor));
         origin = position - face * 0.01 + inside * exitDistance - exitNormal * 0.5;
     } else {
         transmission = GlassTransmission(cosine);
@@ -252,7 +255,11 @@ GlassRays RefractedGlass(float3 tint, float3 bumped, float3 faceNormal, float3 p
 // shows unlit, oC3 world position (alpha: the cubemap's share the game adds to the draw's colour, its mask times tint and
 // LightmappedGeneric's $fresnelreflection Fresnel): the colour the game's lit shaders would write, with the tonemap
 // scale and range fog as on opaque surfaces (shaders/deferred_lighting.hlsl). Refract's twin writes its own outputs
-// (RefractedGlass): oC1's alpha -1 less its cubemap's mask, oC2 the face normal and in alpha 1 where it blurs.
+// (RefractedGlass): oC1 the tangent-space normal and in alpha -1 less its cubemap's mask, oC2 the face normal and in
+// alpha 1 where it blurs, the normal map's coordinates in oC0's and oC3's alpha. Its normal is turned to world space here
+// with the tangent frame of the surface's position and coordinate derivatives (Schüler 2013, "Followup: Normal Mapping
+// Without Precomputed Tangents"): the game's vertex tangents came in zero or arbitrary on brush glass, which Source's
+// screen-space distortion never used (ffa_devcqb, 2026-11-03).
 // Glass reflects the traced scene along the mirrored view where its cubemap was. Where the pane is clear (1 - alpha) it
 // reflects what its two faces reflect (GlassReflectance): the game blends the draw by its alpha, so that share adds to
 // both the colour and the alpha and leaves the rest of what lies behind to the blend. A face of a thick pane reflects
@@ -261,20 +268,43 @@ GlassRays RefractedGlass(float3 tint, float3 bumped, float3 faceNormal, float3 p
 // from afar, lost the reflection their mappers gave them and looked opaque (gm_dust_station, 2026-11-03).
 // `mainView`: the main view's draws see the medium between the eye and the surface as its froxel volume holds it
 // (shaders/froxels.hlsli); views drawn into textures see from elsewhere and light the fog where it meets the surface.
+// The world-space normal of Refract glass from the twin's tangent-space one: the tangent frame comes from the derivatives
+// of the pixel's position and of the normal map's coordinates (`uv`), as the derivatives are taken outside any branch.
+float3 RefractGlassNormal(float3 tangentNormal, float3 faceNormal, float3 dpdx, float3 dpdy, float2 duvdx, float2 duvdy)
+{
+    float3 dp2perp = cross(dpdy, faceNormal);
+    float3 dp1perp = cross(faceNormal, dpdx);
+    float3 tangent = dp2perp * duvdx.x + dp1perp * duvdy.x;
+    float3 bitangent = dp2perp * duvdx.y + dp1perp * duvdy.y;
+    float largest = max(dot(tangent, tangent), dot(bitangent, bitangent));
+    if (largest <= 1e-20)
+        return faceNormal;
+    float scale = rsqrt(largest);
+    float3 bumped = tangentNormal.x * tangent * scale + tangentNormal.y * bitangent * scale + tangentNormal.z * faceNormal;
+    return dot(bumped, bumped) > 1e-8 ? normalize(bumped) : faceNormal;
+}
+
 float4 gmodpp_ForwardTwin(float4 albedo, float4 normal, float4 emissive, float4 position, bool mainView)
 {
+    bool refractGlass = normal.w <= -1.0;
+    float3 dpdx = ddx(position.xyz);
+    float3 dpdy = ddy(position.xyz);
+    float2 uv = float2(albedo.a, position.w);
+    float2 duvdx = ddx(uv);
+    float2 duvdy = ddy(uv);
     float3 n = dot(normal.xyz, normal.xyz) > 0.0625 ? normalize(normal.xyz) : float3(0.0, 0.0, 1.0);
+    if (refractGlass)
+        n = RefractGlassNormal(n, normalize(emissive.xyz), dpdx, dpdy, duvdx, duvdy);
     // Debug views show the light alone, opaque.
     bool lightOnly = g_frame.debugView != 0;
     float3 toEye = normalize(g_frame.eyePosition - position.xyz);
-    float alpha = lightOnly ? 1.0 : albedo.a;
+    float alpha = lightOnly || refractGlass ? 1.0 : albedo.a;
     GlassRays rays = NoGlassRays();
-    bool refracts = normal.w <= -1.0 && !lightOnly && g_frame.traceMask != 0;
+    bool refracts = refractGlass && !lightOnly && g_frame.traceMask != 0;
     // The share of the pixel's colour its own lit surface takes; Refract glass shows only its rays.
     float surfaceWeight = 1.0;
     if (refracts) {
         rays = RefractedGlass(albedo.rgb, n, normalize(emissive.xyz), position.xyz, -1.0 - normal.w, emissive.w);
-        alpha = 1.0;
     } else {
         if (normal.w > 0.0 && !lightOnly && g_frame.traceMask != 0 && g_frame.reflectionScale > 0.0) {
             float3 facing = dot(n, toEye) < 0.0 ? -n : n;

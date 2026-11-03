@@ -1,5 +1,6 @@
 #include "overlay.h"
 
+#include "client_hooks.h"
 #include "command_line.h"
 #include "engine_interfaces.h"
 #include "log.h"
@@ -1749,6 +1750,7 @@ void DrawPerformancePage(Settings& settings)
             SwitchRow("general.overlay", &Settings::performanceOverlay);
             const bool shown = settings.performanceOverlay;
             const char* reason = Text("general.overlay_reason");
+            SwitchRow("general.overlay_hide_with_hud", &Settings::overlayHideWithHud, shown, reason);
             constexpr const char* kDetails[] = {"general.overlay_minimal", "general.overlay_normal", "general.overlay_full", "general.overlay_extra"};
             static_assert(std::size(kDetails) == static_cast<size_t>(OverlayDetail::Count));
             ComboRow("general.overlay_detail", &Settings::overlayDetail, kDetails, shown, reason);
@@ -2713,6 +2715,17 @@ void UpdateMemory()
 }
 
 // The always-visible performance overlay; returns its height.
+// Whether the game hides its HUD: its cl_drawhud cvar, or its Lua (the camera, HUD-hiding addons: client::HudHidden).
+bool GameHudHidden()
+{
+    if (!engine::IsInGame())
+        return false;
+    if (client::HudHidden())
+        return true;
+    const std::optional<std::string> drawHud = engine::ConVarString("cl_drawhud");
+    return drawHud && std::strtol(drawHud->c_str(), nullptr, 10) == 0;
+}
+
 float DrawPerformanceOverlay(const Settings& settings)
 {
     const Statistics& statistics = GetStatistics();
@@ -3063,7 +3076,7 @@ void Render(ID3D12GraphicsCommandList* list, D3D12_CPU_DESCRIPTOR_HANDLE rtv)
     const Settings& settings = GetSettings();
     // The notice moves above the performance overlay when they share a corner.
     float noticeOffset = 0.0f;
-    if (settings.performanceOverlay) {
+    if (settings.performanceOverlay && !(settings.overlayHideWithHud && GameHudHidden())) {
         const float height = DrawPerformanceOverlay(settings);
         if (settings.overlayCorner == NoticeCorner())
             noticeOffset = height + ImGui::GetStyle().ItemSpacing.y;

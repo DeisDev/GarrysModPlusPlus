@@ -279,8 +279,9 @@ struct Settings {
     float exposureMaximum = 16.0f;
     float exposureTime = 1.0f;
 
-    // The always-visible performance overlay.
+    // The always-visible performance overlay; overlayHideWithHud hides it while the game hides its own HUD.
     bool performanceOverlay = false;
+    bool overlayHideWithHud = true;
     OverlayDetail overlayDetail = OverlayDetail::Normal;
     OverlayCorner overlayCorner = OverlayCorner::TopRight;
     // Its look: background opacity and colour, text colour, size (times the menu's font), distance from the screen's

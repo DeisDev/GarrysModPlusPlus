@@ -14,7 +14,10 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <cstddef>
+#include <cstring>
 
 namespace gmodpp::client {
 
@@ -41,17 +44,31 @@ constexpr char kEnable3dSkyboxFogPattern[] = "BA 97 00 00 00 E8 ?? ?? ?? ?? 84 C
 // calls it for views with bloom and tone mapping after their viewmodel and fade, before the screen-space effects and
 // the HUD; the camera effects and colour grading follow it.
 constexpr char kDoEnginePostProcessingLabel[] = "EnginePost";
+// CHudElement's Lua visibility check (client.dll+0x25EF90, REA 2026-11-03): CLuaGamemode::CallWithArgs(0x33), the
+// GM:HUDShouldDraw hook (0x33 in lua_shared's hook name table, where SetupWorldFog is 0x98), with the element's name
+// (the char* at +0x18) as its argument; false hides the element. CHud::Think asks it for every element each frame
+// (Source SDK 2013 hud.cpp). GMod's camera and addons that hide the HUD answer false for CHudGMod, the element that
+// runs GM:HUDPaint; custom HUDs hide only the elements they replace. This is its call of the hook and its push of the
+// name: the other two callers (CFPSPanel, NetGraph) load their names with LEA.
+constexpr char kHudShouldDrawPattern[] = "BA 33 00 00 00 E8 ?? ?? ?? ?? 84 C0 74 ?? 48 8B 0D ?? ?? ?? ?? 45 33 C0 48 8B 53 18";
+constexpr char kHudPaintElement[] = "CHudGMod";
 
 using DrawWorldFn = void(__fastcall*)(void* view, float waterZAdjust);
 using DrawTranslucentRenderablesFn = void(__fastcall*)(void* view, bool inSkybox, bool shadowDepth);
 using EnableFogFn = void(__fastcall*)(void* view);
 using DoEnginePostProcessingFn = void(__fastcall*)(int x, int y, int w, int h, bool flashlightOn, bool postVGui);
+using HudShouldDrawFn = bool(__fastcall*)(void* element);
 DrawWorldFn g_drawWorld = nullptr;
 DrawTranslucentRenderablesFn g_drawTranslucentRenderables = nullptr;
 EnableFogFn g_enableWorldFog = nullptr;
 EnableFogFn g_enable3dSkyboxFog = nullptr;
 DoEnginePostProcessingFn g_doEnginePostProcessing = nullptr;
+HudShouldDrawFn g_hudShouldDraw = nullptr;
 bool g_attempted = false;
+// The last answer for CHudGMod and when it was given; the HUD counts as hidden while a recent answer is no.
+std::atomic<bool> g_hudPaintHidden = false;
+std::atomic<long long> g_hudPaintAnswered = 0;
+constexpr long long kHudAnswerStale = 1000;
 
 void __fastcall HookDrawWorld(void* view, float waterZAdjust)
 {
@@ -121,6 +138,17 @@ void __fastcall HookDoEnginePostProcessing(int x, int y, int w, int h, bool flas
     native::PostProcessView({x, y, x + w, y + h});
 }
 
+bool __fastcall HookHudShouldDraw(void* element)
+{
+    const bool draw = g_hudShouldDraw(element);
+    const char* name = *reinterpret_cast<const char* const*>(static_cast<std::byte*>(element) + 0x18);
+    if (name != nullptr && std::strcmp(name, kHudPaintElement) == 0) {
+        g_hudPaintHidden.store(!draw, std::memory_order_relaxed);
+        g_hudPaintAnswered.store(static_cast<long long>(GetTickCount64()), std::memory_order_relaxed);
+    }
+    return draw;
+}
+
 bool Hook(HMODULE clientModule, void* target, const char* name, void* hook, void** original)
 {
     if (target == nullptr) {
@@ -170,6 +198,9 @@ void TryInstall()
     if (!Install(clientModule, kDoEnginePostProcessingLabel, "DoEnginePostProcessing", reinterpret_cast<void*>(&HookDoEnginePostProcessing),
             reinterpret_cast<void**>(&g_doEnginePostProcessing)))
         log::Info("client.dll: the camera effects and colour grading are unavailable");
+    if (!Hook(clientModule, FindFunctionWithPattern(clientModule, kHudShouldDrawPattern), "HudShouldDraw", reinterpret_cast<void*>(&HookHudShouldDraw),
+            reinterpret_cast<void**>(&g_hudShouldDraw)))
+        log::Info("client.dll: the performance overlay cannot follow the game's HUD");
     // Both hooks are needed: a capture started by DrawWorld must always be finished by the translucent pass.
     if (!Install(clientModule, kDrawTranslucentRenderablesLabel, "DrawTranslucentRenderables", reinterpret_cast<void*>(&HookDrawTranslucentRenderables),
             reinterpret_cast<void**>(&g_drawTranslucentRenderables))) {
@@ -178,6 +209,12 @@ void TryInstall()
     }
     if (!Install(clientModule, kDrawWorldLabel, "DrawWorld", reinterpret_cast<void*>(&HookDrawWorld), reinterpret_cast<void**>(&g_drawWorld)))
         log::Info("client.dll: effects disabled");
+}
+
+bool HudHidden()
+{
+    const long long answered = g_hudPaintAnswered.load(std::memory_order_relaxed);
+    return answered != 0 && static_cast<long long>(GetTickCount64()) - answered < kHudAnswerStale && g_hudPaintHidden.load(std::memory_order_relaxed);
 }
 
 }

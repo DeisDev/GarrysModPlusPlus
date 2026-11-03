@@ -202,6 +202,7 @@ constexpr NamedField kFields[] = {
     {"exposure_time", &Settings::exposureTime, Camera, {0.0f, 10.0f}},
 
     {"performance_overlay", &Settings::performanceOverlay, Overlay, {}, false},
+    {"overlay_hide_with_hud", &Settings::overlayHideWithHud, Overlay, {}, false},
     {"overlay_detail", &Settings::overlayDetail, Overlay, {}, false},
     {"overlay_corner", &Settings::overlayCorner, Overlay, {}, false},
     {"overlay_opacity", &Settings::overlayOpacity, Overlay, {0.0f, 1.0f}, false},

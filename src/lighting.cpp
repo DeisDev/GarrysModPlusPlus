@@ -1362,12 +1362,11 @@ void Lighting::RecordSky(FrameConstants& constants, const ViewInputs& inputs, co
             m_skyDraw.sunRadius = std::atan(kSunSpriteHalfBrightness * inputs.envSun->size / kSunSpriteDistance);
     }
     m_skyDraw.sunRadius *= settings.sunSize;
+    // Set every frame, so a day map's Moon cannot linger into a night map loaded after it.
     const std::optional<MoonState> moon = MoonFor(inputs, scene);
-    if (moon) {
-        m_skyDraw.moonDirection = moon->direction;
-        m_skyDraw.moonIrradiance = moon->irradiance;
-        m_skyDraw.moonScale = moon->scale;
-    }
+    m_skyDraw.moonDirection = moon ? moon->direction : std::array<float, 3>{};
+    m_skyDraw.moonIrradiance = moon ? moon->irradiance : 0.0f;
+    m_skyDraw.moonScale = moon ? moon->scale : 0.0f;
     m_skyDraw.moonlessFloor = settings.moonlessNight;
     // The physical sky's stars are drawn against the sky the map's sun lights: the Sun's, or the Moon's on night maps.
     m_skyDraw.mapLight = MapSunIsMoon() ? MoonIrradiance(1.0f) : 1.0f;

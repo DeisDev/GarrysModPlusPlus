@@ -2,9 +2,13 @@
 // Source: Source SDK 2013 mp/src/materialsystem/stdshaders/refract_ps2x.fxc at 7309a5f (Source 1 SDK License), whose
 // combos GMod's file has (2048 combos, 4 dynamic). Change: instead of distorting the frame buffer copy it writes what
 // shaders/forward_twin.hlsli needs to trace the refraction through the glass: oC0 the refract tint (with its tint
-// texture and colour modulation), oC1 the bumped world normal and in alpha -1 less the cubemap's mask, oC2 the face's
-// world normal and in alpha 1 for the BLUR combos, oC3 the world position. Only the forward output is used: Refract draws
-// come after the G-buffer.
+// texture and colour modulation) and in alpha the normal map's u, oC1 the tangent-space normal with its slopes scaled
+// and in alpha -1 less the cubemap's mask, oC2 the face's world normal and in alpha 1 for the BLUR combos, oC3 the world
+// position and in alpha the normal map's v. The header turns the normal to world space with a tangent frame from the
+// derivatives of the position and of the normal map's coordinates, not the vertex tangents: brush glass arrived with
+// them zero or arbitrary (ffa_devcqb's glass box, measured in game 2026-11-03), which Source never shows, as it moves
+// the frame buffer copy by the tangent-space slopes alone. Only the forward output is used: Refract draws come after
+// the G-buffer.
 // The normal map's slopes are scaled so the traced refraction bends the view as far as Source's distortion moved it:
 // Source shifts the copy by slope * alpha * $refractamount of the screen, about twice that in radians at a 90 degree
 // view, and a thin pane whose face is that steep bends light by (n - 1) * slope.
@@ -113,7 +117,6 @@ GBufferTwinOutput main( PS_INPUT i )
 #endif
 
 	vNormal.xy *= saturate( 2.0f * g_RefractScale * vNormal.a / ( 1.52f - 1.0f ) );
-	float3 worldSpaceNormal = Vec3TangentToWorld( normalize( vNormal.xyz ), i.vWorldNormal, i.vWorldTangent, i.vWorldBinormal );
 #if CUBEMAP
 	float reflectivity = any( g_EnvmapTint > 0.0f ) ? saturate( vNormal.a ) : 0.0f;
 #else
@@ -121,9 +124,9 @@ GBufferTwinOutput main( PS_INPUT i )
 #endif
 
 	GBufferTwinOutput twin;
-	twin.albedo = float4( refractTintColor, 1.0f );
-	twin.normal = float4( normalize( worldSpaceNormal ), -1.0f - reflectivity );
+	twin.albedo = float4( refractTintColor, i.vBumpTexCoord.x );
+	twin.normal = float4( normalize( vNormal.xyz ), -1.0f - reflectivity );
 	twin.emissive = float4( normalize( i.vWorldNormal ), BLUR ? 1.0f : 0.0f );
-	twin.flags = float4( i.worldPos_projPosZ.xyz, 1.0f );
+	twin.flags = float4( i.worldPos_projPosZ.xyz, i.vBumpTexCoord.y );
 	return twin;
 }

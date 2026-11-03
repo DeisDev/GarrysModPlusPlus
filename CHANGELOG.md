@@ -16,6 +16,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - A README with installation steps, requirements and how to build from source.
 - The sky's highlights near a low sun roll off toward white instead of clipping to a flat white blob ("Highlight roll-off" on the Sky page), and "Sun glow" scales the haze of light around the sun.
 - The performance overlay's opacity, background and text colours, size, margin and border can be set on the Performance page.
+- The performance overlay hides while the game hides its HUD (the camera, `cl_drawhud 0`, addons that hide it); "Hide with the game's HUD" on the Performance page, on by default.
 - Menu cards collapse and expand when their heading is clicked, and stay collapsed between sessions. Explanations moved from text under the cards into a help mark on each heading; the menu's icons come from the Lucide icon font.
 
 ### Changed
@@ -168,6 +169,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Refract glass (such as `glass/glasswindow_refract01`) on brushes no longer shows bands and combs of the wrong scene: its normal map was applied with the vertex tangents, which the game leaves empty on brush glass, so rays bent by tens of degrees. The tangent frame now comes from the surface itself.
+- The 3D skybox no longer turns white when the view tilts up far enough for the sky to be drawn after it (mm_trickery): the fog colour is now taken from the last lit draw, not from the sky's.
+- Bulbs placed inside their fixture (a chandelier's ceiling cap, a sconce) no longer throw magnified, stepped shadows of the fixture's arms onto the nearby ceiling: the fixture diffuses them as sealed lamps do.
 - Frame generation turns off while the menu is open, so dragging the menu no longer tears or ghosts.
 - "Reset page" on the Image page now resets frame generation, Reflex and Anti-Lag too, and on the Lighting page no longer resets the display, hardware warning, debug view and latency settings.
 - The lens flare sits on the sun disc on maps whose painted sky puts the sun elsewhere than the map's sunlight, and on the Moon once the sun has set.

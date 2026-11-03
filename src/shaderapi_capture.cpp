@@ -97,6 +97,10 @@ struct State {
     bool skipView = false;
     std::array<float, 2> jitter = {};
     gbuffer::Matrix4 viewProj = {};
+    // The fog constants of the pass's last lit draw (End): the sky faces drawn after the terrain leave c29 white.
+    bool litFogSeen = false;
+    std::array<float, 4> litFogRange = {};
+    std::array<float, 3> litFogColor = {};
     std::array<std::array<float, 4>, bytecode::kForwardUniforms> forwardConstants = {};
     uint32_t forwardDraws = 0;
     uint32_t forwardTwinDraws = 0;
@@ -394,6 +398,7 @@ bool Begin(std::array<float, 2> jitter)
     g_state.jitter = jitter;
     g_state.lightWarps.clear();
     g_state.waterFogColor.reset();
+    g_state.litFogSeen = false;
     g_state.projected.clear();
     g_state.srgbDraws = 0;
     g_state.linearDraws = 0;
@@ -417,9 +422,11 @@ bool End(ViewKind kind, ViewInputs& inputs)
     if (kind != ViewKind::Viewmodel) {
         // Every lit shader's vertex fog constant holds the view's range fog (cFogParams: end / range, 1,
         // 1 - max density, 1 / range) and pixel c29 its colour; Source writes that constant only when fog is on, so
-        // the fog mode says whether it belongs to this view.
-        const float* range = VertexRegister(gbuffer::kVertexFogRegister).v;
-        const float* color = PixelRegister(gbuffer::kFogColorRegister).v;
+        // the fog mode says whether it belongs to this view. They are taken at the pass's last lit draw: the 2D sky's
+        // faces, drawn after the terrain, left c29 white, and the 3D skybox turned white when the view looked up
+        // enough for them to come last (mm_trickery, 2026-11-03).
+        const float* range = g_state.litFogSeen ? g_state.litFogRange.data() : VertexRegister(gbuffer::kVertexFogRegister).v;
+        const float* color = g_state.litFogSeen ? g_state.litFogColor.data() : PixelRegister(gbuffer::kFogColorRegister).v;
         gbuffer::Fog& fog = g_state.fog[kind == ViewKind::Skybox ? 1 : 0];
         const std::optional<engine::FogState> current = engine::CurrentFog();
         fog.params = current && current->mode != 0 ? std::array<float, 4>{range[0] - 1.0f, 0.0f, 1.0f - range[2], range[3]} : std::array<float, 4>{};
@@ -752,6 +759,11 @@ Pass Prepare(std::span<const DWORD> vertexCode, std::span<const DWORD> pixelCode
     const bool modulate = !gbuffer && shaderClass.kind == ShaderKind::Other && blend && depthTest && gameTarget &&
         sourceBlend == kBlendDestinationColor && destinationBlend == kBlendSourceColor;
     pass.route = gbuffer ? Pass::Route::GBuffer : modulate ? Pass::Route::Albedo : Pass::Route::Game;
+    if (gbuffer && shaderClass.kind == ShaderKind::GBuffer) {
+        std::copy_n(VertexRegister(gbuffer::kVertexFogRegister).v, 4, g_state.litFogRange.begin());
+        std::copy_n(PixelRegister(gbuffer::kFogColorRegister).v, 3, g_state.litFogColor.begin());
+        g_state.litFogSeen = true;
+    }
     if (shaderClass.kind == ShaderKind::ProjectedShadow) {
         Count(pixelFile, Path::ProjectedShadow);
         pass.route = Pass::Route::Skip;
