@@ -198,12 +198,14 @@ void GlassRay(GlassRays rays, uint k, out float3 origin, out float3 direction, o
     }
 }
 
-// Refract glass at a point (shaders/twins/refract_ps2x.fxc): its front face has the normal map's ripples. The view bends
-// into the glass there (Snell's law). In a thick pane it crosses to the pane's other face (GlassExit) and bends out of
-// it, losing what each face reflects (Fresnel); in a thin pane both faces are the one triangle, flat behind the ripples,
-// and it loses what the pane reflects (GlassTransmission). What comes through is tinted; where the material has a
-// cubemap (`reflectivity`, its mask) the reflection at the front face is traced too. `blur` (Refract's BLUR combo)
-// spreads the refraction over kGlassBlurAngle. The rays' light is before the tonemap scale.
+// Refract glass at a point (shaders/twins/refract_ps2x.fxc): its front face has the normal map's ripples, flat behind
+// them. The view leaves the pane bent as a thin prism bends it, by (n - 1) times the ripples' slope across the face, the
+// deflection the twin's slopes are scaled to (Source's distortion). In a thick pane it crosses to the pane's other face
+// (GlassExit), losing what each face reflects (Fresnel); in a thin pane both faces are the one triangle, and it loses
+// what the pane reflects (GlassTransmission). Snell's law at a flat back face behind the ripples turned oblique views
+// into bands of total internal reflection, where only the reflection showed (ffa_devcqb, 2026-11-03). What comes through
+// is tinted; where the material has a cubemap (`reflectivity`, its mask) the reflection at the front face is traced too.
+// `blur` (Refract's BLUR combo) spreads the refraction over kGlassBlurAngle. The rays' light is before the tonemap scale.
 GlassRays RefractedGlass(float3 tint, float3 bumped, float3 faceNormal, float3 position, float reflectivity, float blur)
 {
     float3 view = normalize(position - g_frame.eyePosition);
@@ -213,24 +215,22 @@ GlassRays RefractedGlass(float3 tint, float3 bumped, float3 faceNormal, float3 p
     float fresnel = Fresnel(cosine, kGlassIor);
     float3 inside = refract(view, front, 1.0 / kGlassIor);
     inside = dot(inside, inside) > 0.0 ? normalize(inside) : view;
+    float3 tilt = front / max(dot(front, face), 1e-3) - face;
+    float3 through = normalize(view - (kGlassIor - 1.0) * tilt);
+    if (dot(through, face) >= 0.0)
+        through = view;
     float exitDistance;
     float3 exitNormal;
     bool thick = GlassExit(position - face * 0.01, inside, exitDistance, exitNormal);
-    float3 through;
     float3 origin;
     float transmission;
     if (thick) {
-        through = refract(inside, exitNormal, kGlassIor);
-        // Beyond the critical angle the back face mirrors the light inside the pane: none comes through here.
-        transmission = dot(through, through) > 0.0 ? (1.0 - fresnel) * (1.0 - Fresnel(dot(inside, -exitNormal), 1.0 / kGlassIor)) : 0.0;
+        transmission = (1.0 - fresnel) * (1.0 - Fresnel(saturate(dot(through, -exitNormal)), kGlassIor));
         origin = position - face * 0.01 + inside * exitDistance - exitNormal * 0.5;
     } else {
-        through = refract(inside, face, kGlassIor);
         transmission = GlassTransmission(cosine);
         origin = position - face * 0.5;
     }
-    if (dot(through, through) <= 0.0 || dot(through, face) >= 0.0)
-        through = view;
     GlassRays rays = NoGlassRays();
     if (transmission > 0.0) {
         rays.refractions = blur > 0.0 ? 5 : 1;
