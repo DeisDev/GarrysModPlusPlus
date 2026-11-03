@@ -7,7 +7,7 @@
 // offsets (t1), are bound for every pass and read by those built with them (shaders/nvidia).
 #define ROOT_SIGNATURE "RootFlags(CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED), CBV(b0), SRV(t0), RootConstants(num32BitConstants = 12, b1), " \
     "CBV(b2), UAV(u0, space = 2), CBV(b3), UAV(u1, space = 2), UAV(u2, space = 2), SRV(t1, space = 2), " \
-    "StaticSampler(s0, filter = FILTER_MIN_MAG_MIP_LINEAR, addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP), "     "StaticSampler(s2, filter = FILTER_MIN_MAG_MIP_LINEAR, addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP)"
+    "StaticSampler(s0, filter = FILTER_MIN_MAG_MIP_LINEAR, addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP), "     "StaticSampler(s2, filter = FILTER_MIN_MAG_MIP_LINEAR, addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP)"
 
 // Mirrors gmodpp::FrameConstants in src/lighting.h.
 struct FrameConstants
@@ -81,7 +81,8 @@ struct FrameConstants
     // Ray-traced ambient occlusion (shaders/ao.hlsl), or kNoView, and how much of it darkens indirect light.
     uint aoView;
     float aoIntensity;
-    // Half-resolution in-scattered light (shaders/volumetrics.hlsl), or kNoView, and the haze's density per unit.
+    // The integrated froxel volume of volumetric light (shaders/froxels.hlsli), or kNoView, and the haze's density per
+    // unit.
     uint volumetricView;
     float volumetricDensity;
     // Written by shaders/primary.hlsl: the face normal under each pixel, facing the eye.
@@ -92,7 +93,9 @@ struct FrameConstants
     uint indirectBounces;
     uint aoRays;
     uint volumeRays;
-    uint volumetricSteps;
+    // The map's fog lit by the map's own sun and sky (LitFog in shaders/scene.hlsli): the sun's share of the light in open
+    // air.
+    float fogSunShare;
     // traceMask without what may not block each kind of ray: sun shadows, the first indirect bounce (and ambient
     // occlusion), later bounces and local lights' shadows (shadowless props, by FoliageShadows). Indirect rays never
     // meet the local player, whose hidden first-person body would darken the ground under it.
@@ -206,7 +209,21 @@ struct FrameConstants
     // The sun's angular radius for soft shadows (SunDiscDirectionAt), and 1 - its cosine.
     float sunAngularRadius;
     float sunConeSpan;
-    uint3 padding6;
+    // The froxel volume's layout (shaders/froxels.hlsli), this frame's jitter of its sample points within their froxels,
+    // and last frame's slices, which its history is found in.
+    uint3 froxelDims;
+    float2 froxelUvScale;
+    float froxelStart;
+    float froxelRange;
+    float3 froxelJitter;
+    float prevFroxelStart;
+    float prevFroxelRange;
+    // How the light in open air compares with the map's own (LitFog): the sun's per colour channel and the sky's, and the
+    // map's own irradiance averaged over all directions (a quarter of its sun's, half its sky's).
+    float3 fogSunScale;
+    float fogSkyScale;
+    float fogAirLight;
+    uint2 padding6;
     uint4 lightWarpViews[16];
 };
 
@@ -378,11 +395,19 @@ float3 SkyRadiance(float3 direction)
 }
 
 // Source's range fog (CalcRangeFog and BlendPixelFog in common_ps_fxc.h): the share of the fog colour over a surface at
-// a view depth. fogParams.y: 1 under water, whose fog Source blends in linearly.
-float FogOpacity(float viewDepth)
+// a distance from the eye. Source measures it along the view axis, so turning the camera changed the fog on a surface;
+// the fog here follows the distance itself. fogParams.y: 1 under water, whose fog Source blends in linearly.
+float FogOpacity(float distance)
 {
-    float fog = saturate(min(g_frame.fogParams.z, viewDepth * g_frame.fogParams.w - g_frame.fogParams.x));
+    float fog = saturate(min(g_frame.fogParams.z, distance * g_frame.fogParams.w - g_frame.fogParams.x));
     return g_frame.fogParams.y > 0.0 ? fog : fog * fog;
+}
+
+// The light that shows the map's fog now over the map's own, by colour (LitFog in shaders/scene.hlsli, in open air): day
+// and night, and the sun's and sky's strengths and colours.
+float3 FogDaylight()
+{
+    return g_frame.fogSunShare * g_frame.fogSunScale + (1.0 - g_frame.fogSunShare) * g_frame.fogSkyScale;
 }
 
 // The sky's light arriving from a direction, for indirect light: the drawn sky blurred, as bright overall as the

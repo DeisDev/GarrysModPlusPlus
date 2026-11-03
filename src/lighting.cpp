@@ -153,6 +153,15 @@ constexpr UINT kRestirConstantsOffset = 256;
 static_assert(sizeof(RestirConstants) <= kSamplingStride - kRestirConstantsOffset);
 // The indirect light volume is read by the lighting passes and by the game's forward draws in their own command lists.
 constexpr D3D12_RESOURCE_STATES kVolumeRead = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+// The froxel volume's columns (shaders/volumetrics.hlsl): at least this many pixels wide, at most this many rows, as
+// Frostbite's 8x8 tiles at 900p (Hillaire 2015).
+constexpr UINT kFroxelTile = 8;
+constexpr UINT kFroxelRows = 160;
+// The haze's reach (kMaxDistance in shaders/volumetrics.hlsl) and the farthest the volume follows the map's fog.
+constexpr float kHazeDistance = 4096.0f;
+constexpr float kMaxFogDistance = 65536.0f;
+// What the froxel volume's light was gathered in; its history is kept only while that stays the same.
+enum class FroxelMedium { Haze, Fog, Water };
 static_assert(sizeof(SamplingConstants) <= kSamplingStride);
 // The radiance cache (NVIDIA SHaRC): 2^22 entries of 8 + 16 + 16 bytes (160 MiB), SHaRC's recommended size. Voxels are
 // about their distance from the camera over kCacheSceneScale across (a ratio, so Source's units need no conversion);
@@ -839,6 +848,36 @@ bool Lighting::CreateTarget(Texture& texture, UINT width, UINT height, DXGI_FORM
     return true;
 }
 
+bool Lighting::EnsureFroxels(const std::array<UINT, 3>& dims)
+{
+    if (dims == m_froxelDims)
+        return true;
+    if (dims == m_froxelFailedDims)
+        return false;
+    // Frames in flight may still read the old volume.
+    if (m_froxelIntegrated.resource)
+        WaitForGpu();
+    m_froxelDims = {};
+    m_volumetricHistoryValid = false;
+    bool ok = true;
+    for (Texture& texture : m_froxelLight)
+        ok = ok && CreateTarget(texture, dims[0], dims[1], DXGI_FORMAT_R16G16B16A16_FLOAT, dims[2]);
+    ok = ok && CreateTarget(m_froxelProjected, dims[0], dims[1], DXGI_FORMAT_R11G11B10_FLOAT, dims[2]);
+    ok = ok && CreateTarget(m_froxelIntegrated, dims[0], dims[1], DXGI_FORMAT_R16G16B16A16_FLOAT, dims[2]);
+    if (!ok) {
+        for (Texture& texture : m_froxelLight)
+            texture.resource.Reset();
+        m_froxelProjected.resource.Reset();
+        m_froxelIntegrated.resource.Reset();
+        m_froxelFailedDims = dims;
+        log::Info("Lighting: the {}x{}x{} froxel volume could not be made; volumetric light is off", dims[0], dims[1], dims[2]);
+        return false;
+    }
+    m_froxelDims = dims;
+    log::Info("Lighting: volumetric light's froxel volume is {}x{}x{}", dims[0], dims[1], dims[2]);
+    return true;
+}
+
 void Lighting::WriteWaterDraws(UINT slot, const ViewInputs& inputs, const Scene& scene, UINT firstView, FrameConstants& constants)
 {
     const std::span<const GpuWaterBody> bodies = scene.WaterBodies();
@@ -1251,8 +1290,7 @@ void Lighting::RecordSky(FrameConstants& constants, const ViewInputs& inputs, co
     m_skyDraw.sunRadius = kRealSunRadius * kSunWithoutSprite;
     if (inputs.envSun) {
         m_skyDraw.sunColor = inputs.envSun->color;
-        m_skyDraw.sprite = inputs.envSun->material;
-        m_skyDraw.spriteSize = inputs.envSun->size;
+        m_skyDraw.spriteDirection = inputs.envSun->direction;
         if (inputs.envSun->size > 0.0f)
             m_skyDraw.sunRadius = std::atan(kSunSpriteHalfBrightness * inputs.envSun->size / kSunSpriteDistance);
     }
@@ -1407,9 +1445,6 @@ bool Lighting::EnsureTargets(UINT width, UINT height)
     for (Texture& texture : m_aoHistory)
         ok = ok && CreateTarget(texture, width, height, DXGI_FORMAT_R16G16_FLOAT);
     ok = ok && CreateTarget(m_ao, width, height, DXGI_FORMAT_R16_FLOAT);
-    ok = ok && CreateTarget(m_volumetricMarch, (width + 1) / 2, (height + 1) / 2, DXGI_FORMAT_R16G16B16A16_FLOAT);
-    for (Texture& texture : m_volumetricHistory)
-        ok = ok && CreateTarget(texture, (width + 1) / 2, (height + 1) / 2, DXGI_FORMAT_R16G16B16A16_FLOAT);
     for (Texture& texture : m_reflectionHistory)
         ok = ok && CreateTarget(texture, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT);
     for (Texture& texture : m_taaHistory)
@@ -1922,6 +1957,12 @@ bool Lighting::FillConstants(FrameConstants& constants, const Scene& scene, cons
     for (int i = 0; i < 3; ++i)
         constants.eyePosition[i] = inv[i][2] / inv[3][2];
     FillSceneConstants(constants, scene);
+    // The map's own sun and sky, which its fog's colour shows (LitFog in shaders/scene.hlsli).
+    float mapSun[3];
+    float mapSky[3];
+    std::copy_n(constants.sunColor, 3, mapSun);
+    std::copy_n(constants.skyColor, 3, mapSky);
+    const bool mapSunShines = constants.sunEnabled != 0.0f;
     // The 3D skybox's scaled-down scene has no water of its own.
     if (inputs.kind == gbuffer::ViewKind::Skybox)
         constants.waterBodyCount = 0;
@@ -1987,6 +2028,21 @@ bool Lighting::FillConstants(FrameConstants& constants, const Scene& scene, cons
         constants.bakedSunScale[i] = constants.sunEnabled != 0.0f && settings.sun ? settings.sunIntensity * sunStyle * daylight.sun[i] * sunRecolor[i] : 0.0f;
     }
     constants.bakedSkyScale = settings.skyIntensity * skyStyle * daylight.sky;
+    // The fog's light: in open air a quarter of the sun's irradiance and half the sky's, the map's own showing the fog's
+    // colour. The sun's share follows the sun's colour channel by channel, so sunsets colour the fog; a channel the map's
+    // sun nearly lacks is compared with a tenth of its brightest.
+    const float mapSunLight = mapSunShines ? 0.25f * Luminance(mapSun) : 0.0f;
+    const float mapSkyLight = 0.5f * Luminance(mapSky);
+    constants.fogAirLight = mapSunLight + mapSkyLight;
+    constants.fogSunShare = constants.fogAirLight > 0.0f ? mapSunLight / constants.fogAirLight : 0.0f;
+    const float brightestSun = std::max({mapSun[0], mapSun[1], mapSun[2]});
+    for (int i = 0; i < 3; ++i)
+        constants.fogSunScale[i] = constants.sunEnabled != 0.0f && brightestSun > 0.0f ? constants.sunColor[i] / std::max(mapSun[i], 0.1f * brightestSun) : 0.0f;
+    constants.fogSkyScale = mapSkyLight > 0.0f ? Luminance(constants.skyColor) / Luminance(mapSky) : 1.0f;
+    if (inputs.kind == gbuffer::ViewKind::Main) {
+        for (int i = 0; i < 3; ++i)
+            m_fogDaylight[i] = constants.fogSunShare * constants.fogSunScale[i] + (1.0f - constants.fogSunShare) * constants.fogSkyScale;
+    }
     constants.lightScale = settings.lightIntensity;
     constants.indirectScale = settings.indirectLight ? settings.indirectIntensity : 0.0f;
     constants.taaHistoryWeight = settings.taaHistoryWeight;
@@ -2007,7 +2063,6 @@ bool Lighting::FillConstants(FrameConstants& constants, const Scene& scene, cons
     constants.indirectBounces = static_cast<uint32_t>(settings.indirectBounces);
     constants.aoRays = static_cast<uint32_t>(settings.aoRays);
     constants.volumeRays = static_cast<uint32_t>(settings.volumeRays);
-    constants.volumetricSteps = static_cast<uint32_t>(settings.volumetricSteps);
     constants.indirectRayFlags = m_useMicromaps && settings.fastAlphaTests ? D3D12_RAY_FLAG_FORCE_OMM_2_STATE : D3D12_RAY_FLAG_NONE;
     constants.dispatchOriginView = inputs.kind == gbuffer::ViewKind::Viewmodel ? m_viewRect.srv : kInvalidView;
     constants.restirDebugView = kInvalidView;
@@ -3004,34 +3059,110 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     if (main)
         m_lastDenoised = indirect;
     Texture* shaded = indirect != nullptr && rayReconstruction ? &m_giRaw : indirect;
+    bool froxels = false;
     if (volumetrics && constants.traceMask != 0) {
-        const UINT halfWidth = (m_gridWidth + 1) / 2;
-        const UINT halfHeight = (m_gridHeight + 1) / 2;
-        constants.volumetricFog = litFog ? 1u : 0u;
-        // Lit fog darkens where the irradiance volume's indirect light is weaker than the open sky's.
-        const bool indirectVolume = volumeFilled && m_probeIndirect[0].resource;
-        if (indirectVolume) {
-            for (Texture& texture : m_probeIndirect)
-                Use(texture, kVolumeRead);
-        }
-        Use(m_volumetricMarch, write);
-        // Map and dynamic lights scatter in the main view's fog; the 3D skybox is lit without them.
-        DispatchGroups(Pass::Volumetrics, {.input0 = indirectVolume ? m_probeIndirect[0].srv : kInvalidView,
-            .input1 = indirectVolume ? m_probeIndirect[1].srv : kInvalidView, .input2 = indirectVolume ? m_probeIndirect[2].srv : kInvalidView,
-            .input3 = main ? 1u : 0u, .output0 = m_volumetricMarch.uav, .step = 0}, (halfWidth + 7) / 8, (halfHeight + 7) / 8, 1);
-        Use(m_volumetricMarch, read);
-        Use(m_volumetricHistory[previous], read);
-        Use(m_volumetricHistory[current], write);
-        // The 3D skybox's march is not accumulated: the main view's history holds the main view's.
-        DispatchGroups(Pass::Volumetrics, {.input0 = m_volumetricMarch.srv, .input1 = m_volumetricHistory[previous].srv,
-            .input2 = main && m_volumetricHistoryValid ? 1u : 0u, .output0 = m_volumetricHistory[current].uav, .step = 1}, (halfWidth + 7) / 8,
-            (halfHeight + 7) / 8, 1);
-        Use(m_volumetricHistory[current], read);
-        constants.volumetricView = m_volumetricHistory[current].srv;
-        if (rayReconstruction) {
-            FrameConstants& render = *reinterpret_cast<FrameConstants*>(slotConstants + kConstantsStride);
-            render.volumetricView = m_volumetricHistory[current].srv;
-            render.volumetricFog = constants.volumetricFog;
+        // Columns of at least kFroxelTile pixels and at most kFroxelRows rows, so the volume's size stays bounded at
+        // high resolutions.
+        const UINT tile = std::max(kFroxelTile, (m_gridHeight + kFroxelRows - 1) / kFroxelRows);
+        const std::array<UINT, 3> dims = {(m_gridWidth + tile - 1) / tile, (m_gridHeight + tile - 1) / tile,
+            static_cast<UINT>(GetSettings().volumetricSlices)};
+        froxels = EnsureFroxels(dims);
+        if (froxels) {
+            // The slices span what the medium covers: the water the eye is in as far as it lets light through (four
+            // mean free paths), the map's fog from where it starts to where it stops thickening, or the haze.
+            FroxelMedium medium = FroxelMedium::Haze;
+            float start = 0.0f;
+            float range = kHazeDistance;
+            const std::span<const GpuWaterBody> bodies = scene.WaterBodies();
+            if (constants.eyeWater != kInvalidView && constants.eyeWater < bodies.size()) {
+                medium = FroxelMedium::Water;
+                const float* extinction = bodies[constants.eyeWater].extinction;
+                range = std::min(kHazeDistance, 4.0f / std::max(std::min({extinction[0], extinction[1], extinction[2]}), 1e-6f));
+            } else if (litFog && constants.fogParams[3] > 0.0f) {
+                // The fog follows the distance from the eye (FogOpacity), so toward the screen's corners it starts at a
+                // smaller view depth.
+                medium = FroxelMedium::Fog;
+                float cornerScale = 1.0f;
+                for (const float x : {-1.0f, 1.0f}) {
+                    for (const float y : {-1.0f, 1.0f}) {
+                        const float clip[4] = {x, y, 0.5f, 1.0f};
+                        float point[4] = {};
+                        for (int r = 0; r < 4; ++r) {
+                            for (int c = 0; c < 4; ++c)
+                                point[r] += constants.invViewProj[r][c] * clip[c];
+                        }
+                        float offset[3];
+                        for (int i = 0; i < 3; ++i)
+                            offset[i] = point[i] / point[3] - constants.eyePosition[i];
+                        const float viewDepth = constants.viewProj[3][0] * offset[0] + constants.viewProj[3][1] * offset[1] + constants.viewProj[3][2] * offset[2];
+                        if (viewDepth > 0.0f)
+                            cornerScale = std::max(cornerScale, std::sqrt(offset[0] * offset[0] + offset[1] * offset[1] + offset[2] * offset[2]) / viewDepth);
+                    }
+                }
+                start = std::max(constants.fogParams[0] / constants.fogParams[3], 0.0f) / cornerScale;
+                const float end = (std::min(constants.fogParams[2], 1.0f) + constants.fogParams[0]) / constants.fogParams[3];
+                range = std::clamp(end - start, 1.0f, kMaxFogDistance);
+            }
+            // The main view jitters its sample points within their froxels (Halton 2, 3, 5) and keeps their history
+            // while the medium stays the same; the 3D skybox samples the centres afresh.
+            const bool history = main && m_volumetricHistoryValid && m_froxelMedium == static_cast<int>(medium);
+            const auto halton = [](uint64_t index, uint64_t base) {
+                float result = 0.0f;
+                float fraction = 1.0f / static_cast<float>(base);
+                for (uint64_t i = index + 1; i > 0; i /= base, fraction /= static_cast<float>(base))
+                    result += fraction * static_cast<float>(i % base);
+                return result;
+            };
+            const std::array<float, 3> jitter = main ? std::array<float, 3>{halton(m_mainRuns % 1024, 2), halton(m_mainRuns % 1024, 3), halton(m_mainRuns % 1024, 5)}
+                                                     : std::array<float, 3>{0.5f, 0.5f, 0.5f};
+            FrameConstants* blocks[] = {&constants, rayReconstruction ? reinterpret_cast<FrameConstants*>(slotConstants + kConstantsStride) : nullptr};
+            for (FrameConstants* block : blocks) {
+                if (block == nullptr)
+                    continue;
+                std::copy(dims.begin(), dims.end(), block->froxelDims);
+                block->froxelUvScale[0] = static_cast<float>(m_gridWidth) / static_cast<float>(tile * dims[0]);
+                block->froxelUvScale[1] = static_cast<float>(m_gridHeight) / static_cast<float>(tile * dims[1]);
+                block->froxelStart = start;
+                block->froxelRange = range;
+                std::copy(jitter.begin(), jitter.end(), block->froxelJitter);
+                block->prevFroxelStart = m_prevFroxelStart;
+                block->prevFroxelRange = m_prevFroxelRange;
+                block->volumetricFog = litFog ? 1u : 0u;
+            }
+            // Lit fog darkens where the irradiance volume's indirect light is weaker than the open sky's.
+            const bool indirectVolume = volumeFilled && m_probeIndirect[0].resource;
+            if (indirectVolume) {
+                for (Texture& texture : m_probeIndirect)
+                    Use(texture, kVolumeRead);
+            }
+            // The 3D skybox, lit before the main view, writes the slot the main view writes next, never its last.
+            Texture& last = m_froxelLight[previous];
+            Texture& froxelLight = m_froxelLight[current];
+            const UINT groupsX = (dims[0] + 7) / 8;
+            const UINT groupsY = (dims[1] + 7) / 8;
+            Use(last, read);
+            Use(froxelLight, write);
+            Use(m_froxelProjected, write);
+            // Map and dynamic lights scatter in the main view's fog and water; the 3D skybox is lit without them.
+            DispatchGroups(Pass::Volumetrics, {.input0 = last.srv, .input1 = indirectVolume ? m_probeIndirect[0].srv : kInvalidView,
+                .input2 = indirectVolume ? m_probeIndirect[1].srv : kInvalidView, .input3 = indirectVolume ? m_probeIndirect[2].srv : kInvalidView,
+                .input4 = (history ? 1u : 0u) | (main ? 2u : 0u), .output0 = froxelLight.uav, .output1 = m_froxelProjected.uav, .step = 0}, groupsX, groupsY, dims[2]);
+            Use(froxelLight, read);
+            Use(m_froxelProjected, read);
+            Use(m_froxelIntegrated, write);
+            DispatchGroups(Pass::Volumetrics, {.input0 = froxelLight.srv, .input1 = m_froxelProjected.srv, .output0 = m_froxelIntegrated.uav, .step = 1},
+                groupsX, groupsY, 1);
+            // The game's translucent draws read it too (shaders/game_fog.hlsli).
+            Use(m_froxelIntegrated, kVolumeRead);
+            for (FrameConstants* block : blocks) {
+                if (block != nullptr)
+                    block->volumetricView = m_froxelIntegrated.srv;
+            }
+            if (main) {
+                m_froxelMedium = static_cast<int>(medium);
+                m_prevFroxelStart = start;
+                m_prevFroxelRange = range;
+            }
         }
         // Translucent surfaces drawn by the game take the lit fog's colour from the full irradiance volume
         // (shaders/forward_light.hlsli), relative to its average in open sunlit air: a quarter of the sun's irradiance
@@ -3043,7 +3174,7 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
         }
     }
     if (main)
-        m_volumetricHistoryValid = volumetrics && constants.traceMask != 0 && constants.historyValid != 0;
+        m_volumetricHistoryValid = froxels && constants.historyValid != 0;
     if (shaded != nullptr)
         Use(*shaded, read);
     Use(m_giRaw, read);

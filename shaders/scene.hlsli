@@ -1014,31 +1014,24 @@ float3 VolumeIrradiance(float3 position, float3 normal, bool nearest = false)
     return VolumeIrradiance(uint3(g_frame.probeRedView, g_frame.probeGreenView, g_frame.probeBlueView), position, normal, nearest);
 }
 
-// The map's fog lit at a point, before the tonemap scale (shaders/volumetrics.hlsl). In open sunlit air it is the fog's
-// colour as the game blends it; shadowed air loses the sun's share and air that less indirect light reaches than the
-// open sky's (`volume`, an indirect light volume, or kNoView to take the open sky's) loses some of the sky's. The shares
-// are of the irradiance averaged over all directions in open air: a quarter of the sun's, half the sky's.
+// The map's fog lit at a point, before the tonemap scale (shaders/volumetrics.hlsl). In open air lit by the map's own sun
+// and sky it is the fog's colour as the game blends it. Its sun's share (fogSunShare, of the irradiance averaged over all
+// directions in open air: a quarter of the sun's, half the sky's) follows the sunlight that reaches the point now
+// (fogSunScale: day and night, the sun's strength and colour; shadows), its sky's share the sky light now (fogSkyScale)
+// and how much of the open sky's indirect light reaches the point (`volume`, an indirect light volume, or kNoView to take
+// the open sky's).
 float3 LitFog(float3 position, uint3 volume)
 {
-    float sunLight = g_frame.sunEnabled != 0.0 ? 0.25 * Luminance(g_frame.sunColor) : 0.0;
-    float skyLight = 0.5 * Luminance(g_frame.skyColor);
-    float sunShare = sunLight / max(sunLight + skyLight, 1e-6);
-    float3 sun = sunShare > 0.0 ? SunVisibility(position, g_frame.sunShadowMask) : 0.0;
+    float3 sun = 0.0;
+    if (g_frame.sunEnabled != 0.0 && g_frame.fogSunShare > 0.0)
+        sun = g_frame.fogSunScale * SunVisibility(position, g_frame.sunShadowMask);
     float ambient = 1.0;
     if (volume.r != kNoView) {
         float3 indirect = VolumeIrradiance(volume, position, 0.0);
         if (indirect.r >= 0.0)
-            ambient = saturate(Luminance(indirect) / max(skyLight, 1e-6));
+            ambient = saturate(Luminance(indirect) / max(0.5 * Luminance(g_frame.skyColor), 1e-6));
     }
-    return g_frame.fogColor / max(g_frame.tonemapScale, 1e-3) * (sunShare * sun + (1.0 - sunShare) * ambient);
-}
-
-// LitFog's shares of the light in open air: the sun's and, in its units, the irradiance averaged over all directions.
-float SunShareOfAirLight(out float airLight)
-{
-    float sunLight = g_frame.sunEnabled != 0.0 ? 0.25 * Luminance(g_frame.sunColor) : 0.0;
-    airLight = sunLight + 0.5 * Luminance(g_frame.skyColor);
-    return sunLight / max(airLight, 1e-6);
+    return g_frame.fogColor / max(g_frame.tonemapScale, 1e-3) * (g_frame.fogSunShare * sun + (1.0 - g_frame.fogSunShare) * g_frame.fogSkyScale * ambient);
 }
 
 // Water scatters half its light evenly and half strongly forward (Henyey-Greenstein, g = 0.9), as particles in water
@@ -1053,32 +1046,28 @@ float WaterPhase(float cosine)
 }
 
 // The light the water of `body` scatters towards a ray along `direction` at a point, before the tonemap scale. In open
-// water just under the surface, lit by the full sun and sky, it averages the water's fog colour, as LitFog keeps the
-// map fog's: the sun's share follows the sunlight that reaches the point (the surface, the water's sun map: shadows
-// above and in the water, caustics; and the water above) and the phase function, the sky's share the light that
-// reaches its depth.
+// water just under the surface, lit by the map's own sun and sky, it averages the water's fog colour, as LitFog keeps
+// the map fog's, and its shares follow the light now as LitFog's do: the sun's the sunlight that reaches the point (the
+// surface, the water's sun map: shadows above and in the water, caustics; and the water above) and the phase function,
+// the sky's the light that reaches its depth.
 float3 LitWater(float3 position, WaterBody body, float3 direction)
 {
-    float airLight;
-    float sunShare = SunShareOfAirLight(airLight);
     float3 sun = 0.0;
-    if (sunShare > 0.0 && g_frame.sunDirection.z > 0.0) {
+    if (g_frame.sunEnabled != 0.0 && g_frame.fogSunShare > 0.0 && g_frame.sunDirection.z > 0.0) {
         float3 up = RefractedSunDirection(g_frame.sunDirection);
         float length = max(body.surfaceZ - position.z, 0.0) / up.z;
         float3 arriving = SunIntoWater(g_frame.sunDirection) * WaterSunAt(position) * exp(-body.extinction * length);
-        sun = arriving * WaterPhase(dot(direction, up));
+        sun = g_frame.fogSunScale * arriving * WaterPhase(dot(direction, up));
     }
     float3 sky = exp(-body.extinction * max(body.surfaceZ - position.z, 0.0));
-    return body.fogColor * (sunShare * sun + (1.0 - sunShare) * sky);
+    return body.fogColor * (g_frame.fogSunShare * sun + (1.0 - g_frame.fogSunShare) * g_frame.fogSkyScale * sky);
 }
 
 // The water's scattering albedo by colour: the share of the light reaching it that it scatters, from the light it shows
-// in open water (LitWater), at most 1.
+// in open water under the map's own sun and sky (LitWater), at most 1.
 float3 WaterAlbedo(WaterBody body)
 {
-    float airLight;
-    SunShareOfAirLight(airLight);
-    return saturate(body.fogColor / max(airLight, 1e-6));
+    return saturate(body.fogColor / max(g_frame.fogAirLight, 1e-6));
 }
 
 // Light along a ray through the water of `water` from `origin` along `direction` for `length` units: `radiance` from its

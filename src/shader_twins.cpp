@@ -449,4 +449,11 @@ bool HasTwin(std::string_view file)
     return std::any_of(std::begin(kFamilies), std::end(kFamilies), [&](const Family& f) { return f.gameFile == key && !f.forwardOnly; });
 }
 
+bool IsParticleShader(std::string_view file)
+{
+    std::string key(file);
+    std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return key.starts_with("spritecard_");
+}
+
 }

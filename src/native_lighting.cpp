@@ -115,7 +115,7 @@ void Finish(gbuffer::ViewKind kind)
     if (const std::optional<gbuffer::ForwardConstants> forward = world::ForwardLighting(inputs)) {
         g_state.forward = forward;
         g_state.forwardLevel = engine::LevelName();
-        capture::BeginForward(*forward);
+        capture::BeginForward(*forward, true);
     }
 }
 
@@ -205,7 +205,7 @@ void OnViewOpaqueBegin()
 {
     using namespace native;
     if (realtime::CanLightRenderTargetView()) {
-        capture::BeginForward(*realtime::g_state.forward);
+        capture::BeginForward(*realtime::g_state.forward, false);
         return;
     }
     if (!realtime::CanCapture())

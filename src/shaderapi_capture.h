@@ -27,8 +27,10 @@ bool Active();
 // backend's (Backend::Submit). False when nothing was captured.
 bool End(gbuffer::ViewKind kind, ViewInputs& inputs);
 
-// Lights the translucent surfaces drawn until EndForward from the probe volume.
-void BeginForward(const gbuffer::ForwardConstants& constants);
+// Lights the translucent surfaces drawn until EndForward from the probe volume. `mainView`: the main view's own
+// translucent pass, which sees the volumetric light's medium (ForwardConstants::fogFrame); views drawn into textures see
+// from elsewhere.
+void BeginForward(const gbuffer::ForwardConstants& constants, bool mainView);
 void EndForward();
 bool ForwardActive();
 
@@ -67,6 +69,13 @@ struct Pass {
     // A forward twin, lit in the shader from these frame constants and scene (translator::Variant::forwardLighting).
     D3D12_GPU_VIRTUAL_ADDRESS forwardFrame = 0;
     D3D12_GPU_VIRTUAL_ADDRESS forwardScene = 0;
+    // In the main view's translucent pass, its frame constants, which the game's shaders read their fog from
+    // (shaders/game_fog.hlsli, gmodpp_alpha.w); 0 elsewhere.
+    D3D12_GPU_VIRTUAL_ADDRESS fogFrame = 0;
+    // A particle draw (twins::IsParticleShader) after the capture: drawn with translator::Variant::fogEpilogue, fogged by
+    // the volumetric light's medium as it blends (gmodpp_alpha.z): 1 by its alpha, 2 premultiplied, 3 added; 0 not.
+    bool fogEpilogue = false;
+    float fogBlend = 0.0f;
     // A water surface the capture records (gbuffer::WaterSurfaceDraw); its texture mapping comes from its vertices.
     bool waterSurface = false;
 };
@@ -108,8 +117,9 @@ void RecordSkyShader(std::span<const DWORD> pixelCode);
 // the game's sky back. Null without one.
 void SetSky(std::optional<gbuffer::SkyDraw> sky);
 const gbuffer::SkyDraw* Sky();
-// Whether the draw is the sprite of env_sun that the sun's disc replaces: its material, centred 100 units from the eye
-// toward the sun (CGlowOverlay::CalcBasis), m_nSize across each half (gbuffer::EnvSun).
+// Whether the draw is one of env_sun's sprites, which the sun's disc replaces: its core and its glare, quads centred 100
+// units from the eye toward env_sun's direction (CGlowOverlay::CalcBasis), wherever the disc itself is (the menu's sun
+// direction override moves it away).
 bool IsSunSprite(const MeshDraw& mesh);
 // The cube's six face targets (RGBA16F, radiance before the tonemap scale, -1 where nothing was drawn this map),
 // ready to be drawn into; empty when the cube cannot be created.

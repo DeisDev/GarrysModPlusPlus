@@ -81,15 +81,13 @@ constexpr int kRopeMaxSubdiv = 7;
 constexpr float kWorldLimit = 65536.0f;
 
 // env_sun's client class, C_Sun in GMod's client.dll (ClientClass "CSun" at 0x87F2C8, DT_Sun built at 0x30380):
-// m_vDirection is a vector, m_bOn a one-byte bool, m_clrRender a color32, m_nMaterial and m_nSize ints. Its
-// OnDataChanged (0x1FCC10) gives the sun's sprite the material named by m_nMaterial's model, the half size m_nSize and
-// m_clrRender divided by its largest component (REA, 2026-11-02).
+// m_vDirection is a vector, m_bOn a one-byte bool, m_clrRender a color32, m_nSize an int. Its OnDataChanged (0x1FCC10)
+// gives the sun's sprite the half size m_nSize and m_clrRender divided by its largest component (REA, 2026-11-02).
 constexpr char kSunClass[] = "CSun";
 struct SunProps {
     int direction;
     int on;
     int color;
-    int material;
     int size;
 };
 
@@ -275,14 +273,14 @@ std::optional<gbuffer::EnvSun> FindSun()
         if (props == g_sunProps.end()) {
             const void* table = Field<const void*>(clientClass, kClientClassRecvTable);
             props = g_sunProps.emplace(clientClass, SunProps{FindProp(table, "m_vDirection", 0), FindProp(table, "m_bOn", 0), FindProp(table, "m_clrRender", 0),
-                FindProp(table, "m_nMaterial", 0), FindProp(table, "m_nSize", 0)}).first;
+                FindProp(table, "m_nSize", 0)}).first;
             const SunProps& p = props->second;
-            if (p.direction == kNoProp || p.on == kNoProp || p.color == kNoProp || p.material == kNoProp || p.size == kNoProp)
-                log::Info("Entities: env_sun's DT_Sun lacks a known prop (direction {}, on {}, colour {}, material {}, size {}); its sun is ignored",
-                    p.direction, p.on, p.color, p.material, p.size);
+            if (p.direction == kNoProp || p.on == kNoProp || p.color == kNoProp || p.size == kNoProp)
+                log::Info("Entities: env_sun's DT_Sun lacks a known prop (direction {}, on {}, colour {}, size {}); its sun is ignored", p.direction, p.on,
+                    p.color, p.size);
         }
         const SunProps& p = props->second;
-        if (p.direction == kNoProp || p.on == kNoProp || p.color == kNoProp || p.material == kNoProp || p.size == kNoProp)
+        if (p.direction == kNoProp || p.on == kNoProp || p.color == kNoProp || p.size == kNoProp)
             continue;
         gbuffer::EnvSun sun;
         sun.direction = Field<std::array<float, 3>>(entity, static_cast<size_t>(p.direction));
@@ -296,10 +294,6 @@ std::optional<gbuffer::EnvSun> FindSun()
         const float largest = static_cast<float>(std::max({color[0], color[1], color[2]}));
         if (largest > 0.0f)
             sun.color = {color[0] / largest, color[1] / largest, color[2] / largest};
-        const int material = Field<int>(entity, static_cast<size_t>(p.material));
-        const void* model = material != 0 ? Slot<const void*(__fastcall*)(void*, int)>(g_modelInfo, kModelInfoGetModelSlot)(g_modelInfo, material) : nullptr;
-        const char* name = model != nullptr ? Slot<const char*(__fastcall*)(void*, const void*)>(g_modelInfo, kGetModelNameSlot)(g_modelInfo, model) : nullptr;
-        sun.material = name != nullptr ? name : "";
         sun.size = static_cast<float>(Field<int>(entity, static_cast<size_t>(p.size)));
         if (sun.on)
             return sun;

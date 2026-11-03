@@ -200,7 +200,7 @@ WaterResult ShadeWater(int2 pixel, float3 position)
         transmitted = albedos.Load(int3(pixel, 0)).rgb / max(g_frame.tonemapScale, 1e-3);
         if (below && g_frame.fogEnabled != 0) {
             float fog = saturate(min(g_frame.fogParams.z, result.hitDistance * g_frame.fogParams.w - g_frame.fogParams.x));
-            reflection = lerp(reflection, g_frame.fogColor / max(g_frame.tonemapScale, 1e-3), g_frame.fogParams.y > 0.0 ? fog : fog * fog);
+            reflection = lerp(reflection, g_frame.fogColor * FogDaylight() / max(g_frame.tonemapScale, 1e-3), g_frame.fogParams.y > 0.0 ? fog : fog * fog);
         }
     }
     result.color = fresnel * reflection + (1.0 - fresnel) * transmitted;

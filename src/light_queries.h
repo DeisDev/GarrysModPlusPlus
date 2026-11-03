@@ -7,8 +7,8 @@
 namespace gmodpp::light_queries {
 
 // Answers the engine's lighting queries (IVEngineClient::ComputeLighting and GetLightForPoint, which particles
-// and client effects light themselves with) from the ray-traced irradiance volume; points outside it, or any
-// query while the volume is not being filled, get the engine's baked lighting.
+// and client effects light themselves with) from the ray-traced irradiance volume, points outside it from its nearest
+// probes; any query while the volume is not being filled gets the engine's baked lighting.
 void TryInstall();
 
 // The volume as the GPU last filled it: the cells from `origin` on, `grid` probes `spacing` apart, stored at cell

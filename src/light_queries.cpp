@@ -36,14 +36,16 @@ Volume g_volume;
 engine::ComputeLightingFn g_computeLighting = nullptr;
 bool g_attempted = false;
 
-enum class Answer { Volume, NoVolume, Stale, Outside, Count };
+enum class Answer { Volume, NoVolume, Stale, NoPoint, Count };
 constexpr const char* kAnswerNames[] = {"answered from the irradiance volume", "left to the engine: no volume yet",
-    "left to the engine: the volume is out of date", "left to the engine: the point is outside the volume"};
+    "left to the engine: the volume is out of date", "left to the engine: no point or colour given"};
 static_assert(std::size(kAnswerNames) == static_cast<size_t>(Answer::Count));
 // Each kind of answer is logged the first time it is given.
 std::array<std::atomic<bool>, static_cast<size_t>(Answer::Count)> g_logged = {};
 
 // The coefficients at a point, interpolated between the eight probes around it as the GPU's trilinear filter does.
+// Beyond the volume's window, its nearest probes', as translucent surfaces take there (shaders/forward_light.hlsli): the
+// engine's own answer is its baked light, which follows neither the light now nor day and night.
 Answer Sample(const float point[3], float coefficients[3][4])
 {
     std::shared_lock lock(g_mutex);
@@ -54,10 +56,11 @@ Answer Sample(const float point[3], float coefficients[3][4])
     int base[3];
     float fraction[3];
     for (int axis = 0; axis < 3; ++axis) {
-        const float probe = point[axis] / g_volume.spacing - 0.5f;
-        const float window = probe - static_cast<float>(g_volume.origin[axis]);
-        if (!(window >= 0.0f && window <= static_cast<float>(g_volume.grid[axis] - 1)))
-            return Answer::Outside;
+        if (!std::isfinite(point[axis]))
+            return Answer::NoPoint;
+        const float window = std::clamp(point[axis] / g_volume.spacing - 0.5f - static_cast<float>(g_volume.origin[axis]), 0.0f,
+            static_cast<float>(g_volume.grid[axis] - 1));
+        const float probe = window + static_cast<float>(g_volume.origin[axis]);
         base[axis] = static_cast<int>(std::floor(probe));
         fraction[axis] = probe - static_cast<float>(base[axis]);
     }
@@ -83,7 +86,7 @@ Answer Sample(const float point[3], float coefficients[3][4])
 void __fastcall HookComputeLighting(void* engine, const float* point, const float* normal, bool clamp, float* color, float* boxColors)
 {
     float coefficients[3][4];
-    const Answer answer = point != nullptr && color != nullptr ? Sample(point, coefficients) : Answer::Outside;
+    const Answer answer = point != nullptr && color != nullptr ? Sample(point, coefficients) : Answer::NoPoint;
     if (!g_logged[static_cast<size_t>(answer)].exchange(true))
         log::Info("Light queries: first ComputeLighting call {}", kAnswerNames[static_cast<size_t>(answer)]);
     if (answer != Answer::Volume) {

@@ -15,7 +15,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - At night the physical sky shows twinkling stars that turn with the sun, the Milky Way, shooting stars and satellites, set up in the menu's "Night sky" card: how early in the sunset they come out, how many stars and how faint, how bright, how strongly and fast they twinkle, how bright the Milky Way is and how often shooting stars fall. Mirrors, glass and water reflect them, and mirrors and glass show the sun or Moon.
 - A Moon rises on the far side of the sky as the sun sets, in the phase "Moon phase" sets (full by default), pale by day and bright at night. Its light takes over from the sun at night with soft moon shadows, and it shows in mirrors and glass. Turn it off with "Moon".
 - On night maps, where the map's sun is the Moon, the sun disc is drawn as the Moon and the stars come out. The mod tells night maps by how dark their skybox looks; "Map's sun" in the menu sets it by hand.
-- With real-time lighting, a sharp sun disc coloured by the atmosphere replaces `env_sun`'s sprite ("Sun disc" in the menu, on by default). It is as big as the map's `env_sun` sprite looked, and "Sun size" scales it.
+- With real-time lighting, a sharp sun disc coloured by the atmosphere replaces `env_sun`'s sprite and glare ("Sun disc" in the menu, on by default). It is as big as the map's `env_sun` sprite looked, and "Sun size" scales it.
 - The loading screen stays up until ray-traced lighting is ready, and its progress bar shows that work, so maps no longer open with a few frames of the game's own lighting.
 - A "Baked" indirect light option for faster frames: bounce light is baked into the map's lightmaps while it loads, with the same light as ray-traced indirect light, and follows the sun and sky strength settings. The Low preset uses it.
 - Glass and other translucent surfaces are lit by real-time light instead of baked light.
@@ -23,7 +23,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Volumetric light from the sun and flashlights, with an on/off switch and strength in the menu.
 - Debug views for reflections, motion vectors and ambient occlusion.
 - Particles and effects that ask the engine for the light at a point now get real-time light.
-- Ray tracing quality presets (Low, Medium, High, Ultra) and settings for shadow rays, indirect rays and bounces, ambient occlusion rays, light volume rays, volumetric light steps and foliage shadows.
+- With volumetric light on, particles such as smoke and dust are fogged like the rest of the scene.
+- Ray tracing quality presets (Low, Medium, High, Ultra) and settings for shadow rays, indirect rays and bounces, ambient occlusion rays, light volume rays, volumetric light slices and foliage shadows.
 - Opacity micromaps make ray tracing through grass, leaves and fences faster on GPUs that support them, with an option for faster, approximate alpha tests in indirect light.
 - The ambient occlusion pass has its own GPU time in the menu and log.
 - Shadows of swaying grass, leaves and trees (`$treesway`) now move with them.
@@ -76,7 +77,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - The game reaches its main menu sooner: the ray tracing pipeline states are created on several threads in the background instead of one by one before the game window responds. A map opened before they are ready waits for the rest on its loading screen ("Preparing ray tracing shaders...").
 - Characters, NPCs and ragdolls are posed for ray tracing on the GPU instead of the CPU each frame, and their shapes stay in video memory, so maps with many players and NPCs render faster.
 - Props and models that appear for the first time during play no longer pause the game while their ray tracing data is uploaded: the upload no longer waits for the frames in flight to finish.
-- Volumetric light traces one shadow ray per step to the flashlights and projected lights, picked by how much light each adds there, instead of one to each of them: rooms with several projected lights render faster, with the same light on average. With one light, as with a lone flashlight, nothing changes.
+- Volumetric light and lit fog are worked out in a 3D grid that follows the view and is smoothed over frames, so the glow of lamps and flashlights in fog no longer flickers with noise, and it costs less. Flashlight beams are worked out again every frame, so they leave no trails.
+- Glass and other see-through surfaces show the lit fog in front of them, glow around lamps included.
+- With real-time lighting, fog depends on how far away things are, not how deep they are along your view, so turning the camera no longer clears the fog from things near the edges of the screen.
 - Faster frames: the view of the weapon in your hands traces the main view's ray tracing scene instead of building its own every frame; with DLSS Ray Reconstruction, the sun's shadow rays stop at the first thing that blocks them, since only their light is used; every ray query skips the procedural primitives the scene never has; draws no longer look up the bound render targets again for each texture they sample; and constants set again to the values they already hold are no longer uploaded again.
 - Shaders are compiled for the materials a map uses, in the background while the map loads, instead of for every shader the game ships before the game starts. The loading screen shows "Compiling shaders..." while it waits for them; shaders compiled once are kept for later launches.
 - Compiled shaders are kept in one file, `gmodplusplus\cache\shaders.bin`, instead of one file per shader, so reading them is faster. The old `gmodplusplus\cache\shaders` folder is deleted in the background.
@@ -142,6 +145,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Fixed fog staying as bright at night as by day: it now darkens with the sun and sky, takes the colour of the sunset, and follows the sun and sky strength settings. Water's own glow does too.
+- Fixed particles far from the player glowing with the map's baked daytime light, such as smoke at night; they now take the nearest real-time light.
 - The settings menu no longer shows the game's mouse cursor next to its own.
 - Switching pages in the settings menu no longer makes the page's content jump around for a few frames.
 - Maps with water no longer stutter the first time you look at water: the vertex shaders the water's reflection and refraction views draw with (with a clip plane) are compiled while the map loads.

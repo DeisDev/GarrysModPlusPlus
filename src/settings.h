@@ -196,7 +196,8 @@ struct Settings {
     int aoRays = 1;
     // Rays per update of each irradiance volume probe.
     int volumeRays = 32;
-    int volumetricSteps = 16;
+    // Depth slices of volumetric light's froxel volume (shaders/volumetrics.hlsl).
+    int volumetricSlices = 64;
     // Shadow rays per pixel over the sun's disc on the held weapon, which nothing denoises; a quarter as many go over
     // each exactly traced lamp. 1 aims at the centres, for hard shadows.
     int viewmodelShadowRays = 8;

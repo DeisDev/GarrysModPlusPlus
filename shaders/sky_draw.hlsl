@@ -5,8 +5,9 @@
 // vertex shader still places the faces; the constants come through the forward twins' root parameter (register space 1).
 struct SkyDrawConstants
 {
-    // Clip space to world space for the draw: the inverse of its view-projection rows (vertex c8-c11) as drawn.
-    row_major float4x4 clipToWorld;
+    // Clip space to points relative to the eye for the draw: the inverse of its view-projection rows (vertex c8-c11) as
+    // drawn, less the eye's position.
+    row_major float4x4 clipToEye;
     // The viewport's left, top, width and height in pixels.
     float4 viewport;
     // cLightScale.x of the game's sky shader, which Source multiplies its colour by.
@@ -58,8 +59,8 @@ float3 ViewDirection(float2 pixel)
 {
     float2 ndc = (pixel - g_sky.viewport.xy) / g_sky.viewport.zw * float2(2.0, -2.0) + float2(-1.0, 1.0);
     ndc -= float2(1.0, -1.0) / g_sky.viewport.zw;
-    float4 nearPoint = mul(g_sky.clipToWorld, float4(ndc, 0.0, 1.0));
-    float4 farPoint = mul(g_sky.clipToWorld, float4(ndc, 1.0, 1.0));
+    float4 nearPoint = mul(g_sky.clipToEye, float4(ndc, 0.0, 1.0));
+    float4 farPoint = mul(g_sky.clipToEye, float4(ndc, 1.0, 1.0));
     return normalize(farPoint.xyz / farPoint.w - nearPoint.xyz / nearPoint.w);
 }
 

@@ -28,4 +28,8 @@ int LightWarpSampler(std::string_view file, const vcs::Header& header, int stati
 // Whether a game shader file (.vcs name, any case) has a G-buffer twin.
 bool HasTwin(std::string_view file);
 
+// Whether a game pixel shader file (.vcs name, any case) draws particles (SpriteCard; GMod ships spritecard_ps20b), which
+// Source leaves unfogged and the main view's translucent pass fogs (translator::Variant::fogEpilogue).
+bool IsParticleShader(std::string_view file);
+
 }

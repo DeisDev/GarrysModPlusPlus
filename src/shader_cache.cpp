@@ -499,13 +499,19 @@ std::uint64_t Key(std::span<const DWORD> code, const translator::Variant& varian
     key = Fnv(&variant.shadowSamplers, sizeof(variant.shadowSamplers), key);
     key = Fnv(&variant.integerInputs, sizeof(variant.integerInputs), key);
     key = Fnv(&variant.signedInputs, sizeof(variant.signedInputs), key);
-    key = Fnv(&variant.alphaTest, sizeof(variant.alphaTest), key);
+    const std::uint8_t alphaTest = variant.alphaTest;
+    key = Fnv(&alphaTest, sizeof(alphaTest), key);
     const std::uint8_t clipPlanes = variant.clipPlanes;
     key = Fnv(&clipPlanes, sizeof(clipPlanes), key);
     if (variant.forwardLighting != 0) {
         const std::uint64_t headers = LightingHeadersHash();
         key = Fnv(&headers, sizeof(headers), Fnv("forward", 7, key));
+    } else if (translator::UsesGameFog(code, variant)) {
+        const std::uint64_t headers = LightingHeadersHash();
+        key = Fnv(&headers, sizeof(headers), Fnv("fog", 3, key));
     }
+    if (variant.fogEpilogue != 0)
+        key = Fnv("fogblend", 8, key);
     if (variant.clearCoverage != 0)
         key = Fnv("coverage", 8, key);
     if (variant.markMirror != 0)

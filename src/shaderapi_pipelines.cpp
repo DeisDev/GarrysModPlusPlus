@@ -77,6 +77,8 @@ constexpr auto kPipelineLibrarySaveInterval = std::chrono::seconds(30);
 // Root parameters of the translated shaders: vertex b0/b1, pixel b0/b1, then the forward twins' frame constants and
 // scene.
 constexpr UINT kRootForwardFrame = 4;
+// ShaderFogMode_t's SHADER_FOGMODE_FOGCOLOR: the pass blends the scene's fog colour (CommitLinearFogColor in shaderapi.cpp).
+constexpr int kShaderFogColor = 4;
 constexpr UINT kRootForwardScene = 5;
 constexpr UINT kRootParameters = 6;
 
@@ -1217,7 +1219,7 @@ void IssueDraws(ID3D12GraphicsCommandList* commands, const MeshDraw& mesh)
 
 // SkyDrawConstants of shaders/sky_draw.hlsl.
 struct SkyConstants {
-    std::array<Float4, 4> clipToWorld;
+    std::array<Float4, 4> clipToEye;
     float viewport[4];
     float tonemapScale;
     std::uint32_t skyView;
@@ -1243,6 +1245,50 @@ std::uint32_t TargetEncoding(DXGI_FORMAT format)
 
 // The sky shaders' constants for the 2D sky face being drawn into `format`, which they place by the view-projection
 // (c8-c11) as the draw's vertex patches leave it; 0 when it cannot be inverted.
+// The inverse of a draw's view-projection rows that maps clip space to points relative to the eye, in double precision.
+// Far-plane points mapped to the world in single precision moved by up to a few hundredths of a degree from frame to
+// frame with the jittered matrix, which the stars and Moon showed when zoomed in; relative to the eye, a rounding of w
+// only scales a point along its direction.
+bool ClipToEye(const std::array<Float4, 4>& rows, std::array<Float4, 4>& clipToEye)
+{
+    double m[4][8];
+    for (int r = 0; r < 4; ++r) {
+        for (int c = 0; c < 4; ++c) {
+            m[r][c] = rows[static_cast<size_t>(r)].v[c];
+            m[r][c + 4] = r == c ? 1.0 : 0.0;
+        }
+    }
+    for (int column = 0; column < 4; ++column) {
+        int pivot = column;
+        for (int r = column + 1; r < 4; ++r) {
+            if (std::fabs(m[r][column]) > std::fabs(m[pivot][column]))
+                pivot = r;
+        }
+        if (std::fabs(m[pivot][column]) < 1e-300)
+            return false;
+        std::swap(m[pivot], m[column]);
+        const double scale = 1.0 / m[column][column];
+        for (double& value : m[column])
+            value *= scale;
+        for (int r = 0; r < 4; ++r) {
+            if (r == column)
+                continue;
+            const double factor = m[r][column];
+            for (int c = 0; c < 8; ++c)
+                m[r][c] -= factor * m[column][c];
+        }
+    }
+    // The eye is the point the projection sends to w = 0: the inverse maps clip-space (0, 0, 1, 0) to it.
+    if (std::fabs(m[3][6]) < 1e-300)
+        return false;
+    for (int r = 0; r < 4; ++r) {
+        const double eye = r < 3 ? m[r][6] / m[3][6] : 0.0;
+        for (int c = 0; c < 4; ++c)
+            clipToEye[static_cast<size_t>(r)].v[c] = static_cast<float>(m[r][c + 4] - eye * m[3][c + 4]);
+    }
+    return true;
+}
+
 D3D12_GPU_VIRTUAL_ADDRESS SkyDrawConstants(const gbuffer::SkyDraw& sky, std::span<const capture::RegisterPatch> vertexPatches, DXGI_FORMAT format)
 {
     const DynamicState& dynamic = Dynamic();
@@ -1254,7 +1300,7 @@ D3D12_GPU_VIRTUAL_ADDRESS SkyDrawConstants(const gbuffer::SkyDraw& sky, std::spa
             std::copy(patch.value.begin(), patch.value.end(), viewProjection[patch.reg - gbuffer::kViewProjection].v);
     }
     SkyConstants constants = {};
-    if (!InvertRows(viewProjection, constants.clipToWorld))
+    if (!ClipToEye(viewProjection, constants.clipToEye))
         return 0;
     const D3D12_VIEWPORT& viewport = dynamic.viewport;
     const float rect[4] = { viewport.TopLeftX, viewport.TopLeftY, viewport.Width, viewport.Height };
@@ -1462,6 +1508,13 @@ void DrawPass(const ShadowState& shadow, const MeshDraw& mesh)
         pixelVariant.alphaTest = static_cast<std::uint8_t>(shadow.alphaFunc + 1);
     pixelVariant.forwardLighting = pass.forwardFrame != 0 ? 1 : 0;
     pixelVariant.opacityMicromaps = pass.forwardFrame != 0 && GetStatistics().opacityMicromapsAvailable ? 1 : 0;
+    pixelVariant.fogEpilogue = pass.fogEpilogue ? 1 : 0;
+    // The main view's translucent pass (shaders/game_fog.hlsli): 1 where the pass blends the scene's fog colour, 2 where
+    // it blends another, 3 where it has no fog; forward twins take any of them for the main view.
+    if (pass.fogFrame != 0) {
+        pixelState.alpha[2] = pass.fogBlend;
+        pixelState.alpha[3] = shadow.fogMode == kShaderFogColor ? 1.0f : shadow.fogMode != 0 ? 2.0f : 3.0f;
+    }
     pixelVariant.clearCoverage = clearCoverage ? 1 : 0;
     pixelVariant.markMirror = clearCoverage && pass.marksMirror ? 1 : 0;
     if (pass.route == capture::Pass::Route::GBuffer && pass.lightWarpSampler >= 0 && pass.lightWarpSampler < kSamplers) {
@@ -1638,6 +1691,10 @@ void DrawPass(const ShadowState& shadow, const MeshDraw& mesh)
     if (pass.forwardFrame != 0) {
         commands->SetGraphicsRootConstantBufferView(kRootForwardFrame, pass.forwardFrame);
         commands->SetGraphicsRootShaderResourceView(kRootForwardScene, pass.forwardScene);
+    } else {
+        // Shaders that may read their fog from the main view's frame constants (shaders/game_fog.hlsli) do so only
+        // while gmodpp_alpha says so; elsewhere the parameter holds a valid buffer they leave unread.
+        commands->SetGraphicsRootConstantBufferView(kRootForwardFrame, pass.fogFrame != 0 ? pass.fogFrame : pixelStateAddress);
     }
     if (proceduralSky)
         commands->SetGraphicsRootConstantBufferView(kRootForwardFrame, skyConstants);

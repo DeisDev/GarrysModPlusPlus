@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <optional>
 #include <string>
 
 namespace gmodpp::gbuffer {
@@ -68,13 +69,12 @@ struct Fog {
 };
 
 // env_sun as the client has it (C_Sun's DT_Sun, entities.cpp): the direction to the sun, whether it is on, its colour
-// with the largest component 1 (m_clrRender, as C_Sun::OnDataChanged tints its sprite), and its sprite: the material
-// (m_nMaterial's model name) and half size (m_nSize).
+// with the largest component 1 (m_clrRender, as C_Sun::OnDataChanged tints its sprite), and its sprite's half size
+// (m_nSize).
 struct EnvSun {
     std::array<float, 3> direction;
     bool on = false;
     std::array<float, 3> color = {1.0f, 1.0f, 1.0f};
-    std::string material;
     float size = 0.0f;
 };
 
@@ -106,9 +106,9 @@ struct SkyDraw {
     std::array<float, 3> sunColor = {1.0f, 1.0f, 1.0f};
     // The disc's angular radius in radians.
     float sunRadius = 0.0f;
-    // env_sun's sprite (EnvSun::material, EnvSun::size); no material without an env_sun.
-    std::string sprite;
-    float spriteSize = 0.0f;
+    // The direction env_sun's sprites are drawn toward (EnvSun::direction), hidden while the disc is drawn; nothing without
+    // an env_sun.
+    std::optional<std::array<float, 3>> spriteDirection;
     // The night sky over the procedural sky (NightSkyPart bits), the local frame to the stars' frame (its rows), the clock
     // stars twinkle by in seconds, and the satellites (direction, irradiance) and meteors in view.
     uint32_t nightSky = 0;
@@ -157,12 +157,17 @@ struct ForwardConstants {
     Fog fog;
     // Lighting::LitFogScale: the fog's colour is scaled by the volume's average irradiance times this, or kept with 0.
     float litFogScale;
+    // Lighting::FogDaylight: the fog's colour lit as the light is now.
+    std::array<float, 3> fogDaylight;
     // Debug views show the light alone, as if the albedo were white.
     bool lightOnly;
     // Native forward twins (shaders/forward_twin.hlsli): the GPU addresses of their frame constants and ray-traced
     // scene, 0 for none.
     std::uint64_t twinFrame;
     std::uint64_t twinScene;
+    // The main view's frame constants (Lighting::ForwardFrame) with its froxel volume, which the game's shaders read
+    // their fog from (shaders/game_fog.hlsli), or 0.
+    std::uint64_t fogFrame;
 };
 
 }

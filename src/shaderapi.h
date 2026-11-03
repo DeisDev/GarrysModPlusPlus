@@ -101,8 +101,6 @@ int UserClipPlanes(float planes[6][4]);
 bool EyeBelowHeightClip();
 // The current view's eye in world space (the view matrix's inverse), or nothing when the matrix cannot be inverted.
 std::optional<std::array<float, 3>> ViewEye();
-// The inverse of a matrix given by its rows; false when it is singular.
-bool InvertRows(const std::array<Float4, 4>& rows, std::array<Float4, 4>& inverse);
 DepthBias PassDepthBias(int polygonOffsetMode);
 // HDRType_t.
 constexpr int kHdrNone = 0;

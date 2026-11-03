@@ -176,6 +176,12 @@ void Run(const Request& request)
             } else if (request.clipPlanes == 0) {
                 variant.alphaTest = request.alphaTest;
                 Ensure(combo.bytecode, variant, request.name);
+                // Particles drawn after the capture are fogged by the volumetric light (capture::Prepare).
+                if (request.forwardTwin && twins::IsParticleShader(request.name)) {
+                    translator::Variant fogged = variant;
+                    fogged.fogEpilogue = 1;
+                    Ensure(combo.bytecode, fogged, request.name);
+                }
                 // DrawPass clears the coverage only with a single colour output, which the translation lists.
                 translator::Translation base;
                 if (request.clearCoverage && translator::Translate(combo.bytecode, variant, base, error) && base.colorOutputs == 1) {

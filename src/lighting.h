@@ -99,7 +99,9 @@ struct FrameConstants {
     uint32_t indirectBounces;
     uint32_t aoRays;
     uint32_t volumeRays;
-    uint32_t volumetricSteps;
+    // The map's fog lit by the map's own sun and sky (LitFog in shaders/scene.hlsli): the sun's share of the light in open
+    // air.
+    float fogSunShare;
     uint32_t sunShadowMask;
     uint32_t indirectMask;
     uint32_t bounceMask;
@@ -197,7 +199,21 @@ struct FrameConstants {
     // The sun's angular radius for soft shadows, and 1 - its cosine.
     float sunAngularRadius;
     float sunConeSpan;
-    uint32_t padding6[3];
+    // The froxel volume's layout (shaders/froxels.hlsli), this frame's jitter of its sample points within their froxels,
+    // and last frame's slices, which its history is found in.
+    uint32_t froxelDims[3];
+    float froxelUvScale[2];
+    float froxelStart;
+    float froxelRange;
+    float froxelJitter[3];
+    float prevFroxelStart;
+    float prevFroxelRange;
+    // How the light in open air compares with the map's own (LitFog): the sun's per colour channel and the sky's, and the
+    // map's own irradiance averaged over all directions (a quarter of its sun's, half its sky's).
+    float fogSunScale[3];
+    float fogSkyScale;
+    float fogAirLight;
+    uint32_t padding6[2];
     uint32_t lightWarpViews[64];
 };
 
@@ -339,6 +355,9 @@ public:
     bool VolumeReady() const { return m_volumeReady; }
     // 1 / the irradiance volume's average in open sunlit air when the last main view drew its fog lit, or 0.
     float LitFogScale() const { return m_litFogScale; }
+    // How the light that shows the map's fog compares with the map's own in the last main view, by colour (FogDaylight
+    // in shaders/common.hlsli).
+    std::array<float, 3> FogDaylight() const { return m_fogDaylight; }
     // The last main view's frame constants and scene for forward twins (shaders/forward_twin.hlsli); 0 before one ran
     // with its irradiance volume.
     D3D12_GPU_VIRTUAL_ADDRESS ForwardFrame() const { return m_volumeReady ? m_forwardFrame : 0; }
@@ -425,6 +444,8 @@ private:
     bool EnsureTargets(UINT width, UINT height);
     // Creates the radiance cache's buffers, or frees them when `wanted` is false (waiting for the GPU).
     bool EnsureRadianceCache(bool wanted);
+    // Makes the froxel volume's textures `dims` in size; false when they cannot be made (logged).
+    bool EnsureFroxels(const std::array<UINT, 3>& dims);
     // Binds the compute root signature with the view's frame constants, the scene and the slot's sampling constants.
     void BindCompute(D3D12_GPU_VIRTUAL_ADDRESS frameConstants, D3D12_GPU_VIRTUAL_ADDRESS scene, UINT slot);
     // Records RTXDI's passes for the main view (shaders/restir.hlsl): the light PDF, presampling, ReGIR, initial sampling,
@@ -728,9 +749,21 @@ private:
     std::array<Texture, 2> m_aoHistory;
     Texture m_ao;
     // Volumetric light at half resolution: this frame's march and the accumulation of the last two frames.
-    Texture m_volumetricMarch;
-    std::array<Texture, 2> m_volumetricHistory;
+    // Volumetric light's froxel volume (shaders/volumetrics.hlsl): the main view's light of the last two frames, the
+    // projected lights' light of the view being lit, and the integrated volume (shaders/froxels.hlsli).
+    std::array<Texture, 2> m_froxelLight;
+    Texture m_froxelProjected;
+    Texture m_froxelIntegrated;
+    std::array<UINT, 3> m_froxelDims = {};
+    // A size the volume could not be made in, not tried again.
+    std::array<UINT, 3> m_froxelFailedDims = {};
     bool m_volumetricHistoryValid = false;
+    // The medium (FroxelMedium) and slices of the last main view's volume, which its history was gathered in.
+    int m_froxelMedium = -1;
+    float m_prevFroxelStart = 0.0f;
+    float m_prevFroxelRange = 0.0f;
+    // The last main view's FogDaylight.
+    std::array<float, 3> m_fogDaylight = {1.0f, 1.0f, 1.0f};
     // Irradiance volume (shaders/probes.hlsl): red, green and blue coefficients and cells of the last two frames,
     // and the filled volume copied to the game's textures.
     std::array<std::array<Texture, 4>, 2> m_probeHistory;

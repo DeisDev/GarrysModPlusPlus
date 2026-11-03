@@ -923,7 +923,7 @@ void DrawQualityPage(Settings& settings)
         constexpr const char* kEmissive[] = {"quality.emissive_off", "quality.emissive_bounce", "quality.emissive_full"};
         static_assert(std::size(kEmissive) == static_cast<size_t>(EmissiveLighting::Count));
         SegmentRow("quality.emissive", &Settings::emissiveLighting, kEmissive);
-        SliderRow("quality.volumetric_steps", &Settings::volumetricSteps, settings.volumetricLight, Text("quality.volumetric_steps_reason"));
+        SliderRow("quality.volumetric_slices", &Settings::volumetricSlices, settings.volumetricLight, Text("quality.volumetric_slices_reason"));
         widgets::EndRows();
     }
     widgets::EndCard();

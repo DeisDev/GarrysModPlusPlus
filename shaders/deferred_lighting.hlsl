@@ -1,5 +1,6 @@
 #include "baked.hlsli"
 #include "water.hlsli"
+#include "froxels.hlsli"
 
 // Final shading: albedo times (direct light + denoised light) plus self-illumination, reflections and the light
 // the game's additive passes added, written in the encoding the game uses for lit colours. Pixels without
@@ -10,42 +11,35 @@
 // (debug view); output0: shaded colour, encoded or (outputLinear) linear; output1, output2, output3, output4 (or none):
 // Ray Reconstruction's specular albedo, roughness, hit distance and diffuse albedo guides, which water pixels overwrite.
 
-// Light scattered by the haze between the eye and the pixel (shaders/volumetrics.hlsl), after the tonemap scale.
-float3 VolumetricLight(int2 pixel)
-{
-    if (g_frame.volumetricView == kNoView)
-        return 0.0;
-    Texture2D<float4> volumetric = ResourceDescriptorHeap[g_frame.volumetricView];
-    // The half-resolution grid fills only part of the texture when Ray Reconstruction renders below the output size.
-    float2 textureSize;
-    volumetric.GetDimensions(textureSize.x, textureSize.y);
-    float2 position = min((float2(pixel) + 0.5) * 0.5, float2((g_frame.size + 1) / 2) - 0.5);
-    return volumetric.SampleLevel(g_linearClamp, position / textureSize, 0.0).rgb * g_frame.tonemapScale;
-}
-
-// Under water the eye looks through the water it is in: its light gathers at this many points when the volumetric pass
-// does not gather it.
+// Under water the eye looks through the water it is in: its light gathers at this many points without volumetric light.
 static const uint kUnderwaterSteps = 2;
 
-// Source's range fog, applied after the tonemap scale. Lit fog (volumetricFog) only hides the surface here: the fog's
-// own light comes with the volumetric light. Under water the water the eye looks through takes Source's water fog's
-// place (ThroughWater), its light with the volumetric light when that pass runs.
-float3 ApplyFog(float3 color, float3 position, int2 pixel)
+// What the eye sees of `color` (after the tonemap scale) at `position` through the medium between them. With volumetric
+// light the froxel volume (shaders/froxels.hlsli) holds the light the medium scatters on the way and, for the haze, how
+// much of `color` it lets through; Source's range fog, which the lit fog keeps, and the water the eye is in say that
+// exactly. Without volumetric light Source's fog is flat (in the map's fog colour, lit as the light is now), and under
+// water ThroughWater gathers the water's light.
+float3 SeenThroughMedium(float3 color, float3 position, int2 pixel)
 {
+    float viewDepth = mul(g_frame.viewProj, float4(position, 1.0)).w;
+    float4 volumetric = FroxelLight((float2(pixel) + 0.5) * g_frame.invSize, viewDepth);
+    float3 inscatter = volumetric.rgb * g_frame.tonemapScale;
     if (g_frame.eyeWater != kNoView) {
         float3 toPosition = position - g_frame.eyePosition;
         float distance = length(toPosition);
         float3 transmitted = color * exp(-LoadWaterBody(g_frame.eyeWater).extinction * distance);
         if (g_frame.volumetricView != kNoView)
-            return transmitted;
+            return transmitted + inscatter;
         uint seed = PixelSeed(pixel, 0x77u);
         return transmitted + ThroughWater(0.0, g_frame.eyePosition, toPosition / max(distance, 1e-4), distance, g_frame.eyeWater, kUnderwaterSteps, seed) *
             g_frame.tonemapScale;
     }
     if (g_frame.fogEnabled == 0)
-        return color;
-    float fog = FogOpacity(mul(g_frame.viewProj, float4(position, 1.0)).w);
-    return g_frame.volumetricFog != 0 ? color * (1.0 - fog) : lerp(color, g_frame.fogColor, fog);
+        return color * volumetric.a + inscatter;
+    float fog = FogOpacity(length(position - g_frame.eyePosition));
+    if (g_frame.volumetricFog != 0)
+        return color * (1.0 - fog) + inscatter;
+    return lerp(color, g_frame.fogColor * FogDaylight(), fog) + inscatter;
 }
 
 // Source's rim light also adds the ambient light seen along the view (vRimAmbientCubeColor in skin_ps20b) times its
@@ -178,7 +172,7 @@ void main(uint3 id : SV_DispatchThreadID)
     if (!covered && surface.w < 0.0 && g_frame.viewmodel == 0) {
         float3 position = WorldPositionFromDepth(pixel, DepthAt(pixel));
         WaterResult water = ShadeWater(pixel, position);
-        float3 shaded = ApplyFog(water.color * g_frame.tonemapScale, position, pixel) + VolumetricLight(pixel);
+        float3 shaded = SeenThroughMedium(water.color * g_frame.tonemapScale, position, pixel);
         output[pixel] = float4(g_frame.outputLinear != 0 ? shaded : Encode(shaded), color.a);
         if (g_pass.output1 != kNoView) {
             RWTexture2D<float4> specular = ResourceDescriptorHeap[g_pass.output1];
@@ -196,13 +190,21 @@ void main(uint3 id : SV_DispatchThreadID)
     }
     if (!covered) {
         float3 beyond = Decode(color.rgb);
-        // Under water, a pixel this view left undrawn looks through the water to nothing it meets; the back buffer
-        // still holds Source's view into the air there (its refraction view, which is not lit).
-        if (g_frame.eyeWater != kNoView && DepthAt(pixel) >= 1.0) {
-            float3 direction = normalize(WorldPositionFromDepth(pixel, 0.5) - g_frame.eyePosition);
-            beyond = ApplyFog(0.0, g_frame.eyePosition + direction * 65536.0, pixel);
+        float depth = DepthAt(pixel);
+        float3 direction = normalize(WorldPositionFromDepth(pixel, 0.5) - g_frame.eyePosition);
+        float3 sky = beyond;
+        if (g_frame.eyeWater != kNoView) {
+            // Under water, a pixel this view left undrawn looks through the water to nothing it meets; the back buffer
+            // still holds Source's view into the air there (its refraction view, which is not lit). What the game drew
+            // itself it fogged itself: only the water's light is added in front of it.
+            if (depth >= 1.0)
+                sky = SeenThroughMedium(0.0, g_frame.eyePosition + direction * 65536.0, pixel);
+            else
+                sky = beyond + SeenThroughMedium(0.0, WorldPositionFromDepth(pixel, depth), pixel);
+        } else if (g_frame.fogEnabled == 0) {
+            // The haze over what the game drew unlit, and over the sky as far as the sky does not already show it.
+            sky = SeenThroughMedium(beyond, depth >= 1.0 ? g_frame.eyePosition + direction * kHazeSkyDistance : WorldPositionFromDepth(pixel, depth), pixel);
         }
-        float3 sky = beyond + VolumetricLight(pixel);
         output[pixel] = float4(g_frame.outputLinear != 0 ? sky : Encode(sky), color.a);
         MirrorGuides(pixel);
         return;
@@ -307,7 +309,7 @@ void main(uint3 id : SV_DispatchThreadID)
             Texture2D<float4> highlights = ResourceDescriptorHeap[g_frame.specularView];
             specular += highlights.Load(int3(pixel, 0)).rgb;
         }
-        float3 shaded = ApplyFog((albedo * light + emissive + added + specular) * g_frame.tonemapScale, position, pixel) + additive + VolumetricLight(pixel);
+        float3 shaded = SeenThroughMedium((albedo * light + emissive + added + specular) * g_frame.tonemapScale, position, pixel) + additive;
         result = g_frame.outputLinear != 0 ? shaded : Encode(shaded);
         // NRD's validation overlay (debug view 15) over the image.
         if (g_frame.debugView == 15 && g_frame.nrdValidationView != kNoView) {

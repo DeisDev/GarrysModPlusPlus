@@ -57,9 +57,9 @@ float3 BeyondMap(float3 origin, float3 direction, float coneWidth, float coneSpr
     float3 radiance = ClampSample(hit.albedo * irradiance + HitEmission(hit, hitInfo, distance));
     if (g_frame.skyboxFogEnabled == 0)
         return radiance;
-    // The skybox view's range fog (ApplyFog in shaders/deferred_lighting.hlsl), whose colour is after the tonemap scale.
+    // The skybox view's range fog, whose colour is after the tonemap scale, lit as the light is now (FogDaylight).
     float fog = saturate(min(g_frame.skyboxFogParams.z, distance * g_frame.skyboxFogParams.w - g_frame.skyboxFogParams.x));
-    return lerp(radiance, g_frame.skyboxFogColor / g_frame.tonemapScale, g_frame.skyboxFogParams.y > 0.0 ? fog : fog * fog);
+    return lerp(radiance, g_frame.skyboxFogColor * FogDaylight() / g_frame.tonemapScale, g_frame.skyboxFogParams.y > 0.0 ? fog : fog * fog);
 }
 
 // The light leaving a reflected hit lit where it is: its albedo times the sun and one local light, and its indirect

@@ -6,6 +6,7 @@
 // deterministic: random choices would sparkle.
 
 #include "reflection.hlsli"
+#include "froxels.hlsli"
 
 static const uint kForwardLights = 4;
 
@@ -255,7 +256,9 @@ GlassRays RefractedGlass(float3 tint, float3 bumped, float3 faceNormal, float3 p
 // its cubemap was. The game blends the draw by its alpha: where the pane is clear (1 - alpha) the reflection takes its
 // share and leaves the rest of what lies behind to the blend, so it adds to both the colour and the alpha. A face of a
 // thick pane reflects Fresnel's share alone; a thin pane, 2F / (1 + F).
-float4 gmodpp_ForwardTwin(float4 albedo, float4 normal, float4 emissive, float4 position)
+// `mainView`: the main view's draws see the medium between the eye and the surface as its froxel volume holds it
+// (shaders/froxels.hlsli); views drawn into textures see from elsewhere and light the fog where it meets the surface.
+float4 gmodpp_ForwardTwin(float4 albedo, float4 normal, float4 emissive, float4 position, bool mainView)
 {
     float3 n = dot(normal.xyz, normal.xyz) > 0.0625 ? normalize(normal.xyz) : float3(0.0, 0.0, 1.0);
     // Debug views show the light alone, opaque.
@@ -313,21 +316,30 @@ float4 gmodpp_ForwardTwin(float4 albedo, float4 normal, float4 emissive, float4 
         color += (k == 0 ? radiance : ClampSample(radiance)) * weight;
     }
     color *= g_frame.tonemapScale;
+    bool froxels = mainView && g_frame.volumetricView != kNoView;
+    float4 volumetric = froxels ? FroxelLightAt(position.xyz) : float4(0.0, 0.0, 0.0, 1.0);
+    float3 inscatter = volumetric.rgb * g_frame.tonemapScale;
     if (g_frame.eyeWater != kNoView) {
         // Seen from under water, through the water (ThroughWater, at one fixed point: nothing here is denoised).
         float distance = length(position.xyz - g_frame.eyePosition);
-        uint seed = 0;
-        float3 inscatter = ThroughWater(0.0, g_frame.eyePosition, -toEye, distance, g_frame.eyeWater, 1, seed);
-        color = color * exp(-LoadWaterBody(g_frame.eyeWater).extinction * distance) + inscatter * g_frame.tonemapScale;
-    } else if (g_frame.fogEnabled != 0) {
-        float fog = FogOpacity(mul(g_frame.viewProj, float4(position.xyz, 1.0)).w);
-        // Lit fog (shaders/volumetrics.hlsl) is lit where it meets the surface, a unit towards the eye.
-        float3 fogColor = g_frame.fogColor;
-        if (g_frame.volumetricFog != 0) {
-            float3 air = position.xyz + toEye;
-            fogColor = LitFog(air, uint3(g_frame.probeRedView, g_frame.probeGreenView, g_frame.probeBlueView)) * g_frame.tonemapScale;
+        if (!froxels) {
+            uint seed = 0;
+            inscatter = ThroughWater(0.0, g_frame.eyePosition, -toEye, distance, g_frame.eyeWater, 1, seed) * g_frame.tonemapScale;
         }
-        color = lerp(color, fogColor, fog);
+        color = color * exp(-LoadWaterBody(g_frame.eyeWater).extinction * distance) + inscatter;
+    } else if (g_frame.fogEnabled != 0) {
+        float fog = FogOpacity(length(position.xyz - g_frame.eyePosition));
+        if (froxels && g_frame.volumetricFog != 0) {
+            color = color * (1.0 - fog) + inscatter;
+        } else {
+            // Lit fog (shaders/volumetrics.hlsl) is lit where it meets the surface, a unit towards the eye.
+            float3 fogColor = g_frame.fogColor * FogDaylight();
+            if (g_frame.volumetricFog != 0)
+                fogColor = LitFog(position.xyz + toEye, uint3(g_frame.probeRedView, g_frame.probeGreenView, g_frame.probeBlueView)) * g_frame.tonemapScale;
+            color = lerp(color, fogColor, fog) + inscatter;
+        }
+    } else {
+        color = color * volumetric.a + inscatter;
     }
     return float4(color, alpha);
 }

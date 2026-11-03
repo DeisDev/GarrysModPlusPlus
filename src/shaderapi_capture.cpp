@@ -39,11 +39,12 @@ constexpr DXGI_FORMAT kTargetFormats[kTargetCount] = {DXGI_FORMAT_R16G16B16A16_F
 constexpr size_t kMaxProjectedLights = 8;
 // FrameConstants::lightWarpViews in src/lighting.h.
 constexpr size_t kMaxLightWarps = 64;
-// ShaderBlendFactor_t (shaderapi/ishaderdynamic.h): SHADER_BLEND_ONE, SHADER_BLEND_DST_COLOR, SHADER_BLEND_SRC_ALPHA and
-// SHADER_BLEND_SRC_COLOR.
+// ShaderBlendFactor_t (shaderapi/ishaderdynamic.h): SHADER_BLEND_ONE, SHADER_BLEND_DST_COLOR, SHADER_BLEND_SRC_ALPHA,
+// SHADER_BLEND_ONE_MINUS_SRC_ALPHA and SHADER_BLEND_SRC_COLOR.
 constexpr int kBlendOne = 1;
 constexpr int kBlendDestinationColor = 2;
 constexpr int kBlendSourceAlpha = 4;
+constexpr int kBlendOneMinusSourceAlpha = 5;
 constexpr int kBlendSourceColor = 9;
 // Main views captured before the coverage report is logged; the map's materials have been drawn by then.
 constexpr uint64_t kCoverageViews = 600;
@@ -100,6 +101,7 @@ struct State {
     uint32_t forwardTwinDraws = 0;
     D3D12_GPU_VIRTUAL_ADDRESS twinFrame = 0;
     D3D12_GPU_VIRTUAL_ADDRESS twinScene = 0;
+    D3D12_GPU_VIRTUAL_ADDRESS fogFrame = 0;
     uint32_t forwardLogged = 0;
     // Fog of the main view and of the 3D skybox, which has its own.
     std::array<gbuffer::Fog, 2> fog;
@@ -505,7 +507,7 @@ bool End(ViewKind kind, ViewInputs& inputs)
     return true;
 }
 
-void BeginForward(const gbuffer::ForwardConstants& constants)
+void BeginForward(const gbuffer::ForwardConstants& constants, bool mainView)
 {
     if (!g_state.probes[0].resource)
         return;
@@ -514,7 +516,8 @@ void BeginForward(const gbuffer::ForwardConstants& constants)
     const float extent[3] = {kProbeSpacing * kProbeGrid[0], kProbeSpacing * kProbeGrid[1], kProbeSpacing * kProbeGrid[2]};
     auto& c = g_state.forwardConstants;
     c[1] = {0.0f, 0.0f, 0.0f, constants.lightOnly ? 1.0f : 0.0f};
-    c[2] = {constants.fog.color[0], constants.fog.color[1], constants.fog.color[2], constants.fog.known ? constants.litFogScale : 0.0f};
+    c[2] = {constants.fog.color[0] * constants.fogDaylight[0], constants.fog.color[1] * constants.fogDaylight[1], constants.fog.color[2] * constants.fogDaylight[2],
+        constants.fog.known ? constants.litFogScale : 0.0f};
     c[3] = {1.0f / extent[0], 1.0f / extent[1], 1.0f / extent[2], kProbeSpacing};
     // The window ends at the centres of its outermost probes.
     c[0] = {0.0f, 2.0f / (extent[0] - kProbeSpacing), 2.0f / (extent[1] - kProbeSpacing), 2.0f / (extent[2] - kProbeSpacing)};
@@ -524,6 +527,7 @@ void BeginForward(const gbuffer::ForwardConstants& constants)
     c[6] = constants.fog.known ? constants.fog.params : std::array<float, 4>{};
     g_state.twinFrame = constants.twinFrame;
     g_state.twinScene = constants.twinScene;
+    g_state.fogFrame = mainView ? constants.fogFrame : 0;
     g_state.forwardActive = true;
     g_state.forwardDraws = 0;
     g_state.forwardTwinDraws = 0;
@@ -650,6 +654,16 @@ Pass Prepare(std::span<const DWORD> vertexCode, std::span<const DWORD> pixelCode
         if (ScreenSpaceDraw()) {
             Count(pixelFile, Path::ForwardUnlit);
             return pass;
+        }
+        pass.fogFrame = g_state.fogFrame;
+        if (pixelFile != nullptr && twins::IsParticleShader(pixelFile)) {
+            pass.fogEpilogue = true;
+            // The medium's light is added in the encoding the target holds lit colour in: linear, with sRGB writes.
+            if (blend && srgbWrite)
+                pass.fogBlend = destinationBlend == kBlendOne ? 3.0f
+                    : destinationBlend != kBlendOneMinusSourceAlpha ? 0.0f
+                    : sourceBlend == kBlendSourceAlpha ? 1.0f
+                    : sourceBlend == kBlendOne ? 2.0f : 0.0f;
         }
         // Forward twins trace their own light; additive draws add light and are shown as drawn.
         // Refract's twin needs the game shader's registers it was written for.
@@ -886,40 +900,25 @@ bool IsSunSprite(const MeshDraw& mesh)
 {
     const gbuffer::SkyDraw* sky = Sky();
     if (mesh.vertexCount != 4 || mesh.vertexData == nullptr || (mesh.vertexFormat & kVertexPosition) == 0 || sky == nullptr || !sky->sunDisc ||
-        sky->sprite.empty())
-        return false;
-    // The sprite's material is the model name of env_sun's m_nMaterial, with its extension.
-    std::string_view sprite = sky->sprite;
-    if (sprite.size() > 4 && sprite.ends_with(".vmt"))
-        sprite.remove_suffix(4);
-    const std::string_view name = BoundMaterialName();
-    const auto same = [](char a, char b) {
-        const auto fold = [](char c) { return c == '\\' ? '/' : static_cast<char>(std::tolower(static_cast<unsigned char>(c))); };
-        return fold(a) == fold(b);
-    };
-    if (name.size() != sprite.size() || !std::equal(name.begin(), name.end(), sprite.begin(), same))
+        !sky->spriteDirection)
         return false;
     const std::optional<std::array<float, 3>> eye = ViewEye();
     if (!eye)
         return false;
     const UINT stride = mesh.streams[0].StrideInBytes;
-    std::array<std::array<float, 3>, 4> corners;
     std::array<float, 3> centre = {};
-    for (size_t v = 0; v < corners.size(); ++v) {
-        std::memcpy(corners[v].data(), mesh.vertexData + v * stride, sizeof(corners[v]));
+    for (UINT v = 0; v < 4; ++v) {
+        float corner[3];
+        std::memcpy(corner, mesh.vertexData + v * stride, sizeof(corner));
         for (int c = 0; c < 3; ++c)
-            centre[c] += corners[v][c] * 0.25f;
+            centre[c] += corner[c] * 0.25f;
     }
     const std::array<float, 3> toCentre = {centre[0] - (*eye)[0], centre[1] - (*eye)[1], centre[2] - (*eye)[2]};
     const float distance = std::sqrt(toCentre[0] * toCentre[0] + toCentre[1] * toCentre[1] + toCentre[2] * toCentre[2]);
-    const std::array<float, 3>& sun = sky->sunDirection;
+    const std::array<float, 3>& sun = *sky->spriteDirection;
     const float alignment = (toCentre[0] * sun[0] + toCentre[1] * sun[1] + toCentre[2] * sun[2]) / std::max(distance, 1e-3f);
-    const std::array<float, 3> toCorner = {corners[0][0] - centre[0], corners[0][1] - centre[1], corners[0][2] - centre[2]};
-    const float halfDiagonal = std::sqrt(toCorner[0] * toCorner[0] + toCorner[1] * toCorner[1] + toCorner[2] * toCorner[2]);
-    // The glare sprite at the same place is six times its own size (C_SunGlowOverlay::CalcSpriteColorAndSize).
     constexpr float kSpriteDistance = 100.0f;
-    return std::fabs(distance - kSpriteDistance) < 1.0f && alignment > 0.99999f &&
-        std::fabs(halfDiagonal - sky->spriteSize * std::numbers::sqrt2_v<float>) < 0.01f * sky->spriteSize + 0.1f;
+    return std::fabs(distance - kSpriteDistance) < 1.0f && alignment > 0.99999f;
 }
 
 std::span<const D3D12_CPU_DESCRIPTOR_HANDLE> SkyFaces()

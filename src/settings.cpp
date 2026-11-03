@@ -111,7 +111,7 @@ constexpr NamedField kFields[] = {
     {"indirect_bounces", &Settings::indirectBounces, Quality, {1.0f, 3.0f}},
     {"ao_rays", &Settings::aoRays, Quality, {1.0f, 4.0f}},
     {"volume_rays", &Settings::volumeRays, Quality, {8.0f, 64.0f}},
-    {"volumetric_steps", &Settings::volumetricSteps, Quality, {4.0f, 32.0f}},
+    {"volumetric_slices", &Settings::volumetricSlices, Quality, {16.0f, 128.0f}},
     {"viewmodel_shadow_rays", &Settings::viewmodelShadowRays, Quality, {1.0f, 16.0f}},
     {"foliage_shadows", &Settings::foliageShadows, Quality},
     {"indirect_lighting", &Settings::indirectLighting, Quality},
@@ -148,7 +148,7 @@ struct PresetValues {
     int indirectBounces;
     int aoRays;
     int volumeRays;
-    int volumetricSteps;
+    int volumetricSlices;
     int viewmodelShadowRays;
     FoliageShadows foliageShadows;
     bool fastAlphaTests;
@@ -161,10 +161,10 @@ struct PresetValues {
 
 // Low, Medium, High (the original quality) and Ultra.
 constexpr PresetValues kPresets[] = {
-    {1, 1, 1, 1, 1, 16, 8, 1, FoliageShadows::Sun, true, IndirectLighting::Baked, EmissiveLighting::Off, false, LightSampling::Auto, true},
-    {2, 1, 1, 2, 1, 24, 12, 4, FoliageShadows::SunAndIndirect, true, IndirectLighting::RayTraced, EmissiveLighting::Bounce, true, LightSampling::Auto, true},
-    {4, 2, 1, 2, 1, 32, 16, 8, FoliageShadows::All, false, IndirectLighting::RayTraced, EmissiveLighting::Full, true, LightSampling::Auto, true},
-    {8, 4, 2, 3, 2, 64, 32, 16, FoliageShadows::All, false, IndirectLighting::RayTraced, EmissiveLighting::Full, true, LightSampling::Auto, true},
+    {1, 1, 1, 1, 1, 16, 32, 1, FoliageShadows::Sun, true, IndirectLighting::Baked, EmissiveLighting::Off, false, LightSampling::Auto, true},
+    {2, 1, 1, 2, 1, 24, 48, 4, FoliageShadows::SunAndIndirect, true, IndirectLighting::RayTraced, EmissiveLighting::Bounce, true, LightSampling::Auto, true},
+    {4, 2, 1, 2, 1, 32, 64, 8, FoliageShadows::All, false, IndirectLighting::RayTraced, EmissiveLighting::Full, true, LightSampling::Auto, true},
+    {8, 4, 2, 3, 2, 64, 96, 16, FoliageShadows::All, false, IndirectLighting::RayTraced, EmissiveLighting::Full, true, LightSampling::Auto, true},
 };
 static_assert(std::size(kPresets) == static_cast<size_t>(QualityPreset::Custom));
 
@@ -479,7 +479,7 @@ void ApplyPreset(Settings& settings, QualityPreset preset)
     settings.indirectBounces = values.indirectBounces;
     settings.aoRays = values.aoRays;
     settings.volumeRays = values.volumeRays;
-    settings.volumetricSteps = values.volumetricSteps;
+    settings.volumetricSlices = values.volumetricSlices;
     settings.viewmodelShadowRays = values.viewmodelShadowRays;
     settings.foliageShadows = values.foliageShadows;
     settings.fastAlphaTests = values.fastAlphaTests;

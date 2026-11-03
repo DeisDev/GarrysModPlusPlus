@@ -12,6 +12,7 @@
 #include <map>
 #include <optional>
 #include <set>
+#include <string_view>
 
 // Binding model of the generated HLSL (shader model 6.6):
 // - b0: the float constants the shader reads, gmodpp_c[0] = c[firstFloatConstant].
@@ -22,6 +23,9 @@
 // - Vertex and pixel shaders link through one fixed interpolant struct (TEXCOORD0-9, COLOR0-1, FOG), so any pair
 //   matches. A masked declaration keeps its components in place: a pixel shader reading texcoord5 into v4.z reads the
 //   z the vertex shader wrote to texcoord5 ("Match Semantics on vs_3_0 and ps_3_0 Shaders", Shader model 3).
+// - Pixel shaders that blend Source's fog read its parameters (g_FogParams) through gmodpp_FogParams and its colour
+//   (g_LinearFogColor) through gmodpp_LitFogColor, and those of draws Source leaves unfogged (Variant::fogEpilogue) end
+//   with gmodpp_FogBlend (shaders/game_fog.hlsli), all off unless the draw's gmodpp_alpha says otherwise.
 // D3D9 semantics follow the shader model reference (learn.microsoft.com, "Asm Shader Reference"): rcp, rsq, log and
 // nrm of 0 give +-FLT_MAX, pow and log take the absolute value, mova rounds to nearest, texkill tests xyz, vPos is the
 // pixel centre at integer coordinates, and D3D9 pixel centres sit half a pixel off D3D10's (applied to positions).
@@ -126,6 +130,27 @@ float4 gmodpp_lit(float4 s)
 }
 )";
 
+// The float register of a constant the constant table names, if the shader has it.
+std::optional<UINT> FloatRegister(const std::vector<bytecode::Constant>& table, std::string_view name)
+{
+    for (const bytecode::Constant& constant : table) {
+        if (constant.set == bytecode::RegisterSet::Float4 && constant.name == name)
+            return constant.index;
+    }
+    return std::nullopt;
+}
+
+// The registers a pixel shader reads Source's fog from, if it blends any: its colour (g_LinearFogColor,
+// PSREG_LINEAR_FOG_COLOR in the SDK's shader_constant_register_map.h) and its parameters (g_FogParams, common_ps_fxc.h).
+std::optional<UINT> LinearFogColorRegister(const std::vector<bytecode::Constant>& table) { return FloatRegister(table, "g_LinearFogColor"); }
+std::optional<UINT> FogParamsRegister(const std::vector<bytecode::Constant>& table) { return FloatRegister(table, "g_FogParams"); }
+
+// Variant::fogEpilogue fogs only what the shader leaves unfogged.
+bool FogEpilogue(const Variant& variant, const std::vector<bytecode::Constant>& table)
+{
+    return variant.fogEpilogue != 0 && variant.forwardLighting == 0 && !LinearFogColorRegister(table);
+}
+
 class Translator {
 public:
     Translator(std::span<const DWORD> code, const Variant& variant, Translation& out, std::string& error)
@@ -221,6 +246,11 @@ private:
     bool m_usesLoop = false;
     bool m_usesPosition = false;
     bool m_usesFace = false;
+    // The registers of Source's linear fog colour and fog parameters (pixel shaders), and whether the shader reads them.
+    std::optional<UINT> m_fogColorRegister;
+    std::optional<UINT> m_fogParamsRegister;
+    bool m_usesFogColor = false;
+    bool m_usesFogParams = false;
     std::string m_main;
     std::map<UINT, std::string> m_labels;
     std::string* m_body = &m_main;
@@ -264,6 +294,14 @@ std::optional<std::string> Translator::Register(const Operand& operand, int offs
             return std::format("d{}", n);
         m_floatMin = std::min(m_floatMin, n);
         m_floatMax = std::max(m_floatMax, n);
+        if (m_fogColorRegister && n == *m_fogColorRegister) {
+            m_usesFogColor = true;
+            return std::string("gmodpp_fogColor");
+        }
+        if (m_fogParamsRegister && n == *m_fogParamsRegister) {
+            m_usesFogParams = true;
+            return std::string("gmodpp_fogParams");
+        }
         return std::format("gmodpp_c[{} - GMODPP_FIRST]", n);
     }
     case D3DSPR_ADDR:
@@ -857,6 +895,9 @@ std::string Translator::Assemble()
             text += "#define OPACITY_MICROMAPS 1\n";
         text += "#include \"forward_twin.hlsli\"\n";
     }
+    const bool fogEpilogue = m_stage == Stage::Pixel && FogEpilogue(m_variant, m_constantTable);
+    if (m_usesFogColor || m_usesFogParams || fogEpilogue)
+        text += "#include \"game_fog.hlsli\"\n";
     const UINT first = m_floatMin == UINT_MAX ? 0 : m_floatMin;
     m_out.firstFloatConstant = first;
     m_out.floatConstantCount = m_floatMin == UINT_MAX ? 0 : m_floatMax - m_floatMin + 1;
@@ -909,6 +950,10 @@ std::string Translator::Assemble()
         text += "static float4 vPos;\n";
     if (m_usesFace)
         text += "static float4 vFace;\n";
+    if (m_usesFogColor)
+        text += "static float4 gmodpp_fogColor;\n";
+    if (m_usesFogParams)
+        text += "static float4 gmodpp_fogParams;\n";
     for (const Declaration& input : m_inputs) {
         const bool texture = (input.reg & 0x100) != 0;
         text += std::format("static float4 {}{};\n", texture ? "t" : "v", input.reg & 0xFF);
@@ -1006,6 +1051,14 @@ std::string Translator::Assemble()
         text += "    vPos = float4(input.position.xy - 0.5, 0, 0);\n";
     if (m_usesFace)
         text += "    vFace = gmodpp_front ? 1 : -1;\n";
+    const std::string viewportSize = "float2(1.0 / gmodpp_halfPixel.x, -1.0 / gmodpp_halfPixel.y)";
+    // gmodpp_alpha.w in the main view's translucent pass: 1 while the pass blends the scene's fog colour, 2 another colour.
+    if (m_usesFogParams)
+        text += std::format("    gmodpp_fogParams = gmodpp_alpha.w == 1 || gmodpp_alpha.w == 2 ? gmodpp_FogParams(gmodpp_c[{0} - GMODPP_FIRST], input.position, {1}) : "
+                            "gmodpp_c[{0} - GMODPP_FIRST];\n", *m_fogParamsRegister, viewportSize);
+    if (m_usesFogColor)
+        text += std::format("    gmodpp_fogColor = gmodpp_alpha.w == 1 ? gmodpp_LitFogColor(gmodpp_c[{0} - GMODPP_FIRST], input.position, {1}) : "
+                            "gmodpp_c[{0} - GMODPP_FIRST];\n", *m_fogColorRegister, viewportSize);
     for (const Declaration& input : m_inputs) {
         auto member = InterpolantMember(input.usage, input.usageIndex);
         const bool texture = (input.reg & 0x100) != 0;
@@ -1019,12 +1072,14 @@ std::string Translator::Assemble()
             kTests[m_variant.alphaTest]);
     }
     if (forward) {
-        text += "    gmodpp_target0 = gmodpp_ForwardTwin(oC0, oC1, oC2, oC3);\n";
+        text += "    gmodpp_target0 = gmodpp_ForwardTwin(oC0, oC1, oC2, oC3, gmodpp_alpha.w != 0);\n";
     } else {
         for (UINT i = 0; i < 4; ++i) {
             if (m_out.colorOutputs & (1u << i))
                 text += std::format("    gmodpp_target{0} = oC{0};\n", i);
         }
+        if (fogEpilogue && (m_out.colorOutputs & 1u))
+            text += std::format("    gmodpp_target0 = gmodpp_FogBlend(gmodpp_target0, input.position, {}, gmodpp_alpha.z);\n", viewportSize);
         if (m_variant.lightWarpSlot != 0 && (m_out.colorOutputs & 8u))
             text += "    gmodpp_target3.a = gmodpp_alpha.y;\n";
     }
@@ -1052,6 +1107,10 @@ bool Translator::Run()
         return Fail(std::format("shader model {}.{}", m_major, D3DSHADER_VERSION_MINOR(version)));
     m_out.stage = m_stage;
     m_constantTable = bytecode::ConstantTable(m_code);
+    if (m_stage == Stage::Pixel) {
+        m_fogColorRegister = LinearFogColorRegister(m_constantTable);
+        m_fogParamsRegister = FogParamsRegister(m_constantTable);
+    }
     if (!Scan())
         return false;
     for (const Declaration& input : m_inputs) {
@@ -1089,6 +1148,14 @@ bool Translate(std::span<const DWORD> code, const Variant& variant, Translation&
     out = {};
     error.clear();
     return Translator(code, variant, out, error).Run();
+}
+
+bool UsesGameFog(std::span<const DWORD> code, const Variant& variant)
+{
+    if (code.empty() || (code[0] >> 16) != 0xFFFF)
+        return false;
+    const std::vector<bytecode::Constant> table = bytecode::ConstantTable(code);
+    return LinearFogColorRegister(table) || FogParamsRegister(table) || FogEpilogue(variant, table);
 }
 
 }
