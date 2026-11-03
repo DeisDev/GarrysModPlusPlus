@@ -1757,9 +1757,9 @@ void Lighting::RecordClouds(FrameConstants& constants, const ViewInputs& inputs,
         Use(m_cloudShadow, write);
         // Half its rows a frame, as the clouds move centimetres a frame; all of them where it was placed anew (the eye moved
         // a coarse texel, the sun turned) or first made. Its rows of every frame cost 0.4 ms on gm_construct (2026-11-03).
-        const UINT rows = shadowPlaced ? 1u + (m_cloudFrame & 1u) : 0u;
-        DispatchGroups(Pass::Clouds, {.input0 = cloudView, .input1 = rows, .output0 = m_cloudShadow.uav, .step = 3}, 2 * kCloudShadowSize / 8,
-            (rows == 0 ? kCloudShadowSize : kCloudShadowSize / 2) / 8, 1);
+        const UINT shadowRows = shadowPlaced ? 1u + (m_cloudFrame & 1u) : 0u;
+        DispatchGroups(Pass::Clouds, {.input0 = cloudView, .input1 = shadowRows, .output0 = m_cloudShadow.uav, .step = 3}, 2 * kCloudShadowSize / 8,
+            (shadowRows == 0 ? kCloudShadowSize : kCloudShadowSize / 2) / 8, 1);
         m_cloudShadowValid = true;
         Use(m_cloudShadow, kVolumeRead);
     }
