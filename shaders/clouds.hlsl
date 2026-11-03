@@ -202,6 +202,10 @@ static const float kStrength = 0.25;
 static const float kTopShare = 0.8;
 static const float kStratusEdge = 0.1;
 static const float kCellCarve = 1.2;
+// How many times finer than the middle layer's billows its cells are read: about 300 m at Size 1, some 2.5 degrees seen
+// from 7 km, where altocumulus' cloudlets are 1 to 5 degrees wide (WMO International Cloud Atlas). Read at twice, they
+// were twice that and clumped into cumulus-like masses (2026-11-03).
+static const float kCellTiles = 4.0;
 static const float2 kCumulusErosion = float2(0.47, 0.57);
 static const float2 kStratusErosion = float2(0.1, 0.14);
 static const float kMiddleErosion = 0.43;
@@ -400,7 +404,7 @@ float Billows(float2 uv, int cells, uint seed)
 
 // The shapes at `uv` in [0, 1): the low layer's billows (r, about 2.5 km cells over its 40 km tile) and its smooth
 // noise for stratus (g), and the middle layer's billows (b) and the finer billows that cut them into cells (a, read at
-// twice the frequency).
+// kCellTiles times the frequency).
 float4 Shapes(float2 uv)
 {
     return float4(Billows(uv, 16, 0x2f1b6c3du), GradientFbm(float3(uv, 0.5), int3(8, 8, 1), 5, 0x7a4c91e3u), Billows(uv, 16, 0x5a8e2f41u),
@@ -498,7 +502,7 @@ float LayerDensity(CloudConstants clouds, CloudLayer layer, float3 p, float alti
     float stratus = middle ? 0.0 : saturate(1.0 - layer.type - (weather.g - 0.5) * kTypeRegions);
     float cloud = Strength(middle ? shape.b : shape.r, coverage);
     if (middle) {
-        float cells = shapes.SampleLevel(g_linearWrap, uv * 2.0, 0.0).a;
+        float cells = shapes.SampleLevel(g_linearWrap, uv * kCellTiles, 0.0).a;
         cloud -= kCellCarve * (1.0 - cells) * (1.0 - cells) * Dampen(1.0 - cloud);
     }
     if (stratus > 0.0) {
