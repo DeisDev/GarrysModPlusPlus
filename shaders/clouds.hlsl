@@ -29,7 +29,7 @@
 // 5: the cloud cube (output0, its faces) with the light (input1): the texels of each 2 x 2 block at traceOffset, blended
 //    into what they held, or with input2 = 1 every texel anew.
 // 6: the main view's trace with the light (input1) and the 3D skybox's distances (input2, or kNoView): one texel of each
-//    2 x 2 block of the history (CloudConstants::historySize) at traceOffset, the clouds seen (output0: their light with
+//    traceBlock-square block of the history (CloudConstants::historySize) at traceOffset, the clouds seen (output0: their light with
 //    the air's in front, rgb, and transmittance, a) and their depth (output1, kilometres; kNoCloud for none, kMasked where
 //    the screen shows no sky around it).
 // 7: the history (output0) from last frame's (input1), moved with the camera and the wind, and the trace (input2, input3):
@@ -124,9 +124,9 @@ struct CloudConstants
     // wind's offset wraps with it.
     uint cirrusView;
     float cirrusStrandFrequency;
-    // The clouds' shapes (steps 10 to 12).
+    // The clouds' shapes (steps 10 to 12), and the side of the history's blocks a texel of which is traced each frame.
     uint shapesView;
-    float padding;
+    uint traceBlock;
 };
 
 static const uint kLayerLow = 1;
@@ -874,13 +874,13 @@ float4 SampleCatmullRom(Texture2D<float4> history, float2 uv, float2 size)
 }
 
 // The march's jitter for a texel of the history: interleaved gradient noise over the history's texels (Jimenez 2014),
-// advanced by the golden ratio each time the texel is traced again (every fourth frame), so its traces spread evenly over
-// a step. By the trace's texels, the four texels of a block took the same jitter and erred alike, a lattice of blocks on
-// bright clouds; advanced every frame instead, each block kept the same four offsets, a finer lattice (2026-11-03).
-float TraceNoise(uint2 texel)
+// advanced by the golden ratio each time the texel is traced again (every `block` squared frames), so its traces spread
+// evenly over a step. By the trace's texels, the texels of a block took the same jitter and erred alike, a lattice of
+// blocks on bright clouds; advanced every frame instead, each block kept the same offsets, a finer lattice (2026-11-03).
+float TraceNoise(uint2 texel, uint block)
 {
     float noise = frac(52.9829189 * frac(dot(float2(texel), float2(0.06711056, 0.00583715))));
-    return frac(noise + 0.61803399 * float(g_frame.frameIndex / 4));
+    return frac(noise + 0.61803399 * float(g_frame.frameIndex / (block * block)));
 }
 
 // Whether the screen shows the 2D sky anywhere around a history texel (a trace texel each side): pixels the depth leaves
@@ -888,8 +888,8 @@ float TraceNoise(uint2 texel)
 // over the area is checked.
 bool SeesSky(CloudConstants clouds, uint2 texel)
 {
-    float2 low = (float2(texel) - 2.0) / float2(clouds.historySize);
-    float2 high = (float2(texel) + 3.0) / float2(clouds.historySize);
+    float2 low = (float2(texel) - float(clouds.traceBlock)) / float2(clouds.historySize);
+    float2 high = (float2(texel) + float(clouds.traceBlock) + 1.0) / float2(clouds.historySize);
     float2 screenLow = (low * (1.0 + 2.0 * clouds.overscan) - clouds.overscan) * float2(g_frame.size);
     float2 screenHigh = (high * (1.0 + 2.0 * clouds.overscan) - clouds.overscan) * float2(g_frame.size);
     if (any(screenLow < 0.0) || any(screenHigh > float2(g_frame.size)))
@@ -1118,7 +1118,8 @@ void main(uint3 id : SV_DispatchThreadID, uint index : SV_GroupIndex)
     if (g_pass.step == 5) {
         RWTexture2DArray<float4> output = ResourceDescriptorHeap[g_pass.output0];
         bool everyTexel = g_pass.input2 == 1;
-        uint2 texel = everyTexel ? id.xy : id.xy * 2 + clouds.traceOffset;
+        // Its own 2 x 2 blocks, at the main view's offset in steps of 2 x 2 texels for 4 x 4 blocks.
+        uint2 texel = everyTexel ? id.xy : id.xy * 2 + clouds.traceOffset / (clouds.traceBlock / 2);
         if (any(texel >= clouds.cubeTexels))
             return;
         float3 direction = normalize(FaceDirection(id.z, (float2(texel) + 0.5) * (2.0 / clouds.cubeTexels) - 1.0));
@@ -1133,7 +1134,7 @@ void main(uint3 id : SV_DispatchThreadID, uint index : SV_GroupIndex)
     if (g_pass.step == 6) {
         RWTexture2D<float4> output = ResourceDescriptorHeap[g_pass.output0];
         RWTexture2D<float> depthOutput = ResourceDescriptorHeap[g_pass.output1];
-        uint2 texel = id.xy * 2 + clouds.traceOffset;
+        uint2 texel = id.xy * clouds.traceBlock + clouds.traceOffset;
         uint2 size;
         output.GetDimensions(size.x, size.y);
         if (any(id.xy >= size))
@@ -1146,7 +1147,7 @@ void main(uint3 id : SV_DispatchThreadID, uint index : SV_GroupIndex)
         float2 uv = (float2(texel) + 0.5) / float2(clouds.historySize);
         float3 direction = HistoryDirection(clouds, uv);
         float pixelAngle = length(HistoryDirection(clouds, uv + float2(1.0 / clouds.historySize.x, 0.0)) - direction);
-        CloudTrace trace = TraceClouds(clouds, light, eye, direction, TraceNoise(texel), 1.0, pixelAngle, transmittance);
+        CloudTrace trace = TraceClouds(clouds, light, eye, direction, TraceNoise(texel, clouds.traceBlock), 1.0, pixelAngle, transmittance);
         float depth;
         output[id.xy] = SeenClouds(trace, eye, direction, sky.SampleLevel(g_linearClamp, direction, 0.0).rgb, transmittance, depth);
         depthOutput[id.xy] = depth;
@@ -1162,7 +1163,7 @@ void main(uint3 id : SV_DispatchThreadID, uint index : SV_GroupIndex)
     Texture2D<float> traceDepth = ResourceDescriptorHeap[g_pass.input3];
     uint2 traceSize;
     trace.GetDimensions(traceSize.x, traceSize.y);
-    int2 center = int2(texel / 2);
+    int2 center = int2(texel / clouds.traceBlock);
     float4 current = trace.Load(int3(center, 0));
     float depth = traceDepth.Load(int3(center, 0));
     float3 direction = HistoryDirection(clouds, (float2(texel) + 0.5) / float2(clouds.historySize));
@@ -1201,6 +1202,6 @@ void main(uint3 id : SV_DispatchThreadID, uint index : SV_GroupIndex)
         if (around)
             previous = clamp(previous, low, high);
     }
-    bool fresh = all((texel & 1) == clouds.traceOffset);
+    bool fresh = all(texel % clouds.traceBlock == clouds.traceOffset);
     output[texel] = fresh && valid ? lerp(previous, current, kHistoryBlend) : previous;
 }

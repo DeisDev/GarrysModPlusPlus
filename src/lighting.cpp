@@ -1588,15 +1588,15 @@ void Lighting::RecordClouds(FrameConstants& constants, const ViewInputs& inputs,
         }
     }
     // The main view's history at the setting's share of the screen, widened by the overscan; the trace a texel of each
-    // 2 x 2 block of it.
+    // block of it.
     const float share = settings.cloudResolution == CloudResolution::Full ? 1.0f : settings.cloudResolution == CloudResolution::Half ? 0.5f : 0.25f;
     const std::array<UINT, 2> historySize = {static_cast<UINT>(std::ceil(static_cast<float>(m_width) * share * (1.0f + 2.0f * kCloudOverscan))),
         static_cast<UINT>(std::ceil(static_cast<float>(m_height) * share * (1.0f + 2.0f * kCloudOverscan)))};
-    // A texel of each 2 x 2 block is traced a frame. 4 x 4 blocks of a full-sized history, which cost what a half-sized one
-    // in 2 x 2 does, left a lattice on bright clouds: each texel of a block took the light of a different moment and noise
-    // (2026-11-03).
-    const std::array<UINT, 2> traceSize = {(historySize[0] + 1) / 2, (historySize[1] + 1) / 2};
-    if (historySize != m_cloudHistorySize) {
+    // A texel of each block is traced a frame: a full-sized history in 4 x 4 blocks costs what a half-sized one does in
+    // 2 x 2 (a sixteenth of the screen's pixels), and stays sharp.
+    const UINT traceBlock = settings.cloudResolution == CloudResolution::Full ? 4 : 2;
+    const std::array<UINT, 2> traceSize = {(historySize[0] + traceBlock - 1) / traceBlock, (historySize[1] + traceBlock - 1) / traceBlock};
+    if (historySize != m_cloudHistorySize || traceSize != m_cloudTraceSize) {
         // Frames in flight may still draw the sky with the old history.
         WaitForGpu();
         const bool created = CreateTarget(m_cloudTrace, traceSize[0], traceSize[1], DXGI_FORMAT_R16G16B16A16_FLOAT) &&
@@ -1608,6 +1608,7 @@ void Lighting::RecordClouds(FrameConstants& constants, const ViewInputs& inputs,
             return fail("creating the clouds' history failed");
         }
         m_cloudHistorySize = historySize;
+        m_cloudTraceSize = traceSize;
         m_cloudHistoryValid = false;
     }
 
@@ -1714,11 +1715,15 @@ void Lighting::RecordClouds(FrameConstants& constants, const ViewInputs& inputs,
     clouds.historySize[1] = historySize[1];
     clouds.overscan = kCloudOverscan;
     clouds.historyValid = m_cloudHistoryValid ? 1u : 0u;
-    // A texel of each 2 x 2 block a frame, all four in turn.
+    // A texel of each block a frame, all of them in turn: in 2 x 2 blocks diagonally opposite ones one after the other, in
+    // 4 x 4 the same within each 2 x 2 step across the block (Bayer's order), so consecutive frames' texels lie apart.
     constexpr UINT kTraceOrder[4][2] = {{0, 0}, {1, 1}, {1, 0}, {0, 1}};
-    const UINT* offset = kTraceOrder[m_cloudFrame++ % 4];
-    clouds.traceOffset[0] = offset[0];
-    clouds.traceOffset[1] = offset[1];
+    const UINT* coarse = kTraceOrder[m_cloudFrame % 4];
+    const UINT* fine = kTraceOrder[(m_cloudFrame / 4) % 4];
+    ++m_cloudFrame;
+    clouds.traceOffset[0] = traceBlock == 4 ? 2 * coarse[0] + fine[0] : coarse[0];
+    clouds.traceOffset[1] = traceBlock == 4 ? 2 * coarse[1] + fine[1] : coarse[1];
+    clouds.traceBlock = traceBlock;
     clouds.windStep[0] = windStep[0];
     clouds.windStep[1] = windStep[1];
 

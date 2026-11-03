@@ -307,7 +307,7 @@ struct Settings {
     bool opacityMicromaps = true;
     // The main view's clouds at cloudResolution, marched in cloudSteps steps straight up (twice as many toward the
     // horizon) and cloudLightSteps toward the light from each.
-    CloudResolution cloudResolution = CloudResolution::Half;
+    CloudResolution cloudResolution = CloudResolution::Full;
     int cloudSteps = 64;
     int cloudLightSteps = 6;
     // Latency and frame generation (this computer's): NVIDIA Reflex, the frame generator (DLSS or FSR, chosen when the
