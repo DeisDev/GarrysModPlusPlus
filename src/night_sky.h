@@ -36,12 +36,14 @@ struct NightSkyConstants {
     float moonlessFloor;
     float mapLight;
     float starTwilight;
+    float mapSunDirection[3];
+    float padding;
     float satellites[gbuffer::kMaxSatellites][4];
     float meteorStarts[gbuffer::kMaxMeteors][4];
     float meteorAxes[gbuffer::kMaxMeteors][4];
     float meteorFluxes[gbuffer::kMaxMeteors][4];
 };
-static_assert(sizeof(NightSkyConstants) == 384);
+static_assert(sizeof(NightSkyConstants) == 400);
 
 NightSkyConstants PackNightSky(const gbuffer::SkyDraw& draw);
 

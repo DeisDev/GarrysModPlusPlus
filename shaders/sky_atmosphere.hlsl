@@ -5,13 +5,14 @@
 // 0: the transmittance table (output0, kTransmittanceSize).
 // 1: the multiple scattering table (output0, kMultipleScatteringSize square) from the transmittance (input0).
 // 2: the clear sky around an eye kEyeHeight above the ground, lit by sunlight of irradiance 1 from the direction in
-//    input2-4 (float bits), into a cube's faces (output0) from both tables (input0, input1).
+//    input2-4 (float bits), into a cube's faces (output0) from both tables (input0, input1). Alpha: the luminance of its
+//    aerosols' single scattering, the glow around the sun, which step 4 keeps in the sunlight's colour.
 // 3: the game's colours (one group): the mean radiance of the game's sky (input0, the faces of the capture's cube, -1
 //    where nothing was drawn) and of the sky with the map's sun (input1, step 2's sky for light_environment's sun, which
 //    the game's sky shows) in kBands bands of elevation, and from them each band's multiplier (output0, kBands x 1). The
 //    map's sky counts with the night's floor (input2, float bits), so that it still matches the game's. Above the horizon
-//    a band keeps its brightness and takes the game's colour, and one scale makes the sky above the horizon as bright as
-//    the game's; below it, where the clear sky is only a ground of guessed albedo, a band takes the game's colour and
+//    a band keeps its brightness and takes the game's colour (alpha: the multiplier of its luminance alone), and one
+//    scale makes the sky above the horizon as bright as the game's; below it, where the clear sky is only a ground of guessed albedo, a band takes the game's colour and
 //    brightness. Without the game's sky above the horizon the scale makes it as bright as the map's sky light (input3,
 //    float bits: its luminance). Texel kBands: the mean luminance of the game's sky above the horizon where it was drawn
 //    (x, -1 without any), which tells night maps (Lighting::ReadMapSky).
@@ -59,6 +60,8 @@ groupshared float g_daylightSums[kBands * kLanesPerBand];
 struct Scattered
 {
     float3 radiance;
+    // The aerosols' single scattering in it.
+    float3 mie;
     // Hillaire's f_ms (eq. 7, before the isotropic phase): the share of light scattered once more along the ray.
     float3 transfer;
 };
@@ -92,12 +95,14 @@ Scattered Integrate(float3 origin, float3 direction, float3 sun, uint steps, boo
         Medium medium = MediumAt(r - kGroundRadius);
         float3 sunlight = SphereDistance(position, sun, kGroundRadius) < 0.0 ? AtmosphereTransmittance(transmittance, g_linearClamp, r, sunMu) : 0.0;
         float3 scattering = medium.rayleigh + medium.mie;
-        float3 inScattered = sunlight * (medium.rayleigh * rayleighPhase + medium.mie * miePhase);
+        float3 mieScattered = sunlight * (medium.mie * miePhase);
+        float3 inScattered = sunlight * (medium.rayleigh * rayleighPhase) + mieScattered;
         if (multiple)
             inScattered += scattering * multipleScattering.SampleLevel(g_linearClamp, MultipleScatteringUv(r, sunMu), 0.0).rgb;
         float3 extinction = max(medium.extinction, 1e-9);
         float3 stepTransmittance = exp(-extinction * step);
         result.radiance += throughput * (inScattered - inScattered * stepTransmittance) / extinction;
+        result.mie += throughput * (mieScattered - mieScattered * stepTransmittance) / extinction;
         result.transfer += throughput * (scattering - scattering * stepTransmittance) / extinction;
         throughput *= stepTransmittance;
     }
@@ -194,7 +199,9 @@ void ColourBands(uint index)
     GroupMemoryBarrierWithGroupSync();
     if (index < kBands) {
         RWTexture2D<float4> bands = ResourceDescriptorHeap[g_pass.output0];
-        bands[uint2(index, 0)] = float4(BandMultiplier(index, g_scale), 1.0);
+        float3 multiplier = BandMultiplier(index, g_scale);
+        float skyLuminance = Luminance(g_sky[index]);
+        bands[uint2(index, 0)] = float4(multiplier, skyLuminance > 0.0 ? Luminance(multiplier * g_sky[index]) / skyLuminance : Luminance(multiplier));
     }
 }
 
@@ -234,6 +241,17 @@ void Daylight(uint entry, uint index)
         float total = g_daylightSums[0] * (2.0 * 3.14159265 / (kDaylightRings * kDaylightAzimuths));
         output[uint2(entry, 0)] = float4(AtmosphereTransmittance(transmittance, g_linearClamp, origin.z, sun.z), total);
     }
+}
+
+// A clear sky's light (step 2) in the game's colours by a band's multiplier: the aerosols' glow around its sun (alpha,
+// its luminance) is sunlight scattered forward, which keeps the colour of the sunlight that makes it (the
+// transmittance toward `sun` from the eye) and takes the band's brightness alone; the rest takes the band's colour.
+// Coloured as a whole, the glow around a night map's Moon turned orange under a skybox greyer than the clear sky.
+float3 Recoloured(float4 clear, float3 sun, float4 multiplier, Texture2D<float4> transmittance)
+{
+    float3 sunlight = AtmosphereTransmittance(transmittance, g_linearClamp, kGroundRadius + kEyeHeight, sun.z);
+    float3 glow = min(clear.a * sunlight / max(Luminance(sunlight), 1e-12), clear.rgb);
+    return (clear.rgb - glow) * multiplier.rgb + glow * multiplier.a;
 }
 
 // Steps 3 and 5 run as groups of kBands x kLanesPerBand threads.
@@ -288,7 +306,8 @@ void main(uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint index :
         float3 direction = normalize(FaceDirection(id.z, (float2(id.xy) + 0.5) * (2.0 / width) - 1.0));
         float3 sun = float3(asfloat(g_pass.input2), asfloat(g_pass.input3), asfloat(g_pass.input4));
         float3 origin = float3(0.0, 0.0, kGroundRadius + kEyeHeight);
-        output[id] = float4(Integrate(origin, direction, sun, kSkySteps, true, transmittance, multipleScattering).radiance, 1.0);
+        Scattered scattered = Integrate(origin, direction, sun, kSkySteps, true, transmittance, multipleScattering);
+        output[id] = float4(scattered.radiance, Luminance(scattered.mie));
         return;
     }
     if (g_pass.step == 3) {
@@ -322,17 +341,22 @@ void main(uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint index :
     float t = band - floor(band);
     float weights[4] = {pow(1.0 - t, 3.0) / 6.0, (3.0 * t * t * t - 6.0 * t * t + 4.0) / 6.0, (-3.0 * t * t * t + 3.0 * t * t + 3.0 * t + 1.0) / 6.0,
         t * t * t / 6.0};
-    float3 multiplier = 0.0;
+    float4 multiplier = 0.0;
     [unroll]
     for (int k = 0; k < 4; ++k)
-        multiplier += weights[k] * bands.Load(int3(clamp(first + k, 0, int(kBands) - 1), 0, 0)).rgb;
-    float3 clear = sky.Load(int4(id, 0)).rgb;
+        multiplier += weights[k] * bands.Load(int3(clamp(first + k, 0, int(kBands) - 1), 0, 0));
+    Texture2D<float4> transmittance = ResourceDescriptorHeap[night.transmittanceView];
+    float4 clear = sky.Load(int4(id, 0));
+    float3 radiance = Recoloured(clear, night.sunDirection, multiplier, transmittance) +
+        night.moonlessFloor * Recoloured(mapSky.Load(int4(id, 0)), night.mapSunDirection, multiplier, transmittance);
     float3 moonlit = 0.0;
     if (night.moonIrradiance > 0.0) {
         Texture2DArray<float4> moonSky = ResourceDescriptorHeap[g_pass.input4];
-        moonlit = moonSky.Load(int4(id, 0)).rgb;
+        float4 moonClear = moonSky.Load(int4(id, 0));
+        moonlit = moonClear.rgb;
+        radiance += night.moonScale * Recoloured(moonClear, night.moonDirection, multiplier, transmittance);
     }
-    float3 radiance = min((clear + night.moonlessFloor * mapSky.Load(int4(id, 0)).rgb + night.moonScale * moonlit) * multiplier, 65504.0);
-    float gain = Luminance(radiance) / (Luminance(clear) * night.mapLight * night.starTwilight + Luminance(moonlit) * night.moonIrradiance + kNightSkyRadiance);
+    radiance = min(radiance, 65504.0);
+    float gain = Luminance(radiance) / (Luminance(clear.rgb) * night.mapLight * night.starTwilight + Luminance(moonlit) * night.moonIrradiance + kNightSkyRadiance);
     output[id] = float4(radiance, log2(max(gain, 1e-30)));
 }

@@ -1241,6 +1241,8 @@ void Lighting::RecordSky(FrameConstants& constants, const ViewInputs& inputs, co
     m_skyDraw.moonlessFloor = settings.moonlessNight;
     // The physical sky's stars are drawn against the sky the map's sun lights: the Sun's, or the Moon's on night maps.
     m_skyDraw.mapLight = MapSunIsMoon() ? MoonIrradiance(1.0f) : 1.0f;
+    if (const std::optional<std::array<float, 3>> mapSun = MapSunDirection(scene))
+        m_skyDraw.mapSunDirection = *mapSun;
     // Earlier stars: the sun's sky counts as dark as it would be with the sun lower, by the clear sky's irradiance there
     // against here.
     const float sunElevation = std::asin(std::clamp((*sun)[2], -1.0f, 1.0f));

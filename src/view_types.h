@@ -133,6 +133,8 @@ struct SkyDraw {
     float mapLight = 1.0f;
     // How much darker the sun's sky counts when the night sky is drawn against it (Settings::earlierStars).
     float starTwilight = 1.0f;
+    // The map's sun (light_environment's).
+    std::array<float, 3> mapSunDirection = {};
     std::array<std::array<float, 4>, kMaxSatellites> satellites = {};
     uint32_t satelliteCount = 0;
     std::array<Meteor, kMaxMeteors> meteors = {};

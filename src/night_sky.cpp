@@ -211,6 +211,7 @@ NightSkyConstants PackNightSky(const gbuffer::SkyDraw& draw)
     constants.moonlessFloor = draw.moonlessFloor;
     constants.mapLight = draw.mapLight;
     constants.starTwilight = draw.starTwilight;
+    std::copy(draw.mapSunDirection.begin(), draw.mapSunDirection.end(), constants.mapSunDirection);
     for (size_t i = 0; i < draw.satelliteCount; ++i)
         std::copy(draw.satellites[i].begin(), draw.satellites[i].end(), constants.satellites[i]);
     for (size_t i = 0; i < draw.meteorCount; ++i) {

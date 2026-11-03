@@ -59,6 +59,9 @@ struct NightSkyConstants
     float moonlessFloor;
     float mapLight;
     float starTwilight;
+    // The map's sun (light_environment's), whose clear sky the moonless floor is.
+    float3 mapSunDirection;
+    float padding;
     // Satellites: their directions (xyz) and irradiance (w).
     float4 satellites[8];
     // Meteors (MeteorStreak): the direction each started from (xyz) and its head's angle along its path (w); the axis its
