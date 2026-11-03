@@ -2538,7 +2538,7 @@ bool Lighting::FillConstants(FrameConstants& constants, const Scene& scene, cons
     constants.aoRays = static_cast<uint32_t>(settings.aoRays);
     constants.volumeRays = static_cast<uint32_t>(settings.volumeRays);
     constants.indirectRayFlags = m_useMicromaps && settings.fastAlphaTests ? D3D12_RAY_FLAG_FORCE_OMM_2_STATE : D3D12_RAY_FLAG_NONE;
-    constants.dispatchOriginView = inputs.kind == gbuffer::ViewKind::Viewmodel ? m_viewRect.srv : kInvalidView;
+    constants.dispatchOriginView = inputs.kind != gbuffer::ViewKind::Main ? m_viewRect.srv : kInvalidView;
     constants.restirDebugView = kInvalidView;
     constants.selfIllumView = kInvalidView;
     constants.nrdValidationView = kInvalidView;
@@ -3276,14 +3276,22 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
         m_gridWidth = renderWidth;
         m_gridHeight = renderHeight;
     }
-    // The viewmodel covers a small part of the screen; its passes run over a rectangle around it.
-    if (inputs.kind == gbuffer::ViewKind::Viewmodel) {
+    // The viewmodel and the 3D skybox cover part of the screen; their passes run over a rectangle around what they drew
+    // (the 3D skybox's passes over the whole screen cost 2.4 ms on gm_construct at 2560x1440, most of it on pixels the
+    // main view draws over, 2026-11-03). The 3D skybox's distances are cleared outside it.
+    if (inputs.kind != gbuffer::ViewKind::Main) {
+        const bool skyboxView = inputs.kind == gbuffer::ViewKind::Skybox;
         Use(m_viewRect, write);
+        if (skyboxView)
+            Use(m_skyboxDistance, write);
         const D3D12_RESOURCE_BARRIER between = {D3D12_RESOURCE_BARRIER_TYPE_UAV, D3D12_RESOURCE_BARRIER_FLAG_NONE, {.UAV = {m_viewRect.resource.Get()}}};
+        const D3D12_RESOURCE_BARRIER cleared = {D3D12_RESOURCE_BARRIER_TYPE_UAV, D3D12_RESOURCE_BARRIER_FLAG_NONE, {.UAV = {m_skyboxDistance.resource.Get()}}};
         DispatchGroups(Pass::ViewRect, {.output0 = m_viewRect.uav, .step = 0}, 1, 1, 1);
         m_list->ResourceBarrier(1, &between);
-        Dispatch(Pass::ViewRect, {.output0 = m_viewRect.uav, .step = 1});
+        Dispatch(Pass::ViewRect, {.input0 = skyboxView ? m_skyboxDistance.uav : kInvalidView, .output0 = m_viewRect.uav, .step = 1});
         m_list->ResourceBarrier(1, &between);
+        if (skyboxView)
+            m_list->ResourceBarrier(1, &cleared);
         DispatchGroups(Pass::ViewRect, {.output0 = m_viewRect.uav, .step = 2}, 1, 1, 1);
         Use(m_viewRect, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         m_rectDispatch = true;
@@ -3848,7 +3856,7 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     m_rectDispatch = false;
     m_list->SetGraphicsRootSignature(m_compositeRoot.Get());
     // The viewmodel's run lit only a rectangle, so its composite keeps to the pixels its G-buffer covers.
-    const bool covered = inputs.kind == gbuffer::ViewKind::Viewmodel;
+    const bool covered = inputs.kind != gbuffer::ViewKind::Main;
     const D3D12_RESOURCE_STATES pixelRead = read | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     if (covered) {
         const D3D12_RESOURCE_BARRIER barrier = Transition(flags, read, pixelRead);

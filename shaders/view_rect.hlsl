@@ -1,9 +1,10 @@
 #include "common.hlsli"
 
-// The screen rectangle around the G-buffer pixels of the viewmodel's run, widened by kMargin for the passes that read
-// around a pixel, and an indirect dispatch of 8 x 8 groups over it (DispatchPixel). step 0 resets the bounds, step 1
-// grows them by each covered pixel, step 2 writes the dispatch. output0: bounds (min xy, max xy), dispatch arguments
-// at byte 16, origin at byte 32.
+// The screen rectangle around the pixels a run draws (G-buffer surfaces and water) for the viewmodel's and the 3D
+// skybox's runs, widened by kMargin for the passes that read around a pixel, and an indirect dispatch of 8 x 8 groups
+// over it (DispatchPixel). step 0 resets the bounds, step 1 grows them by each covered pixel and clears input0 (the 3D
+// skybox's distances, which its rectangle's passes write only inside it; or kNoView), step 2 writes the dispatch.
+// output0: bounds (min xy, max xy), dispatch arguments at byte 16, origin at byte 32.
 
 // The GI filter reaches 2 * 16 pixels; the others less.
 static const uint kMargin = 40;
@@ -34,7 +35,13 @@ void main(uint3 id : SV_DispatchThreadID)
         return;
     }
     Texture2D<float4> flags = ResourceDescriptorHeap[g_frame.flagsView];
-    bool covered = all(id.xy < g_frame.size) && flags.Load(int3(id.xy, 0)).r >= 0.5;
+    bool inside = all(id.xy < g_frame.size);
+    if (inside && g_pass.input0 != kNoView) {
+        RWTexture2D<float> distances = ResourceDescriptorHeap[g_pass.input0];
+        distances[id.xy] = 0.0;
+    }
+    float4 coverage = inside ? flags.Load(int3(id.xy, 0)) : 0.0;
+    bool covered = inside && (coverage.r >= 0.5 || coverage.g >= 0.5);
     uint2 low = WaveActiveMin(covered ? id.xy : uint2(0xFFFFFFFFu, 0xFFFFFFFFu));
     uint2 high = WaveActiveMax(covered ? id.xy : uint2(0, 0));
     if (WaveActiveAnyTrue(covered) && WaveIsFirstLane()) {

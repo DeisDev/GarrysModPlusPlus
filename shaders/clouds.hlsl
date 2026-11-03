@@ -868,11 +868,14 @@ float4 SampleCatmullRom(Texture2D<float4> history, float2 uv, float2 size)
     return max(sum / (w12.x * w0.y + w0.x * w12.y + w12.x * w12.y + w3.x * w12.y + w12.x * w3.y), 0.0);
 }
 
-// Interleaved gradient noise (Jimenez 2014), moved each frame.
-float FrameNoise(uint2 pixel)
+// The march's jitter for a trace texel: interleaved gradient noise over the trace's texels (Jimenez 2014), advanced by the
+// golden ratio each time the texel's place in its block comes round again (every traceBlock squared frames), so each
+// place's traces spread evenly over a step. Moved on a 64-frame cycle, the places of 4 x 4 blocks, retraced every 16th
+// frame, each saw four related offsets and kept a bias of its own: a faint grid on bright clouds (2026-11-03).
+float TraceNoise(uint2 texel, uint block)
 {
-    float2 p = float2(pixel) + 5.588238 * float(g_frame.frameIndex % 64);
-    return frac(52.9829189 * frac(dot(p, float2(0.06711056, 0.00583715))));
+    float noise = frac(52.9829189 * frac(dot(float2(texel), float2(0.06711056, 0.00583715))));
+    return frac(noise + 0.61803399 * float(g_frame.frameIndex / (block * block)));
 }
 
 // Whether the screen shows the 2D sky anywhere around a history texel (a trace texel each side): pixels the depth leaves
@@ -1140,7 +1143,7 @@ void main(uint3 id : SV_DispatchThreadID, uint index : SV_GroupIndex)
         float pixelAngle = length(HistoryDirection(clouds, uv + float2(1.0 / clouds.historySize.x, 0.0)) - direction);
         // The noise by the trace's own texel: interleaved gradient noise read at every traceBlock-th pixel aliased into
         // hatching.
-        CloudTrace trace = TraceClouds(clouds, light, eye, direction, FrameNoise(id.xy), 1.0, pixelAngle, transmittance);
+        CloudTrace trace = TraceClouds(clouds, light, eye, direction, TraceNoise(id.xy, clouds.traceBlock), 1.0, pixelAngle, transmittance);
         float depth;
         output[id.xy] = SeenClouds(trace, eye, direction, sky.SampleLevel(g_linearClamp, direction, 0.0).rgb, transmittance, depth);
         depthOutput[id.xy] = depth;

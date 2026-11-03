@@ -34,11 +34,13 @@ float4 PSMain(VertexOutput input) : SV_Target
     return Result(input.position.xy);
 }
 
-// PSMain for the pixels the G-buffer covers: the viewmodel's run lights only a rectangle around them.
+// PSMain for the pixels the run drew (G-buffer surfaces and water): the viewmodel's and the 3D skybox's runs light only a
+// rectangle around them (shaders/view_rect.hlsl).
 [RootSignature(ROOT_SIGNATURE)]
 float4 CoveredPS(VertexOutput input) : SV_Target
 {
-    if (g_flags.Load(int3(input.position.xy, 0)).r < 0.5)
+    float4 coverage = g_flags.Load(int3(input.position.xy, 0));
+    if (coverage.r < 0.5 && coverage.g < 0.5)
         discard;
     return Result(input.position.xy);
 }
