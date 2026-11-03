@@ -251,7 +251,7 @@ constexpr WeatherValues kWeathers[] = {
     // Overcast, mackerel sky, cirrus, towering cumulus.
     {0.95f, 0.3f, 700.0f, 900.0f, 0.4f, 0.1f, 0.3f},
     {0.05f, 1.0f, 1200.0f, 900.0f, 0.65f, 0.3f, 0.3f},
-    {0.0f, 1.0f, 1200.0f, 900.0f, 0.05f, 0.7f, 0.5f},
+    {0.0f, 1.0f, 1200.0f, 900.0f, 0.05f, 0.4f, 0.3f},
     {0.3f, 1.0f, 1300.0f, 4500.0f, 0.1f, 0.3f, 0.3f},
 };
 static_assert(std::size(kWeathers) == static_cast<size_t>(Weather::Custom));

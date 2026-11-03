@@ -20,7 +20,7 @@
 // 0: the shape noise (output0, kShapeSize cubed): Perlin-Worley noise, then Worley noise of three octaves at three
 //    frequencies.
 // 1: the detail noise (output0, kDetailSize cubed): Worley noise of three octaves at three frequencies.
-// 2: the weather (output0, kWeatherSize square): coverage by region, cloud type, and the cirrus' bands (two noises mixed).
+// 2: the weather (output0, kWeatherSize square): coverage by region, cloud type, and the cirrus' streaks.
 // 3: the cloud shadow map (output0, two square cascades side by side; FrameConstants::cloudShadowU and on): the sun's
 //    transmittance through the clouds along the line through each texel; with input1 = 1 or 2 only the even or odd rows,
 //    0 all of them.
@@ -35,7 +35,7 @@
 // 7: the history (output0) from last frame's (input1), moved with the camera and the wind, and the trace (input2, input3):
 //    traced texels blend their new light in, the others keep last frame's within the light traced around them; where the
 //    screen shows no sky around them, the cube's clouds (FrameConstants::cloudCubeView).
-// 8: the cirrus' strands (output0, kCirrusSize square, mip 0): fine fibres along x, and finer ones within them.
+// 8: the cirrus' strands (output0, kCirrusSize square, mip 0): veils along x, and fibres within them.
 // 9: a mip of the strands (output0) as the mean of the 2 x 2 texels of the one above (input1), both unordered access views.
 // 10: the clouds' shapes (output0, square, over each layer's weather tile; Shapes), unordered access.
 // 11: their distribution (one group): each channel's cumulative histogram over every kHistogramStride-th texel of input1
@@ -137,11 +137,11 @@ static const uint kShapeSize = 128;
 static const uint kDetailSize = 64;
 static const uint kWeatherSize = 512;
 static const uint kCirrusSize = 1024;
-// The finer strands (the strands' green) repeat this many times within the strands' tile.
-static const float kCirrusFineTiles = 3.0;
-// How far the flow bends the strands, in tiles per unit of flow: some 150 m, about a fibre's spacing (our choice). The flow
-// spans the tile: 400 m over flow cells half the tile across made swirls, like marble (2026-11-03).
-static const float kCirrusWarp = 0.015;
+// How far the flow bends the strands, in tiles per unit of flow: some 300 m, a gentle bend along a veil's few kilometres
+// (our choice).
+static const float kCirrusWarp = 0.03;
+// How far above the coverage's cut the cirrus' field reaches full depth (our choice).
+static const float kCirrusEdge = 0.25;
 
 // The clouds' light (step 4): the light's irradiance above the air in the sky's units (rgb) and the sky's scale (a); the
 // clear sky's mean radiance over the upper hemisphere (rgb) and the cloudy sky's irradiance on a surface facing up over
@@ -356,31 +356,32 @@ float Ridges(float2 p, int2 cells, uint seed)
     return ridge * ridge;
 }
 
-// A slow divergence-free flow over a tile at `uv`: the curl of gradient noise `cells` cells across, by central
-// differences, about one tile unit per cell.
+// A slow divergence-free flow over a tile at `uv`: the curl of one octave of gradient noise `cells` cells across, by
+// central differences, about one unit per cell. The curl weighs each octave of noise by its frequency: the curl of three
+// octaves bent the cirrus' veils every 2.5 km, like noodles, and flow cells half the tile across 400 m made swirls like
+// marble (2026-11-03).
 float2 CurlFlow(float2 uv, int cells, uint seed)
 {
     const float step = 0.5 / kCirrusSize;
     int3 period = int3(cells, cells, 1);
-    float right = GradientFbm(float3(uv + float2(step, 0.0), 0.5), period, 3, seed);
-    float left = GradientFbm(float3(uv - float2(step, 0.0), 0.5), period, 3, seed);
-    float up = GradientFbm(float3(uv + float2(0.0, step), 0.5), period, 3, seed);
-    float down = GradientFbm(float3(uv - float2(0.0, step), 0.5), period, 3, seed);
+    float right = GradientNoise(float3((uv + float2(step, 0.0)) * float(cells), 0.5), period, seed);
+    float left = GradientNoise(float3((uv - float2(step, 0.0)) * float(cells), 0.5), period, seed);
+    float up = GradientNoise(float3((uv + float2(0.0, step)) * float(cells), 0.5), period, seed);
+    float down = GradientNoise(float3((uv - float2(0.0, step)) * float(cells), 0.5), period, seed);
     return float2(up - down, left - right) / (2.0 * step * float(cells));
 }
 
-// The cirrus' strands over a tile at `uv` in [0, 1): fibres 32 times longer along x than across that follow the lines of
-// a slow divergence-free flow (the curl of noise, as the Photon shader pack's cirrus streaks do), so they curve and fan
-// out, thick and thin in patches along their length (r); and finer, shorter fibres (g), which CirrusDepth repeats
-// kCirrusFineTiles times within the tile. Fibres bent across by plain noise ran in parallel waves, like combed hair
-// (2026-11-03).
+// The cirrus' strands over a tile at `uv` in [0, 1), along the lines of a slow divergence-free flow (the curl of noise,
+// as the Photon shader pack's cirrus streaks do), so they curve and fan out: noise for veils a few kilometres long and
+// about a kilometre wide (r, spread over the range as the weather's is) and fibres some 100 m apart within them (g)
+// ("white, delicate filaments ... a fibrous (hair-like) appearance, or a silky sheen", WMO International Cloud Atlas).
+// Fibres alone, in patches about as long as wide, looked like brush strokes, and filaments alone a few hundred metres
+// wide like noodles (2026-11-03).
 float2 CirrusStrands(float2 uv)
 {
-    float2 bent = uv + kCirrusWarp * CurlFlow(uv, 1, 0x1b873593u);
-    float strands = (Ridges(bent, int2(3, 96), 0x85ebca77u) + 0.5 * Ridges(bent, int2(6, 192), 0xc2b2ae3du)) / 1.5;
-    float patches = smoothstep(0.4, 0.7, GradientFbm(float3(bent, 0.5), int3(6, 8, 1), 3, 0x27d4eb2fu));
-    float fine = Ridges(bent, int2(8, 160), 0x165667b1u) * smoothstep(0.3, 0.7, GradientFbm(float3(bent, 0.5), int3(10, 12, 1), 2, 0xd3a2646cu));
-    return float2(saturate(strands * patches * 1.5), fine);
+    float2 bent = uv + kCirrusWarp * CurlFlow(uv, 2, 0x1b873593u);
+    float veils = saturate(GradientFbm(float3(bent, 0.5), int3(3, 12, 1), 4, 0x85ebca77u) * 2.0 - 0.5);
+    return float2(veils, Ridges(bent, int2(3, 96), 0xc2b2ae3du));
 }
 
 // ---- The clouds' shapes (steps 10 to 12).
@@ -514,6 +515,8 @@ float LayerDensity(CloudConstants clouds, CloudLayer layer, float3 p, float alti
         float3 shapePoint = float3(p.xy * layer.shapeFrequency + layer.erosionOffset.xy, altitude * layer.shapeFrequency + layer.offset.z);
         float billows = shapeTexture.SampleLevel(g_linearWrap, shapePoint, 0.0).g;
         cloud -= erosion.x * billows * billows * Dampen(1.0 - cloud);
+        if (cloud <= 0.0)
+            return 0.0;
     }
     if (detail && erosion.y > 0.0) {
         Texture3D<float4> detailTexture = ResourceDescriptorHeap[clouds.detailNoiseView];
@@ -536,25 +539,24 @@ float DensityAt(CloudConstants clouds, CloudLayer layer, float3 p, bool detail)
     return LayerDensity(clouds, layer, p, r - kGroundRadius, (r - layer.bottom) / (layer.top - layer.bottom), detail);
 }
 
-// The cirrus' optical depth straight through it above `p`, seen over `footprint` kilometres: bands along the wind cut to
-// its coverage (the weather's streaks) hold fibres (the strands), which thin out between and along them. The strands' mip
-// follows the footprint, so their fibres average out where a pixel spans many.
+// The cirrus' optical depth straight through it above `p`, seen over `footprint` kilometres: the weather's long streaks
+// along the wind and the strands' veils, cut together at its coverage, so few clouds are long wisps along the streaks'
+// crests, thicker along their fibres. Cut apart and multiplied, few clouds broke into short dashes (2026-11-03). The
+// strands' mip follows the footprint, so the fibres average out where a pixel spans many.
 float CirrusDepth(CloudConstants clouds, float3 p, float footprint)
 {
     if (clouds.cirrusCoverage <= 0.0)
         return 0.0;
     float2 along = float2(dot(p.xy, clouds.cirrusAxis), dot(p.xy, float2(-clouds.cirrusAxis.y, clouds.cirrusAxis.x)));
     Texture2D<float4> weatherTexture = ResourceDescriptorHeap[clouds.weatherView];
-    float4 weather = weatherTexture.SampleLevel(g_linearWrap, along * clouds.cirrusFrequency + clouds.cirrusOffset, 0.0);
-    float band = smoothstep(0.0, 1.0, saturate(Remap(weather.b * 0.7 + weather.a * 0.3, 1.0 - clouds.cirrusCoverage, 1.0, 0.0, 1.0)));
-    if (band <= 0.0)
-        return 0.0;
     Texture2D<float4> strands = ResourceDescriptorHeap[clouds.cirrusView];
+    float streaks = weatherTexture.SampleLevel(g_linearWrap, along * clouds.cirrusFrequency + clouds.cirrusOffset, 0.0).b;
     float2 coordinates = along * clouds.cirrusStrandFrequency + clouds.cirrusOffset * (clouds.cirrusStrandFrequency / clouds.cirrusFrequency);
     float lod = log2(max(footprint * clouds.cirrusStrandFrequency * kCirrusSize, 1.0));
-    float coarse = strands.SampleLevel(g_linearWrap, coordinates, lod).r;
-    float fine = strands.SampleLevel(g_linearWrap, coordinates * kCirrusFineTiles, lod + log2(kCirrusFineTiles)).g;
-    return clouds.cirrusDepth * band * saturate(coarse * (0.5 + fine));
+    float2 strand = strands.SampleLevel(g_linearWrap, coordinates, lod).rg;
+    float cut = 1.0 - clouds.cirrusCoverage;
+    float cover = smoothstep(cut, cut + kCirrusEdge, streaks * 0.7 + strand.r * 0.3);
+    return clouds.cirrusDepth * cover * (0.4 + 0.6 * strand.g);
 }
 
 // ---- Light.
@@ -1051,9 +1053,8 @@ void main(uint3 id : SV_DispatchThreadID, uint index : SV_GroupIndex)
         float coverage = GradientFbm(p, int3(4, 4, 1), 5, 0x9e3779b9u);
         float type = GradientFbm(p, int3(3, 3, 1), 4, 0x85ebca6bu);
         float streaks = GradientFbm(p, int3(2, 24, 1), 5, 0xc2b2ae35u);
-        float fine = GradientFbm(p, int3(16, 16, 1), 4, 0x27d4eb2du);
         // Spread the sums of octaves, which gather around a half, over the range.
-        output[id.xy] = saturate(float4(coverage, type, streaks, fine) * 2.0 - 0.5);
+        output[id.xy] = float4(saturate(float3(coverage, type, streaks) * 2.0 - 0.5), 1.0);
         return;
     }
     if (g_pass.step == 8) {
