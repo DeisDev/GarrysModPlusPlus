@@ -674,6 +674,40 @@ void Backend::BeginFrame()
     Transition(m_frameBuffer, D3D12_RESOURCE_STATE_RENDER_TARGET);
 }
 
+namespace {
+
+// The swap chain's buffer as presented (output.request), copied for writing out once the GPU is done.
+struct OutputCapture {
+    Microsoft::WRL::ComPtr<ID3D12Resource> readback;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
+    bool hdr = false;
+    float paperWhite = 0;
+    float peak = 0;
+};
+
+// Writes the rows of the copy tightly packed, 4 bytes a pixel: B8G8R8A8_UNORM, or R10G10B10A2_UNORM holding sRGB
+// (10 bits) or PQ (HDR10).
+void WriteOutputCapture(const OutputCapture& capture, unsigned presents)
+{
+    const D3D12_SUBRESOURCE_FOOTPRINT& footprint = capture.footprint.Footprint;
+    std::uint8_t* mapped = nullptr;
+    const D3D12_RANGE range = { 0, static_cast<SIZE_T>(footprint.RowPitch) * footprint.Height };
+    if (FAILED(capture.readback->Map(0, &range, reinterpret_cast<void**>(&mapped))))
+        return;
+    std::error_code error;
+    std::filesystem::create_directories(ModDirectory() / L"captures", error);
+    const std::filesystem::path path = ModDirectory() / L"captures" / std::format(L"output_{}_{}x{}_format{}.raw", presents, footprint.Width, footprint.Height,
+        static_cast<int>(footprint.Format));
+    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    for (UINT row = 0; row < footprint.Height; ++row)
+        file.write(reinterpret_cast<const char*>(mapped + static_cast<size_t>(row) * footprint.RowPitch), static_cast<std::streamsize>(footprint.Width) * 4);
+    capture.readback->Unmap(0, nullptr);
+    log::Info("Dev: saved the presented image ({}, format {}, paper white {:.0f} nits, peak {:.0f} nits) to {}", capture.hdr ? "HDR10" : "SDR",
+        static_cast<int>(footprint.Format), capture.paperWhite, capture.peak, path.string());
+}
+
+}
+
 void Backend::Present()
 {
     if (!m_recording)
@@ -688,12 +722,18 @@ void Backend::Present()
     if (std::chrono::steady_clock::now() - firstPresent > kReplayDelay)
         shader_precache::StartReplay(GetOptions().gameDirectory);
     static const bool developer = HasArgument(L"-gmodpp_dev");
+    static unsigned presents = 0;
+    bool captureOutput = false;
     if (developer) {
         static int limit = -1;
-        static unsigned presents = 0;
         if (++presents % kDevFilePollPresents == 0) {
             const std::filesystem::path request = ModDirectory() / L"drawlog.request";
             std::error_code ignored;
+            const std::filesystem::path outputRequest = ModDirectory() / L"output.request";
+            if (std::filesystem::exists(outputRequest, ignored)) {
+                std::filesystem::remove(outputRequest, ignored);
+                captureOutput = true;
+            }
             if (std::filesystem::exists(request, ignored)) {
                 int count = 200;
                 std::ifstream(request) >> count;
@@ -709,6 +749,27 @@ void Backend::Present()
         LimitDraws(limit);
     }
     MapToOutput();
+    OutputCapture outputCapture;
+    if (captureOutput) {
+        const D3D12_RESOURCE_DESC desc = SwapChainBuffer().resource->GetDesc();
+        UINT64 bytes = 0;
+        m_device->GetCopyableFootprints(&desc, 0, 1, 0, &outputCapture.footprint, nullptr, nullptr, &bytes);
+        const D3D12_HEAP_PROPERTIES heap = { D3D12_HEAP_TYPE_READBACK };
+        const D3D12_RESOURCE_DESC buffer = { D3D12_RESOURCE_DIMENSION_BUFFER, 0, bytes, 1, 1, 1, DXGI_FORMAT_UNKNOWN, { 1, 0 }, D3D12_TEXTURE_LAYOUT_ROW_MAJOR };
+        if (SUCCEEDED(m_device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                IID_PPV_ARGS(&outputCapture.readback)))) {
+            Transition(SwapChainBuffer(), D3D12_RESOURCE_STATE_COPY_SOURCE);
+            const D3D12_TEXTURE_COPY_LOCATION to = { outputCapture.readback.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, { .PlacedFootprint = outputCapture.footprint } };
+            const D3D12_TEXTURE_COPY_LOCATION from = { SwapChainBuffer().resource.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, { .SubresourceIndex = 0 } };
+            m_commandList->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+            const display::Mapping mapping = HudlessMapping();
+            outputCapture.hdr = m_outputHdr;
+            outputCapture.paperWhite = mapping.paperWhite;
+            outputCapture.peak = mapping.peak * mapping.paperWhite;
+        } else {
+            log::Info("Dev: creating a readback buffer for the presented image failed");
+        }
+    }
     Transition(SwapChainBuffer(), D3D12_RESOURCE_STATE_PRESENT);
     m_commandList->Close();
     m_recording = false;
@@ -730,6 +791,10 @@ void Backend::Present()
     }
     m_queue->Signal(m_fence.Get(), ++m_fenceValue);
     m_frames[m_frame].fence = m_fenceValue;
+    if (outputCapture.readback) {
+        WaitForGpu();
+        WriteOutputCapture(outputCapture, presents);
+    }
     DrainDebugMessages();
     m_frame = (m_frame + 1) % kFrames;
     BeginFrame();
