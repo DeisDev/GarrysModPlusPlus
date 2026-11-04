@@ -1,6 +1,8 @@
 #ifndef GMODPP_COMMON_HLSLI
 #define GMODPP_COMMON_HLSLI
 
+#include "tone_curve.hlsli"
+
 // Every compute pass shares this layout. Textures and buffers are reached through descriptor heap indices
 // in g_frame and g_pass. The radiance cache's constants (b2) and hash entries (u0, space2: a root descriptor, on which
 // Shader Model 6.6 guarantees 64-bit atomics), and RTXDI's constants (b3), RIS buffer (u1), reservoirs (u2) and neighbour
@@ -238,7 +240,10 @@ struct FrameConstants
     float cloudShadowFineScale;
     float cloudShadowCoarseScale;
     float cloudShadowEdge;
-    uint padding7;
+    // The tone curve lit colour takes before an 8-bit target (shaders/tone_curve.hlsli), and Highlights' strength.
+    uint toneCurve;
+    float highlightRolloff;
+    uint3 padding7;
 };
 
 // Per-pass descriptor indices and parameters; mirrors Lighting::PassArgs in src/lighting.h.
@@ -377,6 +382,12 @@ float3 LinearToSrgb(float3 color)
 float3 Encode(float3 color)
 {
     return g_frame.outputSrgb != 0 ? LinearToSrgb(color) : saturate(color);
+}
+
+// Lit colour after the tonemap scale fitted into an 8-bit target by the menu's tone curve, before Encode.
+float3 ToneMapped(float3 color)
+{
+    return ToneCurve(color, g_frame.toneCurve, g_frame.highlightRolloff);
 }
 
 float3 Decode(float3 color)

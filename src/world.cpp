@@ -85,6 +85,10 @@ struct ModelEntry {
     // transform: the bone may turn away from its bind pose (models/nova/chair_plastic01 faces the other way), and
     // weapons are merged onto their holder's hand bone.
     std::optional<studio::Matrix3x4> rootPoseToBone;
+    // A $staticprop model's bone is its entity's unscaled transform (C_BaseAnimating::SetupBones, client.dll+0x1a4e80):
+    // GMod scales that bone by the model scale only as it draws it (InternalDrawModel, 0x1a0270), for single-bone
+    // models that are $staticprop or set Entity:SetLegacyTransform (REA 2026-11-03).
+    bool staticProp = false;
     // Its kRightHandBone, if it has one: a holder's hand, or where a weapon merged onto that hand is held.
     int rightHand = -1;
     std::optional<studio::Matrix3x4> rightHandPoseToBone;
@@ -1007,8 +1011,10 @@ const ModelEntry& ModelFor(const std::string& mdlPath, int skin = 0)
             }
             std::vector<studio::Matrix3x4> poseToBone;
             if (entry.sceneModel >= 0 && studio::ReadPoseToBone(mdl, poseToBone)) {
-                if (poseToBone.size() == 1)
+                if (poseToBone.size() == 1) {
                     entry.rootPoseToBone = poseToBone[0];
+                    entry.staticProp = studio::IsStaticProp(mdl);
+                }
                 entry.rightHand = studio::BoneIndex(mdl, kRightHandBone);
                 // Characters: players, humans and other character folders, or a humanoid skeleton. Their $halflambert
                 // materials are lit as skin (subsurface scattering, shaders/deferred_lighting.hlsl).
@@ -1738,7 +1744,17 @@ void CollectEntities()
             g_state.bones.resize(kMaxBones);
             if (!entities::SetupBones(entity.renderable, reinterpret_cast<float (*)[3][4]>(g_state.bones.data()), kMaxBones))
                 continue;
-            transform = studio::Multiply(g_state.bones[0], *model.rootPoseToBone);
+            studio::Matrix3x4 bone = g_state.bones[0];
+            if (model.staticProp || entity.legacyTransform) {
+                // A scale of zero or below draws the model collapsed or mirrored, which no instance stands for.
+                if (!std::isfinite(entity.modelScale) || entity.modelScale <= 0.0f)
+                    continue;
+                for (auto& row : bone) {
+                    for (int c = 0; c < 3; ++c)
+                        row[c] *= entity.modelScale;
+                }
+            }
+            transform = studio::Multiply(bone, *model.rootPoseToBone);
         }
         SceneInstance& instance = g_state.dynamicInstances.emplace_back();
         instance.model = model.sceneModel;

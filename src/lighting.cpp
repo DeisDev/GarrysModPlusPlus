@@ -1351,7 +1351,8 @@ void Lighting::RecordSky(FrameConstants& constants, const ViewInputs& inputs, co
     m_skyDraw.sunDisc = disc;
     m_skyDraw.discIsMoon = MapSunIsMoon();
     m_skyDraw.skyView = m_proceduralSky.srv;
-    m_skyDraw.highlightRolloff = GetSettings().skyHighlights;
+    m_skyDraw.toneCurve = static_cast<uint32_t>(GetSettings().toneCurve);
+    m_skyDraw.highlightRolloff = GetSettings().highlightRolloff;
     m_skyDraw.transmittanceView = m_transmittance.srv;
     m_skyDraw.sunDirection = *sun;
     m_skyDraw.sunRadius = kRealSunRadius * kSunWithoutSprite;
@@ -2533,6 +2534,8 @@ bool Lighting::FillConstants(FrameConstants& constants, const Scene& scene, cons
     constants.sharpening = settings.sharpening;
     constants.tonemapScale = inputs.tonemapScale;
     constants.outputSrgb = inputs.outputSrgb ? 1u : 0u;
+    constants.toneCurve = static_cast<uint32_t>(settings.toneCurve);
+    constants.highlightRolloff = settings.highlightRolloff;
     constants.invSize[0] = 1.0f / static_cast<float>(m_width);
     constants.invSize[1] = 1.0f / static_cast<float>(m_height);
     constants.size[0] = m_width;

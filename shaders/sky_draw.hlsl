@@ -1,4 +1,5 @@
 #include "night_sky.hlsli"
+#include "tone_curve.hlsli"
 
 // The game's 2D sky passes drawn with the procedural sky and its night sky (SkyMain), or the sun's disc added over the
 // game's own sky (DiscMain), in place of the game's pixel shader (src/shaderapi_pipelines.cpp, DrawSky). The translated
@@ -15,7 +16,7 @@ struct SkyDrawConstants
     uint skyView;
     // How the target stores colour: 0 floating point, 1 8-bit, 2 8-bit sRGB.
     uint target;
-    // How far the sky's highlights are rolled off toward white before an 8-bit target clips them (0 none, 1 fully).
+    // How far Highlights' tone curve rolls the sky's highlights off toward white (0 none, 1 fully).
     float highlightRolloff;
     // The clouds over the sky (shaders/clouds.hlsl), as (light, transmittance): the last main view's history, whose clip
     // space a direction reaches through cloudViewProj's rows and which spans the screen widened by cloudOverscan on each
@@ -24,7 +25,8 @@ struct SkyDrawConstants
     uint cloudHistoryView;
     uint cloudCubeView;
     float cloudOverscan;
-    uint cloudPadding;
+    // The tone curve an 8-bit target's sky takes (kToneCurveOff, kToneCurveHighlights, kToneCurveFilmic).
+    uint toneCurve;
     NightSkyConstants night;
 };
 
@@ -108,22 +110,6 @@ float4 CloudsToward(float3 direction)
     return clouds;
 }
 
-// The sky near a low sun (the aerosols' glow, the hazy horizon) is many times brighter than white, which the game's
-// linear tonemap scale and 8-bit target clip to a flat plateau. Above a knee the luminance follows a shoulder that
-// never reaches white (Reinhard's x / (1 + x) above the knee, continuous in value and slope), keeping its hue and
-// desaturating toward white as it rises, as film does; so the halo stays a gradient and only the disc is white.
-float3 RolledOff(float3 color, float strength)
-{
-    const float kKnee = 0.75;
-    float luminance = dot(color, float3(0.2126, 0.7152, 0.0722));
-    if (luminance <= kKnee || strength <= 0.0)
-        return color;
-    float x = (luminance - kKnee) / (1.0 - kKnee);
-    float rolled = kKnee + (1.0 - kKnee) * x / (1.0 + x);
-    float3 compressed = lerp(color * (rolled / luminance), rolled.xxx, x / (x + 4.0));
-    return lerp(color, compressed, strength);
-}
-
 float4 SkyMain(Interpolants input) : SV_Target0
 {
     float3 direction = ViewDirection(input.position.xy);
@@ -141,9 +127,11 @@ float4 SkyMain(Interpolants input) : SV_Target0
         color += NightSkyLight(g_sky.night, direction, logGain, kPointFootprint * pixelAngle, g_sky.tonemapScale, transmittance, g_linearClamp) *
             (1.0 - moonCoverage);
     color = color * g_sky.tonemapScale + moon;
-    // The cube the lighting reads (a floating-point target) keeps the sky's true radiance.
+    // The sky near a low sun (the aerosols' glow, the hazy horizon) is many times brighter than white, which an 8-bit
+    // target clips to a flat plateau; the tone curve keeps the halo a gradient, and only the disc is white. The cube the
+    // lighting reads (a floating-point target) keeps the sky's true radiance.
     if (g_sky.target != 0)
-        color = RolledOff(color, g_sky.highlightRolloff);
+        color = ToneCurve(color, g_sky.toneCurve, g_sky.highlightRolloff);
     if (g_sky.night.disc != 0)
         color += SunDisc(g_sky.night, direction, pixelAngle, transmittance, g_linearClamp) * DiscThroughClouds(g_sky.night, clouds.a, g_sky.tonemapScale);
     // An 8-bit target rounds the sky's smooth gradients, after encoding them as sRGB when it does.

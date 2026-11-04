@@ -16,6 +16,8 @@ constexpr int32_t kMdlId = 'I' | ('D' << 8) | ('S' << 16) | ('T' << 24);
 constexpr int32_t kVvdId = 'I' | ('D' << 8) | ('S' << 16) | ('V' << 24);
 constexpr size_t kHeaderHullMin = 104;
 constexpr size_t kHeaderViewMin = 128;
+constexpr size_t kHeaderFlags = 152;
+constexpr int32_t kStudioFlagStaticProp = 0x10;
 constexpr size_t kHeaderNumBones = 156;
 constexpr size_t kHeaderBoneIndex = 160;
 constexpr size_t kBoneSize = 216;
@@ -218,6 +220,12 @@ int BoneCount(std::span<const std::byte> mdlBytes)
 {
     Reader mdl(mdlBytes);
     return mdl.At<int32_t>(kHeaderNumBones).value_or(0);
+}
+
+bool IsStaticProp(std::span<const std::byte> mdlBytes)
+{
+    Reader mdl(mdlBytes);
+    return (mdl.At<int32_t>(kHeaderFlags).value_or(0) & kStudioFlagStaticProp) != 0;
 }
 
 bool ReadBounds(std::span<const std::byte> mdlBytes, bsp::Float3& mins, bsp::Float3& maxs)

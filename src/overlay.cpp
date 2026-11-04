@@ -1199,7 +1199,6 @@ void DrawSkyPage(Settings& settings)
             SwitchRow("lighting.sun_disc", &Settings::sunDisc);
             SliderRow("lighting.sun_size", &Settings::sunSize, settings.sunDisc, Text("lighting.sun_size_reason"));
             SliderRow("lighting.sun_glow", &Settings::sunGlow, settings.physicalSky, physicalSkyReason);
-            SliderRow("lighting.sky_highlights", &Settings::skyHighlights, settings.physicalSky, physicalSkyReason);
             widgets::EndRows();
         }
     }
@@ -1528,6 +1527,19 @@ void DrawImagePage(Settings& settings)
         }
         if (settings.denoiserType == DenoiserType::RayRegeneration && !statistics.rayRegenerationAvailable)
             widgets::Note(Text("image.ray_regeneration_unavailable"));
+    }
+    widgets::EndCard();
+
+    if (widgets::BeginCard("##tone", Text("image.section_tone"), Text("image.tone_note"))) {
+        if (widgets::BeginRows("tone")) {
+            constexpr const char* kCurves[] = {"image.tone_curve_off", "image.tone_curve_highlights", "image.tone_curve_filmic"};
+            static_assert(std::size(kCurves) == static_cast<size_t>(ToneCurve::Count));
+            const bool realtime = settings.realtimeLighting;
+            SegmentRow("image.tone_curve", &Settings::toneCurve, kCurves, {}, realtime, Text("image.tone_reason"));
+            SliderRow("image.highlight_rolloff", &Settings::highlightRolloff, realtime && settings.toneCurve == ToneCurve::Highlights,
+                Text(realtime ? "image.highlight_rolloff_reason" : "image.tone_reason"));
+            widgets::EndRows();
+        }
     }
     widgets::EndCard();
 

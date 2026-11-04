@@ -72,6 +72,11 @@ enum class LightSampling : uint32_t { Legacy = 0, Ris, Restir, Auto, Count };
 // or NVIDIA NRD's RELAX or REBLUR.
 enum class DenoiserType : uint32_t { BuiltIn = 0, Relax, Reblur, RayRegeneration, Count };
 
+// How lit colour after the game's tonemap scale is fitted into the 8-bit image, which clips each channel at white: as
+// Source does (Off), by rolling off the highlights alone, or by a filmic curve (AgX) over the whole range
+// (shaders/tone_curve.hlsli).
+enum class ToneCurve : uint32_t { Off = 0, Highlights, Filmic, Count };
+
 // The resolution the main view's clouds are kept at: a quarter, half or all of the screen's across.
 enum class CloudResolution : uint32_t { Quarter = 0, Half, Full, Count };
 
@@ -167,11 +172,8 @@ struct Settings {
     // Our sun disc replaces env_sun's sprite, scaled from the size it has (Lighting::RecordSky).
     bool sunDisc = true;
     float sunSize = 1.0f;
-    // The aerosols' glow around the sun in the physical sky, times this; and how far the drawn sky's highlights (the
-    // glow and the horizon near a low sun, which are far brighter than white) are rolled off toward white instead of
-    // clipped flat (0 clips, 1 the full shoulder).
+    // The aerosols' glow around the sun in the physical sky, times this.
     float sunGlow = 1.0f;
-    float skyHighlights = 1.0f;
     // Volumetric clouds in the physical sky (shaders/clouds.hlsl). With changingWeather the weather turns from one to
     // another on its own (CloudWeather), each holding about weatherDuration minutes; otherwise `weather` sets the
     // cloudCoverage to highCloudOpacity values (ApplyWeather), and Custom keeps them as they are. The low layer covers
@@ -226,6 +228,10 @@ struct Settings {
     // Share of the reprojected history kept each frame; higher is smoother but slower to react.
     float taaHistoryWeight = 0.9f;
     float sharpening = 0.3f;
+    // The tone curve of the lit 3D view and the drawn sky; Highlights rolls them off toward white by highlightRolloff
+    // (0 clips, 1 the full shoulder).
+    ToneCurve toneCurve = ToneCurve::Highlights;
+    float highlightRolloff = 1.0f;
     // Colour grading of the 3D view after the game's post-processing, before the HUD: exposure in stops, contrast
     // around middle grey, saturation, and white balance (warmth toward a warmer light's colour, tint toward magenta).
     bool grading = false;
@@ -400,7 +406,7 @@ using SettingMember = std::variant<bool Settings::*, float Settings::*, int Sett
     AntiAliasing Settings::*,
     UpscalingMode Settings::*, QualityPreset Settings::*, FoliageShadows Settings::*, IndirectLighting Settings::*, EmissiveLighting Settings::*,
     LightSampling Settings::*, DenoiserType Settings::*, MapSun Settings::*, OverlayDetail Settings::*, OverlayCorner Settings::*, DofFocus Settings::*,
-    CloudResolution Settings::*, Weather Settings::*, ReflexMode Settings::*, FrameGeneration Settings::*>;
+    CloudResolution Settings::*, Weather Settings::*, ReflexMode Settings::*, FrameGeneration Settings::*, ToneCurve Settings::*>;
 
 // A setting's place in the settings table (kFields in settings.cpp).
 using FieldId = uint16_t;

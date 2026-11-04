@@ -226,7 +226,9 @@ struct FrameConstants {
     float cloudShadowFineScale;
     float cloudShadowCoarseScale;
     float cloudShadowEdge;
-    uint32_t padding7;
+    uint32_t toneCurve;
+    float highlightRolloff;
+    uint32_t padding7[3];
 };
 
 // Mirrors SamplingConstants in shaders/nvidia/sharc_common.hlsli: the radiance cache's parameters, bound to every pass

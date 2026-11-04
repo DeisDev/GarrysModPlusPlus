@@ -18,6 +18,10 @@ struct ModelEntity {
     std::string model;
     // Its skin family (C_BaseAnimating::m_nSkin), 0 for entities without one.
     int skin;
+    // C_BaseAnimating::m_flModelScale, 1 for entities without one.
+    float modelScale;
+    // Entity:SetLegacyTransform: its single bone is drawn scaled even when the model is not a $staticprop.
+    bool legacyTransform;
     float transform[3][4];
 };
 

@@ -1091,7 +1091,7 @@ struct SkyConstants {
     std::uint32_t cloudHistoryView;
     std::uint32_t cloudCubeView;
     float cloudOverscan;
-    std::uint32_t cloudPadding;
+    std::uint32_t toneCurve;
     NightSkyConstants night;
 };
 static_assert(sizeof(SkyConstants) == 576);
@@ -1176,6 +1176,7 @@ D3D12_GPU_VIRTUAL_ADDRESS SkyDrawConstants(const gbuffer::SkyDraw& sky, std::spa
     constants.skyView = sky.skyView;
     constants.target = TargetEncoding(format);
     constants.highlightRolloff = sky.highlightRolloff;
+    constants.toneCurve = sky.toneCurve;
     for (size_t r = 0; r < 4; ++r)
         std::copy(sky.cloudViewProj[r].begin(), sky.cloudViewProj[r].end(), constants.cloudViewProj[r].v);
     constants.cloudHistoryView = sky.cloudHistoryView;

@@ -14,7 +14,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - A Menu page: the key that opens the menu can be changed, Escape can close it, and its opacity, size, accent colour and language can be set. It can reopen on the last page and reset its window.
 - An About page with the author, links to the GitHub repository and issues, credits and references, and buttons that open the licences and mod folders.
 - A README with installation steps, requirements and how to build from source.
-- The sky's highlights near a low sun roll off toward white instead of clipping to a flat white blob ("Highlight roll-off" on the Sky page), and "Sun glow" scales the haze of light around the sun.
+- Bright light rolls off toward white instead of clipping to flat white and yellow ("Tone curve" on the Image page). Highlights, the default, softens only the brightest parts of the scene and the sky; Filmic (AgX) compresses the whole range, as film does; Off clips as the game does. "Sun glow" scales the haze of light around the sun.
 - The performance overlay's opacity, background and text colours, size, margin and border can be set on the Performance page.
 - The performance overlay hides while the game hides its HUD (the camera, `cl_drawhud 0`, addons that hide it); "Hide with the game's HUD" on the Performance page, on by default.
 - Menu cards collapse and expand when their heading is clicked, and stay collapsed between sessions. Explanations moved from text under the cards into a help mark on each heading; the menu's icons come from the Lucide icon font.

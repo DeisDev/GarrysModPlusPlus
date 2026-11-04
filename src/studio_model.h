@@ -36,6 +36,9 @@ Matrix3x4 Multiply(const Matrix3x4& a, const Matrix3x4& b);
 // Number of bones in the model; models with more than one bone are skinned.
 int BoneCount(std::span<const std::byte> mdl);
 
+// Whether the model was compiled with $staticprop (STUDIOHDR_FLAGS_STATIC_PROP).
+bool IsStaticProp(std::span<const std::byte> mdl);
+
 // The box around the model's collision hull and view bounds, or false when the header sets neither.
 bool ReadBounds(std::span<const std::byte> mdl, bsp::Float3& mins, bsp::Float3& maxs);
 

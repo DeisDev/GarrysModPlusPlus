@@ -54,6 +54,12 @@ constexpr int kPropTypeDataTable = 6;
 constexpr int kMaxRecvProps = 4096;
 constexpr int kMaxRecvDepth = 16;
 constexpr char kSkinProp[] = "m_nSkin";
+// DT_BaseAnimating's m_flModelScale (built at client.dll+0x195830) and GMod's legacy transform flag beside it, set by
+// Entity:SetLegacyTransform (client.dll+0x12a8b0). C_BaseAnimating::InternalDrawModel (0x1a0270, vtable slot 212) reads
+// both at these offsets (REA 2026-11-03), so the flag is read only where m_flModelScale is where REA found it.
+constexpr char kModelScaleProp[] = "m_flModelScale";
+constexpr int kModelScaleOffset = 0x1818;
+constexpr size_t kLegacyTransform = 0x1be4;
 constexpr int kNoProp = -1;
 constexpr int kModelInfoGetModelSlot = 1;
 // C_BaseCombatWeapon's m_iViewModelIndex and m_iWorldModelIndex (their DT_BaseCombatWeapon RecvProps are built at
@@ -92,8 +98,9 @@ struct SunProps {
 };
 
 void* g_entityList = nullptr;
-// Offset of m_nSkin in each client class, or kNoProp.
+// Offset of m_nSkin and of m_flModelScale in each client class, or kNoProp.
 std::unordered_map<const void*, int> g_skinOffsets;
+std::unordered_map<const void*, int> g_modelScaleOffsets;
 // DT_Sun's offsets per client class.
 std::unordered_map<const void*, SunProps> g_sunProps;
 void* g_modelInfo = nullptr;
@@ -147,16 +154,13 @@ int FindProp(const void* table, const char* name, int depth)
     return kNoProp;
 }
 
-int SkinOf(void* entity)
+// FindProp for a client class, remembered per class in `offsets`.
+int ClassProp(std::unordered_map<const void*, int>& offsets, const void* clientClass, const char* name)
 {
-    void* networkable = Slot<void*(__fastcall*)(void*)>(entity, kGetClientNetworkableSlot)(entity);
-    const void* clientClass = networkable != nullptr ? Slot<const void*(__fastcall*)(void*)>(networkable, kGetClientClassSlot)(networkable) : nullptr;
-    if (clientClass == nullptr)
-        return 0;
-    auto found = g_skinOffsets.find(clientClass);
-    if (found == g_skinOffsets.end())
-        found = g_skinOffsets.emplace(clientClass, FindProp(Field<const void*>(clientClass, kClientClassRecvTable), kSkinProp, 0)).first;
-    return found->second != kNoProp ? std::max(Field<int>(entity, static_cast<size_t>(found->second)), 0) : 0;
+    auto found = offsets.find(clientClass);
+    if (found == offsets.end())
+        found = offsets.emplace(clientClass, FindProp(Field<const void*>(clientClass, kClientClassRecvTable), name, 0)).first;
+    return found->second;
 }
 
 }
@@ -208,7 +212,13 @@ void Collect(std::vector<ModelEntity>& entities)
         out.renderable = renderable;
         out.parent = Slot<void*(__fastcall*)(void*)>(renderable, kGetShadowParentSlot)(renderable);
         out.model = name;
-        out.skin = SkinOf(entity);
+        void* networkable = Slot<void*(__fastcall*)(void*)>(entity, kGetClientNetworkableSlot)(entity);
+        const void* clientClass = networkable != nullptr ? Slot<const void*(__fastcall*)(void*)>(networkable, kGetClientClassSlot)(networkable) : nullptr;
+        const int skin = clientClass != nullptr ? ClassProp(g_skinOffsets, clientClass, kSkinProp) : kNoProp;
+        out.skin = skin != kNoProp ? std::max(Field<int>(entity, static_cast<size_t>(skin)), 0) : 0;
+        const int scale = clientClass != nullptr ? ClassProp(g_modelScaleOffsets, clientClass, kModelScaleProp) : kNoProp;
+        out.modelScale = scale != kNoProp ? Field<float>(entity, static_cast<size_t>(scale)) : 1.0f;
+        out.legacyTransform = scale == kModelScaleOffset && Field<uint8_t>(entity, kLegacyTransform) != 0;
         std::memcpy(out.transform, transform, sizeof(out.transform));
     }
 }

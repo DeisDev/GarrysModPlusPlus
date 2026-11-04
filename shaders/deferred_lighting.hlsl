@@ -3,13 +3,14 @@
 #include "froxels.hlsli"
 
 // Final shading: albedo times (direct light + denoised light) plus self-illumination, reflections and the light
-// the game's additive passes added, written in the encoding the game uses for lit colours. Pixels without
-// G-buffer data keep the game's forward colour.
+// the game's additive passes added, fitted by the tone curve and written in the encoding the game uses for lit colours.
+// Pixels without G-buffer data keep the game's forward colour, which the game already fitted to its target.
 // input0: denoised light (indirect plus the sampled direct remainder), or none for the sky's light; input1: raw
 // estimate (debug view); input2: reflections and self-illumination (shaders/reflections.hlsl), or none; input3:
 // exact direct light (rgb) and sun visibility (a) from shaders/direct.hlsl; input4: sampled direct remainder
-// (debug view); output0: shaded colour, encoded or (outputLinear) linear; output1, output2, output3, output4 (or none):
-// Ray Reconstruction's specular albedo, roughness, hit distance and diffuse albedo guides, which water pixels overwrite.
+// (debug view); output0: shaded colour, encoded or (outputLinear, before the tone curve) linear; output1, output2,
+// output3, output4 (or none): Ray Reconstruction's specular albedo, roughness, hit distance and diffuse albedo guides,
+// which water pixels overwrite.
 
 // Under water the eye looks through the water it is in: its light gathers at this many points without volumetric light.
 static const uint kUnderwaterSteps = 2;
@@ -173,7 +174,7 @@ void main(uint3 id : SV_DispatchThreadID)
         float3 position = WorldPositionFromDepth(pixel, DepthAt(pixel));
         WaterResult water = ShadeWater(pixel, position);
         float3 shaded = SeenThroughMedium(water.color * g_frame.tonemapScale, position, pixel);
-        output[pixel] = float4(g_frame.outputLinear != 0 ? shaded : Encode(shaded), color.a);
+        output[pixel] = float4(g_frame.outputLinear != 0 ? shaded : Encode(ToneMapped(shaded)), color.a);
         if (g_pass.output1 != kNoView) {
             RWTexture2D<float4> specular = ResourceDescriptorHeap[g_pass.output1];
             RWTexture2D<float> roughness = ResourceDescriptorHeap[g_pass.output2];
@@ -309,8 +310,8 @@ void main(uint3 id : SV_DispatchThreadID)
             Texture2D<float4> highlights = ResourceDescriptorHeap[g_frame.specularView];
             specular += highlights.Load(int3(pixel, 0)).rgb;
         }
-        float3 shaded = SeenThroughMedium((albedo * light + emissive + added + specular) * g_frame.tonemapScale, position, pixel) + additive;
-        result = g_frame.outputLinear != 0 ? shaded : Encode(shaded);
+        float3 shaded = SeenThroughMedium((albedo * light + emissive + added + specular) * g_frame.tonemapScale, position, pixel);
+        result = g_frame.outputLinear != 0 ? shaded + additive : Encode(ToneMapped(shaded) + additive);
         // NRD's validation overlay (debug view 15) over the image.
         if (g_frame.debugView == 15 && g_frame.nrdValidationView != kNoView) {
             Texture2D<float4> validation = ResourceDescriptorHeap[g_frame.nrdValidationView];
