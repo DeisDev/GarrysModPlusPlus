@@ -23,3 +23,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - The sun and Moon are drawn at their real brightness, so on an HDR display they reach its peak instead of stopping at white.
 - The Filmic tone curve is Gran Turismo's in SDR as in HDR and keeps hues; it replaces AgX.
 - The menu blends over the game in linear light in SDR as in HDR.
+
+### Fixed
+
+- Clouds no longer repeat in a pattern toward the horizon.

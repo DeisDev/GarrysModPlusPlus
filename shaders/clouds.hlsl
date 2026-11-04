@@ -60,7 +60,8 @@ struct CloudLayer
     float detailFrequency;
     float weatherFrequency;
     float erosion;
-    // The wind's offset in weather tiles (xy) and how far the shapes have evolved in shape tiles (z), both wrapped.
+    // The wind's offset in weather tiles (xy, wrapped by whole periods of the hex lattice: HexTilesAt) and how far the
+    // shapes have evolved in shape tiles (z, wrapped).
     float3 offset;
     // How far the billows' (xy, in shape tiles) and the fine detail's (zw, in detail tiles) noise has drifted, ahead of
     // the wind, so the clouds' shapes change as they go.
@@ -78,7 +79,7 @@ struct CloudConstants
     // The low (cumulus) and middle (altocumulus) layers.
     CloudLayer layers[2];
     // The cirrus: its radius, coverage, optical depth straight through where thickest and cycles per kilometre, the
-    // wind's offset in weather tiles, and the wind's direction, which its streaks lie along.
+    // wind's offset in weather tiles (wrapped as the layers' are), and the wind's direction, which its streaks lie along.
     float cirrusRadius;
     float cirrusCoverage;
     float cirrusDepth;
@@ -452,6 +453,69 @@ float Equalised(RWTexture2D<float> distribution, uint channel, float value)
     return lerp(below, distribution[uint2(bin, channel)], saturate(value * kHistogramBins - float(bin)));
 }
 
+// ---- Hex-tiling (Heitz and Neyret, "High-Performance By-Example Noise using a Histogram-Preserving Blending Operator",
+// HPG 2018; Mikkelsen, "Practical Real-Time Hex-Tiling", JCGT 2022): the weather, the shapes and the cirrus' strands are
+// read through a lattice of hexagons, each showing its texture at its own random offset and, but for the cirrus, whose
+// streaks lie along the wind, its own turn, blended across their edges. Read directly, the 40 km tile came back three or
+// four times toward the horizon, 125 to 165 km away (2026-11-04). The lattice moves with the wind; its hashes repeat every
+// kHexPeriod hexagons along each of its axes, by which CloudWeather::Advance wraps the wind's offset.
+
+static const int kHexPeriod = 256;
+// Our choices: hexagons' centres this many of their texture's tiles apart, for the layers (10 and 5 km at Size 1) and the
+// cirrus (15 km, a streak's length); their weights sharpened by the 7th power (Mikkelsen's, after Burley 2019) and
+// dropped below this share, so most points read one hexagon and blends span about a quarter of the spacing.
+static const float kLayerHexSpacing = 0.25;
+static const float kCirrusHexSpacing = 0.5;
+static const float kHexCutoff = 0.02;
+
+struct HexTiles
+{
+    // For each of the three hexagons around a point: the point from its centre in tiles, turned with it, its hash
+    // (UnitHash3: its offset in x and y, its turn in z) and its weight, 0 for most points' other two.
+    float2 points[3];
+    uint hashes[3];
+    float3 weights;
+};
+
+// The hexagons around `q`, in a texture's tiles, `spacing` tiles apart.
+HexTiles HexTilesAt(float2 q, float spacing, bool turn, uint seed)
+{
+    // Lattice coordinates along (1, 0) and (1/2, sqrt(3)/2) times the spacing: each unit rhombus is two equilateral
+    // triangles, and a point's weights are its barycentric coordinates in its own.
+    const float rowHeight = 0.8660254 * spacing;
+    float row = q.y / rowHeight;
+    float2 lattice = float2(q.x / spacing - 0.5 * row, row);
+    int2 cell = int2(floor(lattice));
+    float2 f = lattice - float2(cell);
+    bool upper = f.x + f.y > 1.0;
+    int2 corners[3] = {upper ? int2(1, 1) : int2(0, 0), int2(1, 0), int2(0, 1)};
+    float3 barycentric = upper ? float3(f.x + f.y - 1.0, 1.0 - f.y, 1.0 - f.x) : float3(1.0 - f.x - f.y, f.x, f.y);
+    float3 squared = barycentric * barycentric;
+    float3 sharp = squared * squared * squared * barycentric;
+    sharp /= sharp.x + sharp.y + sharp.z;
+    HexTiles tiles;
+    tiles.weights = max(sharp - kHexCutoff, 0.0);
+    tiles.weights /= tiles.weights.x + tiles.weights.y + tiles.weights.z;
+    [unroll]
+    for (uint i = 0; i < 3; ++i) {
+        tiles.points[i] = 0.0;
+        tiles.hashes[i] = 0;
+        [branch]
+        if (tiles.weights[i] > 0.0) {
+            float2 local = f - float2(corners[i]);
+            float2 centred = float2(spacing * (local.x + 0.5 * local.y), rowHeight * local.y);
+            tiles.hashes[i] = LatticeHash(int3(cell + corners[i], 0), int3(kHexPeriod, kHexPeriod, 1), seed);
+            if (turn) {
+                float s, c;
+                sincos(6.2831853 * UnitHash3(tiles.hashes[i]).z, s, c);
+                centred = float2(c * centred.x - s * centred.y, s * centred.x + c * centred.y);
+            }
+            tiles.points[i] = centred;
+        }
+    }
+    return tiles;
+}
+
 // ---- Density.
 
 float Linstep(float low, float high, float value) { return saturate((value - low) / (high - low)); }
@@ -461,6 +525,58 @@ float NormalQuantile(float value)
 {
     value = clamp(value, 1e-4, 1.0 - 1e-4);
     return log(value / (1.0 - value)) / 1.702;
+}
+
+// NormalQuantile's inverse: where in [0, 1] a deviate lies.
+float2 NormalShare(float2 deviate)
+{
+    return 1.0 / (1.0 + exp(-1.702 * deviate));
+}
+
+// What a layer's density reads at `uv`, in its weather tiles: the regional coverage and type (the weather's r and g), and
+// the billows and the stratus' smooth noise (the shapes' r and g; for the middle layer its billows and cells, b and a,
+// the cells read kCellTiles times as finely).
+struct LayerFields
+{
+    float2 weather;
+    float2 shape;
+};
+
+LayerFields ReadFields(CloudConstants clouds, float2 uv, bool middle)
+{
+    Texture2D<float4> weatherTexture = ResourceDescriptorHeap[clouds.weatherView];
+    Texture2D<float4> shapes = ResourceDescriptorHeap[clouds.shapesView];
+    LayerFields fields;
+    fields.weather = weatherTexture.SampleLevel(g_linearWrap, uv, 0.0).rg;
+    float4 shape = shapes.SampleLevel(g_linearWrap, uv, 0.0);
+    fields.shape = middle ? float2(shape.b, shapes.SampleLevel(g_linearWrap, uv * kCellTiles, 0.0).a) : shape.rg;
+    return fields;
+}
+
+// The fields at `xy` through the layer's hexagons, blended by Heitz and Neyret's variance-preserving operator: the
+// weather's channels around a half, as sums of octaves spread around one; the shapes, spread evenly over [0, 1], as normal
+// deviates spread back after (their Gaussianisation, here analytic), so a coverage still cuts out its share of the sky.
+// The logistic approximation's deviates blend nearer a normal one, which moves it by at most 1.5% where three hexagons
+// blend evenly (by simulation, 2026-11-04).
+LayerFields LayerFieldsAt(CloudConstants clouds, CloudLayer layer, float2 xy, bool middle)
+{
+    HexTiles tiles = HexTilesAt(xy * layer.weatherFrequency + layer.offset.xy, kLayerHexSpacing, true, middle ? 0x2c1b3c6du : 0x297a2d39u);
+    LayerFields blended = (LayerFields)0;
+    [unroll]
+    for (uint i = 0; i < 3; ++i) {
+        [branch]
+        if (tiles.weights[i] > 0.0) {
+            LayerFields fields = ReadFields(clouds, tiles.points[i] + UnitHash3(tiles.hashes[i]).xy, middle);
+            if (tiles.weights[i] == 1.0)
+                return fields;
+            blended.weather += tiles.weights[i] * fields.weather;
+            blended.shape += tiles.weights[i] * float2(NormalQuantile(fields.shape.x), NormalQuantile(fields.shape.y));
+        }
+    }
+    float scale = rsqrt(dot(tiles.weights, tiles.weights));
+    blended.weather = saturate((blended.weather - 0.5) * scale + 0.5);
+    blended.shape = NormalShare(blended.shape * scale);
+    return blended;
 }
 
 // How strongly cloud forms where the billows, spread evenly over [0, 1], stand at `billows` and `coverage` of the sky is
@@ -495,23 +611,17 @@ float LayerDensity(CloudConstants clouds, CloudLayer layer, float3 p, float alti
         return 0.0;
     float h = height / kTopShare;
     bool middle = layer.field != 0;
-    float2 uv = p.xy * layer.weatherFrequency + layer.offset.xy;
-    Texture2D<float4> weatherTexture = ResourceDescriptorHeap[clouds.weatherView];
-    Texture2D<float4> shapes = ResourceDescriptorHeap[clouds.shapesView];
-    float4 weather = weatherTexture.SampleLevel(g_linearWrap, uv, 0.0);
-    float4 shape = shapes.SampleLevel(g_linearWrap, uv, 0.0);
-    float coverage = saturate(layer.coverage + (weather.r - 0.5) * (middle ? kMiddleRegions : kLowRegions));
+    LayerFields fields = LayerFieldsAt(clouds, layer, p.xy, middle);
+    float coverage = saturate(layer.coverage + (fields.weather.x - 0.5) * (middle ? kMiddleRegions : kLowRegions));
     if (coverage <= 0.0)
         return 0.0;
-    float stratus = middle ? 0.0 : saturate(1.0 - layer.type - (weather.g - 0.5) * kTypeRegions);
-    float cloud = Strength(middle ? shape.b : shape.r, coverage);
-    if (middle) {
-        float cells = shapes.SampleLevel(g_linearWrap, uv * kCellTiles, 0.0).a;
-        cloud -= kCellCarve * (1.0 - cells) * (1.0 - cells) * Dampen(1.0 - cloud);
-    }
+    float stratus = middle ? 0.0 : saturate(1.0 - layer.type - (fields.weather.y - 0.5) * kTypeRegions);
+    float cloud = Strength(fields.shape.x, coverage);
+    if (middle)
+        cloud -= kCellCarve * (1.0 - fields.shape.y) * (1.0 - fields.shape.y) * Dampen(1.0 - cloud);
     if (stratus > 0.0) {
-        float sheet = smoothstep(1.0 - coverage - kStratusEdge, 1.0 - coverage + kStratusEdge, shape.g);
-        sheet = 0.5 * sheet + sheet * Linstep(0.4, 0.8, shape.r);
+        float sheet = smoothstep(1.0 - coverage - kStratusEdge, 1.0 - coverage + kStratusEdge, fields.shape.y);
+        sheet = 0.5 * sheet + sheet * Linstep(0.4, 0.8, fields.shape.x);
         sheet /= sheet + 1.0;
         cloud = lerp(cloud, sheet, stratus);
         cloud *= lerp(1.0, Dampen(saturate(2.0 * h) * Linstep(0.0, 0.1, h) * Linstep(0.0, 0.6, 1.0 - h)), stratus);
@@ -550,6 +660,33 @@ float DensityAt(CloudConstants clouds, CloudLayer layer, float3 p, bool detail)
     return LayerDensity(clouds, layer, p, r - kGroundRadius, (r - layer.bottom) / (layer.top - layer.bottom), detail);
 }
 
+// The cirrus' streaks (the weather's b), veils and fibres (the strands' r and g, at mip `lod`) at `along`, in kilometres
+// along the wind and across it, through its hexagons, which are not turned, so the streaks keep to the wind. Blended,
+// each keeps its variance around its mean: the weather's a half, as its octaves' sums are spread around one, the
+// strands' their last mip.
+float3 CirrusFieldsAt(CloudConstants clouds, float2 along, float lod)
+{
+    Texture2D<float4> weatherTexture = ResourceDescriptorHeap[clouds.weatherView];
+    Texture2D<float4> strands = ResourceDescriptorHeap[clouds.cirrusView];
+    HexTiles tiles = HexTilesAt(along * clouds.cirrusFrequency + clouds.cirrusOffset, kCirrusHexSpacing, false, 0x5f356495u);
+    float strandTiles = clouds.cirrusStrandFrequency / clouds.cirrusFrequency;
+    float3 blended = 0.0;
+    [unroll]
+    for (uint i = 0; i < 3; ++i) {
+        [branch]
+        if (tiles.weights[i] > 0.0) {
+            float streaks = weatherTexture.SampleLevel(g_linearWrap, tiles.points[i] + UnitHash3(tiles.hashes[i]).xy, 0.0).b;
+            float2 strand = strands.SampleLevel(g_linearWrap, tiles.points[i] * strandTiles + UnitHash3(Hash(tiles.hashes[i])).xy, lod).rg;
+            float3 fields = float3(streaks, strand);
+            if (tiles.weights[i] == 1.0)
+                return fields;
+            blended += tiles.weights[i] * fields;
+        }
+    }
+    float3 mean = float3(0.5, strands.Load(int3(0, 0, firstbithigh(kCirrusSize))).rg);
+    return saturate((blended - mean) * rsqrt(dot(tiles.weights, tiles.weights)) + mean);
+}
+
 // The cirrus' optical depth straight through it above `p`, seen over `footprint` kilometres: the weather's long streaks
 // along the wind, the strands' veils and their fibres, cut together at its coverage, so few clouds are wisps along the
 // streaks' crests with fibrous edges, thicker along their fibres. Cut apart and multiplied, few clouds broke into short
@@ -560,15 +697,11 @@ float CirrusDepth(CloudConstants clouds, float3 p, float footprint)
     if (clouds.cirrusCoverage <= 0.0)
         return 0.0;
     float2 along = float2(dot(p.xy, clouds.cirrusAxis), dot(p.xy, float2(-clouds.cirrusAxis.y, clouds.cirrusAxis.x)));
-    Texture2D<float4> weatherTexture = ResourceDescriptorHeap[clouds.weatherView];
-    Texture2D<float4> strands = ResourceDescriptorHeap[clouds.cirrusView];
-    float streaks = weatherTexture.SampleLevel(g_linearWrap, along * clouds.cirrusFrequency + clouds.cirrusOffset, 0.0).b;
-    float2 coordinates = along * clouds.cirrusStrandFrequency + clouds.cirrusOffset * (clouds.cirrusStrandFrequency / clouds.cirrusFrequency);
     float lod = log2(max(footprint * clouds.cirrusStrandFrequency * kCirrusSize, 1.0));
-    float2 strand = strands.SampleLevel(g_linearWrap, coordinates, lod).rg;
+    float3 fields = CirrusFieldsAt(clouds, along, lod);
     float cut = 1.0 - clouds.cirrusCoverage;
-    float cover = smoothstep(cut, cut + kCirrusEdge, streaks * 0.5 + strand.r * 0.4 + strand.g * 0.1);
-    return clouds.cirrusDepth * cover * (0.5 + 0.5 * strand.g);
+    float cover = smoothstep(cut, cut + kCirrusEdge, fields.x * 0.5 + fields.y * 0.4 + fields.z * 0.1);
+    return clouds.cirrusDepth * cover * (0.5 + 0.5 * fields.z);
 }
 
 // ---- Light.

@@ -15,9 +15,10 @@ constexpr float kEyeHeight = 0.2f;
 // A cumulus' extinction where densest, per kilometre: Hess et al. (1998) measured 0.05 to 0.12 per metre (Hillaire 2016,
 // section 5.2); we take 0.08.
 constexpr float kCumulusExtinction = 80.0f;
-// Our choices of scale at Size 1, after the Photon shader pack's (studied, not copied): the weather (where clouds may
-// form, and their type) and the clouds' shapes repeat every kWeatherTile km, the middle layer's every kMiddleScale of
-// that, and within each layer's tile the erosion's billows (the shape volume's cellular noise) repeat kShapeTiles times
+// Our choices of scale at Size 1, after the Photon shader pack's (studied, not copied): the textures of the weather (where
+// clouds may form, and their type) and the clouds' shapes tile every kWeatherTile km, the middle layer's every
+// kMiddleScale of that (read through hexagons, so the sky does not repeat), and within each layer's tile the erosion's
+// billows (the shape volume's cellular noise) repeat kShapeTiles times
 // (about 1.1 km) and its fine detail kDetailTiles times (about 200 m for the low layer, 330 m for the middle one), whole
 // numbers so they wrap with it. The middle layer's clouds are half as dense. The cirrus' bands repeat every kCirrusTile
 // km and its strands kCirrusStrandTiles times within that (about 10 m a texel).
@@ -48,9 +49,28 @@ constexpr double kChangeShare = 1.0 / 3.0;
 constexpr uint32_t kOctaves = 8;
 constexpr float kOctaveEccentricity = 0.5f;
 
+// The hex lattice the clouds are read through (HexTilesAt in shaders/clouds.hlsl): hexagons kLayerHexSpacing and
+// kCirrusHexSpacing tiles apart, whose hashes repeat every kHexPeriod of them along the lattice's axes, (1, 0) and
+// (1/2, sqrt(3)/2) times the spacing.
+constexpr double kHexPeriod = 256.0;
+constexpr double kLayerHexSpacing = 0.25;
+constexpr double kCirrusHexSpacing = 0.5;
+
 double Wrap(double value)
 {
     return value - std::floor(value);
+}
+
+// Wraps the wind's offset, in tiles, by whole periods of the hex lattice, so the clouds read through it stay the same.
+void WrapHexes(std::array<double, 3>& offset, double spacing)
+{
+    const double rowHeight = spacing * std::numbers::sqrt3 / 2.0;
+    const double row = offset[1] / rowHeight;
+    const double along = offset[0] / spacing - 0.5 * row;
+    const double wrappedRow = row - kHexPeriod * std::floor(row / kHexPeriod);
+    const double wrappedAlong = along - kHexPeriod * std::floor(along / kHexPeriod);
+    offset[0] = spacing * (wrappedAlong + 0.5 * wrappedRow);
+    offset[1] = rowHeight * wrappedRow;
 }
 
 // The weathers a weather can turn into (our choices, after common sequences: fair-weather cumulus growing and fading,
@@ -106,14 +126,16 @@ std::array<float, 2> CloudWeather::Advance(const Settings& settings)
         const double detailTile = weatherTiles[layer] / kDetailTiles[layer];
         for (size_t axis = 0; axis < 2; ++axis) {
             const double moved = along[axis] * winds[layer];
-            m_offsets[layer][axis] = Wrap(m_offsets[layer][axis] - moved / weatherTiles[layer]);
+            m_offsets[layer][axis] -= moved / weatherTiles[layer];
             m_erosion[layer][axis] = Wrap(m_erosion[layer][axis] - moved * (1.0 + kBillowDrift * evolution) / shapeTile);
             m_erosion[layer][2 + axis] = Wrap(m_erosion[layer][2 + axis] - moved * (1.0 + kDetailDrift * evolution) / detailTile);
         }
+        WrapHexes(m_offsets[layer], kLayerHexSpacing);
         m_offsets[layer][2] = Wrap(m_offsets[layer][2] - evolution * kEvolutionSpeed * seconds / shapeTile);
     }
     // The cirrus is sampled along the wind (CirrusDepth in shaders/clouds.hlsl).
-    m_offsets[2][0] = Wrap(m_offsets[2][0] - distance * kCirrusWind / (kCirrusTile * size));
+    m_offsets[2][0] -= distance * kCirrusWind / (kCirrusTile * size);
+    WrapHexes(m_offsets[2], kCirrusHexSpacing);
 
     // The changing weather starts from the chosen one, holds it, then turns into another over a share of its duration.
     if (!settings.changingWeather) {
