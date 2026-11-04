@@ -43,8 +43,8 @@ void MarkPresent(bool end);
 uint32_t PresentedFrames();
 
 // DLSS Frame Generation's inputs for the frame, recorded into `list`: the main view's device depth (R32_FLOAT) and motion
-// in its pixels toward last frame's position, both the view's size, and the back buffer before the HUD, all in `state`
-// and left alone until the present; with the camera's constants.
+// in its pixels toward last frame's position, both the view's size, and the view before the HUD as the swap chain
+// shows it, all in `state` and left alone until the present; with the camera's constants.
 struct FrameInputs {
     ID3D12Resource* depth;
     ID3D12Resource* motion;

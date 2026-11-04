@@ -135,7 +135,7 @@ public:
 
     struct Inputs {
         // Device depth (R32_FLOAT) and motion in the view's pixels toward last frame's position, both the view's size, and
-        // the back buffer before the HUD; all in D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE.
+        // the view before the HUD as the swap chain shows it; all in D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE.
         ID3D12Resource* depth;
         ID3D12Resource* motion;
         ID3D12Resource* hudless;
