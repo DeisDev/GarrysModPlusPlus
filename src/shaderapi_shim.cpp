@@ -107,9 +107,15 @@ constexpr unsigned kDeviceGetBackBufferDimensions = 3;
 constexpr unsigned kDevicePresent = 9;
 constexpr unsigned kShaderApiExecuteCommandBuffer = 94;
 constexpr unsigned kShaderApiReadPixels = 159;
+constexpr unsigned kShaderApiTakeSnapshot = 109;
+constexpr unsigned kShaderApiBeginPass = 124;
 constexpr unsigned kShaderUtilRestoreShaderObjects = 12;
+constexpr unsigned kShadowSetDefaultState = 0;
+constexpr unsigned kShadowEnableBlending = 15;
 constexpr unsigned kShadowSetVertexShader = 23;
 constexpr unsigned kShadowSetPixelShader = 24;
+constexpr unsigned kShadowEnableSRGBWrite = 27;
+constexpr unsigned kShadowEnableSRGBRead = 28;
 // IVEngineClient013 slots, confirmed in GMod's engine.dll (see engine_interfaces.cpp). IsInGame
 // (engine.dll+0x7f550, Ghidra) compares the client's signon state with SIGNONSTATE_FULL (6).
 constexpr unsigned kEngineIsInGame = 26;
@@ -158,6 +164,16 @@ struct Benchmark {
     std::vector<double> frameMs;
 };
 
+// What the game sets through IShaderShadow between SetDefaultState and IShaderAPI::TakeSnapshot, kept by the
+// snapshot TakeSnapshot returns, so traced BeginPass calls show the shaders, blending and sRGB states of their pass.
+struct SnapshotNote {
+    std::string vertexShader;
+    std::string pixelShader;
+    bool blending = false;
+    bool srgbWrite = false;
+    std::uint32_t srgbRead = 0;
+};
+
 struct Shim {
     CreateInterfaceFn gameCreateInterface = nullptr;
     CreateInterfaceFn connectFactory = nullptr;
@@ -178,6 +194,7 @@ struct Shim {
     std::string inGameLevel;
     bool benchmarking = false;
     Benchmark benchmark;
+    std::unordered_map<std::int16_t, SnapshotNote> snapshots;
 };
 
 Shim* g_shim = nullptr;
@@ -406,10 +423,14 @@ void NoteShaderFile(const char* fileName)
         log::Info("Shader file: {}", name);
 }
 
+// Materials take their snapshots on the thread that loads them.
+thread_local SnapshotNote t_snapshot;
+
 void __fastcall SetVertexShaderOverride(Wrapper* self, const char* fileName, int staticIndex)
 {
     Record(self, kShadowSetVertexShader, std::format("pFileName=\"{}\", nStaticVshIndex={}", ReadCString(fileName), staticIndex));
     NoteShaderFile(fileName);
+    t_snapshot.vertexShader = std::format("{}#{}", ReadCString(fileName), staticIndex);
     RealSlot<void (*)(void*, const char*, int)>(self->real, kShadowSetVertexShader)(self->real, fileName, staticIndex);
 }
 
@@ -417,7 +438,65 @@ void __fastcall SetPixelShaderOverride(Wrapper* self, const char* fileName, int 
 {
     Record(self, kShadowSetPixelShader, std::format("pFileName=\"{}\", nStaticPshIndex={}", ReadCString(fileName), staticIndex));
     NoteShaderFile(fileName);
+    t_snapshot.pixelShader = std::format("{}#{}", ReadCString(fileName), staticIndex);
     RealSlot<void (*)(void*, const char*, int)>(self->real, kShadowSetPixelShader)(self->real, fileName, staticIndex);
+}
+
+void __fastcall ShadowSetDefaultStateOverride(Wrapper* self)
+{
+    Record(self, kShadowSetDefaultState, "");
+    t_snapshot = {};
+    RealSlot<void (*)(void*)>(self->real, kShadowSetDefaultState)(self->real);
+}
+
+void __fastcall EnableBlendingOverride(Wrapper* self, bool enable)
+{
+    Record(self, kShadowEnableBlending, enable ? "bEnable=true" : "bEnable=false");
+    t_snapshot.blending = enable;
+    RealSlot<void (*)(void*, bool)>(self->real, kShadowEnableBlending)(self->real, enable);
+}
+
+void __fastcall EnableSRGBWriteOverride(Wrapper* self, bool enable)
+{
+    Record(self, kShadowEnableSRGBWrite, enable ? "bEnable=true" : "bEnable=false");
+    t_snapshot.srgbWrite = enable;
+    RealSlot<void (*)(void*, bool)>(self->real, kShadowEnableSRGBWrite)(self->real, enable);
+}
+
+void __fastcall EnableSRGBReadOverride(Wrapper* self, int sampler, bool enable)
+{
+    Record(self, kShadowEnableSRGBRead, std::format("sampler={}, bEnable={}", sampler, enable));
+    if (sampler >= 0 && sampler < 32)
+        t_snapshot.srgbRead = enable ? t_snapshot.srgbRead | 1u << sampler : t_snapshot.srgbRead & ~(1u << sampler);
+    RealSlot<void (*)(void*, int, bool)>(self->real, kShadowEnableSRGBRead)(self->real, sampler, enable);
+}
+
+std::int16_t __fastcall TakeSnapshotOverride(Wrapper* self)
+{
+    Record(self, kShaderApiTakeSnapshot, "");
+    const std::int16_t snapshot = RealSlot<std::int16_t (*)(void*)>(self->real, kShaderApiTakeSnapshot)(self->real);
+    std::scoped_lock lock(g_shim->mutex);
+    g_shim->snapshots[snapshot] = t_snapshot;
+    return snapshot;
+}
+
+// Called for every pass drawn, so its line is formatted only while tracing.
+void __fastcall BeginPassOverride(Wrapper* self, std::int16_t snapshot)
+{
+    if (gmodpp_trace_active) {
+        std::string note;
+        {
+            std::scoped_lock lock(g_shim->mutex);
+            auto found = g_shim->snapshots.find(snapshot);
+            note = found == g_shim->snapshots.end() ? std::string(" (not seen)")
+                : std::format(" (vs {}, ps {}, blending {}, sRGB write {}, sRGB read {:#x})", found->second.vertexShader, found->second.pixelShader,
+                      found->second.blending, found->second.srgbWrite, found->second.srgbRead);
+        }
+        Record(self, kShaderApiBeginPass, std::format("snapshot={}{}", snapshot, note));
+    } else {
+        ++self->trace->calls[kShaderApiBeginPass];
+    }
+    RealSlot<void (*)(void*, std::int16_t)>(self->real, kShaderApiBeginPass)(self->real, snapshot);
 }
 
 void LogCallCounts(std::span<const InterfaceTrace> traces)
@@ -845,14 +924,20 @@ void* WrapIfKnown(const char* name, void* real)
         g_shim->device = real;
         break;
     case kShaderApi:
+        wrapper->slots[kShaderApiTakeSnapshot] = reinterpret_cast<const void*>(&TakeSnapshotOverride);
+        wrapper->slots[kShaderApiBeginPass] = reinterpret_cast<const void*>(&BeginPassOverride);
         g_shim->shaderApi = real;
         break;
     case kHardwareConfig:
         g_shim->hardwareConfig = real;
         break;
     case kShadow:
+        wrapper->slots[kShadowSetDefaultState] = reinterpret_cast<const void*>(&ShadowSetDefaultStateOverride);
+        wrapper->slots[kShadowEnableBlending] = reinterpret_cast<const void*>(&EnableBlendingOverride);
         wrapper->slots[kShadowSetVertexShader] = reinterpret_cast<const void*>(&SetVertexShaderOverride);
         wrapper->slots[kShadowSetPixelShader] = reinterpret_cast<const void*>(&SetPixelShaderOverride);
+        wrapper->slots[kShadowEnableSRGBWrite] = reinterpret_cast<const void*>(&EnableSRGBWriteOverride);
+        wrapper->slots[kShadowEnableSRGBRead] = reinterpret_cast<const void*>(&EnableSRGBReadOverride);
         break;
     case kShaderUtil:
         wrapper->slots[kShaderUtilRestoreShaderObjects] = reinterpret_cast<const void*>(&RestoreShaderObjectsOverride);
