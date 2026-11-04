@@ -930,6 +930,83 @@ bool MatchesAspect(int filter, int width, int height)
     return std::abs(ratio - kRatios[filter]) < kTolerance[filter];
 }
 
+std::string Nits(float nits) { return nits > 0.0f ? ui::Format("display.value_nits", {{"nits", ui::Number(nits, 0)}}) : Text("display.value_unknown"); }
+
+// A switch that has a slider follow what Windows or the display reports (`follow`), and the slider itself, which shows
+// the followed value while the switch is on.
+void FollowRows(const char* followKey, bool Settings::* follow, const char* valueKey, float Settings::* member, float followed, bool enabled,
+    const char* reason, const char* followReason)
+{
+    SwitchRow(followKey, follow, enabled, reason);
+    const bool following = Edited().*follow && followed > 0.0f;
+    float& value = Edited().*member;
+    const SettingRange range = RangeOf(member);
+    BeginRow(valueKey, {FieldOf(member)}, enabled && !following, following ? followReason : reason);
+    float shown = following ? followed : value;
+    if (widgets::Slider("##value", &shown, range.minimum, range.maximum, ui::Number(shown, 0).c_str(), ValueWidth()) && !following)
+        value = std::clamp(std::round(shown), range.minimum, range.maximum);
+    EndRow();
+}
+
+// HDR output (display_output.cpp): what the display and the swap chain do, and how the frame is shown in HDR.
+void DrawHdrCard()
+{
+    const Statistics& statistics = GetStatistics();
+    const Settings& settings = Edited();
+    if (!widgets::BeginCard("##hdr", Text("display.section_hdr"), Text("display.hdr_note")))
+        return widgets::EndCard();
+    const bool hdr = statistics.outputHdr;
+    const char* hdrReason = Text("display.hdr_reason");
+    if (widgets::BeginRows("hdr")) {
+        constexpr const char* kHdr[] = {"display.hdr_output_auto", "display.hdr_output_on", "display.hdr_output_off"};
+        static_assert(std::size(kHdr) == static_cast<size_t>(HdrOutput::Count));
+        SegmentRow("display.hdr_output", &Settings::hdrOutput, kHdr);
+        constexpr const char* kBits[] = {"display.output_bits_auto", "display.output_bits_8", "display.output_bits_10"};
+        static_assert(std::size(kBits) == static_cast<size_t>(OutputBits::Count));
+        SegmentRow("display.output_bits", &Settings::outputBitDepth, kBits, {}, !hdr, Text("display.output_bits_reason"));
+        ValueRow("display.display_name", statistics.displayKnown ? statistics.displayName : Text("display.value_unknown"));
+        ValueRow("display.display_hdr", Text(statistics.displayHdr ? "display.state_on" : "display.state_off"));
+        ValueRow("display.display_peak", Nits(statistics.displayPeakNits));
+        ValueRow("display.windows_sdr_white", Nits(statistics.sdrWhiteNits));
+        ValueRow("display.output_mode", hdr ? std::string(Text("display.output_hdr10"))
+                                            : ui::Format("display.output_sdr", {{"bits", ui::Number(static_cast<float>(statistics.outputBits), 0)}}));
+        FollowRows("display.paper_white_follow", &Settings::paperWhiteFollowWindows, "display.paper_white", &Settings::paperWhite, statistics.sdrWhiteNits, hdr,
+            hdrReason, Text("display.paper_white_follow_reason"));
+        FollowRows("display.peak_follow", &Settings::peakFollowDisplay, "display.peak", &Settings::peakBrightness, statistics.displayPeakNits, hdr, hdrReason,
+            Text("display.peak_follow_reason"));
+        SliderRow("display.black_level", &Settings::hdrBlackLevel, hdr, hdrReason);
+        SliderRow("display.hdr_saturation", &Settings::hdrSaturation, hdr, hdrReason);
+        // The menu's white: 0 follows paper white.
+        bool followsPaper = settings.uiBrightness <= 0.0f;
+        BeginRow("display.ui_follow", {FieldOf(&Settings::uiBrightness)}, hdr, hdrReason);
+        const bool toggled = widgets::Switch("##switch", &followsPaper);
+        const bool clicked = EndRow(true);
+        if (clicked)
+            followsPaper = !followsPaper;
+        const float paperWhite = settings.paperWhiteFollowWindows && statistics.sdrWhiteNits > 0.0f ? statistics.sdrWhiteNits : settings.paperWhite;
+        if (toggled || clicked)
+            Edited().uiBrightness = followsPaper ? 0.0f : std::clamp(std::round(paperWhite), 80.0f, 480.0f);
+        BeginRow("display.ui_brightness", {FieldOf(&Settings::uiBrightness)}, hdr && !followsPaper, followsPaper && hdr ? Text("display.ui_follow_reason") : hdrReason);
+        float shown = followsPaper ? paperWhite : settings.uiBrightness;
+        if (widgets::Slider("##value", &shown, 80.0f, 480.0f, ui::Number(shown, 0).c_str(), ValueWidth()) && !followsPaper)
+            Edited().uiBrightness = std::clamp(std::round(shown), 80.0f, 480.0f);
+        EndRow();
+        widgets::EndRows();
+    }
+    if (statistics.hdrUnavailable || (settings.hdrOutput == HdrOutput::On && !statistics.displayHdr))
+        widgets::Note(Text("display.hdr_unavailable"));
+    ImGui::BeginDisabled(!hdr);
+    const bool calibrating = hdr && native::display::Calibrating();
+    if (widgets::Button(Text(calibrating ? "display.calibrate_stop" : "display.calibrate"), calibrating))
+        native::display::SetCalibration(!calibrating);
+    ImGui::EndDisabled();
+    if (!hdr && native::display::Calibrating())
+        native::display::SetCalibration(false);
+    if (calibrating)
+        widgets::Note(Text("display.calibrate_note"));
+    widgets::EndCard();
+}
+
 void DrawDisplayPage(Settings&)
 {
     const bool console = ConsoleReady();
@@ -1022,16 +1099,19 @@ void DrawDisplayPage(Settings&)
     }
     widgets::EndCard();
 
+    const Statistics& statistics = GetStatistics();
     if (widgets::BeginCard("##picture", Text("display.section_picture"))) {
         if (widgets::BeginRows("picture")) {
-            // mat_monitorgamma only sets the display's gamma ramp, which Direct3D 9 applied in exclusive full screen alone;
-            // the native renderer presents windowed or borderless and never sets one (SetHardwareGammaRamp).
-            GameSliderRow("display.brightness", "mat_monitorgamma", 1.6f, 2.6f, 1, true, false, Text("display.brightness_reason"));
+            // mat_monitorgamma is applied by the display mapping in SDR as Direct3D 9's gamma ramp was
+            // (display_output.cpp); in HDR Windows sets the brightness.
+            GameSliderRow("display.brightness", "mat_monitorgamma", 1.6f, 2.6f, 1, true, !statistics.outputHdr, Text("display.brightness_hdr_reason"));
             GameSliderRow("display.fov", "fov_desired", 75.0f, 100.0f, 0, false);
             widgets::EndRows();
         }
     }
     widgets::EndCard();
+
+    DrawHdrCard();
 
     if (widgets::BeginCard("##engine", Text("display.section_engine"), Text("display.multicore_note"))) {
         if (widgets::BeginRows("engine")) {
