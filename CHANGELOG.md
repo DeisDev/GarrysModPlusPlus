@@ -9,10 +9,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Added
 
 - The mod's version is shown at the bottom of the menu's page list and on the About page, and written at the top of the log.
-- HDR10 output on HDR displays, with paper white, peak brightness, black level, saturation and menu brightness on the Display page. Paper white and peak follow Windows and the display unless set by hand.
-- A calibration pattern for HDR peak brightness, paper white and black level.
+- HDR10 output on HDR displays, with paper white, peak brightness, black level, saturation and HUD and menu brightness on the Display page. Paper white and peak follow Windows and the display unless set by hand.
 - DLSS and FSR Frame Generation work with HDR output.
 - 10-bit SDR output where the display takes it.
+- In HDR, high-contrast scenes are brightened into the range above paper white. The HUD and menu brighten with the game by default, or take a fixed brightness.
 - Debug views showing the image's brightness in nits and the pixels brighter than the display can show.
 
 ### Changed

@@ -1,9 +1,9 @@
 #include "../tone_curve.hlsli"
 #include "../dither.hlsli"
 
-// The display mapping (src/display_output.cpp): the frame's linear light, 1 = paper white, into what a target shows. The
-// 3D view arrives already fitted to the display's peak by the tone curve and colour corrected (shaders/amd/lens.hlsl,
-// FinalMain), the HUD at paper white; light still above the peak is clipped. SDR targets take the sRGB curve, the game's
+// The display mapping (src/display_output.cpp): the frame's linear light, 1 = the HUD's white (UiWhite in HDR, paper
+// white in SDR), into what a target shows. The 3D view arrives already exposed for HDR, fitted to the display's peak by
+// the tone curve and colour corrected (shaders/amd/lens.hlsl, FinalMain); light still above the peak is clipped. SDR targets take the sRGB curve, the game's
 // gamma ramp (mat_monitorgamma) and dither; HDR10 targets saturation and the black level, then Rec. 2020 primaries and
 // the PQ curve. The menu (an sRGB texture holding premultiplied colour) is composited over either.
 
@@ -25,13 +25,14 @@ struct DisplayConstants
     uint frameView;
     uint uiView;
     uint encoding;
-    // The display's peak in paper whites (1 in SDR), paper white in nits (PQ), the black level in nits (PQ).
-    float peak;
+    // PQ: the HDR exposure's state (ExposureMain in shaders/post/post.hlsl) or kNoView, paper white and the black level in
+    // nits.
+    uint exposureView;
     float paperWhite;
     float blackLevel;
     float saturation;
-    // The menu's white in nits (PQ).
-    float uiBrightness;
+    // PQ: the HUD's and menu's white in nits, 0 to follow the HDR exposure (UiWhite).
+    float uiWhite;
     // Dither steps across the encoded range (255 or 1023), 0 for none.
     float ditherSteps;
     // The game's gamma ramp in SDR (shaderapidx9.dll 0x180027c80): 0 none, 1 pow(x, gamma / 2.2), 2 with its TV range.
@@ -40,13 +41,11 @@ struct DisplayConstants
     float tvExponent;
     float tvMin;
     float tvMax;
-    // 16: the frame's luminance in nits (at paperWhite) in false colour; 17: its pixels at the display's peak (clipped there)
-    // in magenta.
+    // 16: the frame's luminance in nits in false colour; 17: its pixels at the display's peak (clipped there) in magenta.
+    // The display's peak in nits (PQ).
     uint debugView;
     float displayPeak;
-    // 1 while the menu calibrates (display::SetCalibration): CalibrationPattern over the frame.
-    uint calibration;
-    uint padding;
+    uint2 padding;
 };
 
 ConstantBuffer<DisplayConstants> g_display : register(b0);
@@ -104,37 +103,6 @@ float3 FalseColor(float nits)
     return ramp;
 }
 
-// The calibration pattern over the top three quarters of the screen, in paper whites (the game's frame shows below it,
-// with the HUD at paper white): a patch at the peak with a square 1.1 times as bright inside, which disappears once the
-// peak is set at or above what the display shows; paper white beside middle grey; near-black steps of 0, 0.5, 1, 2 and
-// 5 nits. `inside` is false where the frame shows.
-float3 CalibrationPattern(float2 pixel, float2 size, out bool inside)
-{
-    float2 uv = pixel / size;
-    inside = uv.y < 0.75;
-    if (!inside)
-        return 0.0;
-    float aspect = size.x / size.y;
-    float2 peakOffset = abs(uv - float2(0.25, 0.3)) * float2(aspect, 1.0);
-    float peakDistance = max(peakOffset.x, peakOffset.y);
-    if (peakDistance < 0.05)
-        return g_display.peak * 1.1;
-    if (peakDistance < 0.18)
-        return g_display.peak;
-    if (uv.y > 0.15 && uv.y < 0.45) {
-        if (uv.x > 0.5 && uv.x < 0.68)
-            return 1.0;
-        if (uv.x > 0.72 && uv.x < 0.9)
-            return 0.18;
-    }
-    if (uv.y > 0.55 && uv.y < 0.7 && uv.x > 0.1 && uv.x < 0.9) {
-        static const float kSteps[5] = {0.0, 0.5, 1.0, 2.0, 5.0};
-        uint step = min(uint((uv.x - 0.1) / 0.16), 4u);
-        return kSteps[step] / max(g_display.paperWhite, 1.0);
-    }
-    return 0.0;
-}
-
 [RootSignature(DISPLAY_ROOT_SIGNATURE)]
 float4 PSMain(VertexOutput input) : SV_Target
 {
@@ -144,18 +112,23 @@ float4 PSMain(VertexOutput input) : SV_Target
     if (g_display.encoding == kEncodingPlainSrgb)
         return float4(LinearToSrgb(saturate(color)), 1.0);
 
-    uint width, height;
-    frame.GetDimensions(width, height);
-    bool pattern = false;
-    if (g_display.calibration != 0) {
-        float3 calibrated = CalibrationPattern(float2(pixel + g_display.origin) + 0.5, float2(width, height), pattern);
-        if (pattern)
-            color = calibrated;
+    bool pq = g_display.encoding == kEncodingPq;
+    // The frame's 1 in nits and the display's peak in its units.
+    float white = 1.0;
+    float peak = 1.0;
+    if (pq) {
+        float gain = 1.0;
+        if (g_display.exposureView != kNoView) {
+            RWStructuredBuffer<float4> exposure = ResourceDescriptorHeap[g_display.exposureView];
+            float4 state = exposure[0];
+            gain = state.y != 0.0 ? state.x : 1.0;
+        }
+        white = max(UiWhite(g_display.paperWhite, g_display.uiWhite, gain), 1.0);
+        peak = g_display.displayPeak / white;
     }
-    float3 mapped = min(color, g_display.peak * (pattern ? 1.1 : 1.0));
-    bool clipped = max(color.r, max(color.g, color.b)) >= g_display.peak * 0.999;
-    if (!pattern)
-        mapped = max(lerp(Luminance(mapped), mapped, g_display.saturation), 0.0);
+    float3 mapped = min(color, peak);
+    bool clipped = max(color.r, max(color.g, color.b)) >= peak * 0.999;
+    mapped = max(lerp(Luminance(mapped), mapped, g_display.saturation), 0.0);
 
     float4 ui = 0.0;
     if (g_display.uiView != kNoView) {
@@ -163,17 +136,17 @@ float4 PSMain(VertexOutput input) : SV_Target
         ui = menu.Load(int3(pixel, 0));
     }
 
-    if (g_display.encoding == kEncodingPq) {
-        float3 nits = mapped * g_display.paperWhite;
+    if (pq) {
+        float3 nits = mapped * white;
         if (g_display.debugView == 16)
-            nits = FalseColor(Luminance(color) * g_display.paperWhite) * g_display.paperWhite;
+            nits = FalseColor(Luminance(color) * white) * g_display.paperWhite;
         else if (g_display.debugView == 17 && clipped)
             nits = float3(1.0, 0.0, 1.0) * g_display.paperWhite;
         // The black level lifts the darkest light, leaving the peak where it is.
-        float peakNits = max(g_display.peak * g_display.paperWhite, 1.0);
+        float peakNits = max(g_display.displayPeak, 1.0);
         nits += g_display.blackLevel * saturate(1.0 - nits / peakNits);
         if (ui.a > 0.0) {
-            float3 menu = SrgbToLinear(ui.rgb / ui.a) * g_display.uiBrightness;
+            float3 menu = SrgbToLinear(ui.rgb / ui.a) * white;
             nits = menu * ui.a + nits * (1.0 - ui.a);
         }
         float3 signal = Pq(mul(kSrgbToRec2020, max(nits, 0.0)));

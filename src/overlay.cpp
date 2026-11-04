@@ -976,34 +976,25 @@ void DrawHdrCard()
             Text("display.peak_follow_reason"));
         SliderRow("display.black_level", &Settings::hdrBlackLevel, hdr, hdrReason);
         SliderRow("display.hdr_saturation", &Settings::hdrSaturation, hdr, hdrReason);
-        // The menu's white: 0 follows paper white.
-        bool followsPaper = settings.uiBrightness <= 0.0f;
+        // The HUD's and menu's white: 0 follows the game (paper white times the HDR exposure, display_output.cpp).
+        bool followsGame = settings.uiBrightness <= 0.0f;
         BeginRow("display.ui_follow", {FieldOf(&Settings::uiBrightness)}, hdr, hdrReason);
-        const bool toggled = widgets::Switch("##switch", &followsPaper);
+        const bool toggled = widgets::Switch("##switch", &followsGame);
         const bool clicked = EndRow(true);
         if (clicked)
-            followsPaper = !followsPaper;
+            followsGame = !followsGame;
         const float paperWhite = settings.paperWhiteFollowWindows && statistics.sdrWhiteNits > 0.0f ? statistics.sdrWhiteNits : settings.paperWhite;
         if (toggled || clicked)
-            Edited().uiBrightness = followsPaper ? 0.0f : std::clamp(std::round(paperWhite), 80.0f, 480.0f);
-        BeginRow("display.ui_brightness", {FieldOf(&Settings::uiBrightness)}, hdr && !followsPaper, followsPaper && hdr ? Text("display.ui_follow_reason") : hdrReason);
-        float shown = followsPaper ? paperWhite : settings.uiBrightness;
-        if (widgets::Slider("##value", &shown, 80.0f, 480.0f, ui::Number(shown, 0).c_str(), ValueWidth()) && !followsPaper)
+            Edited().uiBrightness = followsGame ? 0.0f : std::clamp(std::round(paperWhite), 80.0f, 480.0f);
+        BeginRow("display.ui_brightness", {FieldOf(&Settings::uiBrightness)}, hdr && !followsGame, followsGame && hdr ? Text("display.ui_follow_reason") : hdrReason);
+        float shown = followsGame ? paperWhite : settings.uiBrightness;
+        if (widgets::Slider("##value", &shown, 80.0f, 480.0f, ui::Number(shown, 0).c_str(), ValueWidth()) && !followsGame)
             Edited().uiBrightness = std::clamp(std::round(shown), 80.0f, 480.0f);
         EndRow();
         widgets::EndRows();
     }
     if (statistics.hdrUnavailable || (settings.hdrOutput == HdrOutput::On && !statistics.displayHdr))
         widgets::Note(Text("display.hdr_unavailable"));
-    ImGui::BeginDisabled(!hdr);
-    const bool calibrating = hdr && native::display::Calibrating();
-    if (widgets::Button(Text(calibrating ? "display.calibrate_stop" : "display.calibrate"), calibrating))
-        native::display::SetCalibration(!calibrating);
-    ImGui::EndDisabled();
-    if (!hdr && native::display::Calibrating())
-        native::display::SetCalibration(false);
-    if (calibrating)
-        widgets::Note(Text("display.calibrate_note"));
     widgets::EndCard();
 }
 

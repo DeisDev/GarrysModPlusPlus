@@ -30,28 +30,25 @@ struct Mapping {
     float paperWhite = 80.0f;
     float blackLevel = 0.0f;
     float saturation = 1.0f;
-    // The menu's white in nits (HDR).
-    float uiBrightness = 80.0f;
+    // The HUD's and menu's white in nits, the frame's 1 (HDR): 0 for paper white times the HDR exposure (UiWhite in
+    // shaders/tone_curve.hlsli), whose state the camera effects' last pass left this frame (SetHdrExposure) or
+    // DescriptorHeap::kInvalid.
+    float uiWhite = 0.0f;
+    UINT exposureView = DescriptorHeap::kInvalid;
     // Dither steps over the encoded range: 255 for 8 bits, 1023 for 10.
     float ditherSteps = 255.0f;
     // The game's gamma ramp (mat_monitorgamma), SDR only.
     bool gammaRamp = false;
     // The menu's texture (UiTarget), or DescriptorHeap::kInvalid.
     UINT uiView = DescriptorHeap::kInvalid;
-    // Settings::debugView 16 and 17, and the display's peak in nits for 17.
+    // Settings::debugView 16 and 17, and the display's peak in nits.
     std::uint32_t debugView = 0;
     float displayPeak = 80.0f;
-    // A calibration pattern drawn over the frame (CalibrationPattern), 0 for none.
-    std::uint32_t calibration = 0;
 };
 
 // The mapping the swap chain's buffers take: SDR in `bits` (8 or 10) or HDR10, with the display's paper white and peak
-// (Settings, Statistics) and, while the menu calibrates, the calibration pattern.
+// (Settings, Statistics).
 Mapping ForOutput(bool hdr, UINT bits);
-
-// The menu's calibration patterns (shaders/post/display_output.hlsl) over the frame in HDR, while it is on.
-void SetCalibration(bool on);
-bool Calibrating();
 
 // A display output as DXGI and Windows' display configuration describe it (Using DirectX with Advanced Color,
 // Microsoft Learn): its GDI device name and monitor name, whether Windows runs it in HDR (DXGI_OUTPUT_DESC1::ColorSpace
@@ -103,6 +100,11 @@ struct ColorCorrection {
 };
 void SetColorCorrection(const ColorCorrection& correction);
 void ClearColorCorrection();
+// The HDR exposure's state buffer (an unordered access view, shaders/post/post.hlsl's ExposureMain) when the camera
+// effects' last pass applied it to this frame's 3D view; cleared at each present (ClearHdrExposure), so frames without a
+// 3D view show the HUD and menu at paper white.
+void SetHdrExposure(UINT view);
+void ClearHdrExposure();
 // The recorded volumes' shader resource views (moved into a shader resource state) and weights, and the default weight;
 // returns how many there are.
 UINT ColorCorrectionViews(std::array<UINT, 4>& views, std::array<float, 4>& weights, float& defaultWeight);

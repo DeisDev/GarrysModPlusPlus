@@ -34,11 +34,11 @@ struct DisplayConstants {
     std::uint32_t frameView;
     std::uint32_t uiView;
     std::uint32_t encoding;
-    float peak;
+    std::uint32_t exposureView;
     float paperWhite;
     float blackLevel;
     float saturation;
-    float uiBrightness;
+    float uiWhite;
     float ditherSteps;
     std::uint32_t gammaRamp;
     float gammaExponent;
@@ -47,8 +47,7 @@ struct DisplayConstants {
     float tvMax;
     std::uint32_t debugView;
     float displayPeak;
-    std::uint32_t calibration;
-    std::uint32_t padding;
+    std::uint32_t padding[2];
 };
 static_assert(sizeof(DisplayConstants) == 80);
 
@@ -79,7 +78,7 @@ struct State {
     unsigned presents = 0;
     UiTarget ui;
     ColorCorrection correction;
-    bool calibrating = false;
+    UINT exposureView = kInvalid;
 };
 
 State g_state;
@@ -161,9 +160,9 @@ Mapping ForOutput(bool hdr, UINT bits)
         mapping.peak = std::max(peak / mapping.paperWhite, 1.0f);
         mapping.blackLevel = settings.hdrBlackLevel;
         mapping.saturation = settings.hdrSaturation;
-        mapping.uiBrightness = settings.uiBrightness > 0.0f ? settings.uiBrightness : mapping.paperWhite;
+        mapping.uiWhite = settings.uiBrightness;
         mapping.displayPeak = peak;
-        mapping.calibration = g_state.calibrating ? 1u : 0u;
+        mapping.exposureView = g_state.exposureView;
     }
     const DebugView debugView = GetSettings().debugView;
     mapping.debugView = debugView == DebugView::Luminance || debugView == DebugView::OverPeak ? static_cast<std::uint32_t>(debugView) : 0u;
@@ -192,11 +191,11 @@ bool Map(ID3D12GraphicsCommandList* commands, UINT frameView, D3D12_CPU_DESCRIPT
     c.frameView = frameView;
     c.uiView = mapping.uiView;
     c.encoding = static_cast<std::uint32_t>(mapping.encoding);
-    c.peak = std::max(mapping.peak, 1.0f);
+    c.exposureView = mapping.exposureView;
     c.paperWhite = mapping.paperWhite;
     c.blackLevel = mapping.blackLevel;
     c.saturation = mapping.saturation;
-    c.uiBrightness = mapping.uiBrightness;
+    c.uiWhite = mapping.uiWhite;
     c.ditherSteps = mapping.ditherSteps;
     if (mapping.gammaRamp && mapping.encoding == Encoding::Srgb) {
         const GammaRamp& ramp = Gamma();
@@ -210,7 +209,6 @@ bool Map(ID3D12GraphicsCommandList* commands, UINT frameView, D3D12_CPU_DESCRIPT
     }
     c.debugView = mapping.debugView;
     c.displayPeak = mapping.displayPeak;
-    c.calibration = mapping.calibration;
     const D3D12_GPU_VIRTUAL_ADDRESS constants = UploadConstants(&c, sizeof(c));
     if (constants == 0)
         return false;
@@ -278,10 +276,6 @@ D3D12_CPU_DESCRIPTOR_HANDLE BeginUi(UINT width, UINT height, UINT& view)
 }
 
 void EndUi() { GetBackend().Transition(g_state.ui.resource, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE); }
-
-void SetCalibration(bool on) { g_state.calibrating = on; }
-
-bool Calibrating() { return g_state.calibrating; }
 
 namespace {
 
@@ -398,5 +392,9 @@ UINT ColorCorrectionViews(std::array<UINT, 4>& views, std::array<float, 4>& weig
 }
 
 void ClearColorCorrection() { g_state.correction = {}; }
+
+void SetHdrExposure(UINT view) { g_state.exposureView = view; }
+
+void ClearHdrExposure() { g_state.exposureView = kInvalid; }
 
 }

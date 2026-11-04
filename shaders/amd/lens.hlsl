@@ -120,22 +120,32 @@ float3 Grade(float3 color)
     return max(lerp(Luminance(graded), graded, g_post.gradeSaturation), 0.0);
 }
 
-// input0: the view. The colour grading, the tone curve up to the display's peak, the engine's colour correction below
-// paper white and film grain, back into the frame as display-referred linear light: the HUD, drawn next, stays at paper
-// white. The grain is added to the sRGB-encoded values up to paper white, as FidelityFX Lens grains the displayed image
-// (its amount fades to nothing at 0 and 1); light above paper white keeps its value.
+// input0: the view. In HDR the exposure's gain (ExposureMain in shaders/post/post.hlsl), then the colour grading, the tone
+// curve up to the display's peak, the engine's colour correction below white under Source's exposure and film grain, back
+// into the frame as display-referred linear light in units of the HUD's white (UiWhite; paper white in SDR), which the HUD
+// drawn next writes at 1. The grain is added to the sRGB-encoded values up to paper white, as FidelityFX Lens grains the
+// displayed image (its amount fades to nothing at 0 and 1); light above paper white keeps its value.
 [RootSignature(POST_ROOT_SIGNATURE)]
 float4 FinalMain(float4 position : SV_Position) : SV_Target
 {
     Texture2D<float4> source = ResourceDescriptorHeap[g_postPass.input0];
     int2 pixel = int2(position.xy) - g_post.origin;
     float4 color = source.Load(int3(pixel, 0));
-    float3 graded = max(g_post.gradeEnabled != 0 ? Grade(color.rgb) : color.rgb, 0.0);
+    float gain = 1.0;
+    if (g_post.exposureView != kNoView) {
+        RWStructuredBuffer<float4> exposure = ResourceDescriptorHeap[g_post.exposureView];
+        float4 state = exposure[0];
+        gain = state.y != 0.0 ? state.x : 1.0;
+    }
+    float toFrame = g_post.paperWhite > 0.0 ? g_post.paperWhite / UiWhite(g_post.paperWhite, g_post.uiWhite, gain) : 1.0;
+    float3 exposed = max(color.rgb, 0.0) * gain;
+    float3 graded = max(g_post.gradeEnabled != 0 ? Grade(exposed) : exposed, 0.0);
     graded = ToneCurve(graded, g_post.toneCurve, g_post.highlightRolloff, g_post.tonePeak);
     if (g_post.ccCount != 0) {
-        // Below paper white as the game corrected its 8-bit image; above it unchanged.
-        float3 low = saturate(graded);
-        graded = SrgbToLinear(ColorCorrected(LinearToSrgb(low))) + (graded - low);
+        // Below white under Source's exposure, as the game corrected its 8-bit image; above it unchanged.
+        float3 sourceExposed = graded / gain;
+        float3 low = saturate(sourceExposed);
+        graded = (SrgbToLinear(ColorCorrected(LinearToSrgb(low))) + (sourceExposed - low)) * gain;
     }
     if (g_post.grainAmount > 0.0) {
         float3 encoded = LinearToSrgb(graded);
@@ -143,5 +153,5 @@ float4 FinalMain(float4 position : SV_Position) : SV_Target
         FfxLensApplyFilmGrain(FfxInt32x2(pixel), grained, g_post.grainScale, g_post.grainAmount, g_post.grainSeed);
         graded = SrgbToLinear(encoded + grained - saturate(encoded));
     }
-    return float4(graded, color.a);
+    return float4(graded * toFrame, color.a);
 }

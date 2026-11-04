@@ -2,6 +2,7 @@
 
 #include "color.h"
 #include "display_output.h"
+#include "engine_interfaces.h"
 #include "log.h"
 #include "overlay.h"
 #include "settings.h"
@@ -23,6 +24,8 @@
 #include <g_dof4CS.h>
 #include <g_lensCS.h>
 #include <g_postCameraCS.h>
+#include <g_postExposureCS.h>
+#include <g_postExposureHistogramCS.h>
 #include <g_postFrameMotionCS.h>
 #include <g_postFinalPS.h>
 #include <g_postMotionBlurCS.h>
@@ -36,9 +39,11 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <optional>
 #include <span>
+#include <string>
 #include <utility>
 
 using Microsoft::WRL::ComPtr;
@@ -110,11 +115,16 @@ struct PostConstants {
     float tonePeak;
     std::uint32_t ccCount;
     float ccDefaultWeight;
-    std::uint32_t padding5[3];
+    std::uint32_t exposureView;
+    float brightShare;
+    float brightTarget;
     float ccWeights[4];
     std::uint32_t ccViews[4];
+    float paperWhite;
+    float uiWhite;
+    std::uint32_t padding6[2];
 };
-static_assert(sizeof(PostConstants) == 21 * 16);
+static_assert(sizeof(PostConstants) == 22 * 16);
 
 // Mirrors PostPass in shaders/post/post.hlsli.
 struct PostPass {
@@ -130,12 +140,16 @@ struct PostPass {
 static_assert(sizeof(PostPass) == 8 * sizeof(UINT));
 
 enum class Compute { Prepare, Camera, TileMax, NeighborMax, MotionBlur, DofTiles, DofTilesReverse, DofColor, DofDilate, DofBlur, DofComposite, Cas, Lens,
-    FrameMotion, Count };
+    FrameMotion, ExposureHistogram, Exposure, Count };
 
 constexpr std::span<const unsigned char> kComputeShaders[] = {g_postPrepareCS, g_postCameraCS, g_postTileMaxCS, g_postNeighborMaxCS, g_postMotionBlurCS,
-    g_dof0CS, g_dof0ReverseCS, g_dof1CS, g_dof2CS, g_dof3CS, g_dof4CS, g_casCS, g_lensCS, g_postFrameMotionCS};
+    g_dof0CS, g_dof0ReverseCS, g_dof1CS, g_dof2CS, g_dof3CS, g_dof4CS, g_casCS, g_lensCS, g_postFrameMotionCS, g_postExposureHistogramCS, g_postExposureCS};
 static_assert(std::size(kComputeShaders) == static_cast<size_t>(Compute::Count));
 
+// The HDR exposure's luminance bins (kExposureBins in shaders/post/post.hlsl), and how often (in frames) Source's auto
+// exposure target is read again from its console variables.
+constexpr UINT kExposureBins = 128;
+constexpr unsigned kExposureTargetPollFrames = 30;
 // FidelityFX DoF's half-resolution colour has 4 mips (FFX_DOF_INTERNAL_BILAT_MIP_COUNT in ffx_dof_resources.h).
 constexpr UINT kDofMips = 4;
 // Source's DepthRange(0, 0.1) for the held weapon (IsViewmodelRange in src/native_lighting.cpp).
@@ -188,6 +202,15 @@ struct State {
     DXGI_FORMAT hudlessFormat = DXGI_FORMAT_UNKNOWN;
     // The camera's state across frames (CameraMain in shaders/post/post.hlsl).
     Target camera;
+    // The HDR exposure (ExposureHistogramMain and ExposureMain): the view's luminance bins, its gain across frames, whether
+    // the last frame with a 3D view took it, and Source's auto exposure target it is measured against (UpdateBrightTarget).
+    Target exposureBins;
+    Target exposure;
+    bool exposureRan = false;
+    unsigned exposurePolls = 0;
+    float brightShare = 0.0f;
+    float brightTarget = 0.0f;
+    bool loggedBrightTarget = false;
     ID3D12Resource* depthResource = nullptr;
     UINT depthView = kInvalid;
     std::chrono::steady_clock::time_point last;
@@ -440,7 +463,42 @@ bool EnsureRoot()
         log::Info("Post effects: creating the root signature failed: {:#010x}", static_cast<unsigned>(hr));
         return false;
     }
-    return GetBackend().Device() != nullptr && (g_state.camera.texture.resource || CreateBuffer(g_state.camera, 16, 2));
+    return GetBackend().Device() != nullptr && (g_state.camera.texture.resource || CreateBuffer(g_state.camera, 16, 2)) &&
+        (g_state.exposureBins.texture.resource || CreateBuffer(g_state.exposureBins, 4, kExposureBins)) &&
+        (g_state.exposure.texture.resource || CreateBuffer(g_state.exposure, 16, 1));
+}
+
+std::optional<float> ConVarShare(const char* name)
+{
+    const std::optional<std::string> value = engine::ConVarString(name);
+    if (!value)
+        return std::nullopt;
+    char* end = nullptr;
+    const float percent = std::strtof(value->c_str(), &end);
+    if (end == value->c_str() || !std::isfinite(percent))
+        return std::nullopt;
+    return percent / 100.0f;
+}
+
+// Source's auto exposure target (the SDK's viewpostprocess.cpp, mat_tonemap_algorithm 1): its brightest
+// mat_tonemap_percent_bright_pixels percent of pixels start at mat_tonemap_percent_target percent of white. False while
+// those console variables cannot be read, which leaves HDR without its exposure.
+bool UpdateBrightTarget()
+{
+    if (g_state.exposurePolls++ % kExposureTargetPollFrames != 0)
+        return g_state.brightTarget > 0.0f;
+    const std::optional<float> share = ConVarShare("mat_tonemap_percent_bright_pixels");
+    const std::optional<float> target = ConVarShare("mat_tonemap_percent_target");
+    if (!share || !target || *target <= 0.0f) {
+        if (!std::exchange(g_state.loggedBrightTarget, true))
+            log::Info("Post effects: Source's auto exposure target (mat_tonemap_percent_target, mat_tonemap_percent_bright_pixels) cannot be read; "
+                      "HDR keeps Source's exposure");
+        g_state.brightTarget = 0.0f;
+        return false;
+    }
+    g_state.brightShare = std::clamp(*share, 0.0f, 1.0f);
+    g_state.brightTarget = *target;
+    return true;
 }
 
 // The pipeline states are made when an effect first needs them.
@@ -676,7 +734,16 @@ void PostProcessView(D3D12_RECT rect, bool postVgui)
     c.sharpness = settings.contrastSharpness;
     c.toneCurve = static_cast<std::uint32_t>(settings.toneCurve);
     c.highlightRolloff = settings.highlightRolloff;
-    c.tonePeak = std::max(backend.HudlessMapping().peak, 1.0f);
+    const display::Mapping output = backend.HudlessMapping();
+    c.tonePeak = std::max(output.peak, 1.0f);
+    const bool hdrExposure = backend.OutputHdr() && UpdateBrightTarget();
+    c.exposureView = hdrExposure ? g_state.exposure.uav : kInvalid;
+    c.brightShare = g_state.brightShare;
+    c.brightTarget = g_state.brightTarget;
+    if (backend.OutputHdr()) {
+        c.paperWhite = output.paperWhite;
+        c.uiWhite = output.uiWhite;
+    }
     {
         std::array<UINT, 4> views = {kInvalid, kInvalid, kInvalid, kInvalid};
         std::array<float, 4> weights = {};
@@ -747,6 +814,18 @@ void PostProcessView(D3D12_RECT rect, bool postVgui)
     Use(g_state.scene[current], write);
     if (!Dispatch(Compute::Prepare, {.input0 = backend.FrameBufferTexture(), .output0 = g_state.scene[current].uav}, Groups(width, 8), Groups(height, 8)))
         return;
+    // Measured on the view as Source exposed it, before the effects.
+    const bool exposureRan = std::exchange(g_state.exposureRan, hdrExposure);
+    if (hdrExposure) {
+        Use(g_state.scene[current], read);
+        if (!Dispatch(Compute::ExposureHistogram, {.input0 = g_state.scene[current].srv, .output0 = g_state.exposureBins.uav}, Groups(width, 16),
+                Groups(height, 16)))
+            return;
+        UavBarrier(g_state.exposureBins);
+        if (!Dispatch(Compute::Exposure, {.input0 = g_state.exposureBins.uav, .output0 = g_state.exposure.uav, .step = exposureRan ? 0u : 1u}, 1, 1))
+            return;
+        UavBarrier(g_state.exposure);
+    }
     const auto next = [&](Compute pass, UINT x, UINT y, PostPass args) {
         Use(g_state.scene[current], read);
         Use(g_state.scene[current ^ 1], write);
@@ -828,6 +907,9 @@ void PostProcessView(D3D12_RECT rect, bool postVgui)
     commands->RSSetScissorRects(1, &rect);
     commands->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     commands->DrawInstanced(3, 1, 0, 0);
+    // The display mapping shows the HUD and menu, drawn into the frame after this, by the same exposure.
+    if (hdrExposure)
+        display::SetHdrExposure(g_state.exposure.uav);
     tagFrame();
 }
 

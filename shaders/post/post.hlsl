@@ -91,6 +91,104 @@ void CameraMain()
     camera[1] = float4(flare.b, 0.0, 0.0, 0.0);
 }
 
+// The HDR exposure (src/post_effects.cpp). The view's luminance, 1 at paper white under Source's exposure, is counted in
+// bins of its log2 from kExposureMinLog to kExposureMaxLog. kExposureBins mirrors the C++ constant.
+static const uint kExposureBins = 128;
+static const float kExposureMinLog = -16.0;
+static const float kExposureMaxLog = 8.0;
+// The key of a normal scene: its log-average luminance shows as middle grey (Reinhard et al. 2002, "Photographic Tone
+// Reproduction for Digital Images"; Unreal's auto exposure meters it the same way).
+static const float kMiddleGrey = 0.18;
+// It settles over about a second, three times faster when it darkens, as Source's own exposure does
+// (mat_accelerate_adjust_exposure_down's default).
+static const float kExposureSeconds = 1.0;
+static const float kExposureDarkening = 3.0;
+
+groupshared uint g_exposureBins[kExposureBins];
+
+float ExposureBinLog(float bin)
+{
+    return kExposureMinLog + bin * ((kExposureMaxLog - kExposureMinLog) / float(kExposureBins));
+}
+
+// input0: the view at Source's exposure; output0: the bins, which ExposureMain leaves at zero, counting its pixels.
+[RootSignature(POST_ROOT_SIGNATURE)]
+[numthreads(16, 16, 1)]
+void ExposureHistogramMain(uint2 pixel : SV_DispatchThreadID, uint index : SV_GroupIndex)
+{
+    if (index < kExposureBins)
+        g_exposureBins[index] = 0;
+    GroupMemoryBarrierWithGroupSync();
+    if (all(pixel < g_post.size)) {
+        Texture2D<float4> view = ResourceDescriptorHeap[g_postPass.input0];
+        float luminance = Luminance(max(view.Load(int3(pixel, 0)).rgb, 0.0));
+        float bin = (log2(max(luminance, 1e-30)) - kExposureMinLog) * (float(kExposureBins) / (kExposureMaxLog - kExposureMinLog));
+        InterlockedAdd(g_exposureBins[uint(clamp(bin, 0.0, float(kExposureBins - 1)))], 1u);
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (index < kExposureBins && g_exposureBins[index] != 0) {
+        RWStructuredBuffer<uint> bins = ResourceDescriptorHeap[g_postPass.output0];
+        InterlockedAdd(bins[index], g_exposureBins[index]);
+    }
+}
+
+// The HDR exposure's gain, one group for the frame. Source's auto exposure (the SDK's viewpostprocess.cpp,
+// mat_tonemap_algorithm 1) darkens the view until its brightest pixels (brightShare of them) start at brightTarget of
+// white, so that SDR does not clip them, which leaves an HDR display's range above paper white almost unused. In HDR the
+// view is brightened on top of it toward its log-average at middle grey: never darker than Source keeps it, by no more
+// than Source's target darkened it below that (not where Source's exposure limits kept it darker), and only until its
+// brightest pixels start at brightTarget of the display's peak. input0: the bins, which it zeroes; output0: the state (x
+// the gain, y 1 once set, z the log-average and w where the brightest pixels start, under Source's exposure). step 1 takes
+// the gain at once instead of settling from the last.
+[RootSignature(POST_ROOT_SIGNATURE)]
+[numthreads(kExposureBins, 1, 1)]
+void ExposureMain(uint index : SV_GroupIndex)
+{
+    RWStructuredBuffer<uint> bins = ResourceDescriptorHeap[g_postPass.input0];
+    g_exposureBins[index] = bins[index];
+    bins[index] = 0;
+    GroupMemoryBarrierWithGroupSync();
+    if (index != 0)
+        return;
+    float total = 0.0;
+    float logSum = 0.0;
+    [loop]
+    for (uint i = 0; i < kExposureBins; ++i) {
+        float count = float(g_exposureBins[i]);
+        total += count;
+        logSum += count * ExposureBinLog(float(i) + 0.5);
+    }
+    if (total <= 0.0)
+        return;
+    float average = exp2(logSum / total);
+    // Within its bin by the share of the bin's pixels it needs, as Source's FindLocationOfPercentBrightPixels interpolates.
+    float needed = g_post.brightShare * total;
+    float brightLog = kExposureMaxLog;
+    float counted = 0.0;
+    [loop]
+    for (int b = int(kExposureBins) - 1; b >= 0; --b) {
+        float count = float(g_exposureBins[b]);
+        if (counted + count >= needed) {
+            brightLog = ExposureBinLog(float(b + 1) - (needed - counted) / max(count, 1.0));
+            break;
+        }
+        counted += count;
+    }
+    float bright = exp2(brightLog);
+    float target = g_post.brightTarget;
+    float toGrey = kMiddleGrey / average * min(1.0, bright / target);
+    float toPeak = g_post.tonePeak * min(1.0, target / bright);
+    float gain = max(1.0, min(toGrey, toPeak));
+    RWStructuredBuffer<float4> state = ResourceDescriptorHeap[g_postPass.output0];
+    float4 last = state[0];
+    if (g_postPass.step == 0 && last.y != 0.0 && last.x > 0.0) {
+        float seconds = gain < last.x ? kExposureSeconds / kExposureDarkening : kExposureSeconds;
+        float settle = 1.0 - exp(-g_post.frameSeconds / seconds);
+        gain = exp2(lerp(log2(last.x), log2(gain), settle));
+    }
+    state[0] = float4(gain, 1.0, average, bright);
+}
+
 // Motion blur after McGuire, Hennessy, Bukowski and Osman, "A Reconstruction Filter for Plausible Motion Blur" (I3D
 // 2012): each tile's longest motion over the exposure, then each tile's neighbourhood's, which the reconstruction gathers
 // along.

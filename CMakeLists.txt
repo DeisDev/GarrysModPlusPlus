@@ -361,7 +361,7 @@ add_shader(shaders/flare_visibility.hlsl main cs_6_6 g_flareVisibilityCS)
 add_shader(shaders/flare_visibility.hlsl main cs_6_9 g_flareVisibilityOmmCS -D OPACITY_MICROMAPS=1)
 # The camera effects after the game's post-processing (src/post_effects.cpp): our passes, and AMD FidelityFX's.
 add_shader(shaders/post/post.hlsl VSMain vs_6_6 g_postVS)
-foreach(entry Prepare Camera TileMax NeighborMax MotionBlur FrameMotion)
+foreach(entry Prepare Camera TileMax NeighborMax MotionBlur FrameMotion ExposureHistogram Exposure)
     add_shader(shaders/post/post.hlsl ${entry}Main cs_6_6 g_post${entry}CS)
 endforeach()
 foreach(pass 0 1 2 3 4)

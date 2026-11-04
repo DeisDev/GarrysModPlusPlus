@@ -94,4 +94,11 @@ float3 ToneCurve(float3 color, uint curve, float highlightRolloff, float peak)
     return min(color, peak);
 }
 
+// In HDR, the nits of the frame's 1, the HUD's and the menu's white: `uiWhite`, or where it is 0 paper white times the
+// HDR exposure's `gain` (ExposureMain in shaders/post/post.hlsl), so they stay as bright beside the 3D view as in SDR.
+float UiWhite(float paperWhite, float uiWhite, float gain)
+{
+    return uiWhite > 0.0 ? uiWhite : paperWhite * gain;
+}
+
 #endif

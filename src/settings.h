@@ -374,7 +374,7 @@ struct Settings {
     // The display output (this computer's; src/display_output.cpp): HDR10 or SDR and SDR's bits; in HDR the light of
     // paper white (the game's white, 1 in the frame) and the display's peak in nits, each Windows' own when it follows it
     // (the SDR content brightness slider; the display's reported peak), the black level's lift in nits, saturation, and
-    // the menu's white in nits (0: paper white).
+    // the HUD's and menu's white in nits (0: follows the game, paper white times the HDR exposure).
     HdrOutput hdrOutput = HdrOutput::Auto;
     OutputBits outputBitDepth = OutputBits::Auto;
     float paperWhite = 200.0f;
