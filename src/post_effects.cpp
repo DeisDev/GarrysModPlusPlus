@@ -715,8 +715,10 @@ void PostProcessView(D3D12_RECT rect)
         ID3D12Resource* motion = g_state.frameMotion.texture.resource.Get();
         ID3D12Resource* hudless = g_state.hudless.resource.Get();
         if (fsrGeneration != nullptr) {
+            const display::Mapping mapping = backend.HudlessMapping();
             const FsrFrameGeneration::Inputs inputs = {depth, motion, hudless, rect, static_cast<UINT>(desc.Width), desc.Height,
-                static_cast<float>(frameSeconds * 1000.0)};
+                static_cast<float>(frameSeconds * 1000.0), backend.OutputFormat(), backend.OutputHdr(), mapping.blackLevel,
+                mapping.peak * mapping.paperWhite};
             fsrGeneration->Prepare(commands, inputs, *post);
         } else {
             streamline::TagFrame(commands, {depth, motion, hudless, read, rect}, *post);

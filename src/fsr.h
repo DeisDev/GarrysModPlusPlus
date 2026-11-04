@@ -144,6 +144,12 @@ public:
         UINT displayWidth;
         UINT displayHeight;
         float frameMilliseconds;
+        // The swap chain buffers' format, whether they hold HDR10 (PQ, Rec. 2020), and then the black and peak luminance
+        // in nits the display mapping puts in them.
+        DXGI_FORMAT format;
+        bool hdr;
+        float minNits;
+        float maxNits;
     };
     // Records the frame's preparation for generation into `list` and turns generation on for it.
     void Prepare(ID3D12GraphicsCommandList* list, const Inputs& inputs, const PostView& post);
@@ -156,7 +162,7 @@ public:
     void ReleaseContext();
 
 private:
-    bool EnsureContext(UINT width, UINT height, bool reversedDepth);
+    bool EnsureContext(UINT width, UINT height, bool reversedDepth, DXGI_FORMAT format, bool hdr);
     bool Configure(bool enabled, ID3D12Resource* hudless, const D3D12_RECT& view);
 
     const ffxFunctions* m_functions = nullptr;
@@ -167,6 +173,8 @@ private:
     void* m_context = nullptr;
     UINT m_contextSize[2] = {};
     bool m_contextReversed = false;
+    DXGI_FORMAT m_contextFormat = DXGI_FORMAT_UNKNOWN;
+    bool m_contextHdr = false;
     uint64_t m_frameId = 0;
     bool m_prepared = false;
     bool m_preparedLast = false;

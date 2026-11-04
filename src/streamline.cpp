@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <tuple>
 #include <optional>
 #include <string>
 
@@ -41,7 +42,9 @@ struct State {
     uint32_t lastTagged = 0;
     bool renderMarked = false;
     std::optional<sl::ReflexMode> appliedReflex;
-    std::optional<std::pair<sl::DLSSGMode, uint32_t>> appliedGeneration;
+    std::optional<std::tuple<sl::DLSSGMode, uint32_t, DXGI_FORMAT>> appliedGeneration;
+    DXGI_FORMAT outputFormat = DXGI_FORMAT_B8G8R8A8_UNORM;
+    bool loggedHdrFormat = false;
     // Last frame's camera, for the matrices to it.
     bool havePrevious = false;
     sl::float4x4 previousViewToWorld = {};
@@ -104,17 +107,20 @@ void ApplyOptions()
         }
     }
     if (g_state.frameGeneration) {
-        const std::pair<sl::DLSSGMode, uint32_t> wanted = {generate ? sl::DLSSGMode::eOn : sl::DLSSGMode::eOff,
-            std::clamp(static_cast<uint32_t>(settings.generatedFrames), 1u, std::max(g_state.maxGenerated, 1u))};
+        const std::tuple<sl::DLSSGMode, uint32_t, DXGI_FORMAT> wanted = {generate ? sl::DLSSGMode::eOn : sl::DLSSGMode::eOff,
+            std::clamp(static_cast<uint32_t>(settings.generatedFrames), 1u, std::max(g_state.maxGenerated, 1u)), g_state.outputFormat};
         if (g_state.appliedGeneration != wanted) {
             sl::DLSSGOptions options = {};
-            options.mode = wanted.first;
-            options.numFramesToGenerate = wanted.second;
+            options.mode = std::get<0>(wanted);
+            options.numFramesToGenerate = std::get<1>(wanted);
+            options.colorBufferFormat = static_cast<uint32_t>(std::get<2>(wanted));
+            options.hudLessBufferFormat = static_cast<uint32_t>(std::get<2>(wanted));
             const sl::Result result = slDLSSGSetOptions(kViewport, options);
             if (result != sl::Result::eOk)
                 log::Info("Streamline: setting Frame Generation's options failed ({})", static_cast<int>(result));
             else
-                log::Info("Streamline: Frame Generation {}", wanted.first == sl::DLSSGMode::eOn ? "on" : "off");
+                log::Info("Streamline: Frame Generation {} (format {})", std::get<0>(wanted) == sl::DLSSGMode::eOn ? "on" : "off",
+                    static_cast<int>(std::get<2>(wanted)));
             g_state.appliedGeneration = wanted;
         }
     }
@@ -273,12 +279,22 @@ void MarkPresent(bool end)
 // without options the query is cheapest.
 uint32_t PresentedFrames()
 {
-    if (!g_state.active || !g_state.appliedGeneration || g_state.appliedGeneration->first != sl::DLSSGMode::eOn)
+    if (!g_state.active || !g_state.appliedGeneration || std::get<0>(*g_state.appliedGeneration) != sl::DLSSGMode::eOn)
         return 1;
     sl::DLSSGState state = {};
     if (slDLSSGGetState(kViewport, state, nullptr) != sl::Result::eOk)
         return 1;
+    const uint32_t status = static_cast<uint32_t>(state.status);
+    if ((status & static_cast<uint32_t>(sl::DLSSGStatus::eFailHDRFormatNotSupported)) != 0 && !std::exchange(g_state.loggedHdrFormat, true))
+        log::Info("Streamline: Frame Generation does not support the swap chain's format {} (eFailHDRFormatNotSupported)", static_cast<int>(g_state.outputFormat));
     return state.numFramesActuallyPresented;
+}
+
+void SetOutputFormat(DXGI_FORMAT format)
+{
+    if (format != g_state.outputFormat)
+        g_state.loggedHdrFormat = false;
+    g_state.outputFormat = format;
 }
 
 bool FrameGenerationWanted()

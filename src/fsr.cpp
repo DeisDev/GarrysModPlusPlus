@@ -163,7 +163,7 @@ bool FsrUpscaler::EnsureContext(UINT outputWidth, UINT outputHeight, bool revers
     if (m_context != nullptr && m_contextSize[0] == outputWidth && m_contextSize[1] == outputHeight && m_contextReversed == reversedDepth)
         return true;
     Release();
-    // The light is linear HDR before Source's tonemap scale, which FSR's own exposure then follows.
+    // The light is linear HDR after Source's tonemap scale (1 = paper white); FSR's own exposure follows it.
     ffxCreateContextDescUpscale create = {};
     create.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
     create.flags = FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE | FFX_UPSCALE_ENABLE_AUTO_EXPOSURE | (reversedDepth ? FFX_UPSCALE_ENABLE_DEPTH_INVERTED : 0u);
@@ -385,10 +385,22 @@ ffxReturnCode_t PresentFrame(ffxCallbackDescFrameGenerationPresent* params, void
     return FFX_API_RETURN_OK;
 }
 
+// How the back buffer encodes colour (ffxDispatchDescFrameGeneration::backbufferTransferFunction, minMaxLuminance), as
+// the last Prepare saw the swap chain.
+struct Transfer {
+    uint32_t function = FFX_API_BACKBUFFER_TRANSFER_FUNCTION_SRGB;
+    float minNits = 0.0f;
+    float maxNits = 80.0f;
+};
+Transfer g_transfer;
+
 // Generation's work, recorded by FSR's swap chain during Present on the render thread (frame-interpolation-api.md,
 // Dispatch frame generation).
 ffxReturnCode_t GenerateFrame(ffxDispatchDescFrameGeneration* params, void* context)
 {
+    params->backbufferTransferFunction = g_transfer.function;
+    params->minMaxLuminance[0] = g_transfer.minNits;
+    params->minMaxLuminance[1] = g_transfer.maxNits;
     return fsr::g_functions.Dispatch(static_cast<ffxContext*>(context), &params->header);
 }
 
@@ -431,18 +443,20 @@ Microsoft::WRL::ComPtr<IDXGISwapChain4> FsrFrameGeneration::CreateSwapChain(ID3D
     return owned;
 }
 
-bool FsrFrameGeneration::EnsureContext(UINT width, UINT height, bool reversedDepth)
+bool FsrFrameGeneration::EnsureContext(UINT width, UINT height, bool reversedDepth, DXGI_FORMAT format, bool hdr)
 {
-    if (m_context != nullptr && m_contextSize[0] == width && m_contextSize[1] == height && m_contextReversed == reversedDepth)
+    if (m_context != nullptr && m_contextSize[0] == width && m_contextSize[1] == height && m_contextReversed == reversedDepth && m_contextFormat == format &&
+        m_contextHdr == hdr)
         return true;
     ReleaseContext();
-    // The back buffer holds 8-bit sRGB-encoded colour, not HDR; depth and motion come at the view's size.
+    // The back buffer holds the display mapping's output: sRGB-encoded SDR in 8 or 10 bits, or HDR10 (PQ); depth and
+    // motion come at the view's size.
     ffxCreateContextDescFrameGeneration create = {};
     create.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION;
-    create.flags = reversedDepth ? FFX_FRAMEGENERATION_ENABLE_DEPTH_INVERTED : 0u;
+    create.flags = (reversedDepth ? FFX_FRAMEGENERATION_ENABLE_DEPTH_INVERTED : 0u) | (hdr ? FFX_FRAMEGENERATION_ENABLE_HIGH_DYNAMIC_RANGE : 0u);
     create.displaySize = {width, height};
     create.maxRenderSize = {width, height};
-    create.backBufferFormat = FFX_API_SURFACE_FORMAT_B8G8R8A8_UNORM;
+    create.backBufferFormat = format == DXGI_FORMAT_R10G10B10A2_UNORM ? FFX_API_SURFACE_FORMAT_R10G10B10A2_UNORM : FFX_API_SURFACE_FORMAT_B8G8R8A8_UNORM;
     ffxCreateContextDescFrameGenerationVersion version = {};
     version.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION_VERSION;
     version.version = FFX_FRAMEGENERATION_VERSION;
@@ -466,6 +480,8 @@ bool FsrFrameGeneration::EnsureContext(UINT width, UINT height, bool reversedDep
     m_contextSize[0] = width;
     m_contextSize[1] = height;
     m_contextReversed = reversedDepth;
+    m_contextFormat = format;
+    m_contextHdr = hdr;
     return true;
 }
 
@@ -503,8 +519,10 @@ void FsrFrameGeneration::Prepare(ID3D12GraphicsCommandList* list, const Inputs& 
     const float m22 = post.viewToClip[10];
     const float m32 = post.viewToClip[14];
     const bool reversed = m32 > 0.0f;
-    if (!EnsureContext(inputs.displayWidth, inputs.displayHeight, reversed) || !Configure(true, inputs.hudless, inputs.view))
+    if (!EnsureContext(inputs.displayWidth, inputs.displayHeight, reversed, inputs.format, inputs.hdr) || !Configure(true, inputs.hudless, inputs.view))
         return;
+    g_transfer = {inputs.hdr ? static_cast<uint32_t>(FFX_API_BACKBUFFER_TRANSFER_FUNCTION_PQ) : static_cast<uint32_t>(FFX_API_BACKBUFFER_TRANSFER_FUNCTION_SRGB),
+        inputs.minNits, inputs.maxNits};
     const UINT width = static_cast<UINT>(inputs.view.right - inputs.view.left);
     const UINT height = static_cast<UINT>(inputs.view.bottom - inputs.view.top);
     ffxDispatchDescFrameGenerationPrepareV2 prepare = {};

@@ -823,6 +823,7 @@ void Backend::SwitchOutput(DXGI_FORMAT format, bool hdr)
     }
     m_outputHdr = hdr;
     AcquireBuffers();
+    streamline::SetOutputFormat(format);
     log::Info("Native: the swap chain shows {} in format {}", hdr ? "HDR10" : "SDR", static_cast<int>(format));
 }
 
