@@ -2531,6 +2531,7 @@ bool Lighting::FillConstants(FrameConstants& constants, const Scene& scene, cons
     constants.taaHistoryWeight = settings.taaHistoryWeight;
     constants.sharpening = settings.sharpening;
     constants.tonemapScale = inputs.tonemapScale;
+    constants.displayPeak = std::max(inputs.displayPeak, 1.0f);
     constants.invSize[0] = 1.0f / static_cast<float>(m_width);
     constants.invSize[1] = 1.0f / static_cast<float>(m_height);
     constants.size[0] = m_width;

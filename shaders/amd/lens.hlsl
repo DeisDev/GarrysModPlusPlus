@@ -120,11 +120,11 @@ float3 Grade(float3 color)
     return max(lerp(Luminance(graded), graded, g_post.gradeSaturation), 0.0);
 }
 
-// input0: the view. In HDR the exposure's gain (ExposureMain in shaders/post/post.hlsl), then the colour grading, the tone
-// curve up to the display's peak, the engine's colour correction below white under Source's exposure and film grain, back
-// into the frame as display-referred linear light in units of the HUD's white (UiWhite; paper white in SDR), which the HUD
-// drawn next writes at 1. The grain is added to the sRGB-encoded values up to paper white, as FidelityFX Lens grains the
-// displayed image (its amount fades to nothing at 0 and 1); light above paper white keeps its value.
+// input0: the view. In HDR the brightness boost's gain (ExposureMain in shaders/post/post.hlsl), then the colour grading,
+// the tone curve up to the display's peak, the engine's colour correction below white under Source's exposure and film
+// grain, back into the frame as display-referred linear light in units of the HUD's white (UiWhite; paper white in SDR),
+// which the HUD drawn next writes at 1. The grain is added to the sRGB-encoded values up to paper white, as FidelityFX
+// Lens grains the displayed image (its amount fades to nothing at 0 and 1); light above paper white keeps its value.
 [RootSignature(POST_ROOT_SIGNATURE)]
 float4 FinalMain(float4 position : SV_Position) : SV_Target
 {
@@ -137,7 +137,7 @@ float4 FinalMain(float4 position : SV_Position) : SV_Target
         float4 state = exposure[0];
         gain = state.y != 0.0 ? state.x : 1.0;
     }
-    float toFrame = g_post.paperWhite > 0.0 ? g_post.paperWhite / UiWhite(g_post.paperWhite, g_post.uiWhite, gain) : 1.0;
+    float toFrame = g_post.paperWhite > 0.0 ? g_post.paperWhite / UiWhite(g_post.paperWhite, g_post.uiWhite) : 1.0;
     float3 exposed = max(color.rgb, 0.0) * gain;
     float3 graded = max(g_post.gradeEnabled != 0 ? Grade(exposed) : exposed, 0.0);
     graded = ToneCurve(graded, g_post.toneCurve, g_post.highlightRolloff, g_post.tonePeak);

@@ -13,6 +13,9 @@
 
 static const uint kDiscSun = 1;
 static const uint kDiscMoon = 2;
+// The most the sun's or Moon's disc is drawn at, in the frame's units (paper whites after the tonemap scale): above the
+// sky's glow around a low sun (about 100) and any display's peak (10000 nits over 80 is 125), well within half floats.
+static const float kDiscLimit = 1024.0;
 
 static const uint kNightStars = 1;
 static const uint kNightMilkyWay = 2;
@@ -369,7 +372,7 @@ static const float kMoonAngularRadius = 4.596e-3;
 // share of a footprint `edge` radians wide inside it (it hides the stars behind it). The sun lights the sphere at its
 // phase (Lommel-Seeliger, so a full Moon is even to its edge) and the maria (MoonAlbedo). Its surface is as bright as
 // the real Moon's (its irradiance over the lit share of its disc) at the gain the sky there is shown with (`logGain`),
-// as bright as the target holds at most: pale by day, bright at night. The air colours it, and the ground hides it.
+// up to kDiscLimit: pale by day, bright at night. The air colours it, and the ground hides it.
 float3 MoonDisc(NightSkyConstants night, float3 direction, float edge, float logGain, float tonemapScale, Texture2D<float4> transmittance,
     SamplerState linearClamp, out float coverage)
 {
@@ -395,17 +398,16 @@ float3 MoonDisc(NightSkyConstants night, float3 direction, float edge, float log
     float shade = lit > 0.0 ? min(2.0 * lit / (lit + towardEye), 1.0) : 0.0;
     float litShare = 0.5 - 0.5 * dot(moon, night.sunDirection);
     float radiance = night.moonIrradiance / (3.14159265 * kMoonAngularRadius * kMoonAngularRadius * max(litShare, 0.01));
-    float shown = min(radiance * exp2(logGain) * tonemapScale, 1.0);
+    float shown = min(radiance * exp2(logGain) * tonemapScale, kDiscLimit);
     float3 color = AtmosphereTransmittance(transmittance, linearClamp, eye.z, moon.z);
     color /= max(max(color.r, max(color.g, color.b)), 1e-6);
     return color * (MoonAlbedo(offset) * shade * shown * coverage);
 }
 
-// The sun's disc toward a direction, after the tonemap scale. It is thousands of times brighter than the sky, so it is
-// shown as bright as the target holds, in the colour the atmosphere leaves it (env_sun's tint times the transmittance
-// toward it), with Allen's limb darkening at 550 nm (I / I0 = 0.3 + 0.93 mu - 0.23 mu^2; Cox, Allen's Astrophysical
-// Quantities, 2000), or as the Moon (MoonAlbedo). Its edge covers the share of a footprint `edge` radians wide inside it,
-// and the ground hides it below the horizon.
+// The sun's disc toward a direction, in the colour the atmosphere leaves it (env_sun's tint times the transmittance
+// toward it) with its brightest channel at 1, with Allen's limb darkening at 550 nm (I / I0 = 0.3 + 0.93 mu - 0.23 mu^2;
+// Cox, Allen's Astrophysical Quantities, 2000), or as the Moon (MoonAlbedo); DiscThroughClouds gives its brightness. Its
+// edge covers the share of a footprint `edge` radians wide inside it, and the ground hides it below the horizon.
 float3 SunDisc(NightSkyConstants night, float3 direction, float edge, Texture2D<float4> transmittance, SamplerState linearClamp)
 {
     float3 sun = night.sunDirection;
@@ -426,11 +428,13 @@ float3 SunDisc(NightSkyConstants night, float3 direction, float edge, Texture2D<
     return color * ((0.3 + 0.93 * mu - 0.23 * mu * mu) * coverage);
 }
 
-// How much of the disc (SunDisc) shows through clouds that let `transmittance` of it through: shown as bright as the
-// target holds, it dims only where so little of its radiance gets through that the target holds it.
+// The brightness of the disc (SunDisc) through clouds that let `transmittance` of it through, after the tonemap scale:
+// its radiance up to kDiscLimit, so it stays the brightest thing in the frame (the glow around a low sun reaches 100
+// paper whites) and reaches any display's peak through the tone curve, while the frame's half floats hold it with any
+// tonemap scale.
 float DiscThroughClouds(NightSkyConstants night, float transmittance, float tonemapScale)
 {
-    return saturate(transmittance * night.discRadiance * tonemapScale);
+    return min(transmittance * night.discRadiance * tonemapScale, kDiscLimit);
 }
 
 // The log2 of the gain the night sky is drawn with (NightSkyLight, MoonDisc) behind clouds that let `transmittance` through.

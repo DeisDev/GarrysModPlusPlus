@@ -4,6 +4,7 @@
 #include "log.h"
 #include "shader_bytecode.h"
 #include "shaderapi.h"
+#include "shaderapi_device.h"
 #include "shaderapi_meshes.h"
 #include "shaderapi_textures.h"
 #include "shader_twins.h"
@@ -487,6 +488,7 @@ bool End(ViewKind kind, ViewInputs& inputs)
     inputs.jitter = g_state.jitter;
     const float scale = PixelRegister(gbuffer::kLightScaleRegister).v[0];
     inputs.tonemapScale = scale > 0.0f ? scale : 1.0f;
+    inputs.displayPeak = GetBackend().HudlessMapping().peak;
     inputs.fog = g_state.fog[kind == ViewKind::Skybox ? 1 : 0];
     inputs.sway = g_state.swayClock;
     inputs.paintedSun = g_state.paintedSun;

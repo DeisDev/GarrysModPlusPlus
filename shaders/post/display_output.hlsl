@@ -2,10 +2,11 @@
 #include "../dither.hlsli"
 
 // The display mapping (src/display_output.cpp): the frame's linear light, 1 = the HUD's white (UiWhite in HDR, paper
-// white in SDR), into what a target shows. The 3D view arrives already exposed for HDR, fitted to the display's peak by
-// the tone curve and colour corrected (shaders/amd/lens.hlsl, FinalMain); light still above the peak is clipped. SDR targets take the sRGB curve, the game's
-// gamma ramp (mat_monitorgamma) and dither; HDR10 targets saturation and the black level, then Rec. 2020 primaries and
-// the PQ curve. The menu (an sRGB texture holding premultiplied colour) is composited over either.
+// white in SDR), into what a target shows. The 3D view arrives fitted to the display's peak by the tone curve and colour
+// corrected (shaders/amd/lens.hlsl, FinalMain); light still above the peak is clipped. SDR targets take the sRGB curve,
+// the game's gamma ramp (mat_monitorgamma) and dither; HDR10 targets saturation and the black level, then Rec. 2020
+// primaries and the PQ curve. The menu (an sRGB texture holding premultiplied colour) is composited over either in
+// linear light, as the game's HUD blends.
 
 #define DISPLAY_ROOT_SIGNATURE "RootFlags(CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED), CBV(b0), " \
     "StaticSampler(s0, filter = FILTER_MIN_MAG_MIP_LINEAR, addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, " \
@@ -25,13 +26,11 @@ struct DisplayConstants
     uint frameView;
     uint uiView;
     uint encoding;
-    // PQ: the HDR exposure's state (ExposureMain in shaders/post/post.hlsl) or kNoView, paper white and the black level in
-    // nits.
-    uint exposureView;
+    // PQ: paper white and the black level in nits.
     float paperWhite;
     float blackLevel;
     float saturation;
-    // PQ: the HUD's and menu's white in nits, 0 to follow the HDR exposure (UiWhite).
+    // PQ: the HUD's and menu's white in nits, 0 for paper white (UiWhite).
     float uiWhite;
     // Dither steps across the encoded range (255 or 1023), 0 for none.
     float ditherSteps;
@@ -45,7 +44,7 @@ struct DisplayConstants
     // The display's peak in nits (PQ).
     uint debugView;
     float displayPeak;
-    uint2 padding;
+    uint3 padding;
 };
 
 ConstantBuffer<DisplayConstants> g_display : register(b0);
@@ -117,23 +116,20 @@ float4 PSMain(VertexOutput input) : SV_Target
     float white = 1.0;
     float peak = 1.0;
     if (pq) {
-        float gain = 1.0;
-        if (g_display.exposureView != kNoView) {
-            RWStructuredBuffer<float4> exposure = ResourceDescriptorHeap[g_display.exposureView];
-            float4 state = exposure[0];
-            gain = state.y != 0.0 ? state.x : 1.0;
-        }
-        white = max(UiWhite(g_display.paperWhite, g_display.uiWhite, gain), 1.0);
+        white = max(UiWhite(g_display.paperWhite, g_display.uiWhite), 1.0);
         peak = g_display.displayPeak / white;
     }
     float3 mapped = min(color, peak);
     bool clipped = max(color.r, max(color.g, color.b)) >= peak * 0.999;
     mapped = max(lerp(Luminance(mapped), mapped, g_display.saturation), 0.0);
 
+    // The menu's premultiplied sRGB colour, as linear light over the frame's white.
     float4 ui = 0.0;
     if (g_display.uiView != kNoView) {
         Texture2D<float4> menu = ResourceDescriptorHeap[g_display.uiView];
         ui = menu.Load(int3(pixel, 0));
+        if (ui.a > 0.0)
+            ui.rgb = SrgbToLinear(ui.rgb / ui.a) * ui.a;
     }
 
     if (pq) {
@@ -145,10 +141,7 @@ float4 PSMain(VertexOutput input) : SV_Target
         // The black level lifts the darkest light, leaving the peak where it is.
         float peakNits = max(g_display.displayPeak, 1.0);
         nits += g_display.blackLevel * saturate(1.0 - nits / peakNits);
-        if (ui.a > 0.0) {
-            float3 menu = SrgbToLinear(ui.rgb / ui.a) * white;
-            nits = menu * ui.a + nits * (1.0 - ui.a);
-        }
+        nits = ui.rgb * white + nits * (1.0 - ui.a);
         float3 signal = Pq(mul(kSrgbToRec2020, max(nits, 0.0)));
         if (g_display.ditherSteps > 0.0)
             signal += DitherNoise(uint2(pixel)) / g_display.ditherSteps;
@@ -159,13 +152,13 @@ float4 PSMain(VertexOutput input) : SV_Target
         mapped = FalseColor(Luminance(color) * g_display.paperWhite);
     else if (g_display.debugView == 17 && clipped)
         mapped = float3(1.0, 0.0, 1.0);
-    float3 encoded = LinearToSrgb(saturate(mapped));
+    mapped = ui.rgb + saturate(mapped) * (1.0 - ui.a);
+    float3 encoded = LinearToSrgb(mapped);
     if (g_display.gammaRamp != 0) {
         encoded = pow(encoded, g_display.gammaExponent);
         if (g_display.gammaRamp == 2)
             encoded = saturate(pow(encoded, g_display.tvExponent) * (g_display.tvMax - g_display.tvMin) + g_display.tvMin);
     }
-    encoded = ui.rgb + encoded * (1.0 - ui.a);
     if (g_display.ditherSteps > 0.0)
         encoded += DitherNoise(uint2(pixel)) / g_display.ditherSteps;
     return float4(encoded, 1.0);

@@ -976,19 +976,20 @@ void DrawHdrCard()
             Text("display.peak_follow_reason"));
         SliderRow("display.black_level", &Settings::hdrBlackLevel, hdr, hdrReason);
         SliderRow("display.hdr_saturation", &Settings::hdrSaturation, hdr, hdrReason);
-        // The HUD's and menu's white: 0 follows the game (paper white times the HDR exposure, display_output.cpp).
-        bool followsGame = settings.uiBrightness <= 0.0f;
+        SliderRow("display.hdr_brightness_boost", &Settings::hdrBrightnessBoost, hdr, hdrReason);
+        // The HUD's and menu's white: 0 is paper white (display_output.cpp).
+        bool atPaperWhite = settings.uiBrightness <= 0.0f;
         BeginRow("display.ui_follow", {FieldOf(&Settings::uiBrightness)}, hdr, hdrReason);
-        const bool toggled = widgets::Switch("##switch", &followsGame);
+        const bool toggled = widgets::Switch("##switch", &atPaperWhite);
         const bool clicked = EndRow(true);
         if (clicked)
-            followsGame = !followsGame;
+            atPaperWhite = !atPaperWhite;
         const float paperWhite = settings.paperWhiteFollowWindows && statistics.sdrWhiteNits > 0.0f ? statistics.sdrWhiteNits : settings.paperWhite;
         if (toggled || clicked)
-            Edited().uiBrightness = followsGame ? 0.0f : std::clamp(std::round(paperWhite), 80.0f, 480.0f);
-        BeginRow("display.ui_brightness", {FieldOf(&Settings::uiBrightness)}, hdr && !followsGame, followsGame && hdr ? Text("display.ui_follow_reason") : hdrReason);
-        float shown = followsGame ? paperWhite : settings.uiBrightness;
-        if (widgets::Slider("##value", &shown, 80.0f, 480.0f, ui::Number(shown, 0).c_str(), ValueWidth()) && !followsGame)
+            Edited().uiBrightness = atPaperWhite ? 0.0f : std::clamp(std::round(paperWhite), 80.0f, 480.0f);
+        BeginRow("display.ui_brightness", {FieldOf(&Settings::uiBrightness)}, hdr && !atPaperWhite, atPaperWhite && hdr ? Text("display.ui_follow_reason") : hdrReason);
+        float shown = atPaperWhite ? paperWhite : settings.uiBrightness;
+        if (widgets::Slider("##value", &shown, 80.0f, 480.0f, ui::Number(shown, 0).c_str(), ValueWidth()) && !atPaperWhite)
             Edited().uiBrightness = std::clamp(std::round(shown), 80.0f, 480.0f);
         EndRow();
         widgets::EndRows();

@@ -30,11 +30,8 @@ struct Mapping {
     float paperWhite = 80.0f;
     float blackLevel = 0.0f;
     float saturation = 1.0f;
-    // The HUD's and menu's white in nits, the frame's 1 (HDR): 0 for paper white times the HDR exposure (UiWhite in
-    // shaders/tone_curve.hlsli), whose state the camera effects' last pass left this frame (SetHdrExposure) or
-    // DescriptorHeap::kInvalid.
+    // The HUD's and menu's white in nits, the frame's 1 (HDR): 0 for paper white (UiWhite in shaders/tone_curve.hlsli).
     float uiWhite = 0.0f;
-    UINT exposureView = DescriptorHeap::kInvalid;
     // Dither steps over the encoded range: 255 for 8 bits, 1023 for 10.
     float ditherSteps = 255.0f;
     // The game's gamma ramp (mat_monitorgamma), SDR only.
@@ -100,11 +97,6 @@ struct ColorCorrection {
 };
 void SetColorCorrection(const ColorCorrection& correction);
 void ClearColorCorrection();
-// The HDR exposure's state buffer (an unordered access view, shaders/post/post.hlsl's ExposureMain) when the camera
-// effects' last pass applied it to this frame's 3D view; cleared at each present (ClearHdrExposure), so frames without a
-// 3D view show the HUD and menu at paper white.
-void SetHdrExposure(UINT view);
-void ClearHdrExposure();
 // The recorded volumes' shader resource views (moved into a shader resource state) and weights, and the default weight;
 // returns how many there are.
 UINT ColorCorrectionViews(std::array<UINT, 4>& views, std::array<float, 4>& weights, float& defaultWeight);

@@ -34,43 +34,26 @@ float3 RolledOff(float3 color, float strength, float peak)
     return lerp(color, compressed, strength) * peak;
 }
 
-// Troy Sobotka's AgX as Blender ships it, in Rec. 2020 primaries (the inset and outset matrices of Eary Chow's
-// AgX_LUT_Gen, AgXBaseRec2020.py), with Benjamin Wrensch's polynomial fit of its sigmoid, as Filament's AgxToneMapper
-// and three.js's AgXToneMapping implement it: log2 encoding from 10 stops below middle grey to 6.5 above, the sigmoid, a
-// power of 2.2 back to linear. Middle grey (0.18) shows at 0.21, 1 at 0.59, 16 reaches white, and bright colours
-// desaturate toward white instead of clipping channel by channel. SDR only: it has no form for a brighter peak.
-float3 AgX(float3 color)
+// Hajime Uchimura's tone curve for Gran Turismo Sport (CEDEC 2017, "HDR Theory and Practice") with its published
+// defaults: a toe (power 1.33 below 0.22), a linear middle (slope 1) and an exponential shoulder that approaches the peak
+// without reaching it. The shoulder starts at UchimuraShoulder(peak): 0.53 for an SDR display, where white shows at 0.83;
+// 2.1 paper whites on a display with 5 times paper white's peak, where white stays white.
+static const float kUchimuraContrast = 1.0;
+static const float kUchimuraLinearStart = 0.22;
+static const float kUchimuraLinearLength = 0.4;
+static const float kUchimuraToe = 1.33;
+
+float UchimuraShoulder(float peak)
 {
-    static const float3x3 kInset = {
-        0.856627153315983, 0.0951212405381588, 0.0482516061458583,
-        0.137318972929847, 0.761241990602591, 0.101439036467562,
-        0.11189821299995, 0.0767994186031903, 0.811302368396859};
-    static const float3x3 kOutset = {
-        1.1271005818144368, -0.11060664309660323, -0.016493938717834573,
-        -0.1413297634984383, 1.157823702216272, -0.016493938717834257,
-        -0.14132976349843826, -0.11060664309660294, 1.2519364065950405};
-    const float kMinEv = -12.47393;
-    const float kMaxEv = 4.026069;
-    float3 x = mul(kInset, mul(kSrgbToRec2020, max(color, 0.0)));
-    x = saturate((log2(max(x, 1e-10)) - kMinEv) / (kMaxEv - kMinEv));
-    float3 x2 = x * x;
-    float3 x4 = x2 * x2;
-    x = 15.5 * x4 * x2 - 40.14 * x4 * x + 31.96 * x4 - 6.868 * x2 * x + 0.4298 * x2 + 0.1191 * x - 0.00232;
-    x = pow(max(mul(kOutset, x), 0.0), 2.2);
-    return saturate(mul(kRec2020ToSrgb, x));
+    return kUchimuraLinearStart + (peak - kUchimuraLinearStart) * kUchimuraLinearLength / kUchimuraContrast;
 }
 
-// Hajime Uchimura's tone curve for Gran Turismo Sport (CEDEC 2017, "HDR Theory and Practice"), per channel, with its
-// published defaults: a toe (power 1.33 below 0.22), a linear middle (slope 1) and an exponential shoulder that
-// approaches the peak `peak` without reaching it. Filmic's curve for an HDR display.
 float3 Uchimura(float3 x, float peak)
 {
-    const float a = 1.0;
-    const float m = 0.22;
-    const float l = 0.4;
-    const float c = 1.33;
+    const float a = kUchimuraContrast;
+    const float m = kUchimuraLinearStart;
     x = max(x, 0.0);
-    float l0 = (peak - m) * l / a;
+    float l0 = (peak - m) * kUchimuraLinearLength / a;
     float s0 = m + l0;
     float s1 = m + a * l0;
     float c2 = a * peak / (peak - s1);
@@ -78,27 +61,41 @@ float3 Uchimura(float3 x, float peak)
     float3 w0 = 1.0 - smoothstep(0.0, m, x);
     float3 w2 = step(s0, x);
     float3 w1 = 1.0 - w0 - w2;
-    float3 toe = m * pow(x / m, c);
+    float3 toe = m * pow(x / m, kUchimuraToe);
     float3 shoulder = peak - (peak - s1) * exp(cp * (x - s0));
     float3 linearPart = m + a * (x - m);
     return toe * w0 + linearPart * w1 + shoulder * w2;
+}
+
+// Filmic, on SDR and HDR displays alike: Uchimura's curve keeping the hue. The colour is scaled by the curve of its
+// brightest channel, so no channel passes the peak and hues hold where the curve per channel turns orange yellow; into
+// the shoulder it blends toward the curve per channel (as RolledOff desaturates), so the brightest colours go white as
+// film does. Our choice: Gran Turismo applies the curve per channel.
+float3 Filmic(float3 color, float peak)
+{
+    float brightest = max(color.r, max(color.g, color.b));
+    if (brightest <= 0.0)
+        return 0.0;
+    float3 hueKept = color * (Uchimura(brightest.xxx, peak).x / brightest);
+    float shoulder = UchimuraShoulder(peak);
+    float x = max(brightest - shoulder, 0.0) / (peak - shoulder);
+    return lerp(hueKept, Uchimura(color, peak), x / (x + 4.0));
 }
 
 float3 ToneCurve(float3 color, uint curve, float highlightRolloff, float peak)
 {
     color = max(color, 0.0);
     if (curve == kToneCurveFilmic)
-        return peak <= 1.0 ? AgX(color) : Uchimura(color, peak);
+        return Filmic(color, peak);
     if (curve == kToneCurveHighlights)
         color = RolledOff(color, highlightRolloff, peak);
     return min(color, peak);
 }
 
-// In HDR, the nits of the frame's 1, the HUD's and the menu's white: `uiWhite`, or where it is 0 paper white times the
-// HDR exposure's `gain` (ExposureMain in shaders/post/post.hlsl), so they stay as bright beside the 3D view as in SDR.
-float UiWhite(float paperWhite, float uiWhite, float gain)
+// In HDR, the nits of the frame's 1, the HUD's and the menu's white: `uiWhite`, or paper white where it is 0.
+float UiWhite(float paperWhite, float uiWhite)
 {
-    return uiWhite > 0.0 ? uiWhite : paperWhite * gain;
+    return uiWhite > 0.0 ? uiWhite : paperWhite;
 }
 
 #endif

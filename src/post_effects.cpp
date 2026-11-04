@@ -122,7 +122,8 @@ struct PostConstants {
     std::uint32_t ccViews[4];
     float paperWhite;
     float uiWhite;
-    std::uint32_t padding6[2];
+    float exposureLimit;
+    std::uint32_t padding6;
 };
 static_assert(sizeof(PostConstants) == 22 * 16);
 
@@ -202,8 +203,9 @@ struct State {
     DXGI_FORMAT hudlessFormat = DXGI_FORMAT_UNKNOWN;
     // The camera's state across frames (CameraMain in shaders/post/post.hlsl).
     Target camera;
-    // The HDR exposure (ExposureHistogramMain and ExposureMain): the view's luminance bins, its gain across frames, whether
-    // the last frame with a 3D view took it, and Source's auto exposure target it is measured against (UpdateBrightTarget).
+    // The HDR brightness boost (ExposureHistogramMain and ExposureMain): the view's luminance bins, its gain across frames,
+    // whether the last frame with a 3D view took it, and Source's auto exposure target it is measured against
+    // (UpdateBrightTarget).
     Target exposureBins;
     Target exposure;
     bool exposureRan = false;
@@ -482,7 +484,7 @@ std::optional<float> ConVarShare(const char* name)
 
 // Source's auto exposure target (the SDK's viewpostprocess.cpp, mat_tonemap_algorithm 1): its brightest
 // mat_tonemap_percent_bright_pixels percent of pixels start at mat_tonemap_percent_target percent of white. False while
-// those console variables cannot be read, which leaves HDR without its exposure.
+// those console variables cannot be read, which leaves HDR without its brightness boost.
 bool UpdateBrightTarget()
 {
     if (g_state.exposurePolls++ % kExposureTargetPollFrames != 0)
@@ -492,7 +494,7 @@ bool UpdateBrightTarget()
     if (!share || !target || *target <= 0.0f) {
         if (!std::exchange(g_state.loggedBrightTarget, true))
             log::Info("Post effects: Source's auto exposure target (mat_tonemap_percent_target, mat_tonemap_percent_bright_pixels) cannot be read; "
-                      "HDR keeps Source's exposure");
+                      "the HDR brightness boost is off");
         g_state.brightTarget = 0.0f;
         return false;
     }
@@ -736,10 +738,11 @@ void PostProcessView(D3D12_RECT rect, bool postVgui)
     c.highlightRolloff = settings.highlightRolloff;
     const display::Mapping output = backend.HudlessMapping();
     c.tonePeak = std::max(output.peak, 1.0f);
-    const bool hdrExposure = backend.OutputHdr() && UpdateBrightTarget();
+    const bool hdrExposure = backend.OutputHdr() && settings.hdrBrightnessBoost > 0.0f && UpdateBrightTarget();
     c.exposureView = hdrExposure ? g_state.exposure.uav : kInvalid;
     c.brightShare = g_state.brightShare;
     c.brightTarget = g_state.brightTarget;
+    c.exposureLimit = std::exp2(settings.hdrBrightnessBoost);
     if (backend.OutputHdr()) {
         c.paperWhite = output.paperWhite;
         c.uiWhite = output.uiWhite;
@@ -907,9 +910,6 @@ void PostProcessView(D3D12_RECT rect, bool postVgui)
     commands->RSSetScissorRects(1, &rect);
     commands->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     commands->DrawInstanced(3, 1, 0, 0);
-    // The display mapping shows the HUD and menu, drawn into the frame after this, by the same exposure.
-    if (hdrExposure)
-        display::SetHdrExposure(g_state.exposure.uav);
     tagFrame();
 }
 

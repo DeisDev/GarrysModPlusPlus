@@ -99,19 +99,20 @@ struct PostConstants
     float tonePeak;
     uint ccCount;
     float ccDefaultWeight;
-    // The HDR exposure's state (ExposureMain in shaders/post/post.hlsl), kNoView in SDR, and Source's auto exposure
-    // target: the share of pixels counted as bright and where the brightest of them start, in the view's white
-    // (mat_tonemap_percent_bright_pixels and mat_tonemap_percent_target over 100).
+    // The HDR brightness boost's state (ExposureMain in shaders/post/post.hlsl), kNoView when off or in SDR, and Source's
+    // auto exposure target: the share of pixels counted as bright and where the brightest of them start, in the view's
+    // white (mat_tonemap_percent_bright_pixels and mat_tonemap_percent_target over 100).
     uint exposureView;
     float brightShare;
     float brightTarget;
     float4 ccWeights;
     uint4 ccViews;
-    // In HDR, paper white (0 in SDR) and the HUD's and menu's white in nits (0: paper white times the HDR exposure, so
-    // they keep the brightness SDR gives them beside the 3D view). The frame's 1 is the HUD's white.
+    // In HDR, paper white (0 in SDR) and the HUD's and menu's white in nits (0: paper white). The frame's 1 is the HUD's
+    // white. The most the brightness boost may brighten the view by (2 to the power of its stops).
     float paperWhite;
     float uiWhite;
-    uint2 padding6;
+    float exposureLimit;
+    uint padding6;
 };
 
 // Per pass: descriptor indices and a parameter.

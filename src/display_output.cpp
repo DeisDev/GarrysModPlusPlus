@@ -34,7 +34,6 @@ struct DisplayConstants {
     std::uint32_t frameView;
     std::uint32_t uiView;
     std::uint32_t encoding;
-    std::uint32_t exposureView;
     float paperWhite;
     float blackLevel;
     float saturation;
@@ -47,7 +46,7 @@ struct DisplayConstants {
     float tvMax;
     std::uint32_t debugView;
     float displayPeak;
-    std::uint32_t padding[2];
+    std::uint32_t padding[3];
 };
 static_assert(sizeof(DisplayConstants) == 80);
 
@@ -78,7 +77,6 @@ struct State {
     unsigned presents = 0;
     UiTarget ui;
     ColorCorrection correction;
-    UINT exposureView = kInvalid;
 };
 
 State g_state;
@@ -162,7 +160,6 @@ Mapping ForOutput(bool hdr, UINT bits)
         mapping.saturation = settings.hdrSaturation;
         mapping.uiWhite = settings.uiBrightness;
         mapping.displayPeak = peak;
-        mapping.exposureView = g_state.exposureView;
     }
     const DebugView debugView = GetSettings().debugView;
     mapping.debugView = debugView == DebugView::Luminance || debugView == DebugView::OverPeak ? static_cast<std::uint32_t>(debugView) : 0u;
@@ -191,7 +188,6 @@ bool Map(ID3D12GraphicsCommandList* commands, UINT frameView, D3D12_CPU_DESCRIPT
     c.frameView = frameView;
     c.uiView = mapping.uiView;
     c.encoding = static_cast<std::uint32_t>(mapping.encoding);
-    c.exposureView = mapping.exposureView;
     c.paperWhite = mapping.paperWhite;
     c.blackLevel = mapping.blackLevel;
     c.saturation = mapping.saturation;
@@ -392,9 +388,5 @@ UINT ColorCorrectionViews(std::array<UINT, 4>& views, std::array<float, 4>& weig
 }
 
 void ClearColorCorrection() { g_state.correction = {}; }
-
-void SetHdrExposure(UINT view) { g_state.exposureView = view; }
-
-void ClearHdrExposure() { g_state.exposureView = kInvalid; }
 
 }

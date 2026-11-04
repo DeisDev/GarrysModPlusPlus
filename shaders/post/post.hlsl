@@ -91,8 +91,8 @@ void CameraMain()
     camera[1] = float4(flare.b, 0.0, 0.0, 0.0);
 }
 
-// The HDR exposure (src/post_effects.cpp). The view's luminance, 1 at paper white under Source's exposure, is counted in
-// bins of its log2 from kExposureMinLog to kExposureMaxLog. kExposureBins mirrors the C++ constant.
+// The HDR brightness boost (src/post_effects.cpp). The view's luminance, 1 at paper white under Source's exposure, is
+// counted in bins of its log2 from kExposureMinLog to kExposureMaxLog. kExposureBins mirrors the C++ constant.
 static const uint kExposureBins = 128;
 static const float kExposureMinLog = -16.0;
 static const float kExposureMaxLog = 8.0;
@@ -132,14 +132,14 @@ void ExposureHistogramMain(uint2 pixel : SV_DispatchThreadID, uint index : SV_Gr
     }
 }
 
-// The HDR exposure's gain, one group for the frame. Source's auto exposure (the SDK's viewpostprocess.cpp,
+// The HDR brightness boost's gain, one group for the frame. Source's auto exposure (the SDK's viewpostprocess.cpp,
 // mat_tonemap_algorithm 1) darkens the view until its brightest pixels (brightShare of them) start at brightTarget of
-// white, so that SDR does not clip them, which leaves an HDR display's range above paper white almost unused. In HDR the
-// view is brightened on top of it toward its log-average at middle grey: never darker than Source keeps it, by no more
-// than Source's target darkened it below that (not where Source's exposure limits kept it darker), and only until its
-// brightest pixels start at brightTarget of the display's peak. input0: the bins, which it zeroes; output0: the state (x
-// the gain, y 1 once set, z the log-average and w where the brightest pixels start, under Source's exposure). step 1 takes
-// the gain at once instead of settling from the last.
+// white, so that SDR does not clip them. When the boost is on, the view is brightened on top of it toward its log-average
+// at middle grey: never darker than Source keeps it, by at most exposureLimit, less where Source's exposure limits kept
+// the view darker than its target (bright below brightTarget), and only until its brightest pixels start at brightTarget
+// of the display's peak. input0: the bins, which it zeroes; output0: the state (x the gain, y 1 once set, z the
+// log-average and w where the brightest pixels start, under Source's exposure). step 1 takes the gain at once instead of
+// settling from the last.
 [RootSignature(POST_ROOT_SIGNATURE)]
 [numthreads(kExposureBins, 1, 1)]
 void ExposureMain(uint index : SV_GroupIndex)
@@ -178,7 +178,7 @@ void ExposureMain(uint index : SV_GroupIndex)
     float target = g_post.brightTarget;
     float toGrey = kMiddleGrey / average * min(1.0, bright / target);
     float toPeak = g_post.tonePeak * min(1.0, target / bright);
-    float gain = max(1.0, min(toGrey, toPeak));
+    float gain = max(1.0, min(min(toGrey, toPeak), g_post.exposureLimit));
     RWStructuredBuffer<float4> state = ResourceDescriptorHeap[g_postPass.output0];
     float4 last = state[0];
     if (g_postPass.step == 0 && last.y != 0.0 && last.x > 0.0) {

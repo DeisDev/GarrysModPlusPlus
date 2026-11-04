@@ -41,7 +41,7 @@ struct FrameConstants {
     float sunDirection[3];
     float sunEnabled;
     float sunColor[3];
-    uint32_t padding8;
+    float displayPeak;
     float skyColor[3];
     uint32_t debugView;
     float invSize[2];
@@ -294,8 +294,9 @@ struct ViewInputs {
     // to them (clip-space offsets, NDC units).
     gbuffer::Matrix4 viewProj = {};
     std::array<float, 2> jitter = {};
-    // The tonemap scale Source multiplies lit colours by (cLightScale.x).
+    // The tonemap scale Source multiplies lit colours by (cLightScale.x), and the display's peak in paper whites (1 in SDR).
     float tonemapScale = 1.0f;
+    float displayPeak = 1.0f;
     gbuffer::Fog fog;
     // The 3D skybox view's fog, for reflected rays that continue into the skybox.
     gbuffer::Fog skyboxFog;

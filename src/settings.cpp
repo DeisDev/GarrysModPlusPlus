@@ -58,6 +58,7 @@ constexpr NamedField kFields[] = {
     {"hdr_black_level", &Settings::hdrBlackLevel, Display, {0.0f, 1.0f}, false},
     {"hdr_saturation", &Settings::hdrSaturation, Display, {0.5f, 1.5f}, false},
     {"ui_brightness", &Settings::uiBrightness, Display, {0.0f, 480.0f}, false},
+    {"hdr_brightness_boost", &Settings::hdrBrightnessBoost, Display, {0.0f, 1.0f}, false},
 
     {"sun", &Settings::sun, Lighting},
     {"sun_intensity", &Settings::sunIntensity, Lighting, {0.0f, 4.0f}},

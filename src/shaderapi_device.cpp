@@ -914,7 +914,6 @@ void Backend::MapToOutput()
     display::Map(m_commandList.Get(), m_frameBufferTexture, m_backBufferViews[m_swapChain->GetCurrentBackBufferIndex()], m_outputFormat, m_width, m_height,
         0, 0, mapping);
     display::ClearColorCorrection();
-    display::ClearHdrExposure();
 }
 
 // Logs the debug layer's errors (at most kMaxDebugMessages in all).

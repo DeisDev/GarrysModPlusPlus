@@ -21,7 +21,8 @@ struct FrameConstants
     float3 sunDirection;
     float sunEnabled;
     float3 sunColor;
-    uint padding8;
+    // The display's peak in paper whites (1 in SDR), for ClampSample.
+    float displayPeak;
     float3 skyColor;
     uint debugView;
     float2 invSize;
@@ -376,12 +377,13 @@ float3 LinearToSrgb(float3 color)
 float Luminance(float3 color) { return dot(color, float3(0.2126, 0.7152, 0.0722)); }
 
 // Rays that reach surfaces right next to a light see its falloff blow up. One sample brighter than this many
-// times white on screen is scaled down to it, so it cannot leave a firefly for the denoisers.
+// times the display's peak on screen is scaled down to it, so it cannot leave a firefly for the denoisers; on an HDR
+// display the limit rises with the peak, so glints the display can show are kept.
 static const float kMaxSampleBrightness = 8.0;
 
 float3 ClampSample(float3 color)
 {
-    float limit = kMaxSampleBrightness / max(g_frame.tonemapScale, 1e-3);
+    float limit = kMaxSampleBrightness * max(g_frame.displayPeak, 1.0) / max(g_frame.tonemapScale, 1e-3);
     float luminance = Luminance(color);
     return luminance > limit ? color * (limit / luminance) : color;
 }

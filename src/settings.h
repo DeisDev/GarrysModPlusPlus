@@ -80,8 +80,7 @@ enum class LightSampling : uint32_t { Legacy = 0, Ris, Restir, Auto, Count };
 enum class DenoiserType : uint32_t { BuiltIn = 0, Relax, Reblur, RayRegeneration, Count };
 
 // How the frame's light fits what the display shows, up to its peak: clipped there as Source does (Off), by rolling off
-// the highlights alone, or by a filmic curve over the whole range (AgX in SDR, Uchimura's in HDR;
-// shaders/tone_curve.hlsli).
+// the highlights alone, or by a filmic curve over the whole range (Uchimura's, keeping hue; shaders/tone_curve.hlsli).
 enum class ToneCurve : uint32_t { Off = 0, Highlights, Filmic, Count };
 
 // Whether the swap chain shows HDR10 (Rec. 2020 primaries, PQ): while Windows runs the display in HDR (Auto), whenever
@@ -373,8 +372,10 @@ struct Settings {
     bool backgroundFullSpeed = false;
     // The display output (this computer's; src/display_output.cpp): HDR10 or SDR and SDR's bits; in HDR the light of
     // paper white (the game's white, 1 in the frame) and the display's peak in nits, each Windows' own when it follows it
-    // (the SDR content brightness slider; the display's reported peak), the black level's lift in nits, saturation, and
-    // the HUD's and menu's white in nits (0: follows the game, paper white times the HDR exposure).
+    // (the SDR content brightness slider; the display's reported peak), the black level's lift in nits, saturation, the
+    // HUD's and menu's white in nits (0: paper white), and the brightness boost in stops: how far the 3D view may be
+    // brightened toward middle grey into the range above paper white (post_effects.cpp; 0 keeps Source's exposure, as
+    // SDR shows it).
     HdrOutput hdrOutput = HdrOutput::Auto;
     OutputBits outputBitDepth = OutputBits::Auto;
     float paperWhite = 200.0f;
@@ -384,6 +385,7 @@ struct Settings {
     float hdrBlackLevel = 0.0f;
     float hdrSaturation = 1.0f;
     float uiBrightness = 0.0f;
+    float hdrBrightnessBoost = 0.0f;
 
     bool operator==(const Settings&) const = default;
 };
