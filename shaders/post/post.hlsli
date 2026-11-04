@@ -114,11 +114,12 @@ SamplerState g_postPoint : register(s1);
 
 float3 SrgbToLinear(float3 color)
 {
-    return select(color <= 0.04045, color / 12.92, pow((color + 0.055) / 1.055, 2.4));
+    return select(color <= 0.04045, color / 12.92, pow((max(color, 0.0) + 0.055) / 1.055, 2.4));
 }
 
 float3 LinearToSrgb(float3 color)
 {
+    color = max(color, 0.0);
     return select(color <= 0.0031308, color * 12.92, 1.055 * pow(color, 1.0 / 2.4) - 0.055);
 }
 

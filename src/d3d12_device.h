@@ -7,6 +7,10 @@
 
 namespace gmodpp {
 
+// The frame the game draws into and the lighting composites into (native::Backend): linear light times the tonemap
+// scale, 1 = paper white.
+inline constexpr DXGI_FORMAT kFrameFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
+
 // A device factory that loads the Agility SDK's D3D12Core.dll from `runtimeDirectory` for this process's devices
 // alone (independent devices; no developer mode or exported SDK version needed), or nothing where the system's D3D12
 // cannot do that. Made on the first call, which names the directory; the launch check and the backend share it.

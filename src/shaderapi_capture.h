@@ -97,7 +97,7 @@ Pass Prepare(std::span<const DWORD> vertexCode, std::span<const DWORD> pixelCode
 // Takes a water surface pass's texture mapping from its first triangle's vertices (WaterSurfaceDraw::uvS, uvT).
 void RecordWaterMapping(const MeshDraw& mesh);
 // Binds the capture's targets for a pass routed to them.
-Targets BindTargets(const Pass& pass, bool srgb);
+Targets BindTargets(const Pass& pass);
 // Adds the G-buffer's coverage target to a pass's targets as render target 1, for a pass with clearsCoverage.
 void AddCoverageTarget(Targets& targets);
 // The slot of a light warp texture (its shader resource view) in the view's table, over 255 for the flags target's

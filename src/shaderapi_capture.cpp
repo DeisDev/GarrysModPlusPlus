@@ -31,11 +31,11 @@ namespace {
 using gbuffer::ShaderKind;
 using gbuffer::ViewKind;
 
-// Albedo and self-illumination are linear; FP16 keeps dark albedo precise. The light target has the back buffer's
-// format, so additive passes write it as they would the back buffer.
+// Albedo and self-illumination are linear; FP16 keeps dark albedo precise. The light target has the frame's format, so
+// additive passes write it as they would the frame.
 enum TargetIndex { kAlbedo, kNormal, kEmissive, kFlags, kLight, kTargetCount };
 constexpr DXGI_FORMAT kTargetFormats[kTargetCount] = {DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16G16B16A16_FLOAT,
-    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_TYPELESS};
+    DXGI_FORMAT_B8G8R8A8_UNORM, Backend::kFrameFormat};
 constexpr size_t kMaxProjectedLights = 8;
 // FrameConstants::lightWarpViews in src/lighting.h.
 constexpr size_t kMaxLightWarps = 64;
@@ -58,7 +58,6 @@ static_assert(std::size(kPathNames) == static_cast<size_t>(Path::Count));
 struct Target {
     TrackedResource resource;
     D3D12_CPU_DESCRIPTOR_HANDLE view = {};
-    D3D12_CPU_DESCRIPTOR_HANDLE srgbView = {};
 };
 
 struct SkyCube {
@@ -130,10 +129,6 @@ struct State {
     uint32_t flashlightDraws = 0;
     std::pair<uint32_t, size_t> loggedProjection = {0, 0};
     uint64_t sections = 0;
-    uint32_t srgbDraws = 0;
-    uint32_t linearDraws = 0;
-    bool outputSrgb = true;
-    bool loggedSrgb = false;
     bool loggedOtherTarget = false;
     bool loggedCounts = false;
     // Draws per material shader, pixel shader file and path, for the coverage report. Both names are static strings:
@@ -208,13 +203,8 @@ bool CreateTargets()
         target.view = backend.RenderTargetViews().Allocate();
         D3D12_RENDER_TARGET_VIEW_DESC view = {};
         view.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
-        view.Format = i == kLight ? DXGI_FORMAT_B8G8R8A8_UNORM : kTargetFormats[i];
+        view.Format = kTargetFormats[i];
         backend.Device()->CreateRenderTargetView(target.resource.resource.Get(), &view, target.view);
-        if (i == kLight) {
-            target.srgbView = backend.RenderTargetViews().Allocate();
-            view.Format = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
-            backend.Device()->CreateRenderTargetView(target.resource.resource.Get(), &view, target.srgbView);
-        }
     }
     g_state.width = width;
     g_state.height = height;
@@ -400,8 +390,6 @@ bool Begin(std::array<float, 2> jitter)
     g_state.waterFogColor.reset();
     g_state.litFogSeen = false;
     g_state.projected.clear();
-    g_state.srgbDraws = 0;
-    g_state.linearDraws = 0;
     g_state.active = true;
     ++g_state.sections;
     if (!g_state.loggedCounts) {
@@ -453,22 +441,13 @@ bool End(ViewKind kind, ViewInputs& inputs)
     }
     g_state.flashlightDraws = 0;
     g_state.projected.clear();
-    if (g_state.srgbDraws + g_state.linearDraws != 0) {
-        const bool srgb = g_state.srgbDraws >= g_state.linearDraws;
-        if (srgb != g_state.outputSrgb || !g_state.loggedSrgb) {
-            g_state.loggedSrgb = true;
-            log::Info("G-buffer: the game draws lit surfaces with sRGB {} ({} sRGB draws, {} linear draws)", srgb ? "on" : "off", g_state.srgbDraws,
-                g_state.linearDraws);
-            g_state.outputSrgb = srgb;
-        }
-    }
 
     Backend& backend = GetBackend();
     auto common = [&](TrackedResource& resource) {
         backend.Transition(resource, D3D12_RESOURCE_STATE_COMMON);
         return resource.resource.Get();
     };
-    inputs.color = common(backend.BackBuffer());
+    inputs.color = common(backend.FrameBuffer());
     inputs.depth = common(backend.DepthBuffer());
     inputs.albedo = common(g_state.targets[kAlbedo].resource);
     inputs.normal = common(g_state.targets[kNormal].resource);
@@ -508,7 +487,6 @@ bool End(ViewKind kind, ViewInputs& inputs)
     inputs.jitter = g_state.jitter;
     const float scale = PixelRegister(gbuffer::kLightScaleRegister).v[0];
     inputs.tonemapScale = scale > 0.0f ? scale : 1.0f;
-    inputs.outputSrgb = g_state.outputSrgb;
     inputs.fog = g_state.fog[kind == ViewKind::Skybox ? 1 : 0];
     inputs.sway = g_state.swayClock;
     inputs.paintedSun = g_state.paintedSun;
@@ -673,7 +651,8 @@ Pass Prepare(std::span<const DWORD> vertexCode, std::span<const DWORD> pixelCode
         pass.fogFrame = g_state.fogFrame;
         if (pixelFile != nullptr && twins::IsParticleShader(pixelFile)) {
             pass.fogEpilogue = true;
-            // The medium's light is added in the encoding the target holds lit colour in: linear, with sRGB writes.
+            // The medium's light is added where the draw writes linear light: with sRGB writes (without them its output is
+            // decoded after the shader, Variant::decodeOutput).
             if (blend && srgbWrite)
                 pass.fogBlend = destinationBlend == kBlendOne ? 3.0f
                     : destinationBlend != kBlendOneMinusSourceAlpha ? 0.0f
@@ -811,8 +790,6 @@ Pass Prepare(std::span<const DWORD> vertexCode, std::span<const DWORD> pixelCode
         pass.pixelCode = shaderClass.replacement;
     }
     pass.pixelName = pixel->name.c_str();
-    // The game's sRGB state for its own lit surfaces says how the back buffer is encoded.
-    ++(srgbWrite ? g_state.srgbDraws : g_state.linearDraws);
     for (UINT r = 0; r < 4; ++r)
         std::copy_n(VertexRegister(gbuffer::kViewProjection + r).v, 4, g_state.viewProj[r].begin());
     return pass;
@@ -829,28 +806,31 @@ void AddCoverageTarget(Targets& targets)
     backend.Commands()->OMSetRenderTargets(targets.count, targets.colors, FALSE, targets.depth.ptr != 0 ? &targets.depth : nullptr);
 }
 
-Targets BindTargets(const Pass& pass, bool srgb)
+Targets BindTargets(const Pass& pass)
 {
     Backend& backend = GetBackend();
     Targets targets;
     targets.width = backend.Width();
     targets.height = backend.Height();
-    auto add = [&](TargetIndex index, bool srgbView) {
+    auto add = [&](TargetIndex index) {
         Target& target = g_state.targets[index];
         backend.Transition(target.resource, D3D12_RESOURCE_STATE_RENDER_TARGET);
-        targets.colors[targets.count] = srgbView ? target.srgbView : target.view;
-        targets.colorFormats[targets.count] = index == kLight ? (srgbView ? DXGI_FORMAT_B8G8R8A8_UNORM_SRGB : DXGI_FORMAT_B8G8R8A8_UNORM) : kTargetFormats[index];
+        targets.colors[targets.count] = target.view;
+        targets.colorFormats[targets.count] = kTargetFormats[index];
         ++targets.count;
     };
     switch (pass.route) {
     case Pass::Route::GBuffer:
-        add(kAlbedo, false);
-        add(kNormal, false);
-        add(kEmissive, false);
-        add(kFlags, false);
+        add(kAlbedo);
+        add(kNormal);
+        add(kEmissive);
+        add(kFlags);
         break;
-    case Pass::Route::Albedo: add(kAlbedo, false); break;
-    case Pass::Route::Light: add(kLight, srgb); break;
+    case Pass::Route::Albedo: add(kAlbedo); break;
+    case Pass::Route::Light:
+        add(kLight);
+        targets.linear = true;
+        break;
     default: break;
     }
     backend.Transition(backend.DepthBuffer(), D3D12_RESOURCE_STATE_DEPTH_WRITE);
@@ -966,8 +946,6 @@ void Release()
             backend.Retire(std::move(target.resource.resource));
         if (target.view.ptr != 0)
             backend.RenderTargetViews().Free(target.view);
-        if (target.srgbView.ptr != 0)
-            backend.RenderTargetViews().Free(target.srgbView);
         target = {};
     }
     g_state.width = 0;

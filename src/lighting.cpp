@@ -600,7 +600,7 @@ HRESULT Lighting::CreatePipelines(std::stop_token stop)
             desc.RasterizerState.DepthClipEnable = TRUE;
             desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
             desc.NumRenderTargets = 1;
-            desc.RTVFormats[0] = DXGI_FORMAT_B8G8R8A8_UNORM;
+            desc.RTVFormats[0] = kFrameFormat;
             desc.SampleDesc.Count = 1;
             return m_device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(covered ? &m_compositeCoveredPipeline : &m_compositePipeline));
         });
@@ -1351,8 +1351,6 @@ void Lighting::RecordSky(FrameConstants& constants, const ViewInputs& inputs, co
     m_skyDraw.sunDisc = disc;
     m_skyDraw.discIsMoon = MapSunIsMoon();
     m_skyDraw.skyView = m_proceduralSky.srv;
-    m_skyDraw.toneCurve = static_cast<uint32_t>(GetSettings().toneCurve);
-    m_skyDraw.highlightRolloff = GetSettings().highlightRolloff;
     m_skyDraw.transmittanceView = m_transmittance.srv;
     m_skyDraw.sunDirection = *sun;
     m_skyDraw.sunRadius = kRealSunRadius * kSunWithoutSprite;
@@ -1832,7 +1830,7 @@ bool Lighting::EnsureTargets(UINT width, UINT height)
     desc.Height = height;
     desc.DepthOrArraySize = 1;
     desc.MipLevels = 1;
-    desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    desc.Format = kFrameFormat;
     desc.SampleDesc.Count = 1;
     m_colorCopy.Reset();
     if (FAILED(m_device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&m_colorCopy))))
@@ -1859,7 +1857,7 @@ bool Lighting::EnsureTargets(UINT width, UINT height)
         ok = ok && CreateTarget(texture, width, height, DXGI_FORMAT_R32G32_FLOAT);
     for (Texture& texture : m_giFiltered)
         ok = ok && CreateTarget(texture, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT);
-    // Linear (Ray Reconstruction) or encoded shaded colour.
+    // Shaded linear light, as the frame holds it.
     ok = ok && CreateTarget(m_lit, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT);
     ok = ok && CreateTarget(m_restirDebug, width, height, DXGI_FORMAT_R8G8B8A8_UNORM);
     ok = ok && CreateTarget(m_selfIllum, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT);
@@ -1886,11 +1884,11 @@ bool Lighting::EnsureTargets(UINT width, UINT height)
         ok = ok && CreateTarget(texture, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT);
     for (Texture& texture : m_viewmodelIndirect)
         ok = ok && CreateTarget(texture, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT);
-    ok = ok && CreateTarget(m_resolved, width, height, DXGI_FORMAT_R8G8B8A8_UNORM);
+    ok = ok && CreateTarget(m_resolved, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT);
     ok = ok && CreateTarget(m_translucentDepth, width, height, DXGI_FORMAT_R32_FLOAT);
     // Ray Reconstruction's inputs use the top-left render-size part of these.
     constexpr DXGI_FORMAT kRrFormats[] = {DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R16G16B16A16_FLOAT,
-        DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16G16B16A16_FLOAT,
+        DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16G16B16A16_FLOAT,
         DXGI_FORMAT_R16G16B16A16_FLOAT};
     static_assert(std::size(kRrFormats) == RrInputCount);
     for (UINT i = 0; i < RrInputCount; ++i)
@@ -2533,9 +2531,6 @@ bool Lighting::FillConstants(FrameConstants& constants, const Scene& scene, cons
     constants.taaHistoryWeight = settings.taaHistoryWeight;
     constants.sharpening = settings.sharpening;
     constants.tonemapScale = inputs.tonemapScale;
-    constants.outputSrgb = inputs.outputSrgb ? 1u : 0u;
-    constants.toneCurve = static_cast<uint32_t>(settings.toneCurve);
-    constants.highlightRolloff = settings.highlightRolloff;
     constants.invSize[0] = 1.0f / static_cast<float>(m_width);
     constants.invSize[1] = 1.0f / static_cast<float>(m_height);
     constants.size[0] = m_width;
@@ -3084,7 +3079,7 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     srv.Texture2D.MipLevels = 1;
-    srv.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    srv.Format = kFrameFormat;
     m_device->CreateShaderResourceView(m_colorCopy.Get(), &srv, m_descriptors->Cpu(views));
     srv.Format = DepthViewFormat(depth->GetDesc().Format);
     m_device->CreateShaderResourceView(depth, &srv, m_descriptors->Cpu(views + 1));
@@ -3293,7 +3288,6 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
         render.lightView = m_rrInputs[RrLight].srv;
         render.albedoView = m_rrInputs[RrAlbedo].srv;
         render.emissiveView = m_rrInputs[RrEmissive].srv;
-        render.outputLinear = 1;
         m_list->SetComputeRootConstantBufferView(0, passConstantsGpu);
         m_gridWidth = renderWidth;
         m_gridHeight = renderHeight;

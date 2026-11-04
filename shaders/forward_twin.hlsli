@@ -374,5 +374,5 @@ float4 gmodpp_ForwardTwin(float4 albedo, float4 normal, float4 emissive, float4 
     } else {
         color = color * volumetric.a + inscatter;
     }
-    return float4(lightOnly ? color : ToneMapped(color), alpha);
+    return float4(color, alpha);
 }

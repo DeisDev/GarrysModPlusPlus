@@ -1,5 +1,3 @@
-#include "dither.hlsli"
-
 #define ROOT_SIGNATURE "DescriptorTable(SRV(t0), visibility = SHADER_VISIBILITY_PIXEL), DescriptorTable(SRV(t1), visibility = SHADER_VISIBILITY_PIXEL)"
 
 Texture2D<float4> g_result : register(t0);
@@ -20,12 +18,10 @@ VertexOutput VSMain(uint vertex : SV_VertexID)
     return output;
 }
 
-// The lit image, already encoded as the game's colour target holds it, dithered into the 8-bit target.
+// The lit image, as the linear light the frame holds.
 float4 Result(float2 pixel)
 {
-    float4 color = g_result.Load(int3(pixel, 0));
-    color.rgb += DitherNoise(uint2(pixel)) / 255.0;
-    return color;
+    return g_result.Load(int3(pixel, 0));
 }
 
 [RootSignature(ROOT_SIGNATURE)]

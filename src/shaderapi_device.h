@@ -1,6 +1,8 @@
 #pragma once
 
+#include "d3d12_device.h"
 #include "descriptor_heap.h"
+#include "display_output.h"
 #include "fsr.h"
 #include "settings.h"
 #include "shaderapi_native.h"
@@ -65,12 +67,15 @@ std::vector<std::pair<int, int>> Resolutions();
 Microsoft::WRL::ComPtr<IDXGIAdapter1> AdapterOfDisplay(int index);
 
 // The Direct3D 12 device, the game window's flip-model swap chain and the frame's command list. Commands are recorded
-// into one list per frame, which Present submits; the backend keeps kFrames frames in flight.
+// into one list per frame, which Present submits; the backend keeps kFrames frames in flight. The game draws into the
+// frame, a linear floating-point texture of the window's size; Present maps it into the swap chain's buffer
+// (display_output.h).
 class Backend {
 public:
     static constexpr UINT kBackBuffers = 3;
     static constexpr UINT kFrames = 2;
-    static constexpr DXGI_FORMAT kBackBufferFormat = DXGI_FORMAT_B8G8R8A8_UNORM;
+    // The frame: linear light times the tonemap scale, 1 = paper white, never clipped before Present.
+    static constexpr DXGI_FORMAT kFrameFormat = gmodpp::kFrameFormat;
     static constexpr DXGI_FORMAT kDepthFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
     // The depth buffer's resource format, which shader resource views can read.
     static constexpr DXGI_FORMAT kDepthResourceFormat = DXGI_FORMAT_R24G8_TYPELESS;
@@ -110,11 +115,16 @@ public:
     std::uint64_t PendingFence() const { return m_fenceValue + 1; }
     std::uint64_t CompletedFence() const { return m_fence->GetCompletedValue(); }
 
-    // What draws to the default target render into: the swap chain's current buffer.
-    TrackedResource& BackBuffer() { return SwapChainBuffer(); }
-    D3D12_CPU_DESCRIPTOR_HANDLE BackBufferView(bool srgb) const;
+    // What draws to the default target render into: the frame.
+    TrackedResource& FrameBuffer() { return m_frameBuffer; }
+    D3D12_CPU_DESCRIPTOR_HANDLE FrameBufferView() const { return m_frameBufferView; }
     // Its shader resource view.
-    UINT BackBufferTexture() const { return m_backBufferTextures[m_swapChain->GetCurrentBackBufferIndex()]; }
+    UINT FrameBufferTexture() const { return m_frameBufferTexture; }
+    // The swap chain buffers' format (SDR: 8 or 10 bits; HDR10: R10G10B10A2 with PQ).
+    DXGI_FORMAT OutputFormat() const { return m_outputFormat; }
+    // How the frame is mapped into the swap chain's buffers, without the menu: what frame generation's view without the
+    // HUD must match.
+    display::Mapping HudlessMapping() const;
     TrackedResource& DepthBuffer() { return m_depthBuffer; }
     D3D12_CPU_DESCRIPTOR_HANDLE DepthBufferView() const { return m_depthView; }
     // FSR's frame generation while its swap chain presents and the menu wants it, else null.
@@ -167,7 +177,10 @@ private:
     bool CreateSwapChain();
     int m_placedDisplay = -1;
     bool CreateDepthBuffer();
+    bool CreateFrameBuffer();
     TrackedResource& SwapChainBuffer() { return m_backBuffers[m_swapChain->GetCurrentBackBufferIndex()]; }
+    // Maps the frame and the menu into the swap chain's current buffer.
+    void MapToOutput();
     void DrainDebugMessages();
     void BeginFrame();
     void WaitForGpu();
@@ -185,8 +198,11 @@ private:
     Microsoft::WRL::ComPtr<IDXGISwapChain3> m_swapChain;
     FsrFrameGeneration m_fsrFrameGeneration;
     std::array<TrackedResource, kBackBuffers> m_backBuffers;
-    std::array<D3D12_CPU_DESCRIPTOR_HANDLE, kBackBuffers * 2> m_backBufferViews = {};
-    std::array<UINT, kBackBuffers> m_backBufferTextures = { DescriptorHeap::kInvalid, DescriptorHeap::kInvalid, DescriptorHeap::kInvalid };
+    std::array<D3D12_CPU_DESCRIPTOR_HANDLE, kBackBuffers> m_backBufferViews = {};
+    DXGI_FORMAT m_outputFormat = DXGI_FORMAT_B8G8R8A8_UNORM;
+    TrackedResource m_frameBuffer;
+    D3D12_CPU_DESCRIPTOR_HANDLE m_frameBufferView = {};
+    UINT m_frameBufferTexture = DescriptorHeap::kInvalid;
     TrackedResource m_depthBuffer;
     D3D12_CPU_DESCRIPTOR_HANDLE m_depthView = {};
     std::array<Frame, kFrames> m_frames;

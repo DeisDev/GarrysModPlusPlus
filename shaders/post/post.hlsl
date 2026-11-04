@@ -14,7 +14,7 @@ VertexOutput VSMain(uint vertex : SV_VertexID)
     return output;
 }
 
-// input0: the back buffer, whose 8-bit values the game wrote sRGB-encoded; output0: the view in linear colour.
+// input0: the frame (linear light); output0: the view.
 [RootSignature(POST_ROOT_SIGNATURE)]
 [numthreads(8, 8, 1)]
 void PrepareMain(uint2 pixel : SV_DispatchThreadID)
@@ -23,8 +23,7 @@ void PrepareMain(uint2 pixel : SV_DispatchThreadID)
         return;
     Texture2D<float4> source = ResourceDescriptorHeap[g_postPass.input0];
     RWTexture2D<float4> output = ResourceDescriptorHeap[g_postPass.output0];
-    float4 color = source.Load(int3(int2(pixel) + g_post.origin, 0));
-    output[pixel] = float4(SrgbToLinear(color.rgb), color.a);
+    output[pixel] = source.Load(int3(int2(pixel) + g_post.origin, 0));
 }
 
 // The camera's state, one thread for the frame. output0: the focus distance (x), whether it holds one yet (y), and

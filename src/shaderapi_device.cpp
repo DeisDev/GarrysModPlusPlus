@@ -4,6 +4,7 @@
 #include "busy_window.h"
 #include "command_line.h"
 #include "d3d12_device.h"
+#include "display_output.h"
 #include "log.h"
 #include "native_lighting.h"
 #include "options.h"
@@ -225,7 +226,13 @@ void RemoveModeChangeCallback(DeviceManagerObject* self, void (*callback)())
 
 void ReleaseResources(NativeObject*) {}
 void ReacquireResources(NativeObject*) {}
-ImageFormat GetBackBufferFormat(NativeObject*) { return kImageFormatBgra8888; }
+// The engine and client create the render targets derived from the frame in this format (engine.dll 0x180111750:
+// _rt_FullFrameFB, _rt_FullFrameFB1 and _rt_gui; 0x1801108a0 and 0x180110940: _rt_SmallFB0-1 and _rt_TeenyFB0-2;
+// client.dll 0x180169470: _rt_WaterReflection and _rt_Camera; 0x1800640c0: GMod's s_pMoBlurTex0-1, s_pBloomTex0-1 and
+// s_pMorphTexture0-1; 0x1800b6dc0: Lua's GetRenderTarget, and GetRenderTargetEx without an image format; REA 2026-11-04),
+// so they hold linear light as the frame does (Texture::srgbEmulated). Targets asked for in another format
+// (_rt_PowerOfTwoFB, _rt_WaterRefraction and _rt_spawnicon in 8 bits) keep it.
+ImageFormat GetBackBufferFormat(NativeObject*) { return kImageFormatRgba16161616F; }
 
 void GetBackBufferDimensions(NativeObject*, int& width, int& height)
 {
@@ -300,7 +307,8 @@ void GetWindowSize(NativeObject*, int& width, int& height)
     height = rect.bottom - rect.top;
 }
 
-// Windowed Direct3D 9 does not change the gamma ramp, and the game runs windowed or borderless here.
+// Direct3D 9 applied the gamma ramp in exclusive full screen alone; the display mapping applies mat_monitorgamma itself
+// (display_output.cpp), in every display mode.
 void SetHardwareGammaRamp(NativeObject*, float, float, float, float, bool) {}
 
 }
@@ -421,7 +429,7 @@ bool Backend::CreateSwapChain()
         for (TrackedResource& buffer : m_backBuffers)
             buffer = {};
         m_fsrFrameGeneration.ReleaseContext();
-        HRESULT hr = m_swapChain->ResizeBuffers(kBackBuffers, m_width, m_height, DXGI_FORMAT_B8G8R8A8_UNORM, m_tearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0);
+        HRESULT hr = m_swapChain->ResizeBuffers(kBackBuffers, m_width, m_height, m_outputFormat, m_tearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0);
         if (FAILED(hr)) {
             log::Info("Native: ResizeBuffers failed: {:#010x}", Hex(hr));
             return false;
@@ -430,10 +438,9 @@ bool Backend::CreateSwapChain()
         DXGI_SWAP_CHAIN_DESC1 desc = {};
         desc.Width = m_width;
         desc.Height = m_height;
-        desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        desc.Format = m_outputFormat;
         desc.SampleDesc.Count = 1;
-        // Copies of the back buffer into textures (StretchRect) read it in a shader.
-        desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT | DXGI_USAGE_SHADER_INPUT;
+        desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
         desc.BufferCount = kBackBuffers;
         desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
         desc.Flags = m_tearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
@@ -454,28 +461,16 @@ bool Backend::CreateSwapChain()
     for (UINT i = 0; i < kBackBuffers; ++i) {
         m_swapChain->GetBuffer(i, IID_PPV_ARGS(&m_backBuffers[i].resource));
         m_backBuffers[i].state = D3D12_RESOURCE_STATE_PRESENT;
-        // Flip-model buffers accept an sRGB view of their UNORM format (DXGI flip model documentation).
-        for (UINT srgb = 0; srgb < 2; ++srgb) {
-            D3D12_CPU_DESCRIPTOR_HANDLE& view = m_backBufferViews[i * 2 + srgb];
-            if (view.ptr == 0)
-                view = m_rtvs.Allocate();
-            D3D12_RENDER_TARGET_VIEW_DESC desc = {};
-            desc.Format = srgb ? DXGI_FORMAT_B8G8R8A8_UNORM_SRGB : kBackBufferFormat;
-            desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
-            m_device->CreateRenderTargetView(m_backBuffers[i].resource.Get(), &desc, view);
-        }
-        if (m_backBufferTextures[i] == DescriptorHeap::kInvalid)
-            m_backBufferTextures[i] = m_descriptors.Allocate();
-        D3D12_SHADER_RESOURCE_VIEW_DESC view = {};
-        view.Format = kBackBufferFormat;
-        view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-        view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        view.Texture2D.MipLevels = 1;
-        m_device->CreateShaderResourceView(m_backBuffers[i].resource.Get(), &view, m_descriptors.Cpu(m_backBufferTextures[i]));
+        if (m_backBufferViews[i].ptr == 0)
+            m_backBufferViews[i] = m_rtvs.Allocate();
+        D3D12_RENDER_TARGET_VIEW_DESC desc = {};
+        desc.Format = m_outputFormat;
+        desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+        m_device->CreateRenderTargetView(m_backBuffers[i].resource.Get(), &desc, m_backBufferViews[i]);
     }
-    if (!CreateDepthBuffer())
+    if (!CreateFrameBuffer() || !CreateDepthBuffer())
         return false;
-    log::Info("Native: swap chain {}x{}, vsync {}", m_width, m_height, m_vsync ? "on" : "off");
+    log::Info("Native: swap chain {}x{} in format {}, vsync {}", m_width, m_height, static_cast<int>(m_outputFormat), m_vsync ? "on" : "off");
     BeginFrame();
     return true;
 }
@@ -514,9 +509,34 @@ bool Backend::CreateDepthBuffer()
     return true;
 }
 
-D3D12_CPU_DESCRIPTOR_HANDLE Backend::BackBufferView(bool srgb) const
+bool Backend::CreateFrameBuffer()
 {
-    return m_backBufferViews[m_swapChain->GetCurrentBackBufferIndex() * 2 + (srgb ? 1 : 0)];
+    if (m_frameBuffer.resource != nullptr)
+        Retire(std::move(m_frameBuffer.resource));
+    m_frameBuffer = {};
+    const D3D12_HEAP_PROPERTIES heap = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC desc = {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = m_width;
+    desc.Height = m_height;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = kFrameFormat;
+    desc.SampleDesc.Count = 1;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    HRESULT hr = m_device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&m_frameBuffer.resource));
+    if (FAILED(hr)) {
+        log::Info("Native: creating the {}x{} frame buffer failed: {:#010x}", m_width, m_height, Hex(hr));
+        return false;
+    }
+    m_frameBuffer.state = D3D12_RESOURCE_STATE_COMMON;
+    if (m_frameBufferView.ptr == 0)
+        m_frameBufferView = m_rtvs.Allocate();
+    m_device->CreateRenderTargetView(m_frameBuffer.resource.Get(), nullptr, m_frameBufferView);
+    if (m_frameBufferTexture == DescriptorHeap::kInvalid)
+        m_frameBufferTexture = m_descriptors.Allocate();
+    m_device->CreateShaderResourceView(m_frameBuffer.resource.Get(), nullptr, m_descriptors.Cpu(m_frameBufferTexture));
+    return true;
 }
 
 bool Backend::SetMode(HWND window, const ShaderDeviceInfo& info)
@@ -641,7 +661,7 @@ void Backend::BeginFrame()
     m_commandList->Reset(frame.allocator.Get(), nullptr);
     ++m_listGeneration;
     m_recording = true;
-    Transition(BackBuffer(), D3D12_RESOURCE_STATE_RENDER_TARGET);
+    Transition(m_frameBuffer, D3D12_RESOURCE_STATE_RENDER_TARGET);
 }
 
 void Backend::Present()
@@ -673,12 +693,8 @@ void Backend::Present()
         }
         LimitDraws(limit);
     }
-    TrackedResource& presented = SwapChainBuffer();
-    if (overlay::Visible()) {
-        Transition(presented, D3D12_RESOURCE_STATE_RENDER_TARGET);
-        overlay::Render(m_commandList.Get(), m_backBufferViews[m_swapChain->GetCurrentBackBufferIndex() * 2]);
-    }
-    Transition(presented, D3D12_RESOURCE_STATE_PRESENT);
+    MapToOutput();
+    Transition(SwapChainBuffer(), D3D12_RESOURCE_STATE_PRESENT);
     m_commandList->Close();
     m_recording = false;
     ID3D12CommandList* lists[] = { m_commandList.Get() };
@@ -705,6 +721,28 @@ void Backend::Present()
     // The next frame starts: Reflex and Anti-Lag 2 wait here, before the game reads input for it.
     streamline::BeginFrame();
     anti_lag::Update();
+}
+
+display::Mapping Backend::HudlessMapping() const { return display::ForOutput(false, 8); }
+
+void Backend::MapToOutput()
+{
+    display::Mapping mapping = HudlessMapping();
+    if (overlay::Visible()) {
+        UINT view = DescriptorHeap::kInvalid;
+        const D3D12_CPU_DESCRIPTOR_HANDLE target = display::BeginUi(m_width, m_height, view);
+        if (target.ptr != 0) {
+            overlay::Render(m_commandList.Get(), target);
+            display::EndUi();
+            mapping.uiView = view;
+        }
+    }
+    Transition(m_frameBuffer, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    TrackedResource& presented = SwapChainBuffer();
+    Transition(presented, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    display::Map(m_commandList.Get(), m_frameBufferTexture, m_backBufferViews[m_swapChain->GetCurrentBackBufferIndex()], m_outputFormat, m_width, m_height,
+        0, 0, mapping);
+    display::ClearColorCorrection();
 }
 
 // Logs the debug layer's errors (at most kMaxDebugMessages in all).

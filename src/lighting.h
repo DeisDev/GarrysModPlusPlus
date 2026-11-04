@@ -41,7 +41,7 @@ struct FrameConstants {
     float sunDirection[3];
     float sunEnabled;
     float sunColor[3];
-    uint32_t outputSrgb;
+    uint32_t padding8;
     float skyColor[3];
     uint32_t debugView;
     float invSize[2];
@@ -78,7 +78,7 @@ struct FrameConstants {
     uint32_t emissiveView;
     uint32_t materialsView;
     float reflectionScale;
-    uint32_t outputLinear;
+    uint32_t padding9;
     uint32_t lightRangesView;
     uint32_t lightIndicesView;
     uint32_t bspNodesView;
@@ -226,9 +226,7 @@ struct FrameConstants {
     float cloudShadowFineScale;
     float cloudShadowCoarseScale;
     float cloudShadowEdge;
-    uint32_t toneCurve;
-    float highlightRolloff;
-    uint32_t padding7[3];
+    uint32_t padding7[5];
 };
 
 // Mirrors SamplingConstants in shaders/nvidia/sharc_common.hlsli: the radiance cache's parameters, bound to every pass
@@ -296,9 +294,8 @@ struct ViewInputs {
     // to them (clip-space offsets, NDC units).
     gbuffer::Matrix4 viewProj = {};
     std::array<float, 2> jitter = {};
-    // The tonemap scale Source multiplies lit colours by (cLightScale.x), and whether the colour target holds sRGB.
+    // The tonemap scale Source multiplies lit colours by (cLightScale.x).
     float tonemapScale = 1.0f;
-    bool outputSrgb = false;
     gbuffer::Fog fog;
     // The 3D skybox view's fog, for reflected rays that continue into the skybox.
     gbuffer::Fog skyboxFog;

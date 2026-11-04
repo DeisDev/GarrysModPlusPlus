@@ -8,7 +8,7 @@ namespace gmodpp::native {
 enum InitReturnVal : int { kInitFailed = 0, kInitOk = 1 };
 
 // ImageFormat values used by the backend (public/bitmap/imageformat.h).
-enum ImageFormat : int { kImageFormatBgra8888 = 12, kImageFormatBgrx8888 = 16 };
+enum ImageFormat : int { kImageFormatBgra8888 = 12, kImageFormatBgrx8888 = 16, kImageFormatRgba16161616F = 24 };
 
 constexpr int kShaderDisplayModeVersion = 1;
 constexpr int kMaterialAdapterNameLength = 512;

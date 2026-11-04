@@ -65,7 +65,7 @@ void main(uint3 id : SV_DispatchThreadID)
     // should keep sharp. Mirrors (flags b alone) keep a neutral albedo under their specular guides. Other pixels without
     // a surface (the sky, the 3D skybox, the game's own shading) are drawn lit and noise-free: their colour is their
     // albedo, so Ray Reconstruction keeps their texture instead of smoothing it as noisy light.
-    float4 guide = float4(saturate(Decode(colour.rgb)), 1.0);
+    float4 guide = float4(saturate(colour.rgb), 1.0);
     if (coverage.r > 0.0 || coverage.g > 0.5)
         guide = albedo.Load(load);
     else if (coverage.b > 0.5)

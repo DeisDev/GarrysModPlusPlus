@@ -1,6 +1,7 @@
 #include "post_effects.h"
 
 #include "color.h"
+#include "display_output.h"
 #include "log.h"
 #include "overlay.h"
 #include "settings.h"
@@ -168,11 +169,14 @@ struct State {
     Target tileMax;
     Target neighborMax;
     UINT blurTile = 0;
-    // Frame generation's inputs: the main view's motion and depth at its resolution, and the back buffer before the HUD.
+    // Frame generation's inputs: the main view's motion and depth at its resolution, and the view before the HUD as the
+    // swap chain shows it (display::Map), in its format.
     Target frameMotion;
     Target frameDepth;
     TrackedResource hudless;
+    D3D12_CPU_DESCRIPTOR_HANDLE hudlessTarget = {};
     UINT hudlessSize[2] = {};
+    DXGI_FORMAT hudlessFormat = DXGI_FORMAT_UNKNOWN;
     // The camera's state across frames (CameraMain in shaders/post/post.hlsl).
     Target camera;
     ID3D12Resource* depthResource = nullptr;
@@ -358,11 +362,11 @@ bool EnsureTargets(UINT width, UINT height)
     return true;
 }
 
-// The copy of the back buffer frame generation takes as the view without the HUD, made again when the back buffer's size
+// Frame generation's view without the HUD, in the swap chain's format, made again when the frame's size or the format
 // changes.
-bool EnsureHudless(const D3D12_RESOURCE_DESC& backBuffer)
+bool EnsureHudless(UINT width, UINT height, DXGI_FORMAT format)
 {
-    if (g_state.hudless.resource && g_state.hudlessSize[0] == backBuffer.Width && g_state.hudlessSize[1] == backBuffer.Height)
+    if (g_state.hudless.resource && g_state.hudlessSize[0] == width && g_state.hudlessSize[1] == height && g_state.hudlessFormat == format)
         return true;
     Backend& backend = GetBackend();
     if (g_state.hudless.resource)
@@ -370,12 +374,13 @@ bool EnsureHudless(const D3D12_RESOURCE_DESC& backBuffer)
     g_state.hudless = {};
     D3D12_RESOURCE_DESC desc = {};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    desc.Width = backBuffer.Width;
-    desc.Height = backBuffer.Height;
+    desc.Width = width;
+    desc.Height = height;
     desc.DepthOrArraySize = 1;
     desc.MipLevels = 1;
-    desc.Format = backBuffer.Format;
+    desc.Format = format;
     desc.SampleDesc.Count = 1;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     const D3D12_HEAP_PROPERTIES heap = {D3D12_HEAP_TYPE_DEFAULT};
     const HRESULT hr = backend.Device()->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
         IID_PPV_ARGS(&g_state.hudless.resource));
@@ -384,8 +389,12 @@ bool EnsureHudless(const D3D12_RESOURCE_DESC& backBuffer)
         return false;
     }
     g_state.hudless.state = D3D12_RESOURCE_STATE_COMMON;
-    g_state.hudlessSize[0] = static_cast<UINT>(backBuffer.Width);
-    g_state.hudlessSize[1] = backBuffer.Height;
+    if (g_state.hudlessTarget.ptr == 0)
+        g_state.hudlessTarget = backend.RenderTargetViews().Allocate();
+    backend.Device()->CreateRenderTargetView(g_state.hudless.resource.Get(), nullptr, g_state.hudlessTarget);
+    g_state.hudlessSize[0] = width;
+    g_state.hudlessSize[1] = height;
+    g_state.hudlessFormat = format;
     return true;
 }
 
@@ -458,7 +467,7 @@ ID3D12PipelineState* FinalPipeline()
         desc.RasterizerState.DepthClipEnable = TRUE;
         desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
         desc.NumRenderTargets = 1;
-        desc.RTVFormats[0] = Backend::kBackBufferFormat;
+        desc.RTVFormats[0] = Backend::kFrameFormat;
         desc.SampleDesc.Count = 1;
         const HRESULT hr = GetBackend().Device()->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&g_state.final));
         if (FAILED(hr)) {
@@ -557,7 +566,7 @@ void PostProcessView(D3D12_RECT rect)
         return;
     }
     Backend& backend = GetBackend();
-    TrackedResource& backBuffer = backend.BackBuffer();
+    TrackedResource& backBuffer = backend.FrameBuffer();
     const D3D12_RESOURCE_DESC desc = backBuffer.resource->GetDesc();
     rect.left = std::max(rect.left, LONG(0));
     rect.top = std::max(rect.top, LONG(0));
@@ -689,13 +698,17 @@ void PostProcessView(D3D12_RECT rect)
         Use(g_state.frameMotion, read);
         Use(g_state.frameDepth, read);
     }
-    // Frame generation's view without the HUD: the back buffer once the effects are in it, kept until the present.
+    // Frame generation's view without the HUD: the frame once the effects are in it, mapped as the swap chain's buffer
+    // will be ("the same colour space and post-processing as the back buffer", NVIDIA's DLSS-G guide), kept until the
+    // present.
     const auto tagFrame = [&] {
-        if (!frameGeneration || !EnsureHudless(desc))
+        if (!frameGeneration || !EnsureHudless(static_cast<UINT>(desc.Width), desc.Height, backend.OutputFormat()))
             return;
-        backend.Transition(backBuffer, D3D12_RESOURCE_STATE_COPY_SOURCE);
-        backend.Transition(g_state.hudless, D3D12_RESOURCE_STATE_COPY_DEST);
-        commands->CopyResource(g_state.hudless.resource.Get(), backBuffer.resource.Get());
+        backend.Transition(backBuffer, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        backend.Transition(g_state.hudless, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        if (!display::Map(commands, backend.FrameBufferTexture(), g_state.hudlessTarget, backend.OutputFormat(), static_cast<UINT>(desc.Width), desc.Height, 0, 0,
+                backend.HudlessMapping()))
+            return;
         backend.Transition(g_state.hudless, read);
         backend.Transition(backBuffer, D3D12_RESOURCE_STATE_RENDER_TARGET);
         ID3D12Resource* depth = g_state.frameDepth.texture.resource.Get();
@@ -716,7 +729,7 @@ void PostProcessView(D3D12_RECT rect)
     backend.Transition(backBuffer, read);
     size_t current = 0;
     Use(g_state.scene[current], write);
-    if (!Dispatch(Compute::Prepare, {.input0 = backend.BackBufferTexture(), .output0 = g_state.scene[current].uav}, Groups(width, 8), Groups(height, 8)))
+    if (!Dispatch(Compute::Prepare, {.input0 = backend.FrameBufferTexture(), .output0 = g_state.scene[current].uav}, Groups(width, 8), Groups(height, 8)))
         return;
     const auto next = [&](Compute pass, UINT x, UINT y, PostPass args) {
         Use(g_state.scene[current], read);
@@ -792,7 +805,7 @@ void PostProcessView(D3D12_RECT rect)
     commands->SetGraphicsRootConstantBufferView(0, constants);
     const PostPass finalArgs = {.input0 = g_state.scene[current].srv};
     commands->SetGraphicsRoot32BitConstants(1, sizeof(PostPass) / sizeof(UINT), &finalArgs, 0);
-    const D3D12_CPU_DESCRIPTOR_HANDLE target = backend.BackBufferView(false);
+    const D3D12_CPU_DESCRIPTOR_HANDLE target = backend.FrameBufferView();
     commands->OMSetRenderTargets(1, &target, FALSE, nullptr);
     const D3D12_VIEWPORT viewport = {static_cast<float>(rect.left), static_cast<float>(rect.top), static_cast<float>(width), static_cast<float>(height), 0, 1};
     commands->RSSetViewports(1, &viewport);

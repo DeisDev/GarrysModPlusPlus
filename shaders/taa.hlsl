@@ -3,8 +3,8 @@
 // Temporal anti-aliasing resolve. The scene is rendered with a sub-pixel jitter that changes every frame; the
 // history is reprojected with the motion vectors (shaders/primary.hlsl) and clipped to the colour range of the current 3x3
 // neighbourhood (in YCoCg) before blending, which rejects most ghosting from motion and disocclusion.
-// input0: shaded colour (encoded); input1: last frame's history (linear); output0: new history; step: 1 when the
-// history may be used.
+// input0: shaded linear light; input1: last frame's history; output0: new history; step: 1 when the history may be
+// used.
 
 float3 RgbToYCoCg(float3 c)
 {
@@ -33,7 +33,7 @@ void main(uint3 id : SV_DispatchThreadID)
     for (int y = -1; y <= 1; ++y) {
         for (int x = -1; x <= 1; ++x) {
             int2 tap = clamp(pixel + int2(x, y), int2(0, 0), int2(g_frame.size) - 1);
-            float3 color = RgbToYCoCg(Decode(current.Load(int3(tap, 0)).rgb));
+            float3 color = RgbToYCoCg(current.Load(int3(tap, 0)).rgb);
             if (x == 0 && y == 0)
                 center = color;
             moment1 += color;

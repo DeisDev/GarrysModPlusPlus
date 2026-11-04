@@ -1,8 +1,6 @@
 #ifndef GMODPP_COMMON_HLSLI
 #define GMODPP_COMMON_HLSLI
 
-#include "tone_curve.hlsli"
-
 // Every compute pass shares this layout. Textures and buffers are reached through descriptor heap indices
 // in g_frame and g_pass. The radiance cache's constants (b2) and hash entries (u0, space2: a root descriptor, on which
 // Shader Model 6.6 guarantees 64-bit atomics), and RTXDI's constants (b3), RIS buffer (u1), reservoirs (u2) and neighbour
@@ -23,7 +21,7 @@ struct FrameConstants
     float3 sunDirection;
     float sunEnabled;
     float3 sunColor;
-    uint outputSrgb;
+    uint padding8;
     float3 skyColor;
     uint debugView;
     float2 invSize;
@@ -60,8 +58,7 @@ struct FrameConstants
     uint emissiveView;
     uint materialsView;
     float reflectionScale;
-    // 1 when the lighting pass writes linear colour (before the tonemap's encoding) for Ray Reconstruction.
-    uint outputLinear;
+    uint padding9;
     // Scene::LightLists.
     uint lightRangesView;
     uint lightIndicesView;
@@ -240,10 +237,8 @@ struct FrameConstants
     float cloudShadowFineScale;
     float cloudShadowCoarseScale;
     float cloudShadowEdge;
-    // The tone curve lit colour takes before an 8-bit target (shaders/tone_curve.hlsli), and Highlights' strength.
-    uint toneCurve;
-    float highlightRolloff;
-    uint3 padding7;
+    uint padding7;
+    uint4 padding10;
 };
 
 // Per-pass descriptor indices and parameters; mirrors Lighting::PassArgs in src/lighting.h.
@@ -378,23 +373,6 @@ float3 LinearToSrgb(float3 color)
     return select(color <= 0.0031308, color * 12.92, 1.055 * pow(color, 1.0 / 2.4) - 0.055);
 }
 
-// The game's colour targets hold lit colour (times the tonemap scale) sRGB-encoded when it renders with sRGB writes.
-float3 Encode(float3 color)
-{
-    return g_frame.outputSrgb != 0 ? LinearToSrgb(color) : saturate(color);
-}
-
-// Lit colour after the tonemap scale fitted into an 8-bit target by the menu's tone curve, before Encode.
-float3 ToneMapped(float3 color)
-{
-    return ToneCurve(color, g_frame.toneCurve, g_frame.highlightRolloff, 1.0);
-}
-
-float3 Decode(float3 color)
-{
-    return g_frame.outputSrgb != 0 ? SrgbToLinear(color) : color;
-}
-
 float Luminance(float3 color) { return dot(color, float3(0.2126, 0.7152, 0.0722)); }
 
 // Rays that reach surfaces right next to a light see its falloff blow up. One sample brighter than this many
@@ -458,8 +436,9 @@ float3 SkyLight(float3 direction)
     return sky.SampleLevel(g_linearClamp, direction, 0.0).rgb;
 }
 
-// The game's additive passes at a surface pixel of the resolved image, linear. They were drawn with the frame's jitter, which
-// shifts the image by `shift` output pixels (x right, y down); sampling there puts them back in place.
+// The game's additive passes at a surface pixel of the resolved image (linear light, as the frame holds it). They were drawn
+// with the frame's jitter, which shifts the image by `shift` output pixels (x right, y down); sampling there puts them
+// back in place.
 float3 AdditiveAfterResolve(int2 pixel, float2 shift)
 {
     if (g_frame.additiveAfterResolve == 0)
@@ -469,7 +448,7 @@ float3 AdditiveAfterResolve(int2 pixel, float2 shift)
     if (flags.Load(int3(pixel, 0)).r < 0.5)
         return 0.0;
     Texture2D<float4> light = ResourceDescriptorHeap[g_frame.lightView];
-    return Decode(light.SampleLevel(g_linearClamp, (float2(pixel) + 0.5 + shift) * g_frame.invSize, 0.0).rgb);
+    return light.SampleLevel(g_linearClamp, (float2(pixel) + 0.5 + shift) * g_frame.invSize, 0.0).rgb;
 }
 
 // Roughness (GGX alpha) below which a reflection is a mirror.

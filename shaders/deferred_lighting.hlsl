@@ -3,12 +3,12 @@
 #include "froxels.hlsli"
 
 // Final shading: albedo times (direct light + denoised light) plus self-illumination, reflections and the light
-// the game's additive passes added, fitted by the tone curve and written in the encoding the game uses for lit colours.
-// Pixels without G-buffer data keep the game's forward colour, which the game already fitted to its target.
+// the game's additive passes added, written as the linear light the frame holds (the display mapping at present fits it
+// to the display). Pixels without G-buffer data keep the game's colour.
 // input0: denoised light (indirect plus the sampled direct remainder), or none for the sky's light; input1: raw
 // estimate (debug view); input2: reflections and self-illumination (shaders/reflections.hlsl), or none; input3:
 // exact direct light (rgb) and sun visibility (a) from shaders/direct.hlsl; input4: sampled direct remainder
-// (debug view); output0: shaded colour, encoded or (outputLinear, before the tone curve) linear; output1, output2,
+// (debug view); output0: shaded linear light; output1, output2,
 // output3, output4 (or none): Ray Reconstruction's specular albedo, roughness, hit distance and diffuse albedo guides,
 // which water pixels overwrite.
 
@@ -168,13 +168,13 @@ void main(uint3 id : SV_DispatchThreadID)
         return;
     }
     Texture2D<float4> lightTexture = ResourceDescriptorHeap[g_frame.lightView];
-    float3 additive = g_frame.additiveAfterResolve != 0 ? 0.0 : Decode(lightTexture.Load(int3(pixel, 0)).rgb);
+    float3 additive = g_frame.additiveAfterResolve != 0 ? 0.0 : lightTexture.Load(int3(pixel, 0)).rgb;
     // Water belongs to the main view's run; the viewmodel's run, over a rectangle of the same image, leaves it as lit.
     if (!covered && surface.w < 0.0 && g_frame.viewmodel == 0) {
         float3 position = WorldPositionFromDepth(pixel, DepthAt(pixel));
         WaterResult water = ShadeWater(pixel, position);
         float3 shaded = SeenThroughMedium(water.color * g_frame.tonemapScale, position, pixel);
-        output[pixel] = float4(g_frame.outputLinear != 0 ? shaded : Encode(ToneMapped(shaded)), color.a);
+        output[pixel] = float4(shaded, color.a);
         if (g_pass.output1 != kNoView) {
             RWTexture2D<float4> specular = ResourceDescriptorHeap[g_pass.output1];
             RWTexture2D<float> roughness = ResourceDescriptorHeap[g_pass.output2];
@@ -190,7 +190,7 @@ void main(uint3 id : SV_DispatchThreadID)
         return;
     }
     if (!covered) {
-        float3 beyond = Decode(color.rgb);
+        float3 beyond = color.rgb;
         float depth = DepthAt(pixel);
         float3 direction = normalize(WorldPositionFromDepth(pixel, 0.5) - g_frame.eyePosition);
         float3 sky = beyond;
@@ -206,18 +206,19 @@ void main(uint3 id : SV_DispatchThreadID)
             // The haze over what the game drew unlit, and over the sky as far as the sky does not already show it.
             sky = SeenThroughMedium(beyond, depth >= 1.0 ? g_frame.eyePosition + direction * kHazeSkyDistance : WorldPositionFromDepth(pixel, depth), pixel);
         }
-        output[pixel] = float4(g_frame.outputLinear != 0 ? sky : Encode(sky), color.a);
+        output[pixel] = float4(sky, color.a);
         MirrorGuides(pixel);
         return;
     }
     Texture2D<float4> albedos = ResourceDescriptorHeap[g_frame.albedoView];
     float3 albedo = albedos.Load(int3(pixel, 0)).rgb;
     if (g_frame.debugView == 1) {
-        output[pixel] = float4(Encode(albedo), color.a);
+        output[pixel] = float4(albedo, color.a);
         return;
     }
+    // Data views show their values as the screen's encoded values.
     if (g_frame.debugView == 2) {
-        output[pixel] = float4(surface.xyz * 0.5 + 0.5, color.a);
+        output[pixel] = float4(SrgbToLinear(surface.xyz * 0.5 + 0.5), color.a);
         return;
     }
 
@@ -260,17 +261,17 @@ void main(uint3 id : SV_DispatchThreadID)
     switch (g_frame.debugView) {
     case 4: {
         Texture2D<float4> remainder = ResourceDescriptorHeap[g_pass.input4];
-        result = Encode((direct + remainder.Load(int3(pixel, 0)).rgb) * g_frame.tonemapScale * 0.5);
+        result = (direct + remainder.Load(int3(pixel, 0)).rgb) * g_frame.tonemapScale * 0.5;
         break;
     }
-    case 5: result = Encode(indirect * g_frame.tonemapScale); break;
+    case 5: result = indirect * g_frame.tonemapScale; break;
     case 6: {
         Texture2D<float4> raw = ResourceDescriptorHeap[g_pass.input1];
-        result = Encode(raw.Load(int3(pixel, 0)).rgb * g_frame.tonemapScale);
+        result = raw.Load(int3(pixel, 0)).rgb * g_frame.tonemapScale;
         break;
     }
-    case 7: result = directLight.a; break;
-    case 8: result = Encode(Decode(lightTexture.Load(int3(pixel, 0)).rgb)); break;
+    case 7: result = SrgbToLinear(directLight.a); break;
+    case 8: result = lightTexture.Load(int3(pixel, 0)).rgb; break;
     case 9: {
         // Reflections, self-illumination from the material table and Phong highlights.
         float3 highlights = AmbientRim(pixel, surface.xyz, indirect);
@@ -278,19 +279,19 @@ void main(uint3 id : SV_DispatchThreadID)
             Texture2D<float4> specularTexture = ResourceDescriptorHeap[g_frame.specularView];
             highlights += specularTexture.Load(int3(pixel, 0)).rgb;
         }
-        result = Encode((added + highlights) * g_frame.tonemapScale);
+        result = (added + highlights) * g_frame.tonemapScale;
         break;
     }
-    case 11: result = ambientOcclusion; break;
+    case 11: result = SrgbToLinear(ambientOcclusion); break;
     // The radiance cache's voxels, each its own colour (black without the cache).
-    case 12: result = RadianceCacheEnabled() ? CacheDebugColor(position, GeometricNormalAt(pixel)) : 0.0; break;
+    case 12: result = RadianceCacheEnabled() ? SrgbToLinear(CacheDebugColor(position, GeometricNormalAt(pixel))) : 0.0; break;
     // RTXDI's sample per pixel: its light as a colour, or its reservoir's sample count (shaders/restir.hlsl); black without.
     case 13:
     case 14: {
         result = 0.0;
         if (g_frame.restirDebugView != kNoView) {
             Texture2D<float4> restir = ResourceDescriptorHeap[g_frame.restirDebugView];
-            result = restir.Load(int3(pixel, 0)).rgb;
+            result = SrgbToLinear(restir.Load(int3(pixel, 0)).rgb);
         }
         break;
     }
@@ -298,7 +299,7 @@ void main(uint3 id : SV_DispatchThreadID)
         // Red and green: motion towards last frame (a tenth of a pixel per step); blue: unlit material.
         Texture2D<float2> motion = ResourceDescriptorHeap[g_frame.motionView];
         Texture2D<uint> pixelFlags = ResourceDescriptorHeap[g_frame.pixelFlagsView];
-        result = float3(saturate(0.5 + motion.Load(int3(pixel, 0)) * 0.05), (pixelFlags.Load(int3(pixel, 0)) & kPixelUnlit) != 0 ? 1.0 : 0.0);
+        result = SrgbToLinear(float3(saturate(0.5 + motion.Load(int3(pixel, 0)) * 0.05), (pixelFlags.Load(int3(pixel, 0)) & kPixelUnlit) != 0 ? 1.0 : 0.0));
         break;
     }
     default: {
@@ -311,12 +312,12 @@ void main(uint3 id : SV_DispatchThreadID)
             specular += highlights.Load(int3(pixel, 0)).rgb;
         }
         float3 shaded = SeenThroughMedium((albedo * light + emissive + added + specular) * g_frame.tonemapScale, position, pixel);
-        result = g_frame.outputLinear != 0 ? shaded + additive : Encode(ToneMapped(shaded) + additive);
+        result = shaded + additive;
         // NRD's validation overlay (debug view 15) over the image.
         if (g_frame.debugView == 15 && g_frame.nrdValidationView != kNoView) {
             Texture2D<float4> validation = ResourceDescriptorHeap[g_frame.nrdValidationView];
             float4 overlay = validation.Load(int3(pixel, 0));
-            result = lerp(result, overlay.rgb, overlay.a);
+            result = lerp(result, SrgbToLinear(overlay.rgb), overlay.a);
         }
         break;
     }

@@ -1,5 +1,6 @@
 #include "shaderapi_textures.h"
 
+#include "display_output.h"
 #include "log.h"
 #include "native_lighting.h"
 #include "shaderapi.h"
@@ -255,6 +256,7 @@ std::intptr_t Create(int width, int height, int depth, int format, int mips, int
             return 0;
         }
         texture->storage = StorageFormat(nearest);
+        texture->srgbEmulated = texture->IsRenderTarget() && !texture->IsDepth() && texture->storage == kImageFormatRgba16161616F;
         texture->copies.resize(static_cast<size_t>(std::max(copies, 1)));
         for (Texture::Copy& copy : texture->copies) {
             if (!CreateCopy(*texture, copy)) {
@@ -499,8 +501,56 @@ void TexWrap(NativeObject*, int coordinate, int mode)
         texture->addressW = address;
 }
 
-// Copies a rectangle of render target 0 (the back buffer for the default target) to memory in `format`, waiting for
-// the GPU like Direct3D 9's GetRenderTargetData.
+// What ReadTarget copies linear light into before reading it back: an 8-bit render target, kept for the next read.
+struct EncodedTarget {
+    TrackedResource resource;
+    D3D12_CPU_DESCRIPTOR_HANDLE target = {};
+    UINT width = 0;
+    UINT height = 0;
+};
+EncodedTarget g_encoded;
+
+// Maps `width` x `height` of linear light (`view`, which `source` holds) into g_encoded as 8-bit sRGB bytes.
+TrackedResource* Encode(TrackedResource& source, UINT view, UINT width, UINT height, const display::Mapping& mapping)
+{
+    Backend& backend = GetBackend();
+    if (!g_encoded.resource.resource || g_encoded.width < width || g_encoded.height < height) {
+        if (g_encoded.resource.resource)
+            backend.Retire(std::move(g_encoded.resource.resource));
+        g_encoded.resource = {};
+        D3D12_RESOURCE_DESC desc = {};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        desc.Width = std::max(width, g_encoded.width);
+        desc.Height = std::max(height, g_encoded.height);
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = 1;
+        desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        desc.SampleDesc.Count = 1;
+        desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        const D3D12_HEAP_PROPERTIES heap = { D3D12_HEAP_TYPE_DEFAULT };
+        const HRESULT hr = backend.Device()->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+            IID_PPV_ARGS(&g_encoded.resource.resource));
+        if (FAILED(hr)) {
+            log::Info("Native: creating a {}x{} target to read the frame back failed: {:#010x}", desc.Width, desc.Height, static_cast<unsigned>(hr));
+            return nullptr;
+        }
+        g_encoded.resource.state = D3D12_RESOURCE_STATE_COMMON;
+        if (g_encoded.target.ptr == 0)
+            g_encoded.target = backend.RenderTargetViews().Allocate();
+        backend.Device()->CreateRenderTargetView(g_encoded.resource.resource.Get(), nullptr, g_encoded.target);
+        g_encoded.width = static_cast<UINT>(desc.Width);
+        g_encoded.height = desc.Height;
+    }
+    backend.Transition(source, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    backend.Transition(g_encoded.resource, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    if (!display::Map(backend.Commands(), view, g_encoded.target, DXGI_FORMAT_B8G8R8A8_UNORM, width, height, 0, 0, mapping))
+        return nullptr;
+    return &g_encoded.resource;
+}
+
+// Copies a rectangle of render target 0 (the frame for the default target) to memory in `format`, waiting for the GPU
+// like Direct3D 9's GetRenderTargetData. Linear light is read back as the 8-bit sRGB bytes it stands for: the frame as
+// the screen shows it in SDR, promoted render targets clipped at white.
 void ReadTarget(int x, int y, int width, int height, unsigned char* data, int format, int stride)
 {
     Backend& backend = GetBackend();
@@ -511,14 +561,22 @@ void ReadTarget(int x, int y, int width, int height, unsigned char* data, int fo
     UINT targetWidth = backend.Width();
     UINT targetHeight = backend.Height();
     if (texture != nullptr && !texture->copies.empty() && !texture->IsDepth()) {
-        source = &texture->Current().resource;
-        sourceFormat = texture->storage;
         targetWidth = static_cast<UINT>(texture->width);
         targetHeight = static_cast<UINT>(texture->height);
+        if (texture->srgbEmulated) {
+            display::Mapping mapping;
+            mapping.encoding = display::Encoding::PlainSrgb;
+            source = Encode(texture->Current().resource, texture->Current().view, targetWidth, targetHeight, mapping);
+        } else {
+            source = &texture->Current().resource;
+            sourceFormat = texture->storage;
+        }
     } else {
         realtime::OnBackBufferRead();
-        source = &backend.BackBuffer();
+        source = Encode(backend.FrameBuffer(), backend.FrameBufferTexture(), targetWidth, targetHeight, display::ForScreenshot());
     }
+    if (source == nullptr)
+        return;
     const UINT left = static_cast<UINT>(std::clamp(x, 0, static_cast<int>(targetWidth)));
     const UINT top = static_cast<UINT>(std::clamp(y, 0, static_cast<int>(targetHeight)));
     const UINT right = std::min(targetWidth, left + static_cast<UINT>(std::max(width, 0)));
@@ -694,8 +752,8 @@ bool TargetSurface(int id, bool read, CopySurface& surface)
         if (read)
             realtime::OnBackBufferRead();
         Backend& backend = GetBackend();
-        surface = { &backend.BackBuffer(), backend.BackBufferTexture(), backend.BackBufferView(false), Backend::kBackBufferFormat, backend.Width(),
-            backend.Height() };
+        surface = { &backend.FrameBuffer(), backend.FrameBufferTexture(), backend.FrameBufferView(), Backend::kFrameFormat, backend.Width(), backend.Height(),
+            DescriptorHeap::kInvalid, {}, DXGI_FORMAT_UNKNOWN, true };
         return true;
     }
     Texture* texture = TextureFromHandle(handle);

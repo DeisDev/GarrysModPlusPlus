@@ -2,8 +2,8 @@
 
 // Restores detail the temporal resolve softens: an unsharp mask over the four direct neighbours, limited to
 // their colour range so edges do not ring, then adds the game's additive passes (AdditiveAfterResolve).
-// input0: resolved history (linear); input1, input2: the jitter's image shift in pixels (float bits); output0: final
-// colour (encoded).
+// input0: resolved history; input1, input2: the jitter's image shift in pixels (float bits); output0: final linear
+// light.
 
 [RootSignature(ROOT_SIGNATURE)]
 [numthreads(8, 8, 1)]
@@ -24,5 +24,5 @@ void main(uint3 id : SV_DispatchThreadID)
     float3 high = max(center, max(max(up, down), max(left, right)));
     float3 sharpened = center + (center - (up + down + left + right) * 0.25) * (g_frame.sharpening * 2.0);
     float3 additive = AdditiveAfterResolve(pixel, float2(asfloat(g_pass.input1), asfloat(g_pass.input2)));
-    output[pixel] = float4(Encode(clamp(sharpened, low, high) + additive), 1.0);
+    output[pixel] = float4(clamp(sharpened, low, high) + additive, 1.0);
 }

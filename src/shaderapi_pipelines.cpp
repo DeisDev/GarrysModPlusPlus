@@ -982,6 +982,8 @@ void PrecacheShaders(const ShadowState& state)
             request.forwardTwin = twins && (state.blend || GetSettings().renderTargetLighting);
             request.clearCoverage = twins && state.depthTest && !state.blend && state.depthWrite && state.colorWrite;
             request.opacityMicromaps = GetStatistics().opacityMicromapsAvailable;
+            // Passes with sRGB writes off mostly draw into the frame (the HUD, VGUI): DrawPass decodes their output there.
+            request.decodeOutput = state.srgbWrite == 0;
         }
         shader_precache::Enqueue(request);
     }
@@ -1008,10 +1010,11 @@ Targets PrepareTargets(bool srgb)
     for (UINT i = 0; i < kRenderTargets; ++i) {
         const std::intptr_t handle = state.colorTargets[i];
         if (i == 0 && handle == kDefaultTarget) {
-            backend.Transition(backend.BackBuffer(), D3D12_RESOURCE_STATE_RENDER_TARGET);
-            targets.colors[0] = backend.BackBufferView(srgb);
-            targets.colorFormats[0] = srgb ? DXGI_FORMAT_B8G8R8A8_UNORM_SRGB : Backend::kBackBufferFormat;
+            backend.Transition(backend.FrameBuffer(), D3D12_RESOURCE_STATE_RENDER_TARGET);
+            targets.colors[0] = backend.FrameBufferView();
+            targets.colorFormats[0] = Backend::kFrameFormat;
             targets.count = 1;
+            targets.linear = true;
             continue;
         }
         Texture* texture = TextureFromHandle(handle);
@@ -1099,33 +1102,18 @@ struct SkyConstants {
     float viewport[4];
     float tonemapScale;
     std::uint32_t skyView;
-    std::uint32_t target;
-    float highlightRolloff;
+    std::uint32_t padding0[2];
     std::array<Float4, 4> cloudViewProj;
     std::uint32_t cloudHistoryView;
     std::uint32_t cloudCubeView;
     float cloudOverscan;
-    std::uint32_t toneCurve;
+    std::uint32_t padding1;
     NightSkyConstants night;
 };
 static_assert(sizeof(SkyConstants) == 576);
 
-// SkyDrawConstants::target: how a colour target stores colour.
-std::uint32_t TargetEncoding(DXGI_FORMAT format)
-{
-    switch (format) {
-    case DXGI_FORMAT_B8G8R8A8_UNORM:
-    case DXGI_FORMAT_B8G8R8X8_UNORM:
-    case DXGI_FORMAT_R8G8B8A8_UNORM: return 1;
-    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
-    case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
-    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: return 2;
-    default: return 0;
-    }
-}
-
-// The sky shaders' constants for the 2D sky face being drawn into `format`, which they place by the view-projection
-// (c8-c11) as the draw's vertex patches leave it; 0 when it cannot be inverted.
+// The sky shaders' constants for the 2D sky face being drawn, which they place by the view-projection (c8-c11) as the
+// draw's vertex patches leave it; 0 when it cannot be inverted.
 // The inverse of a draw's view-projection rows that maps clip space to points relative to the eye, in double precision.
 // Far-plane points mapped to the world in single precision moved by up to a few hundredths of a degree from frame to
 // frame with the jittered matrix, which the stars and Moon showed when zoomed in; relative to the eye, a rounding of w
@@ -1170,7 +1158,7 @@ bool ClipToEye(const std::array<Float4, 4>& rows, std::array<Float4, 4>& clipToE
     return true;
 }
 
-D3D12_GPU_VIRTUAL_ADDRESS SkyDrawConstants(const gbuffer::SkyDraw& sky, std::span<const capture::RegisterPatch> vertexPatches, DXGI_FORMAT format)
+D3D12_GPU_VIRTUAL_ADDRESS SkyDrawConstants(const gbuffer::SkyDraw& sky, std::span<const capture::RegisterPatch> vertexPatches)
 {
     const DynamicState& dynamic = Dynamic();
     std::array<Float4, 4> viewProjection;
@@ -1188,9 +1176,6 @@ D3D12_GPU_VIRTUAL_ADDRESS SkyDrawConstants(const gbuffer::SkyDraw& sky, std::spa
     std::copy(std::begin(rect), std::end(rect), constants.viewport);
     constants.tonemapScale = dynamic.pixelFloats[gbuffer::kLightScaleRegister].v[0];
     constants.skyView = sky.skyView;
-    constants.target = TargetEncoding(format);
-    constants.highlightRolloff = sky.highlightRolloff;
-    constants.toneCurve = sky.toneCurve;
     for (size_t r = 0; r < 4; ++r)
         std::copy(sky.cloudViewProj[r].begin(), sky.cloudViewProj[r].end(), constants.cloudViewProj[r].v);
     constants.cloudHistoryView = sky.cloudHistoryView;
@@ -1362,10 +1347,10 @@ void DrawPass(const ShadowState& shadow, const MeshDraw& mesh)
     if (vertexBase == nullptr || (pixelBase == nullptr && !depthOnly))
         return;
 
-    Targets targets = pass.route == capture::Pass::Route::Game ? PrepareTargets(shadow.srgbWrite != 0) : capture::BindTargets(pass, shadow.srgbWrite != 0);
+    Targets targets = pass.route == capture::Pass::Route::Game ? PrepareTargets(shadow.srgbWrite != 0) : capture::BindTargets(pass);
     // The 2D sky's faces show the procedural sky, or get the sun's disc over the game's sky (shaders/sky_draw.hlsl).
     const gbuffer::SkyDraw* sky = pass.route == capture::Pass::Route::Game && !depthOnly && targets.count == 1 && capture::SkyMaterial() ? capture::Sky() : nullptr;
-    const D3D12_GPU_VIRTUAL_ADDRESS skyConstants = sky != nullptr ? SkyDrawConstants(*sky, pass.vertexPatches, targets.colorFormats[0]) : 0;
+    const D3D12_GPU_VIRTUAL_ADDRESS skyConstants = sky != nullptr ? SkyDrawConstants(*sky, pass.vertexPatches) : 0;
     const bool proceduralSky = skyConstants != 0 && sky->sky;
     const bool depthWrite = dynamic.overrideDepthEnable ? dynamic.depthEnable : shadow.depthWrite != 0;
     // The sky lies behind everything, so no surface's coverage is left where it draws.

@@ -2,6 +2,7 @@
 
 #include "command_line.h"
 #include "d3d12_device.h"
+#include "display_output.h"
 #include "engine_interfaces.h"
 #include "log.h"
 #include "options.h"
@@ -169,7 +170,7 @@ void OnDeviceReady()
         return;
     }
     g_state.available = world::Initialize(device.Get(), backend.Queue(), backend.Descriptors(), support, ModDirectory());
-    overlay::Initialize(backend.Window(), backend.Device(), backend.Queue(), backend.Descriptors(), Backend::kBackBufferFormat, Backend::kFrames);
+    overlay::Initialize(backend.Window(), backend.Device(), backend.Queue(), backend.Descriptors(), display::kUiFormat, Backend::kFrames);
 }
 
 void OnViewport(float minDepth, float maxDepth)

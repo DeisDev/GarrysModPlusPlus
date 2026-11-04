@@ -3,7 +3,6 @@
 // pixel corners, half a pixel off red and green, and its effects do not follow the field of view.
 
 #include "../post/flare.hlsli"
-#include "../dither.hlsli"
 #include "ffx_core.h"
 
 // The callbacks ffx_lens.h's FfxLens calls, which this file does not use.
@@ -106,16 +105,21 @@ float3 Grade(float3 color)
     return max(lerp(Luminance(graded), graded, g_post.gradeSaturation), 0.0);
 }
 
-// input0: the view (linear). The colour grading, sRGB encoding and film grain (on the encoded values, as FidelityFX Lens
-// grains the displayed image), dithered into the back buffer.
+// input0: the view. The colour grading and film grain, back into the frame as linear light. The grain is added to the
+// sRGB-encoded values up to paper white, as FidelityFX Lens grains the displayed image (its amount fades to nothing at 0
+// and 1); light above paper white keeps its value.
 [RootSignature(POST_ROOT_SIGNATURE)]
 float4 FinalMain(float4 position : SV_Position) : SV_Target
 {
     Texture2D<float4> source = ResourceDescriptorHeap[g_postPass.input0];
     int2 pixel = int2(position.xy) - g_post.origin;
     float4 color = source.Load(int3(pixel, 0));
-    float3 encoded = LinearToSrgb(saturate(g_post.gradeEnabled != 0 ? Grade(color.rgb) : color.rgb));
-    if (g_post.grainAmount > 0.0)
-        FfxLensApplyFilmGrain(FfxInt32x2(pixel), encoded, g_post.grainScale, g_post.grainAmount, g_post.grainSeed);
-    return float4(encoded + DitherNoise(uint2(position.xy)) / 255.0, color.a);
+    float3 graded = max(g_post.gradeEnabled != 0 ? Grade(color.rgb) : color.rgb, 0.0);
+    if (g_post.grainAmount > 0.0) {
+        float3 encoded = LinearToSrgb(graded);
+        float3 grained = saturate(encoded);
+        FfxLensApplyFilmGrain(FfxInt32x2(pixel), grained, g_post.grainScale, g_post.grainAmount, g_post.grainSeed);
+        graded = SrgbToLinear(encoded + grained - saturate(encoded));
+    }
+    return float4(graded, color.a);
 }
