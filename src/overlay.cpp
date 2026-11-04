@@ -1840,7 +1840,7 @@ void DrawPerformancePage(Settings& settings)
         if (widgets::BeginRows("developer")) {
             constexpr const char* kViews[] = {"debug.final", "debug.albedo", "debug.normals", "debug.coverage", "debug.direct_light", "debug.indirect_light",
                 "debug.indirect_raw", "debug.sun_visibility", "debug.additive_light", "debug.reflections", "debug.motion_vectors", "debug.ambient_occlusion",
-                "debug.radiance_cache", "debug.light_sample", "debug.reservoir_samples", "debug.denoiser_validation"};
+                "debug.radiance_cache", "debug.light_sample", "debug.reservoir_samples", "debug.denoiser_validation", "debug.luminance", "debug.over_peak"};
             static_assert(std::size(kViews) == static_cast<size_t>(DebugView::Count));
             ComboRow("general.debug_view", &Settings::debugView, kViews);
             widgets::EndRows();

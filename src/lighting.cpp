@@ -2542,7 +2542,7 @@ bool Lighting::FillConstants(FrameConstants& constants, const Scene& scene, cons
     constants.size[1] = m_height;
     constants.normalBias = 2.0f;
     constants.frameIndex = static_cast<uint32_t>(inputs.frame);
-    constants.debugView = static_cast<uint32_t>(settings.debugView);
+    constants.debugView = IsLightingDebugView(settings.debugView) ? static_cast<uint32_t>(settings.debugView) : 0u;
     constants.reflectionScale = settings.reflections ? settings.reflectionIntensity : 0.0f;
     constants.exactLights = static_cast<uint32_t>(settings.exactLights);
     constants.sampledLightRays = static_cast<uint32_t>(settings.sampledLightRays);
@@ -2795,7 +2795,7 @@ AntiAliasing Lighting::AntiAliasingMode() const
 Lighting::Upscaler Lighting::RenderSize(UINT outputWidth, UINT outputHeight, UINT& width, UINT& height)
 {
     const Settings& settings = GetSettings();
-    if (settings.debugView != DebugView::Final)
+    if (IsLightingDebugView(settings.debugView))
         return Upscaler::None;
     const AntiAliasing mode = AntiAliasingMode();
     const bool dlss = mode == AntiAliasing::RayReconstruction;

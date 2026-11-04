@@ -131,7 +131,7 @@ float4 SkyMain(Interpolants input) : SV_Target0
     // target clips to a flat plateau; the tone curve keeps the halo a gradient, and only the disc is white. The cube the
     // lighting reads (a floating-point target) keeps the sky's true radiance.
     if (g_sky.target != 0)
-        color = ToneCurve(color, g_sky.toneCurve, g_sky.highlightRolloff);
+        color = ToneCurve(color, g_sky.toneCurve, g_sky.highlightRolloff, 1.0);
     if (g_sky.night.disc != 0)
         color += SunDisc(g_sky.night, direction, pixelAngle, transmittance, g_linearClamp) * DiscThroughClouds(g_sky.night, clouds.a, g_sky.tonemapScale);
     // An 8-bit target rounds the sky's smooth gradients, after encoding them as sRGB when it does.

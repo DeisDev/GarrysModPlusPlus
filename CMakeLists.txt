@@ -371,6 +371,9 @@ add_shader(shaders/amd/dof.hlsl main cs_6_6 g_dof0ReverseCS -D DOF_PASS=0 -D FFX
 add_shader(shaders/amd/cas.hlsl main cs_6_6 g_casCS ${FFX_SHADER_OPTIONS})
 add_shader(shaders/amd/lens.hlsl LensMain cs_6_6 g_lensCS ${FFX_SHADER_OPTIONS})
 add_shader(shaders/amd/lens.hlsl FinalMain ps_6_6 g_postFinalPS ${FFX_SHADER_OPTIONS})
+# The display mapping at present (src/display_output.cpp).
+add_shader(shaders/post/display_output.hlsl VSMain vs_6_6 g_displayOutputVS)
+add_shader(shaders/post/display_output.hlsl PSMain ps_6_6 g_displayOutputPS)
 add_d3d9_shader(shaders/forward_snippet.hlsl main g_forwardSnippetPS)
 add_d3d9_shader(shaders/forward_snippet.hlsl main g_forwardSnippetPS2 PROFILE ps_2_b /D FORWARD_PS2=1)
 add_d3d9_shader(shaders/water_surface.hlsl main g_waterSurfacePS PROFILE ps_2_b)
@@ -562,6 +565,7 @@ add_library(gmodpp SHARED
     src/shaderapi_meshes.cpp
     src/shaderapi_pipelines.cpp
     src/post_effects.cpp
+    src/display_output.cpp
     src/exposure.cpp
     src/fsr.cpp
     src/anti_lag.cpp

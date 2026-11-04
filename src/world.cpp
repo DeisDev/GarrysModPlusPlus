@@ -2009,7 +2009,7 @@ std::optional<gbuffer::ForwardConstants> ForwardLighting(const ViewInputs& input
         forward.fog = inputs.fog;
         forward.litFogScale = g_state.lighting->LitFogScale();
     }
-    forward.lightOnly = GetSettings().debugView != DebugView::Final;
+    forward.lightOnly = IsLightingDebugView(GetSettings().debugView);
     forward.twinFrame = g_state.lighting->ForwardFrame();
     forward.twinScene = g_state.lighting->ForwardScene();
     forward.fogFrame = g_state.lighting->ForwardFrame();

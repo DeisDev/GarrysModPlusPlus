@@ -34,8 +34,15 @@ enum class DebugView : uint32_t {
     ReservoirM = 14,
     // NRD's validation overlay over the image (CommonSettings::enableValidation).
     DenoiserValidation = 15,
+    // Drawn by the display mapping over the final image (src/display_output.cpp): the frame's luminance in nits as a
+    // false colour, and its pixels brighter than the display's peak.
+    Luminance = 16,
+    OverPeak = 17,
     Count
 };
+
+// Whether a debug view replaces the lighting's output (1-15), rather than showing the final image (0, 16, 17).
+inline bool IsLightingDebugView(DebugView view) { return view != DebugView::Final && view < DebugView::Luminance; }
 
 enum class AntiAliasing : uint32_t { Off = 0, Temporal = 1, RayReconstruction = 2, Fsr = 3, Count };
 

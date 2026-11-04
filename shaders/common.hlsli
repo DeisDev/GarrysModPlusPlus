@@ -387,7 +387,7 @@ float3 Encode(float3 color)
 // Lit colour after the tonemap scale fitted into an 8-bit target by the menu's tone curve, before Encode.
 float3 ToneMapped(float3 color)
 {
-    return ToneCurve(color, g_frame.toneCurve, g_frame.highlightRolloff);
+    return ToneCurve(color, g_frame.toneCurve, g_frame.highlightRolloff, 1.0);
 }
 
 float3 Decode(float3 color)
