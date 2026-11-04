@@ -19,3 +19,4 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - The game draws into a high dynamic range image, so nothing is clipped at white until the image is shown. The tone curve now covers everything on screen: particles, sprites, glass and the sky roll off with the rest of the image.
 - The Brightness slider in the video options works again, in every display mode.
+- Maps' colour correction is applied after the tone curve, so it no longer clips bright light.

@@ -2,10 +2,12 @@
 
 #include "busy_window.h"
 #include "command_line.h"
+#include "display_output.h"
 #include "log.h"
 #include "night_sky.h"
 #include "settings.h"
 #include "shaderapi_capture.h"
+#include "shader_bytecode.h"
 #include "shader_cache.h"
 #include "shader_compiler.h"
 #include "shader_precache.h"
@@ -1292,6 +1294,72 @@ void DrawSkyFaces(PipelineKey key, const CompiledShader& vertexShader, const Com
 
 }
 
+namespace {
+
+// engine_post's colour correction (Engine_Post_ps2x.fxc's PerformColorCorrection: colour x ColorCorrectionDefaultWeight
+// plus each volume's look-up times its ColorCorrectionVolumeWeights component), by the registers its constant table
+// names. stdshader_dx9.dll's engine_post draw (0x180022ea0) reads the frame and its volumes with sRGB reads off, sets c3
+// and c4 from IShaderAPI::GetCurrentColorCorrection and binds the volumes from s2 (REA 2026-11-04).
+struct ColorCorrectionShader {
+    int defaultWeight = -1;
+    int weights = -1;
+    std::array<int, 4> volumes = {-1, -1, -1, -1};
+    UINT count = 0;
+};
+
+const ColorCorrectionShader& ColorCorrectionOf(std::span<const DWORD> pixelCode)
+{
+    static std::unordered_map<const DWORD*, ColorCorrectionShader> shaders;
+    auto found = shaders.find(pixelCode.data());
+    if (found != shaders.end())
+        return found->second;
+    ColorCorrectionShader shader;
+    for (const bytecode::Constant& constant : bytecode::ConstantTable(pixelCode)) {
+        if (constant.set == bytecode::RegisterSet::Float4 && constant.name == "ColorCorrectionDefaultWeight")
+            shader.defaultWeight = static_cast<int>(constant.index);
+        else if (constant.set == bytecode::RegisterSet::Float4 && constant.name == "ColorCorrectionVolumeWeights")
+            shader.weights = static_cast<int>(constant.index);
+        else if (constant.set == bytecode::RegisterSet::Sampler && constant.name.starts_with("ColorCorrectionVolumeTexture") && constant.name.size() == 29) {
+            const int volume = constant.name.back() - '0';
+            if (volume >= 0 && volume < 4)
+                shader.volumes[static_cast<size_t>(volume)] = static_cast<int>(constant.index);
+        }
+    }
+    while (shader.count < 4 && shader.volumes[shader.count] >= 0)
+        ++shader.count;
+    if (shader.defaultWeight < 0 || shader.weights < 0)
+        shader.count = 0;
+    return shaders.emplace(pixelCode.data(), shader).first->second;
+}
+
+// Takes the colour correction out of an engine_post draw into the frame: the draw keeps the colour (default weight 1,
+// volume weights 0) and the display mapping applies the volumes after the tone curve (display::SetColorCorrection),
+// where they no longer clip the light above paper white.
+void MoveColorCorrection(std::span<const DWORD> pixelCode, std::vector<capture::RegisterPatch>& patches)
+{
+    const ColorCorrectionShader& shader = ColorCorrectionOf(pixelCode);
+    if (shader.count == 0)
+        return;
+    const DynamicState& dynamic = Dynamic();
+    display::ColorCorrection correction;
+    correction.count = shader.count;
+    correction.defaultWeight = dynamic.pixelFloats[static_cast<size_t>(shader.defaultWeight)].v[0];
+    const float* weights = dynamic.pixelFloats[static_cast<size_t>(shader.weights)].v;
+    for (UINT i = 0; i < shader.count; ++i) {
+        correction.weights[i] = weights[i];
+        const int sampler = shader.volumes[i];
+        correction.textures[i] = sampler < kSamplers ? dynamic.textures[static_cast<size_t>(sampler)] : 0;
+    }
+    display::SetColorCorrection(correction);
+    static bool logged = false;
+    if (!std::exchange(logged, true))
+        log::Info("Native: the engine's colour correction ({} volumes) is applied after the tone curve", shader.count);
+    patches.push_back({static_cast<UINT>(shader.defaultWeight), {1.0f, 1.0f, 1.0f, 1.0f}});
+    patches.push_back({static_cast<UINT>(shader.weights), {0.0f, 0.0f, 0.0f, 0.0f}});
+}
+
+}
+
 void DrawPass(const ShadowState& shadow, const MeshDraw& mesh)
 {
     if (!Initialize())
@@ -1358,6 +1426,10 @@ void DrawPass(const ShadowState& shadow, const MeshDraw& mesh)
         pixelBase->info.colorOutputs == 1 && targets.count == 1 && targets.depth.ptr != 0;
     if (clearCoverage)
         capture::AddCoverageTarget(targets);
+
+    std::vector<capture::RegisterPatch> pixelPatches = pass.pixelPatches;
+    if (pass.route == capture::Pass::Route::Game && targets.linear && !depthOnly && dynamic.colorTargets[0] == kDefaultTarget)
+        MoveColorCorrection(drawnPixelCode, pixelPatches);
 
     StateBuffer pixelState = {};
     translator::Variant pixelVariant;
@@ -1574,7 +1646,7 @@ void DrawPass(const ShadowState& shadow, const MeshDraw& mesh)
     const D3D12_GPU_VIRTUAL_ADDRESS pixelStateAddress = UploadConstants(&pixelState, sizeof(pixelState));
     commands->SetGraphicsRootConstantBufferView(0, FloatConstants(*vertexShader, dynamic.vertexFloats.data(), kVertexFloatConstants, dynamic.vertexFloatsVersion, g_cache.vertexConstants, vertexStateAddress, pass.vertexPatches));
     commands->SetGraphicsRootConstantBufferView(1, vertexStateAddress);
-    commands->SetGraphicsRootConstantBufferView(2, pixelShader != nullptr ? FloatConstants(*pixelShader, dynamic.pixelFloats.data(), kPixelFloatConstants, dynamic.pixelFloatsVersion, g_cache.pixelConstants, pixelStateAddress, pass.pixelPatches) : pixelStateAddress);
+    commands->SetGraphicsRootConstantBufferView(2, pixelShader != nullptr ? FloatConstants(*pixelShader, dynamic.pixelFloats.data(), kPixelFloatConstants, dynamic.pixelFloatsVersion, g_cache.pixelConstants, pixelStateAddress, pixelPatches) : pixelStateAddress);
     commands->SetGraphicsRootConstantBufferView(3, pixelStateAddress);
     if (pass.forwardFrame != 0) {
         commands->SetGraphicsRootConstantBufferView(kRootForwardFrame, pass.forwardFrame);
