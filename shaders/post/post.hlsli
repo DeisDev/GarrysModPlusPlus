@@ -92,6 +92,16 @@ struct PostConstants
     // The motion vectors' resolution over the view's (below 1 when the lighting was upscaled).
     float2 motionScale;
     float focalPixels;
+    // The tone curve (shaders/tone_curve.hlsli) up to the display's peak in paper whites, and the engine's colour
+    // correction after it: its look-up count, default weight, weights and 32^3 volumes.
+    uint toneCurve;
+    float highlightRolloff;
+    float tonePeak;
+    uint ccCount;
+    float ccDefaultWeight;
+    uint3 padding5;
+    float4 ccWeights;
+    uint4 ccViews;
 };
 
 // Per pass: descriptor indices and a parameter.

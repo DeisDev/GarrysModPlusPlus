@@ -34,8 +34,6 @@ struct DisplayConstants {
     std::uint32_t frameView;
     std::uint32_t uiView;
     std::uint32_t encoding;
-    std::uint32_t toneCurve;
-    float highlightRolloff;
     float peak;
     float paperWhite;
     float blackLevel;
@@ -47,16 +45,12 @@ struct DisplayConstants {
     float tvExponent;
     float tvMin;
     float tvMax;
-    std::uint32_t colorCorrection;
-    float ccDefaultWeight;
-    float ccWeights[4];
-    std::uint32_t ccViews[4];
     std::uint32_t debugView;
     float displayPeak;
     std::uint32_t calibration;
     std::uint32_t padding;
 };
-static_assert(sizeof(DisplayConstants) == 128);
+static_assert(sizeof(DisplayConstants) == 80);
 
 // IShaderDevice::SetHardwareGammaRamp's arguments, from the console variables materialsystem passes it
 // (mat_monitorgamma and its TV range).
@@ -151,21 +145,11 @@ ID3D12PipelineState* Pipeline(DXGI_FORMAT format)
     return pipeline.Get();
 }
 
-Mapping Common()
-{
-    const Settings& settings = GetSettings();
-    Mapping mapping;
-    mapping.toneCurve = static_cast<std::uint32_t>(settings.toneCurve);
-    mapping.highlightRolloff = settings.highlightRolloff;
-    mapping.colorCorrection = g_state.correction.count > 0;
-    return mapping;
-}
-
 }
 
 Mapping ForOutput(bool hdr, UINT bits)
 {
-    Mapping mapping = Common();
+    Mapping mapping;
     mapping.encoding = hdr ? Encoding::Pq : Encoding::Srgb;
     mapping.ditherSteps = bits >= 10 ? 1023.0f : 255.0f;
     mapping.gammaRamp = !hdr;
@@ -188,7 +172,7 @@ Mapping ForOutput(bool hdr, UINT bits)
 
 Mapping ForScreenshot()
 {
-    Mapping mapping = Common();
+    Mapping mapping;
     mapping.encoding = Encoding::Srgb;
     // Direct3D 9's gamma ramp changed what the display showed, not the back buffer that screenshots read.
     mapping.gammaRamp = false;
@@ -208,8 +192,6 @@ bool Map(ID3D12GraphicsCommandList* commands, UINT frameView, D3D12_CPU_DESCRIPT
     c.frameView = frameView;
     c.uiView = mapping.uiView;
     c.encoding = static_cast<std::uint32_t>(mapping.encoding);
-    c.toneCurve = mapping.toneCurve;
-    c.highlightRolloff = mapping.highlightRolloff;
     c.peak = std::max(mapping.peak, 1.0f);
     c.paperWhite = mapping.paperWhite;
     c.blackLevel = mapping.blackLevel;
@@ -225,20 +207,6 @@ bool Map(ID3D12GraphicsCommandList* commands, UINT frameView, D3D12_CPU_DESCRIPT
         c.tvExponent = ramp.tvExponent > 0.0f ? 2.2f / ramp.tvExponent : 1.0f;
         c.tvMin = ramp.tvMin / 255.0f;
         c.tvMax = ramp.tvMax / 255.0f;
-    }
-    if (mapping.colorCorrection) {
-        const ColorCorrection& correction = g_state.correction;
-        c.ccDefaultWeight = correction.defaultWeight;
-        for (std::uint32_t i = 0; i < std::min<std::uint32_t>(correction.count, 4); ++i) {
-            Texture* texture = TextureFromHandle(correction.textures[i]);
-            if (texture == nullptr || texture->copies.empty() || texture->depth <= 1)
-                break;
-            Texture::Copy& copy = texture->Current();
-            backend.Transition(copy.resource, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
-            c.ccViews[i] = copy.view;
-            c.ccWeights[i] = correction.weights[i];
-            c.colorCorrection = i + 1;
-        }
     }
     c.debugView = mapping.debugView;
     c.displayPeak = mapping.displayPeak;
@@ -410,6 +378,24 @@ std::optional<DisplayDesc> FindDisplay(IDXGIFactory1* factory, LUID adapterLuid,
 }
 
 void SetColorCorrection(const ColorCorrection& correction) { g_state.correction = correction; }
+
+UINT ColorCorrectionViews(std::array<UINT, 4>& views, std::array<float, 4>& weights, float& defaultWeight)
+{
+    Backend& backend = GetBackend();
+    const ColorCorrection& correction = g_state.correction;
+    defaultWeight = correction.defaultWeight;
+    UINT count = 0;
+    for (; count < std::min<UINT>(correction.count, 4); ++count) {
+        Texture* texture = TextureFromHandle(correction.textures[count]);
+        if (texture == nullptr || texture->copies.empty() || texture->depth <= 1)
+            break;
+        Texture::Copy& copy = texture->Current();
+        backend.Transition(copy.resource, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
+        views[count] = copy.view;
+        weights[count] = correction.weights[count];
+    }
+    return count;
+}
 
 void ClearColorCorrection() { g_state.correction = {}; }
 

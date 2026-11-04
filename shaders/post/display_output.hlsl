@@ -1,11 +1,11 @@
 #include "../tone_curve.hlsli"
 #include "../dither.hlsli"
 
-// The display mapping (src/display_output.cpp): the frame's linear light, 1 = paper white, into what a target shows. SDR
-// targets take the tone curve, the engine's colour correction, saturation, the sRGB curve, the game's gamma ramp
-// (mat_monitorgamma) and dither; HDR10 targets the tone curve up to the display's peak, colour correction below paper
-// white, saturation and the black level, then Rec. 2020 primaries and the PQ curve. The menu (an sRGB texture holding
-// premultiplied colour) is composited over either.
+// The display mapping (src/display_output.cpp): the frame's linear light, 1 = paper white, into what a target shows. The
+// 3D view arrives already fitted to the display's peak by the tone curve and colour corrected (shaders/amd/lens.hlsl,
+// FinalMain), the HUD at paper white; light still above the peak is clipped. SDR targets take the sRGB curve, the game's
+// gamma ramp (mat_monitorgamma) and dither; HDR10 targets saturation and the black level, then Rec. 2020 primaries and
+// the PQ curve. The menu (an sRGB texture holding premultiplied colour) is composited over either.
 
 #define DISPLAY_ROOT_SIGNATURE "RootFlags(CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED), CBV(b0), " \
     "StaticSampler(s0, filter = FILTER_MIN_MAG_MIP_LINEAR, addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, " \
@@ -25,9 +25,7 @@ struct DisplayConstants
     uint frameView;
     uint uiView;
     uint encoding;
-    uint toneCurve;
-    float highlightRolloff;
-    // The curve's peak in paper whites (1 in SDR), paper white in nits (PQ), the black level in nits (PQ).
+    // The display's peak in paper whites (1 in SDR), paper white in nits (PQ), the black level in nits (PQ).
     float peak;
     float paperWhite;
     float blackLevel;
@@ -42,14 +40,8 @@ struct DisplayConstants
     float tvExponent;
     float tvMin;
     float tvMax;
-    // The engine's colour correction (Engine_Post_ps2x.fxc's PerformColorCorrection): its look-up count, default weight,
-    // weights and 32^3 volumes.
-    uint colorCorrection;
-    float ccDefaultWeight;
-    float4 ccWeights;
-    uint4 ccViews;
-    // 16: the frame's luminance in nits (at paperWhite) in false colour; 17: the frame's pixels brighter than the display's
-    // peak (displayPeak, nits) in magenta.
+    // 16: the frame's luminance in nits (at paperWhite) in false colour; 17: its pixels at the display's peak (clipped there)
+    // in magenta.
     uint debugView;
     float displayPeak;
     // 1 while the menu calibrates (display::SetCalibration): CalibrationPattern over the frame.
@@ -100,19 +92,6 @@ VertexOutput VSMain(uint vertex : SV_VertexID)
     VertexOutput output;
     output.position = float4(uv * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
     return output;
-}
-
-// The engine's colour correction over sRGB-encoded colour, as engine_post blends its look-ups.
-float3 ColorCorrected(float3 encoded)
-{
-    float3 lookup = encoded * (31.0 / 32.0) + 0.5 / 32.0;
-    float3 result = encoded * g_display.ccDefaultWeight;
-    [loop]
-    for (uint i = 0; i < g_display.colorCorrection; ++i) {
-        Texture3D<float4> volume = ResourceDescriptorHeap[NonUniformResourceIndex(g_display.ccViews[i])];
-        result += volume.SampleLevel(g_linear, lookup, 0.0).rgb * g_display.ccWeights[i];
-    }
-    return result;
 }
 
 // Luminance in nits as a false colour: blue at 1, green at 100, red from 1000 up, white at 10000.
@@ -173,12 +152,8 @@ float4 PSMain(VertexOutput input) : SV_Target
         if (pattern)
             color = calibrated;
     }
-    float3 mapped = pattern ? min(color, g_display.peak * 1.1) : ToneCurve(color, g_display.toneCurve, g_display.highlightRolloff, g_display.peak);
-    if (g_display.colorCorrection != 0 && !pattern) {
-        // Below paper white as the game corrected its 8-bit image; above it unchanged.
-        float3 low = saturate(mapped);
-        mapped = SrgbToLinear(ColorCorrected(LinearToSrgb(low))) + (mapped - low);
-    }
+    float3 mapped = min(color, g_display.peak * (pattern ? 1.1 : 1.0));
+    bool clipped = max(color.r, max(color.g, color.b)) >= g_display.peak * 0.999;
     if (!pattern)
         mapped = max(lerp(Luminance(mapped), mapped, g_display.saturation), 0.0);
 
@@ -192,7 +167,7 @@ float4 PSMain(VertexOutput input) : SV_Target
         float3 nits = mapped * g_display.paperWhite;
         if (g_display.debugView == 16)
             nits = FalseColor(Luminance(color) * g_display.paperWhite) * g_display.paperWhite;
-        else if (g_display.debugView == 17 && max(color.r, max(color.g, color.b)) * g_display.paperWhite > g_display.displayPeak)
+        else if (g_display.debugView == 17 && clipped)
             nits = float3(1.0, 0.0, 1.0) * g_display.paperWhite;
         // The black level lifts the darkest light, leaving the peak where it is.
         float peakNits = max(g_display.peak * g_display.paperWhite, 1.0);
@@ -209,7 +184,7 @@ float4 PSMain(VertexOutput input) : SV_Target
 
     if (g_display.debugView == 16)
         mapped = FalseColor(Luminance(color) * g_display.paperWhite);
-    else if (g_display.debugView == 17 && max(color.r, max(color.g, color.b)) * g_display.paperWhite > g_display.displayPeak)
+    else if (g_display.debugView == 17 && clipped)
         mapped = float3(1.0, 0.0, 1.0);
     float3 encoded = LinearToSrgb(saturate(mapped));
     if (g_display.gammaRamp != 0) {

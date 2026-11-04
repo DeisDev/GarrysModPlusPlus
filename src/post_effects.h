@@ -9,6 +9,6 @@ namespace gmodpp::native {
 // effects and the HUD: motion blur, depth of field (AMD FidelityFX DoF), the lens (distortion, chromatic aberration, the
 // lens flare, vignetting), contrast adaptive sharpening (AMD FidelityFX CAS), grading and film grain. Shaders in
 // shaders/post and shaders/amd.
-void PostProcessView(D3D12_RECT rect);
+void PostProcessView(D3D12_RECT rect, bool postVgui);
 
 }

@@ -3,6 +3,7 @@
 // pixel corners, half a pixel off red and green, and its effects do not follow the field of view.
 
 #include "../post/flare.hlsli"
+#include "../tone_curve.hlsli"
 #include "ffx_core.h"
 
 // The callbacks ffx_lens.h's FfxLens calls, which this file does not use.
@@ -98,6 +99,20 @@ void LensMain(uint2 pixel : SV_DispatchThreadID)
 
 static const float kMiddleGrey = 0.18;
 
+// The engine's colour correction over sRGB-encoded colour, as engine_post blends its look-ups (Engine_Post_ps2x.fxc's
+// PerformColorCorrection).
+float3 ColorCorrected(float3 encoded)
+{
+    float3 lookup = encoded * (31.0 / 32.0) + 0.5 / 32.0;
+    float3 result = encoded * g_post.ccDefaultWeight;
+    [loop]
+    for (uint i = 0; i < g_post.ccCount; ++i) {
+        Texture3D<float4> volume = ResourceDescriptorHeap[NonUniformResourceIndex(g_post.ccViews[i])];
+        result += volume.SampleLevel(g_postLinear, lookup, 0.0).rgb * g_post.ccWeights[i];
+    }
+    return result;
+}
+
 float3 Grade(float3 color)
 {
     float3 graded = color * g_post.gradeGain;
@@ -105,9 +120,10 @@ float3 Grade(float3 color)
     return max(lerp(Luminance(graded), graded, g_post.gradeSaturation), 0.0);
 }
 
-// input0: the view. The colour grading and film grain, back into the frame as linear light. The grain is added to the
-// sRGB-encoded values up to paper white, as FidelityFX Lens grains the displayed image (its amount fades to nothing at 0
-// and 1); light above paper white keeps its value.
+// input0: the view. The colour grading, the tone curve up to the display's peak, the engine's colour correction below
+// paper white and film grain, back into the frame as display-referred linear light: the HUD, drawn next, stays at paper
+// white. The grain is added to the sRGB-encoded values up to paper white, as FidelityFX Lens grains the displayed image
+// (its amount fades to nothing at 0 and 1); light above paper white keeps its value.
 [RootSignature(POST_ROOT_SIGNATURE)]
 float4 FinalMain(float4 position : SV_Position) : SV_Target
 {
@@ -115,6 +131,12 @@ float4 FinalMain(float4 position : SV_Position) : SV_Target
     int2 pixel = int2(position.xy) - g_post.origin;
     float4 color = source.Load(int3(pixel, 0));
     float3 graded = max(g_post.gradeEnabled != 0 ? Grade(color.rgb) : color.rgb, 0.0);
+    graded = ToneCurve(graded, g_post.toneCurve, g_post.highlightRolloff, g_post.tonePeak);
+    if (g_post.ccCount != 0) {
+        // Below paper white as the game corrected its 8-bit image; above it unchanged.
+        float3 low = saturate(graded);
+        graded = SrgbToLinear(ColorCorrected(LinearToSrgb(low))) + (graded - low);
+    }
     if (g_post.grainAmount > 0.0) {
         float3 encoded = LinearToSrgb(graded);
         float3 grained = saturate(encoded);

@@ -1,9 +1,9 @@
 #ifndef GMODPP_TONE_CURVE_HLSLI
 #define GMODPP_TONE_CURVE_HLSLI
 
-// How the frame's linear light (after the game's tonemap scale, 1 = paper white) fits what the display shows, up to its
-// peak in paper whites (1 in SDR) (Settings::toneCurve, src/display_output.cpp): clipped at the peak, by rolling off the
-// highlights alone, or by a filmic curve over the whole range.
+// How the 3D view's light (after the game's tonemap scale, 1 = paper white) fits what the display shows, up to its peak
+// in paper whites (1 in SDR) (Settings::toneCurve, applied by the camera effects' last pass, shaders/amd/lens.hlsl, before
+// the HUD): clipped at the peak, by rolling off the highlights alone, or by a filmic curve over the whole range.
 static const uint kToneCurveOff = 0;
 static const uint kToneCurveHighlights = 1;
 static const uint kToneCurveFilmic = 2;

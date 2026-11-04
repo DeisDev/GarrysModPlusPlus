@@ -24,9 +24,8 @@ enum class Encoding : std::uint32_t {
 // What the pass applies besides the frame. Built by ForOutput and ForScreenshot.
 struct Mapping {
     Encoding encoding = Encoding::Srgb;
-    std::uint32_t toneCurve = 0;
-    float highlightRolloff = 1.0f;
-    // The tone curve's peak in paper whites (1 in SDR), paper white and the black level in nits (HDR).
+    // The display's peak in paper whites (1 in SDR; the tone curve's, which the camera effects' last pass applies to the
+    // 3D view, post_effects.cpp), paper white and the black level in nits (HDR).
     float peak = 1.0f;
     float paperWhite = 80.0f;
     float blackLevel = 0.0f;
@@ -37,8 +36,6 @@ struct Mapping {
     float ditherSteps = 255.0f;
     // The game's gamma ramp (mat_monitorgamma), SDR only.
     bool gammaRamp = false;
-    // The engine's colour correction recorded at this frame's engine_post draw (SetColorCorrection).
-    bool colorCorrection = false;
     // The menu's texture (UiTarget), or DescriptorHeap::kInvalid.
     UINT uiView = DescriptorHeap::kInvalid;
     // Settings::debugView 16 and 17, and the display's peak in nits for 17.
@@ -96,8 +93,8 @@ void EndUi();
 inline constexpr DXGI_FORMAT kUiFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
 
 // The engine's colour correction at its engine_post draw (shaderapi_pipelines.cpp): the look-up count, default weight,
-// weights and the textures' handles, which ForOutput and ForScreenshot apply after the tone curve. Cleared at each
-// present (ClearColorCorrection), as the engine sets it each frame it draws engine_post.
+// weights and the textures' handles, which the camera effects' last pass applies to the 3D view after the tone curve.
+// Cleared at each present (ClearColorCorrection), as the engine sets it each frame it draws engine_post.
 struct ColorCorrection {
     std::uint32_t count = 0;
     float defaultWeight = 1.0f;
@@ -106,5 +103,8 @@ struct ColorCorrection {
 };
 void SetColorCorrection(const ColorCorrection& correction);
 void ClearColorCorrection();
+// The recorded volumes' shader resource views (moved into a shader resource state) and weights, and the default weight;
+// returns how many there are.
+UINT ColorCorrectionViews(std::array<UINT, 4>& views, std::array<float, 4>& weights, float& defaultWeight);
 
 }

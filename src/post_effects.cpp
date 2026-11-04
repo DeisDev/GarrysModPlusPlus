@@ -8,6 +8,7 @@
 #include "shaderapi.h"
 #include "shaderapi_device.h"
 #include "shaderapi_pipelines.h"
+#include "shaderapi_textures.h"
 #include "streamline.h"
 #include "world.h"
 
@@ -104,8 +105,16 @@ struct PostConstants {
     float gradeSaturation;
     float motionScale[2];
     float focalPixels;
+    std::uint32_t toneCurve;
+    float highlightRolloff;
+    float tonePeak;
+    std::uint32_t ccCount;
+    float ccDefaultWeight;
+    std::uint32_t padding5[3];
+    float ccWeights[4];
+    std::uint32_t ccViews[4];
 };
-static_assert(sizeof(PostConstants) == 17 * 16);
+static_assert(sizeof(PostConstants) == 21 * 16);
 
 // Mirrors PostPass in shaders/post/post.hlsli.
 struct PostPass {
@@ -535,10 +544,11 @@ std::optional<Camera> CameraOf(const gbuffer::Matrix4& viewProj)
 
 }
 
-void PostProcessView(D3D12_RECT rect)
+void PostProcessView(D3D12_RECT rect, bool postVgui)
 {
     const Settings& settings = GetSettings();
-    if (g_state.failed)
+    // The second pass some games run over the menus (the SDK's bPostVGui) sees a view that is tone mapped already.
+    if (g_state.failed || postVgui)
         return;
     const std::optional<PostView> post = world::CurrentPostView();
     std::optional<Camera> camera;
@@ -553,13 +563,11 @@ void PostProcessView(D3D12_RECT rect)
     const bool lens = aberration > 0.0f || distortion != 0.0f || vignette > 0.0f || flare;
     const bool grain = settings.filmGrain && settings.grainAmount > 0.0f;
     const bool grade = GradingChanges(settings);
-    const bool effects = depthOfField || motionBlur || lens || settings.contrastSharpening || grain || grade;
     // Frame generation takes the main view's depth, motion and the view without the HUD from here.
     FsrFrameGeneration* fsrGeneration = GetBackend().FsrFrameGenerator();
     // Neither generator runs while the menu is open: it moves without motion vectors (FSR turns off on frames without inputs).
     const bool frameGeneration = camera && post->motionView != kInvalid && !overlay::Open() && (streamline::FrameGenerationWanted() || fsrGeneration != nullptr);
-    if (!effects && !frameGeneration)
-        return;
+    // The last pass always runs: it fits the 3D view to the display (the tone curve, colour correction) before the HUD.
     if (Dynamic().colorTargets[0] != kDefaultTarget) {
         if (!std::exchange(g_state.loggedTarget, true))
             log::Info("Post effects: skipped a view drawn outside the back buffer");
@@ -666,6 +674,16 @@ void PostProcessView(D3D12_RECT rect)
     c.grainScale = settings.grainSize * static_cast<float>(height) / 1080.0f;
     c.grainSeed = static_cast<std::uint32_t>(g_state.seconds * kGrainRate);
     c.sharpness = settings.contrastSharpness;
+    c.toneCurve = static_cast<std::uint32_t>(settings.toneCurve);
+    c.highlightRolloff = settings.highlightRolloff;
+    c.tonePeak = std::max(backend.HudlessMapping().peak, 1.0f);
+    {
+        std::array<UINT, 4> views = {kInvalid, kInvalid, kInvalid, kInvalid};
+        std::array<float, 4> weights = {};
+        c.ccCount = display::ColorCorrectionViews(views, weights, c.ccDefaultWeight);
+        std::copy(views.begin(), views.end(), c.ccViews);
+        std::copy(weights.begin(), weights.end(), c.ccWeights);
+    }
     c.gradeEnabled = grade ? 1u : 0u;
     if (grade) {
         const std::array<float, 3> gain = GradeGain(settings);
@@ -724,10 +742,6 @@ void PostProcessView(D3D12_RECT rect)
             streamline::TagFrame(commands, {depth, motion, hudless, read, rect}, *post);
         }
     };
-    if (!effects) {
-        tagFrame();
-        return;
-    }
     backend.Transition(backBuffer, read);
     size_t current = 0;
     Use(g_state.scene[current], write);

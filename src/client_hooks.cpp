@@ -135,7 +135,7 @@ void __fastcall HookEnable3dSkyboxFog(void* view)
 void __fastcall HookDoEnginePostProcessing(int x, int y, int w, int h, bool flashlightOn, bool postVGui)
 {
     g_doEnginePostProcessing(x, y, w, h, flashlightOn, postVGui);
-    native::PostProcessView({x, y, x + w, y + h});
+    native::PostProcessView({x, y, x + w, y + h}, postVGui);
 }
 
 bool __fastcall HookHudShouldDraw(void* element)
