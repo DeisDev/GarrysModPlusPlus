@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 using Microsoft::WRL::ComPtr;
 
@@ -84,6 +85,7 @@ struct State {
     unsigned presents = 0;
     UiTarget ui;
     ColorCorrection correction;
+    bool calibrating = false;
 };
 
 State g_state;
@@ -167,6 +169,18 @@ Mapping ForOutput(bool hdr, UINT bits)
     mapping.encoding = hdr ? Encoding::Pq : Encoding::Srgb;
     mapping.ditherSteps = bits >= 10 ? 1023.0f : 255.0f;
     mapping.gammaRamp = !hdr;
+    if (hdr) {
+        const Settings& settings = GetSettings();
+        const Statistics& statistics = GetStatistics();
+        mapping.paperWhite = settings.paperWhiteFollowWindows && statistics.sdrWhiteNits > 0.0f ? statistics.sdrWhiteNits : settings.paperWhite;
+        const float peak = settings.peakFollowDisplay && statistics.displayPeakNits > 0.0f ? statistics.displayPeakNits : settings.peakBrightness;
+        mapping.peak = std::max(peak / mapping.paperWhite, 1.0f);
+        mapping.blackLevel = settings.hdrBlackLevel;
+        mapping.saturation = settings.hdrSaturation;
+        mapping.uiBrightness = settings.uiBrightness > 0.0f ? settings.uiBrightness : mapping.paperWhite;
+        mapping.displayPeak = peak;
+        mapping.calibration = g_state.calibrating ? 1u : 0u;
+    }
     const DebugView debugView = GetSettings().debugView;
     mapping.debugView = debugView == DebugView::Luminance || debugView == DebugView::OverPeak ? static_cast<std::uint32_t>(debugView) : 0u;
     return mapping;
@@ -296,6 +310,104 @@ D3D12_CPU_DESCRIPTOR_HANDLE BeginUi(UINT width, UINT height, UINT& view)
 }
 
 void EndUi() { GetBackend().Transition(g_state.ui.resource, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE); }
+
+void SetCalibration(bool on) { g_state.calibrating = on; }
+
+bool Calibrating() { return g_state.calibrating; }
+
+namespace {
+
+std::string Utf8(const wchar_t* text)
+{
+    const int size = WideCharToMultiByte(CP_UTF8, 0, text, -1, nullptr, 0, nullptr, nullptr);
+    std::string result(size > 0 ? static_cast<size_t>(size) - 1 : 0, '\0');
+    if (size > 1)
+        WideCharToMultiByte(CP_UTF8, 0, text, -1, result.data(), size, nullptr, nullptr);
+    return result;
+}
+
+// Windows' SDR white level and the monitor's name for the display path whose source is the GDI device `device`
+// (QueryDisplayConfig, DisplayConfigGetDeviceInfo).
+void ReadDisplayConfig(DisplayDesc& display)
+{
+    UINT32 pathCount = 0;
+    UINT32 modeCount = 0;
+    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &pathCount, &modeCount) != ERROR_SUCCESS)
+        return;
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths(pathCount);
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes(modeCount);
+    if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &pathCount, paths.data(), &modeCount, modes.data(), nullptr) != ERROR_SUCCESS)
+        return;
+    for (UINT32 i = 0; i < pathCount; ++i) {
+        const DISPLAYCONFIG_PATH_INFO& path = paths[i];
+        DISPLAYCONFIG_SOURCE_DEVICE_NAME source = {};
+        source.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+        source.header.size = sizeof(source);
+        source.header.adapterId = path.sourceInfo.adapterId;
+        source.header.id = path.sourceInfo.id;
+        if (DisplayConfigGetDeviceInfo(&source.header) != ERROR_SUCCESS || display.device != source.viewGdiDeviceName)
+            continue;
+        // SDRWhiteLevel: the SDR white level in multiples of 80 nits, times 1000.
+        DISPLAYCONFIG_SDR_WHITE_LEVEL white = {};
+        white.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL;
+        white.header.size = sizeof(white);
+        white.header.adapterId = path.targetInfo.adapterId;
+        white.header.id = path.targetInfo.id;
+        if (DisplayConfigGetDeviceInfo(&white.header) == ERROR_SUCCESS)
+            display.sdrWhiteNits = static_cast<float>(white.SDRWhiteLevel) / 1000.0f * 80.0f;
+        DISPLAYCONFIG_TARGET_DEVICE_NAME target = {};
+        target.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
+        target.header.size = sizeof(target);
+        target.header.adapterId = path.targetInfo.adapterId;
+        target.header.id = path.targetInfo.id;
+        if (DisplayConfigGetDeviceInfo(&target.header) == ERROR_SUCCESS && target.monitorFriendlyDeviceName[0] != L'\0')
+            display.name = Utf8(target.monitorFriendlyDeviceName);
+        return;
+    }
+}
+
+}
+
+std::string Utf8Name(const std::wstring& device) { return Utf8(device.c_str()); }
+
+std::optional<DisplayDesc> FindDisplay(IDXGIFactory1* factory, LUID adapterLuid, HWND window)
+{
+    ComPtr<IDXGIFactory4> factory4;
+    ComPtr<IDXGIAdapter1> adapter;
+    if (factory == nullptr || FAILED(factory->QueryInterface(IID_PPV_ARGS(&factory4))) || FAILED(factory4->EnumAdapterByLuid(adapterLuid, IID_PPV_ARGS(&adapter))))
+        return std::nullopt;
+    RECT area = {};
+    if (window == nullptr || !GetWindowRect(window, &area))
+        return std::nullopt;
+    std::optional<DisplayDesc> best;
+    LONG bestArea = 0;
+    ComPtr<IDXGIOutput> output;
+    for (UINT i = 0; adapter->EnumOutputs(i, &output) != DXGI_ERROR_NOT_FOUND; ++i) {
+        ComPtr<IDXGIOutput6> output6;
+        DXGI_OUTPUT_DESC1 desc = {};
+        if (FAILED(output.As(&output6)) || FAILED(output6->GetDesc1(&desc)))
+            continue;
+        const RECT& d = desc.DesktopCoordinates;
+        const LONG width = std::max(0L, std::min(area.right, d.right) - std::max(area.left, d.left));
+        const LONG height = std::max(0L, std::min(area.bottom, d.bottom) - std::max(area.top, d.top));
+        if (width * height <= bestArea)
+            continue;
+        bestArea = width * height;
+        DisplayDesc display;
+        display.device = desc.DeviceName;
+        display.name = Utf8(desc.DeviceName);
+        display.hdr = desc.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+        display.peakNits = desc.MaxLuminance;
+        display.fullFrameNits = desc.MaxFullFrameLuminance;
+        display.blackNits = desc.MinLuminance;
+        display.bits = desc.BitsPerColor;
+        display.desktop = d;
+        best = display;
+    }
+    if (best)
+        ReadDisplayConfig(*best);
+    return best;
+}
 
 void SetColorCorrection(const ColorCorrection& correction) { g_state.correction = correction; }
 

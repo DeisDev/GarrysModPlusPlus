@@ -3,9 +3,12 @@
 #include "descriptor_heap.h"
 
 #include <d3d12.h>
+#include <dxgi1_6.h>
 
 #include <array>
 #include <cstdint>
+#include <optional>
+#include <string>
 
 namespace gmodpp::native::display {
 
@@ -45,8 +48,34 @@ struct Mapping {
     std::uint32_t calibration = 0;
 };
 
-// The mapping the swap chain's buffers take: SDR in `bits` (8 or 10) or HDR10.
+// The mapping the swap chain's buffers take: SDR in `bits` (8 or 10) or HDR10, with the display's paper white and peak
+// (Settings, Statistics) and, while the menu calibrates, the calibration pattern.
 Mapping ForOutput(bool hdr, UINT bits);
+
+// The menu's calibration patterns (shaders/post/display_output.hlsl) over the frame in HDR, while it is on.
+void SetCalibration(bool on);
+bool Calibrating();
+
+// A display output as DXGI and Windows' display configuration describe it (Using DirectX with Advanced Color,
+// Microsoft Learn): its GDI device name and monitor name, whether Windows runs it in HDR (DXGI_OUTPUT_DESC1::ColorSpace
+// is G2084_P2020), its luminance range in nits, Windows' SDR white level in nits (DISPLAYCONFIG_SDR_WHITE_LEVEL, 0 when
+// unknown) and the bits per colour of its link.
+struct DisplayDesc {
+    std::wstring device;
+    std::string name;
+    bool hdr = false;
+    float peakNits = 0.0f;
+    float fullFrameNits = 0.0f;
+    float blackNits = 0.0f;
+    float sdrWhiteNits = 0.0f;
+    UINT bits = 8;
+    RECT desktop = {};
+};
+// The output of `adapter` (by LUID, enumerated through `factory`) whose desktop area intersects the window most, as
+// Microsoft's guidance picks it (not IDXGISwapChain::GetContainingOutput), or nothing when the window covers none.
+std::optional<DisplayDesc> FindDisplay(IDXGIFactory1* factory, LUID adapter, HWND window);
+// A GDI device name in UTF-8, for the log.
+std::string Utf8Name(const std::wstring& device);
 // An 8-bit SDR view of the frame without the menu, as the screen shows it in SDR: what ReadPixels, screenshots and
 // capture.request read.
 Mapping ForScreenshot();

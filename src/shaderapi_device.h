@@ -17,6 +17,8 @@
 #include <cstdint>
 #include <functional>
 #include <mutex>
+#include <optional>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -120,8 +122,9 @@ public:
     D3D12_CPU_DESCRIPTOR_HANDLE FrameBufferView() const { return m_frameBufferView; }
     // Its shader resource view.
     UINT FrameBufferTexture() const { return m_frameBufferTexture; }
-    // The swap chain buffers' format (SDR: 8 or 10 bits; HDR10: R10G10B10A2 with PQ).
+    // The swap chain buffers' format (SDR: 8 or 10 bits; HDR10: R10G10B10A2 with PQ), and whether they show HDR10.
     DXGI_FORMAT OutputFormat() const { return m_outputFormat; }
+    bool OutputHdr() const { return m_outputHdr; }
     // How the frame is mapped into the swap chain's buffers, without the menu: what frame generation's view without the
     // HUD must match.
     display::Mapping HudlessMapping() const;
@@ -178,6 +181,12 @@ private:
     int m_placedDisplay = -1;
     bool CreateDepthBuffer();
     bool CreateFrameBuffer();
+    // Takes the swap chain's buffers and makes their views, and sets the colour space they are shown in.
+    void AcquireBuffers();
+    // Finds the display the window is on and switches the swap chain between SDR and HDR10 as Settings::hdrOutput and
+    // the display ask (display_output.h), recording nothing.
+    void UpdateOutput();
+    void SwitchOutput(DXGI_FORMAT format, bool hdr);
     TrackedResource& SwapChainBuffer() { return m_backBuffers[m_swapChain->GetCurrentBackBufferIndex()]; }
     // Maps the frame and the menu into the swap chain's current buffer.
     void MapToOutput();
@@ -200,6 +209,17 @@ private:
     std::array<TrackedResource, kBackBuffers> m_backBuffers;
     std::array<D3D12_CPU_DESCRIPTOR_HANDLE, kBackBuffers> m_backBufferViews = {};
     DXGI_FORMAT m_outputFormat = DXGI_FORMAT_B8G8R8A8_UNORM;
+    bool m_outputHdr = false;
+    // The display the window was last found on, the factory its outputs are enumerated through (made again when DXGI says
+    // the display configuration changed, IDXGIFactory1::IsCurrent), the window's place then, and the presents since.
+    std::optional<display::DisplayDesc> m_display;
+    Microsoft::WRL::ComPtr<IDXGIFactory1> m_displayFactory;
+    RECT m_displayWindow = {};
+    unsigned m_displayPresents = 0;
+    // HDR10 asked for (Settings::hdrOutput On) on a display or swap chain that can't show it; tried again when the
+    // display or the setting changes.
+    bool m_hdrRefused = false;
+    HdrOutput m_hdrRequest = HdrOutput::Auto;
     TrackedResource m_frameBuffer;
     D3D12_CPU_DESCRIPTOR_HANDLE m_frameBufferView = {};
     UINT m_frameBufferTexture = DescriptorHeap::kInvalid;

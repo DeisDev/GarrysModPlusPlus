@@ -458,6 +458,16 @@ bool Backend::CreateSwapChain()
         }
         m_factory->MakeWindowAssociation(m_window, DXGI_MWA_NO_ALT_ENTER);
     }
+    AcquireBuffers();
+    if (!CreateFrameBuffer() || !CreateDepthBuffer())
+        return false;
+    log::Info("Native: swap chain {}x{} in format {}, vsync {}", m_width, m_height, static_cast<int>(m_outputFormat), m_vsync ? "on" : "off");
+    BeginFrame();
+    return true;
+}
+
+void Backend::AcquireBuffers()
+{
     for (UINT i = 0; i < kBackBuffers; ++i) {
         m_swapChain->GetBuffer(i, IID_PPV_ARGS(&m_backBuffers[i].resource));
         m_backBuffers[i].state = D3D12_RESOURCE_STATE_PRESENT;
@@ -468,11 +478,11 @@ bool Backend::CreateSwapChain()
         desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
         m_device->CreateRenderTargetView(m_backBuffers[i].resource.Get(), &desc, m_backBufferViews[i]);
     }
-    if (!CreateFrameBuffer() || !CreateDepthBuffer())
-        return false;
-    log::Info("Native: swap chain {}x{} in format {}, vsync {}", m_width, m_height, static_cast<int>(m_outputFormat), m_vsync ? "on" : "off");
-    BeginFrame();
-    return true;
+    // R10G10B10A2 takes either G22_P709 (SDR) or G2084_P2020 (HDR10); B8G8R8A8 G22_P709 (DXGI_COLOR_SPACE_TYPE).
+    const DXGI_COLOR_SPACE_TYPE space = m_outputHdr ? DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 : DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+    const HRESULT hr = m_swapChain->SetColorSpace1(space);
+    if (FAILED(hr))
+        log::Info("Native: SetColorSpace1({}) failed: {:#010x}", static_cast<int>(space), Hex(hr));
 }
 
 bool Backend::CreateDepthBuffer()
@@ -669,6 +679,7 @@ void Backend::Present()
     if (!m_recording)
         return;
     RunPending();
+    UpdateOutput();
     busy::NotePresent();
     SavePipelineLibrary(false);
     // Once the game has been drawing for a few seconds (its menu is up), shaders of earlier sessions that an update
@@ -723,7 +734,97 @@ void Backend::Present()
     anti_lag::Update();
 }
 
-display::Mapping Backend::HudlessMapping() const { return display::ForOutput(false, 8); }
+display::Mapping Backend::HudlessMapping() const { return display::ForOutput(m_outputHdr, m_outputFormat == DXGI_FORMAT_R10G10B10A2_UNORM ? 10 : 8); }
+
+// How often (in presents) the display is looked for again while the window stays put: Windows' SDR white level and HDR
+// switch raise no event the swap chain sees.
+constexpr unsigned kDisplayPollPresents = 60;
+
+void Backend::UpdateOutput()
+{
+    RECT window = {};
+    GetWindowRect(m_window, &window);
+    const bool moved = !EqualRect(&window, &m_displayWindow);
+    const bool stale = m_displayFactory == nullptr || !m_displayFactory->IsCurrent();
+    if (moved || stale || ++m_displayPresents >= kDisplayPollPresents) {
+        m_displayPresents = 0;
+        m_displayWindow = window;
+        if (stale) {
+            m_displayFactory = nullptr;
+            CreateDXGIFactory1(IID_PPV_ARGS(&m_displayFactory));
+        }
+        std::optional<display::DisplayDesc> found = display::FindDisplay(m_displayFactory.Get(), m_device->GetAdapterLuid(), m_window);
+        if (found) {
+            const bool changed = !m_display || m_display->device != found->device || m_display->hdr != found->hdr || m_display->peakNits != found->peakNits ||
+                m_display->sdrWhiteNits != found->sdrWhiteNits || m_display->bits != found->bits;
+            if (changed) {
+                log::Info("Native: display '{}' ({}), HDR {}, peak {:.0f} nits, full frame {:.0f} nits, black {:.3f} nits, SDR white {:.0f} nits, {} bits",
+                    found->name, display::Utf8Name(found->device), found->hdr ? "on" : "off", found->peakNits, found->fullFrameNits, found->blackNits,
+                    found->sdrWhiteNits, found->bits);
+                if (!m_display || m_display->device != found->device || m_display->hdr != found->hdr)
+                    m_hdrRefused = false;
+            }
+            m_display = std::move(found);
+        }
+    }
+    Statistics& statistics = GetStatistics();
+    if (m_display) {
+        statistics.displayKnown = true;
+        statistics.displayName = m_display->name;
+        statistics.displayHdr = m_display->hdr;
+        statistics.displayPeakNits = m_display->peakNits;
+        statistics.displayFullFrameNits = m_display->fullFrameNits;
+        statistics.displayBlackNits = m_display->blackNits;
+        statistics.sdrWhiteNits = m_display->sdrWhiteNits;
+        statistics.displayBits = m_display->bits;
+    }
+
+    const Settings& settings = GetSettings();
+    if (settings.hdrOutput != m_hdrRequest) {
+        m_hdrRequest = settings.hdrOutput;
+        m_hdrRefused = false;
+    }
+    const bool displayHdr = m_display && m_display->hdr;
+    const bool wantHdr = !m_hdrRefused && (settings.hdrOutput == HdrOutput::On || (settings.hdrOutput == HdrOutput::Auto && displayHdr));
+    const bool tenBits = settings.outputBitDepth == OutputBits::Ten || (settings.outputBitDepth == OutputBits::Auto && m_display && m_display->bits >= 10);
+    const DXGI_FORMAT format = wantHdr || tenBits ? DXGI_FORMAT_R10G10B10A2_UNORM : DXGI_FORMAT_B8G8R8A8_UNORM;
+    if (format != m_outputFormat || wantHdr != m_outputHdr)
+        SwitchOutput(format, wantHdr);
+    statistics.outputHdr = m_outputHdr;
+    statistics.outputBits = m_outputFormat == DXGI_FORMAT_R10G10B10A2_UNORM ? 10 : 8;
+    statistics.hdrUnavailable = m_hdrRefused;
+}
+
+// Microsoft's D3D12HDR sample's order: the buffers are released, resized to the new format, and the colour space set
+// once the swap chain says it can present it (CheckColorSpaceSupport).
+void Backend::SwitchOutput(DXGI_FORMAT format, bool hdr)
+{
+    Flush();
+    for (TrackedResource& buffer : m_backBuffers)
+        buffer = {};
+    m_fsrFrameGeneration.ReleaseContext();
+    HRESULT hr = m_swapChain->ResizeBuffers(kBackBuffers, m_width, m_height, format, m_tearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0);
+    if (FAILED(hr)) {
+        log::Info("Native: resizing the swap chain's buffers to format {} failed: {:#010x}", static_cast<int>(format), Hex(hr));
+        if (hdr)
+            m_hdrRefused = true;
+        AcquireBuffers();
+        return;
+    }
+    m_outputFormat = format;
+    if (hdr) {
+        UINT support = 0;
+        if (FAILED(m_swapChain->CheckColorSpaceSupport(DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020, &support)) ||
+            (support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT) == 0) {
+            log::Info("Native: the swap chain cannot present HDR10 on this display; staying in SDR");
+            m_hdrRefused = true;
+            hdr = false;
+        }
+    }
+    m_outputHdr = hdr;
+    AcquireBuffers();
+    log::Info("Native: the swap chain shows {} in format {}", hdr ? "HDR10" : "SDR", static_cast<int>(format));
+}
 
 void Backend::MapToOutput()
 {

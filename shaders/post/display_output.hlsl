@@ -52,7 +52,7 @@ struct DisplayConstants
     // peak (displayPeak, nits) in magenta.
     uint debugView;
     float displayPeak;
-    // Calibration pattern (display::Calibration), 0 for none.
+    // 1 while the menu calibrates (display::SetCalibration): CalibrationPattern over the frame.
     uint calibration;
     uint padding;
 };
@@ -125,39 +125,34 @@ float3 FalseColor(float nits)
     return ramp;
 }
 
-// The calibration patterns, in paper whites, or a negative value outside them.
+// The calibration pattern over the top three quarters of the screen, in paper whites (the game's frame shows below it,
+// with the HUD at paper white): a patch at the peak with a square 1.1 times as bright inside, which disappears once the
+// peak is set at or above what the display shows; paper white beside middle grey; near-black steps of 0, 0.5, 1, 2 and
+// 5 nits. `inside` is false where the frame shows.
 float3 CalibrationPattern(float2 pixel, float2 size, out bool inside)
 {
-    inside = true;
     float2 uv = pixel / size;
-    float peak = g_display.peak;
-    // A peak patch on the left: the slider's peak, and inside it a square 1.1 times as bright that vanishes once the
-    // peak is set at or below the display's.
-    if (g_display.calibration == 1) {
-        float2 centre = float2(0.25, 0.5);
-        float2 offset = abs(uv - centre) * float2(size.x / size.y, 1.0);
-        if (max(offset.x, offset.y) < 0.06)
-            return peak * 1.1;
-        if (max(offset.x, offset.y) < 0.2)
-            return peak;
+    inside = uv.y < 0.75;
+    if (!inside)
         return 0.0;
+    float aspect = size.x / size.y;
+    float2 peakOffset = abs(uv - float2(0.25, 0.3)) * float2(aspect, 1.0);
+    float peakDistance = max(peakOffset.x, peakOffset.y);
+    if (peakDistance < 0.05)
+        return g_display.peak * 1.1;
+    if (peakDistance < 0.18)
+        return g_display.peak;
+    if (uv.y > 0.15 && uv.y < 0.45) {
+        if (uv.x > 0.5 && uv.x < 0.68)
+            return 1.0;
+        if (uv.x > 0.72 && uv.x < 0.9)
+            return 0.18;
     }
-    // Paper white beside middle grey, and near-black steps of 0, 0.5, 1, 2 and 5 nits along the bottom.
-    if (g_display.calibration == 2) {
-        if (uv.y > 0.75) {
-            uint step = min(uint(uv.x * 5.0), 4u);
-            static const float kSteps[5] = {0.0, 0.5, 1.0, 2.0, 5.0};
-            return kSteps[step] / max(g_display.paperWhite, 1.0);
-        }
-        if (uv.y > 0.3 && uv.y < 0.6) {
-            if (uv.x > 0.2 && uv.x < 0.45)
-                return 1.0;
-            if (uv.x > 0.55 && uv.x < 0.8)
-                return 0.18;
-        }
-        return 0.0;
+    if (uv.y > 0.55 && uv.y < 0.7 && uv.x > 0.1 && uv.x < 0.9) {
+        static const float kSteps[5] = {0.0, 0.5, 1.0, 2.0, 5.0};
+        uint step = min(uint((uv.x - 0.1) / 0.16), 4u);
+        return kSteps[step] / max(g_display.paperWhite, 1.0);
     }
-    inside = false;
     return 0.0;
 }
 

@@ -79,10 +79,16 @@ enum class LightSampling : uint32_t { Legacy = 0, Ris, Restir, Auto, Count };
 // or NVIDIA NRD's RELAX or REBLUR.
 enum class DenoiserType : uint32_t { BuiltIn = 0, Relax, Reblur, RayRegeneration, Count };
 
-// How lit colour after the game's tonemap scale is fitted into the 8-bit image, which clips each channel at white: as
-// Source does (Off), by rolling off the highlights alone, or by a filmic curve (AgX) over the whole range
-// (shaders/tone_curve.hlsli).
+// How the frame's light fits what the display shows, up to its peak: clipped there as Source does (Off), by rolling off
+// the highlights alone, or by a filmic curve over the whole range (AgX in SDR, Uchimura's in HDR;
+// shaders/tone_curve.hlsli).
 enum class ToneCurve : uint32_t { Off = 0, Highlights, Filmic, Count };
+
+// Whether the swap chain shows HDR10 (Rec. 2020 primaries, PQ): while Windows runs the display in HDR (Auto), whenever
+// the swap chain can show it (On), or never (src/display_output.cpp).
+enum class HdrOutput : uint32_t { Auto = 0, On, Off, Count };
+// The bits per channel of SDR output: what the display's link carries (Auto), 8 or 10.
+enum class OutputBits : uint32_t { Auto = 0, Eight, Ten, Count };
 
 // The resolution the main view's clouds are kept at: a quarter, half or all of the screen's across.
 enum class CloudResolution : uint32_t { Quarter = 0, Half, Full, Count };
@@ -365,6 +371,19 @@ struct Settings {
     std::string menuCollapsed;
     // Turns off GMod's frame rate cap while its window is not focused (engine::CapUnfocusedFrames).
     bool backgroundFullSpeed = false;
+    // The display output (this computer's; src/display_output.cpp): HDR10 or SDR and SDR's bits; in HDR the light of
+    // paper white (the game's white, 1 in the frame) and the display's peak in nits, each Windows' own when it follows it
+    // (the SDR content brightness slider; the display's reported peak), the black level's lift in nits, saturation, and
+    // the menu's white in nits (0: paper white).
+    HdrOutput hdrOutput = HdrOutput::Auto;
+    OutputBits outputBitDepth = OutputBits::Auto;
+    float paperWhite = 200.0f;
+    bool paperWhiteFollowWindows = true;
+    float peakBrightness = 1000.0f;
+    bool peakFollowDisplay = true;
+    float hdrBlackLevel = 0.0f;
+    float hdrSaturation = 1.0f;
+    float uiBrightness = 0.0f;
 
     bool operator==(const Settings&) const = default;
 };
@@ -413,7 +432,8 @@ using SettingMember = std::variant<bool Settings::*, float Settings::*, int Sett
     AntiAliasing Settings::*,
     UpscalingMode Settings::*, QualityPreset Settings::*, FoliageShadows Settings::*, IndirectLighting Settings::*, EmissiveLighting Settings::*,
     LightSampling Settings::*, DenoiserType Settings::*, MapSun Settings::*, OverlayDetail Settings::*, OverlayCorner Settings::*, DofFocus Settings::*,
-    CloudResolution Settings::*, Weather Settings::*, ReflexMode Settings::*, FrameGeneration Settings::*, ToneCurve Settings::*>;
+    CloudResolution Settings::*, Weather Settings::*, ReflexMode Settings::*, FrameGeneration Settings::*, ToneCurve Settings::*,
+    HdrOutput Settings::*, OutputBits Settings::*>;
 
 // A setting's place in the settings table (kFields in settings.cpp).
 using FieldId = uint16_t;
@@ -558,6 +578,21 @@ struct Statistics {
     float gameFogEnd = 0.0f;
     float gameFogMaxDensity = 1.0f;
     bool gameFogKnown = false;
+    // The display the game window covers most (src/display_output.cpp): its name, whether Windows runs it in HDR, its
+    // peak, full-frame and black luminance and Windows' SDR white level in nits (0 when unknown), and the bits per colour
+    // its link carries. What the swap chain shows: HDR10 or SDR, in how many bits, and whether HDR was asked for but
+    // the swap chain cannot show it.
+    std::string displayName;
+    bool displayKnown = false;
+    bool displayHdr = false;
+    float displayPeakNits = 0.0f;
+    float displayFullFrameNits = 0.0f;
+    float displayBlackNits = 0.0f;
+    float sdrWhiteNits = 0.0f;
+    uint32_t displayBits = 8;
+    bool outputHdr = false;
+    uint32_t outputBits = 8;
+    bool hdrUnavailable = false;
 };
 
 Statistics& GetStatistics();
