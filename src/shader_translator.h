@@ -49,8 +49,10 @@ struct Variant {
     // Pixel shaders whose samples are clipped to [0, 1], as an 8-bit target gave them: Source's bloom and auto exposure
     // passes, tuned on the 8-bit image (shaderapi_pipelines.cpp, ReadsClippedFrame).
     std::uint8_t saturateSamples : 1 = 0;
-    // Zero, so that variants compare equal byte for byte.
-    std::uint8_t unused : 1 = 0;
+    // Pixel shaders drawing into an encoded copy of such a target (a blended draw with sRGB writes off, so it blends
+    // the encoded values as Direct3D 9 did: EncodedDraw in shaderapi_pipelines.cpp): oC0 is clamped to [0, 1], as the
+    // 8-bit target clamped it, and stored as it is.
+    std::uint8_t clampOutput : 1 = 0;
     // Pixel shaders: samplers reading such a target with sRGB reads off, which see its colour encoded as the 8-bit
     // target's bytes were.
     std::uint16_t encodedSamplers = 0;

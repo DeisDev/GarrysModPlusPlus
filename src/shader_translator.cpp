@@ -1085,7 +1085,9 @@ std::string Translator::Assemble()
             if (m_out.colorOutputs & (1u << i))
                 text += std::format("    gmodpp_target{0} = oC{0};\n", i);
         }
-        if (m_variant.decodeOutput != 0 && (m_out.colorOutputs & 1u))
+        if (m_variant.clampOutput != 0 && (m_out.colorOutputs & 1u))
+            text += "    gmodpp_target0 = saturate(gmodpp_target0);\n";
+        else if (m_variant.decodeOutput != 0 && (m_out.colorOutputs & 1u))
             text += "    gmodpp_target0.rgb = gmodpp_decode(gmodpp_target0.rgb);\n";
         if (fogEpilogue && (m_out.colorOutputs & 1u))
             text += std::format("    gmodpp_target0 = gmodpp_FogBlend(gmodpp_target0, input.position, {}, gmodpp_alpha.z);\n", viewportSize);

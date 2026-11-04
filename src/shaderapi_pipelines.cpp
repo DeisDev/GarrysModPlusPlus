@@ -242,6 +242,8 @@ struct PipelineCache {
     // The pixel shaders the 2D sky's faces are drawn with in place of the game's (shaders/sky_draw.hlsl).
     CompiledShader skyShader;
     CompiledShader discShader;
+    // Redraws an encoded draw's geometry to encode its target's pixels or decode them back (EncodedDraw).
+    CompiledShader codecShader;
     std::uint64_t boundGeneration = ~0ull;
     ID3D12PipelineState* boundPipeline = nullptr;
     // Shaders the render thread asked shader_precache::Build for, and the time it waited.
@@ -413,6 +415,21 @@ void OpenPipelineLibrary(const std::filesystem::path& path)
     g_cache.librarySaved = std::chrono::steady_clock::now();
 }
 
+// Copies the pixels a draw covers between a target and its encoded copy (EncodedDraw): sRGB-encoded (indices.z 1) or
+// decoded (0). Its only input, SV_Position, comes first in every translated vertex shader's output (gmodpp_Interpolants),
+// so it links with any of them.
+constexpr const char* kCodecPixelShader = R"(cbuffer Codec : register(b0) { float4 unused; uint4 indices; };
+float4 main(float4 position : SV_Position) : SV_Target
+{
+    Texture2D<float4> source = ResourceDescriptorHeap[indices.x];
+    float4 c = source.Load(int3(position.xy, 0));
+    float3 x = max(c.rgb, 0);
+    float3 encoded = select(x <= 0.0031308, x * 12.92, 1.055 * pow(x, 1.0 / 2.4) - 0.055);
+    float3 decoded = select(x <= 0.04045, x / 12.92, pow((x + 0.055) / 1.055, 2.4));
+    return float4(indices.z != 0 ? encoded : decoded, c.a);
+}
+)";
+
 bool Initialize()
 {
     if (g_cache.initialized)
@@ -432,6 +449,14 @@ bool Initialize()
         shader->dxilHash = Fnv(dxil.data(), dxil.size());
         shader->info.stage = translator::Stage::Pixel;
         shader->info.colorOutputs = 1;
+    }
+    if (g_cache.compiler.Compile(kCodecPixelShader, L"ps_6_6", g_cache.codecShader.dxil, error)) {
+        g_cache.codecShader.dxilHash = Fnv(g_cache.codecShader.dxil.data(), g_cache.codecShader.dxil.size());
+        g_cache.codecShader.info.stage = translator::Stage::Pixel;
+        g_cache.codecShader.info.colorOutputs = 1;
+    } else {
+        g_cache.codecShader.dxil.clear();
+        log::Info("Native: compiling the shader that blends encoded colour failed: {}", error);
     }
     OpenPipelineLibrary(PipelineLibraryPath());
     g_cache.usable = true;
@@ -1296,6 +1321,163 @@ void DrawSkyFaces(PipelineKey key, const CompiledShader& vertexShader, const Com
 
 namespace {
 
+// Direct3D 9 blended a draw with sRGB writes off on its 8-bit target's encoded values. Into a target holding linear
+// light, such a draw (the bloom's bloomadd, sprites) goes into a copy of the target holding the pixels it covers encoded,
+// where the pipeline blends as Direct3D 9 did; they are then decoded back. Blending linear light made the bloom far
+// weaker.
+struct EncodedCopy {
+    TrackedResource resource;
+    UINT view = DescriptorHeap::kInvalid;
+    D3D12_CPU_DESCRIPTOR_HANDLE target = {};
+    UINT width = 0;
+    UINT height = 0;
+    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+};
+// One per size and format of target drawn into, the most recently used last; a new size takes the least recently used
+// one's place when there are kEncodedCopies (the window was resized).
+constexpr size_t kEncodedCopies = 4;
+std::vector<std::unique_ptr<EncodedCopy>> g_encodedCopies;
+
+struct EncodedDraw {
+    TrackedResource* target = nullptr;
+    UINT targetView = DescriptorHeap::kInvalid;
+    D3D12_CPU_DESCRIPTOR_HANDLE targetRtv = {};
+    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+    EncodedCopy* copy = nullptr;
+};
+
+EncodedCopy* EncodedCopyFor(UINT width, UINT height, DXGI_FORMAT format)
+{
+    auto found = std::ranges::find_if(g_encodedCopies, [&](const std::unique_ptr<EncodedCopy>& copy) {
+        return copy->width == width && copy->height == height && copy->format == format;
+    });
+    if (found != g_encodedCopies.end()) {
+        std::rotate(found, found + 1, g_encodedCopies.end());
+        return g_encodedCopies.back().get();
+    }
+    Backend& backend = GetBackend();
+    std::unique_ptr<EncodedCopy> copy;
+    if (g_encodedCopies.size() == kEncodedCopies) {
+        copy = std::move(g_encodedCopies.front());
+        g_encodedCopies.erase(g_encodedCopies.begin());
+        backend.Retire(std::move(copy->resource.resource));
+        copy->resource = {};
+        // Frames in flight may still read the old view.
+        backend.RetireDescriptor(copy->view);
+        copy->view = backend.Descriptors().Allocate();
+    } else {
+        copy = std::make_unique<EncodedCopy>();
+        copy->target = backend.RenderTargetViews().Allocate();
+        copy->view = backend.Descriptors().Allocate();
+    }
+    D3D12_RESOURCE_DESC desc = {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = width;
+    desc.Height = height;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = format;
+    desc.SampleDesc.Count = 1;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    const D3D12_HEAP_PROPERTIES heap = { D3D12_HEAP_TYPE_DEFAULT };
+    const HRESULT hr = backend.Device()->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+        IID_PPV_ARGS(&copy->resource.resource));
+    if (FAILED(hr)) {
+        log::Info("Native: creating a {}x{} target to blend encoded colour in failed: {:#010x}", width, height, static_cast<unsigned>(hr));
+        copy->width = copy->height = 0;
+        g_encodedCopies.insert(g_encodedCopies.begin(), std::move(copy));
+        return nullptr;
+    }
+    copy->resource.state = D3D12_RESOURCE_STATE_COMMON;
+    backend.Device()->CreateRenderTargetView(copy->resource.resource.Get(), nullptr, copy->target);
+    backend.Device()->CreateShaderResourceView(copy->resource.resource.Get(), nullptr, backend.Descriptors().Cpu(copy->view));
+    copy->width = width;
+    copy->height = height;
+    copy->format = format;
+    return g_encodedCopies.emplace_back(std::move(copy)).get();
+}
+
+// Render target 0 and its copy for an encoded draw; false when it cannot take one.
+bool PrepareEncodedDraw(const Targets& targets, EncodedDraw& draw)
+{
+    if (g_cache.codecShader.dxil.empty())
+        return false;
+    Backend& backend = GetBackend();
+    const std::intptr_t handle = Dynamic().colorTargets[0];
+    if (handle == kDefaultTarget) {
+        draw = { &backend.FrameBuffer(), backend.FrameBufferTexture(), backend.FrameBufferView(), Backend::kFrameFormat };
+    } else {
+        Texture* texture = TextureFromHandle(handle);
+        if (texture == nullptr || texture->copies.empty())
+            return false;
+        Texture::Copy& copy = texture->Current();
+        draw = { &copy.resource, copy.view, copy.target, texture->TargetFormat(false) };
+    }
+    if (draw.targetView == DescriptorHeap::kInvalid)
+        return false;
+    draw.copy = EncodedCopyFor(targets.width, targets.height, draw.format);
+    return draw.copy != nullptr;
+}
+
+// Draws the mesh into the copy with `pipeline`, which blends the copy's encoded values: the geometry is drawn first to
+// encode the target's pixels it covers into the copy, and after to decode them back (a superset of what the draw
+// writes: no depth test or culling). Leaves the targets, `pipeline` and the pixel constants bound, as a plain draw does.
+void DrawEncoded(ID3D12GraphicsCommandList* commands, const PipelineKey& key, ID3D12PipelineState* pipeline, D3D12_GPU_VIRTUAL_ADDRESS pixelFloats,
+    const Targets& targets, const EncodedDraw& draw, const MeshDraw& mesh)
+{
+    PipelineKey codecKey = key;
+    codecKey.pixelShader = &g_cache.codecShader;
+    std::memset(&codecKey.blend, 0, sizeof(codecKey.blend));
+    D3D12_RENDER_TARGET_BLEND_DESC& blend = codecKey.blend.RenderTarget[0];
+    blend.SrcBlend = blend.SrcBlendAlpha = D3D12_BLEND_ONE;
+    blend.DestBlend = blend.DestBlendAlpha = D3D12_BLEND_ZERO;
+    blend.BlendOp = blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+    blend.LogicOp = D3D12_LOGIC_OP_NOOP;
+    blend.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    codecKey.raster.CullMode = D3D12_CULL_MODE_NONE;
+    codecKey.raster.DepthBias = 0;
+    codecKey.raster.SlopeScaledDepthBias = 0;
+    std::memset(&codecKey.depthStencil, 0, sizeof(codecKey.depthStencil));
+    codecKey.depthStencil.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+    codecKey.depthStencil.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    codecKey.depthStencil.FrontFace = codecKey.depthStencil.BackFace = { D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_COMPARISON_FUNC_ALWAYS };
+    codecKey.depthFormat = DXGI_FORMAT_UNKNOWN;
+    ID3D12PipelineState* codec = Pipeline(codecKey);
+    if (codec == nullptr)
+        return;
+
+    Backend& backend = GetBackend();
+    const D3D12_CPU_DESCRIPTOR_HANDLE* depth = targets.depth.ptr != 0 ? &targets.depth : nullptr;
+    struct {
+        float unused[4];
+        std::uint32_t indices[4];
+    } constants = { {}, { draw.targetView, 0, 1, 0 } };
+    backend.Transition(*draw.target, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    backend.Transition(draw.copy->resource, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    commands->OMSetRenderTargets(1, &draw.copy->target, FALSE, nullptr);
+    commands->SetPipelineState(codec);
+    commands->SetGraphicsRootConstantBufferView(2, UploadConstants(&constants, sizeof(constants)));
+    IssueDraws(commands, mesh);
+
+    commands->OMSetRenderTargets(1, &draw.copy->target, FALSE, depth);
+    commands->SetPipelineState(pipeline);
+    commands->SetGraphicsRootConstantBufferView(2, pixelFloats);
+    IssueDraws(commands, mesh);
+
+    constants.indices[0] = draw.copy->view;
+    constants.indices[2] = 0;
+    backend.Transition(draw.copy->resource, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    backend.Transition(*draw.target, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    commands->OMSetRenderTargets(1, &draw.targetRtv, FALSE, nullptr);
+    commands->SetPipelineState(codec);
+    commands->SetGraphicsRootConstantBufferView(2, UploadConstants(&constants, sizeof(constants)));
+    IssueDraws(commands, mesh);
+
+    commands->OMSetRenderTargets(targets.count, targets.colors, FALSE, depth);
+    commands->SetPipelineState(pipeline);
+    commands->SetGraphicsRootConstantBufferView(2, pixelFloats);
+}
+
 // engine_post's colour correction (Engine_Post_ps2x.fxc's PerformColorCorrection: colour x ColorCorrectionDefaultWeight
 // plus each volume's look-up times its ColorCorrectionVolumeWeights component), by the registers its constant table
 // names. stdshader_dx9.dll's engine_post draw (0x180022ea0) reads the frame and its volumes with sRGB reads off, sets c3
@@ -1485,6 +1667,13 @@ void DrawPass(const ShadowState& shadow, const MeshDraw& mesh)
     pixelVariant.markMirror = clearCoverage && pass.marksMirror ? 1 : 0;
     // The 2D sky's own shader writes linear light (sky_draw.hlsl), forward twins too.
     pixelVariant.decodeOutput = targets.linear && shadow.srgbWrite == 0 && pass.forwardFrame == 0 && !proceduralSky ? 1 : 0;
+    EncodedDraw encodedDraw;
+    const bool encoded = pixelVariant.decodeOutput != 0 && blendEnabled && pass.route == capture::Pass::Route::Game && sky == nullptr && pixelBase != nullptr
+        && pixelBase->info.colorOutputs == 1 && targets.count == 1 && !clearCoverage && PrepareEncodedDraw(targets, encodedDraw);
+    if (encoded) {
+        pixelVariant.decodeOutput = 0;
+        pixelVariant.clampOutput = 1;
+    }
     pixelVariant.saturateSamples = pass.route == capture::Pass::Route::Game && !depthOnly && ReadsClippedFrame(pixelName, drawnPixelCode) ? 1 : 0;
     if (pass.route == capture::Pass::Route::GBuffer && pass.lightWarpSampler >= 0 && pass.lightWarpSampler < kSamplers) {
         pixelVariant.lightWarpSlot = 1;
@@ -1611,8 +1800,9 @@ void DrawPass(const ShadowState& shadow, const MeshDraw& mesh)
                 viewport.TopLeftX, viewport.TopLeftY, viewport.Width, viewport.Height, c(4), c(5), c(6), c(7), c(8), c(9), c(10), c(11), c(58), c(59), c(60),
                 t0 != nullptr ? t0->name : "none", t0 != nullptr ? t0->width : 0, t0 != nullptr ? t0->height : 0, dynamic.colorTargets[0],
                 vertexShader->info.firstFloatConstant, vertexShader->info.floatConstantCount);
-            log::Info("DIAG   srgb write {} read {:#x} linear target {} decode {} encoded {:#x} clipped {}", shadow.srgbWrite, shadow.srgbRead, targets.linear,
-                static_cast<int>(pixelVariant.decodeOutput), pixelVariant.encodedSamplers, static_cast<int>(pixelVariant.saturateSamples));
+            log::Info("DIAG   srgb write {} read {:#x} linear target {} decode {} encoded {:#x} clipped {} blend {} encoded blend {}", shadow.srgbWrite, shadow.srgbRead,
+                targets.linear, static_cast<int>(pixelVariant.decodeOutput), pixelVariant.encodedSamplers, static_cast<int>(pixelVariant.saturateSamples),
+                blendEnabled, encoded);
             if (mesh.vertexData != nullptr) {
                 const float* p = reinterpret_cast<const float*>(mesh.vertexData);
                 const int stride = mesh.streams[0].StrideInBytes / 4;
@@ -1669,7 +1859,9 @@ void DrawPass(const ShadowState& shadow, const MeshDraw& mesh)
     const D3D12_GPU_VIRTUAL_ADDRESS pixelStateAddress = UploadConstants(&pixelState, sizeof(pixelState));
     commands->SetGraphicsRootConstantBufferView(0, FloatConstants(*vertexShader, dynamic.vertexFloats.data(), kVertexFloatConstants, dynamic.vertexFloatsVersion, g_cache.vertexConstants, vertexStateAddress, pass.vertexPatches));
     commands->SetGraphicsRootConstantBufferView(1, vertexStateAddress);
-    commands->SetGraphicsRootConstantBufferView(2, pixelShader != nullptr ? FloatConstants(*pixelShader, dynamic.pixelFloats.data(), kPixelFloatConstants, dynamic.pixelFloatsVersion, g_cache.pixelConstants, pixelStateAddress, pixelPatches) : pixelStateAddress);
+    const D3D12_GPU_VIRTUAL_ADDRESS pixelFloats = pixelShader != nullptr ? FloatConstants(*pixelShader, dynamic.pixelFloats.data(), kPixelFloatConstants,
+        dynamic.pixelFloatsVersion, g_cache.pixelConstants, pixelStateAddress, pixelPatches) : pixelStateAddress;
+    commands->SetGraphicsRootConstantBufferView(2, pixelFloats);
     commands->SetGraphicsRootConstantBufferView(3, pixelStateAddress);
     if (pass.forwardFrame != 0) {
         commands->SetGraphicsRootConstantBufferView(kRootForwardFrame, pass.forwardFrame);
@@ -1692,7 +1884,10 @@ void DrawPass(const ShadowState& shadow, const MeshDraw& mesh)
     }
     commands->RSSetScissorRects(1, &scissor);
     commands->OMSetStencilRef(static_cast<UINT>(dynamic.stencilRef) & 0xff);
-    IssueDraws(commands, mesh);
+    if (encoded)
+        DrawEncoded(commands, key, pipeline, pixelFloats, targets, encodedDraw, mesh);
+    else
+        IssueDraws(commands, mesh);
 
     if (skyConstants != 0 && !sky->sky && sky->sunDisc)
         DrawSunDisc(key, skyConstants, mesh);
