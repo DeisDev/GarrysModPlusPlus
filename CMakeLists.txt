@@ -1,5 +1,21 @@
 cmake_minimum_required(VERSION 3.25)
-project(GarrysModPP LANGUAGES C CXX ASM_MASM)
+
+# The mod's version (Semantic Versioning 2.0.0), set here only: src/gmodpp_version.h.in takes it to the code, the
+# version resources of both DLLs and the log.
+set(GMODPP_VERSION 0.9.0-alpha)
+if(NOT GMODPP_VERSION MATCHES "^([0-9]+)\\.([0-9]+)\\.([0-9]+)(-[0-9A-Za-z.-]+)?$")
+    message(FATAL_ERROR "GMODPP_VERSION '${GMODPP_VERSION}' is not a semantic version")
+endif()
+set(GMODPP_VERSION_MAJOR ${CMAKE_MATCH_1})
+set(GMODPP_VERSION_MINOR ${CMAKE_MATCH_2})
+set(GMODPP_VERSION_PATCH ${CMAKE_MATCH_3})
+if(CMAKE_MATCH_4)
+    set(GMODPP_VERSION_PRERELEASE 1)
+else()
+    set(GMODPP_VERSION_PRERELEASE 0)
+endif()
+project(GarrysModPP VERSION ${GMODPP_VERSION_MAJOR}.${GMODPP_VERSION_MINOR}.${GMODPP_VERSION_PATCH} LANGUAGES C CXX ASM_MASM)
+configure_file(src/gmodpp_version.h.in "${CMAKE_CURRENT_BINARY_DIR}/gmodpp_version.h" @ONLY)
 
 if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
     message(FATAL_ERROR "GarrysMod++ targets the 64-bit branch of Garry's Mod; configure with an x64 toolchain.")
@@ -512,11 +528,13 @@ add_library(gmodpp_loader SHARED
 )
 set_target_properties(gmodpp_loader PROPERTIES OUTPUT_NAME winmm)
 target_compile_definitions(gmodpp_loader PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
+target_include_directories(gmodpp_loader PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 target_compile_options(gmodpp_loader PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4 /permissive- /utf-8>)
 target_link_libraries(gmodpp_loader PRIVATE minhook)
 
 # The game's shader API replacement, loaded from bin\win64\gmodpp through the loader.
 add_library(gmodpp SHARED
+    src/gmodpp.rc
     src/shaderapi_shim.cpp
     src/shaderapi_slots.cpp
     src/shaderapi_thunks.asm
@@ -590,7 +608,7 @@ add_library(gmodpp SHARED
 target_compile_definitions(gmodpp PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
 target_compile_options(gmodpp PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4 /permissive- /utf-8>)
 target_include_directories(gmodpp BEFORE PRIVATE "${AGILITY_SDK_DIR}/build/native/include")
-target_include_directories(gmodpp PRIVATE "${DXC_DIR}/inc" "${SHADER_OUTPUT_DIR}" "${DLSS_SDK_DIR}/include" "${RTXDI_DIR}/Include"
+target_include_directories(gmodpp PRIVATE "${CMAKE_CURRENT_BINARY_DIR}" "${DXC_DIR}/inc" "${SHADER_OUTPUT_DIR}" "${DLSS_SDK_DIR}/include" "${RTXDI_DIR}/Include"
     "${FSR_DIR}/Kits/FidelityFX/api/include" "${FSR_DIR}/Kits/FidelityFX/upscalers/include" "${FSR_DIR}/Kits/FidelityFX/denoisers/include"
     "${FSR_DIR}/Kits/FidelityFX/framegeneration/include" "${FSR_DIR}/Kits/OpenSource/amd/antilag2" "${STREAMLINE_DIR}/include")
 # ReSTIRDI.cpp leaves a parameter unused in release builds (its check is an assert).

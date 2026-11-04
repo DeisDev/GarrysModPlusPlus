@@ -3,6 +3,7 @@
 #include "client_hooks.h"
 #include "command_line.h"
 #include "engine_interfaces.h"
+#include "gmodpp_version.h"
 #include "log.h"
 #include "options.h"
 #include "overlay_widgets.h"
@@ -2546,6 +2547,7 @@ void DrawAboutPage(Settings&)
         ImGui::PushFont(widgets::GetFonts().title);
         widgets::Text(Text("menu.title"));
         ImGui::PopFont();
+        widgets::Text(ui::Format("about.version", {{"version", kVersion}}).c_str());
         widgets::Text(Text("about.summary"));
     }
     widgets::EndCard();
@@ -2847,6 +2849,15 @@ bool DrawMenu()
                     if (widgets::NavItem(Text(kPages[i].key), g_state.page == static_cast<Page>(i)))
                         g_state.page = static_cast<Page>(i);
                 }
+                // The version sits at the bottom of the page list, or right under it when the list fills the window.
+                const float bottom = ImGui::GetCursorPosY() + ImGui::GetContentRegionAvail().y;
+                ImGui::SetCursorPosY(std::max(ImGui::GetCursorPosY() + style.ItemSpacing.y, bottom - ImGui::GetFrameHeight()));
+                const std::string version = ui::Visual(ui::Format("menu.version", {{"version", kVersion}}));
+                const float padding = style.FramePadding.x * 1.6f;
+                const float start = ImGui::GetCursorPosX() + padding;
+                const float end = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - padding;
+                ImGui::SetCursorPosX(widgets::RightToLeft() ? end - ImGui::CalcTextSize(version.c_str()).x : start);
+                ImGui::TextDisabled("%s", version.c_str());
             }
             ImGui::EndChild();
         };

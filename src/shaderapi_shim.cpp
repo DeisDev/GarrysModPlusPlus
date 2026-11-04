@@ -1,5 +1,6 @@
 #include "capture.h"
 #include "command_line.h"
+#include "gmodpp_version.h"
 #include "hardware_check.h"
 #include "log.h"
 #include "module_scan.h"
@@ -923,6 +924,7 @@ Shim* LoadShim()
     std::error_code error;
     std::filesystem::create_directories(ModDirectory() / L"logs", error);
     log::Open((ModDirectory() / L"logs" / L"gmodpp.log").c_str());
+    log::Info("GarrysMod++ {}", kVersion);
     auto* shim = new Shim{};
     shim->devMode = HasArgument(L"-gmodpp_dev");
     shim->mainThread = GetCurrentThreadId();

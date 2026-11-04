@@ -1,4 +1,5 @@
 #include "command_line.h"
+#include "gmodpp_version.h"
 #include "log.h"
 
 #include <windows.h>
@@ -71,6 +72,7 @@ void InstallShaderApiRedirect()
     std::error_code error;
     std::filesystem::create_directories(ModDirectory() / L"logs", error);
     log::Open((ModDirectory() / L"logs" / L"loader.log").c_str());
+    log::Info("GarrysMod++ {} loader", kVersion);
 
     g_shaderApiPath = ModDirectory() / L"gmodpp.dll";
     MH_STATUS status = MH_Initialize();
