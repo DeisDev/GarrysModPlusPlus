@@ -1535,10 +1535,8 @@ void DrawImagePage(Settings& settings)
         if (widgets::BeginRows("tone")) {
             constexpr const char* kCurves[] = {"image.tone_curve_off", "image.tone_curve_highlights", "image.tone_curve_filmic"};
             static_assert(std::size(kCurves) == static_cast<size_t>(ToneCurve::Count));
-            const bool realtime = settings.realtimeLighting;
-            SegmentRow("image.tone_curve", &Settings::toneCurve, kCurves, {}, realtime, Text("image.tone_reason"));
-            SliderRow("image.highlight_rolloff", &Settings::highlightRolloff, realtime && settings.toneCurve == ToneCurve::Highlights,
-                Text(realtime ? "image.highlight_rolloff_reason" : "image.tone_reason"));
+            SegmentRow("image.tone_curve", &Settings::toneCurve, kCurves);
+            SliderRow("image.highlight_rolloff", &Settings::highlightRolloff, settings.toneCurve == ToneCurve::Highlights, Text("image.highlight_rolloff_reason"));
             widgets::EndRows();
         }
     }
