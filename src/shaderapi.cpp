@@ -1078,7 +1078,8 @@ unsigned ClearColor()
 }
 
 // ClearBuffers (0x1800118d0): Direct3D 9 clears the viewport of every bound target; colour is written without sRGB
-// conversion, depth to 1 (0 with reverse depth), stencil to 0.
+// conversion (so a target holding linear light for an 8-bit one is cleared to the light those bytes decode to), depth to
+// 1 (0 with reverse depth), stencil to 0.
 void ClearBuffers(NativeObject*, bool color, bool depth, bool stencil, int, int)
 {
     const std::uint8_t* config = Config();
@@ -1096,9 +1097,12 @@ void ClearBuffers(NativeObject*, bool color, bool depth, bool stencil, int, int)
     if (color) {
         const unsigned c = ClearColor();
         const float value[4] = { ((c >> 16) & 0xff) / 255.0f, ((c >> 8) & 0xff) / 255.0f, (c & 0xff) / 255.0f, (c >> 24) / 255.0f };
+        // A target holding linear light for an 8-bit sRGB one takes the light those bytes stand for.
+        auto decoded = [](float x) { return x <= 0.04045f ? x / 12.92f : std::pow((x + 0.055f) / 1.055f, 2.4f); };
+        const float linear[4] = { decoded(value[0]), decoded(value[1]), decoded(value[2]), value[3] };
         for (UINT i = 0; i < targets.count; ++i) {
             if (targets.colors[i].ptr != 0)
-                commands->ClearRenderTargetView(targets.colors[i], value, 1, &rect);
+                commands->ClearRenderTargetView(targets.colors[i], i == 0 && targets.linear ? linear : value, 1, &rect);
         }
     }
     D3D12_CLEAR_FLAGS flags = {};

@@ -652,7 +652,7 @@ float LightWarpSlot(std::intptr_t handle, bool srgbRead)
 
 // Fills one stage's texture and sampler indices and moves its textures into a shader resource state.
 void BindSamplers(const CompiledShader& shader, const std::intptr_t* handles, int count, std::int32_t srgbRead, StateBuffer& state,
-    std::uint16_t* shadowSamplers)
+    std::uint16_t* shadowSamplers, std::uint16_t* encodedSamplers)
 {
     Backend& backend = GetBackend();
     const DynamicState& dynamic = Dynamic();
@@ -681,6 +681,9 @@ void BindSamplers(const CompiledShader& shader, const std::intptr_t* handles, in
         state.samplers[s] = backend.SamplerIndex(SamplerFor(*texture, border, point, dynamic.anisotropy, dynamic.minFilterOverride, dynamic.magFilterOverride));
         if (shadowSamplers != nullptr && (texture->storage == kFormatNvDst16 || texture->storage == kFormatNvDst24))
             *shadowSamplers |= static_cast<std::uint16_t>(1u << s);
+        // Texture::srgbEmulated read with sRGB reads off: what Direct3D 9 read raw from the 8-bit target's bytes.
+        if (encodedSamplers != nullptr && texture->srgbEmulated && ((srgbRead >> s) & 1) == 0)
+            *encodedSamplers |= static_cast<std::uint16_t>(1u << s);
     }
 }
 
@@ -791,8 +794,12 @@ void StretchRect(const CopySurface& source, const D3D12_RECT& sourceRect, const 
     const LONG height = sourceRect.bottom - sourceRect.top;
     if (width <= 0 || height <= 0 || destinationRect.right <= destinationRect.left || destinationRect.bottom <= destinationRect.top)
         return;
+    // Linear light into an 8-bit texture is written through its sRGB view, 8-bit bytes into linear light read through
+    // the source's, so the bytes are what the frame's 8-bit target would have held and given.
+    const bool encode = source.linear && !destination.linear && destination.srgbTarget.ptr != 0;
+    const bool decode = !source.linear && destination.linear && source.srgbTexture != DescriptorHeap::kInvalid;
     if (width == destinationRect.right - destinationRect.left && height == destinationRect.bottom - destinationRect.top
-        && Family(source.format) == Family(destination.format)) {
+        && Family(source.format) == Family(destination.format) && !encode && !decode) {
         backend.Transition(*source.resource, D3D12_RESOURCE_STATE_COPY_SOURCE);
         backend.Transition(*destination.resource, D3D12_RESOURCE_STATE_COPY_DEST);
         D3D12_TEXTURE_COPY_LOCATION to = {};
@@ -810,7 +817,8 @@ void StretchRect(const CopySurface& source, const D3D12_RECT& sourceRect, const 
         log::Info("Native: a scaled copy into a texture that is not a render target was skipped");
         return;
     }
-    ID3D12PipelineState* pipeline = BlitPipeline(destination.format);
+    const D3D12_CPU_DESCRIPTOR_HANDLE target = encode ? destination.srgbTarget : destination.target;
+    ID3D12PipelineState* pipeline = BlitPipeline(encode ? destination.srgbFormat : destination.format);
     if (pipeline == nullptr)
         return;
     backend.Transition(*source.resource, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
@@ -827,9 +835,9 @@ void StretchRect(const CopySurface& source, const D3D12_RECT& sourceRect, const 
         std::uint32_t indices[4];
     } constants = { { static_cast<float>(sourceRect.left) / source.width, static_cast<float>(sourceRect.top) / source.height,
                         static_cast<float>(width) / source.width, static_cast<float>(height) / source.height },
-        { source.texture, backend.SamplerIndex(sampler), 0, 0 } };
+        { decode ? source.srgbTexture : source.texture, backend.SamplerIndex(sampler), 0, 0 } };
     commands->SetGraphicsRootConstantBufferView(2, UploadConstants(&constants, sizeof(constants)));
-    commands->OMSetRenderTargets(1, &destination.target, FALSE, nullptr);
+    commands->OMSetRenderTargets(1, &target, FALSE, nullptr);
     const D3D12_VIEWPORT viewport = { static_cast<float>(destinationRect.left), static_cast<float>(destinationRect.top),
         static_cast<float>(destinationRect.right - destinationRect.left), static_cast<float>(destinationRect.bottom - destinationRect.top), 0, 1 };
     commands->RSSetViewports(1, &viewport);
@@ -1015,6 +1023,8 @@ Targets PrepareTargets(bool srgb)
         targets.colors[i] = useSrgb ? copy.srgbTarget : copy.target;
         targets.colorFormats[i] = texture->TargetFormat(useSrgb);
         targets.count = i + 1;
+        if (i == 0)
+            targets.linear = texture->srgbEmulated;
     }
     Texture* depth = state.depthTarget == kDefaultTarget ? nullptr : TextureFromHandle(state.depthTarget);
     if (state.depthTarget == kDefaultTarget) {
@@ -1367,7 +1377,7 @@ void DrawPass(const ShadowState& shadow, const MeshDraw& mesh)
     StateBuffer pixelState = {};
     translator::Variant pixelVariant;
     if (pixelBase != nullptr)
-        BindSamplers(*pixelBase, dynamic.textures.data(), kSamplers, shadow.srgbRead, pixelState, &pixelVariant.shadowSamplers);
+        BindSamplers(*pixelBase, dynamic.textures.data(), kSamplers, shadow.srgbRead, pixelState, &pixelVariant.shadowSamplers, &pixelVariant.encodedSamplers);
     if (pass.probes) {
         D3D12_SAMPLER_DESC probeSampler = {};
         probeSampler.Filter = D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT;
@@ -1380,6 +1390,7 @@ void DrawPass(const ShadowState& shadow, const MeshDraw& mesh)
             pixelState.textures[s] = capture::ProbeView(i);
             pixelState.samplers[s] = backend.SamplerIndex(probeSampler);
             pixelVariant.shadowSamplers &= static_cast<std::uint16_t>(~(1u << s));
+            pixelVariant.encodedSamplers &= static_cast<std::uint16_t>(~(1u << s));
         }
     }
     if (shadow.alphaTest)
@@ -1395,12 +1406,14 @@ void DrawPass(const ShadowState& shadow, const MeshDraw& mesh)
     }
     pixelVariant.clearCoverage = clearCoverage ? 1 : 0;
     pixelVariant.markMirror = clearCoverage && pass.marksMirror ? 1 : 0;
+    // The 2D sky's own shader writes linear light (sky_draw.hlsl), forward twins too.
+    pixelVariant.decodeOutput = targets.linear && shadow.srgbWrite == 0 && pass.forwardFrame == 0 && !proceduralSky ? 1 : 0;
     if (pass.route == capture::Pass::Route::GBuffer && pass.lightWarpSampler >= 0 && pass.lightWarpSampler < kSamplers) {
         pixelVariant.lightWarpSlot = 1;
         pixelState.alpha[1] = LightWarpSlot(dynamic.textures[static_cast<size_t>(pass.lightWarpSampler)], ((shadow.srgbRead >> pass.lightWarpSampler) & 1) != 0);
     }
     StateBuffer vertexState = {};
-    BindSamplers(*vertexBase, dynamic.vertexTextures.data(), kVertexSamplers, 0, vertexState, nullptr);
+    BindSamplers(*vertexBase, dynamic.vertexTextures.data(), kVertexSamplers, 0, vertexState, nullptr, nullptr);
 
     PipelineKey key;
     std::memset(&key, 0, sizeof(key));

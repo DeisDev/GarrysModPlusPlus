@@ -678,10 +678,12 @@ void TexUnlock(NativeObject*)
 CopySurface TextureSurface(Texture& texture)
 {
     Texture::Copy& copy = texture.Current();
-    return { &copy.resource, copy.view, copy.target, texture.TargetFormat(false), static_cast<UINT>(texture.width), static_cast<UINT>(texture.height) };
+    const DXGI_FORMAT srgbFormat = texture.TargetFormat(true);
+    return { &copy.resource, copy.view, copy.target, texture.TargetFormat(false), static_cast<UINT>(texture.width), static_cast<UINT>(texture.height),
+        copy.srgbView, copy.srgbTarget, srgbFormat != texture.TargetFormat(false) ? srgbFormat : DXGI_FORMAT_UNKNOWN, texture.srgbEmulated };
 }
 
-// The colour of render target `id` as Direct3D 9's GetRenderTarget gives it: the back buffer for the default target 0,
+// The colour of render target `id` as Direct3D 9's GetRenderTarget gives it: the frame for the default target 0,
 // resolved when it is read.
 bool TargetSurface(int id, bool read, CopySurface& surface)
 {

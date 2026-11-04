@@ -56,6 +56,10 @@ struct Texture {
     D3DTEXTUREFILTERTYPE magFilter = D3DTEXF_POINT;
     D3DTEXTUREFILTERTYPE minFilter = D3DTEXF_POINT;
     D3DTEXTUREFILTERTYPE mipFilter = D3DTEXF_NONE;
+    // A floating-point render target asked for in the frame's format (GetBackBufferFormat), which holds what an 8-bit
+    // sRGB target of the frame would: linear light, written and read as Direct3D 9 would its 8-bit bytes
+    // (shaderapi_pipelines.cpp: sRGB-off writes decoded, sRGB-off reads encoded).
+    bool srgbEmulated = false;
 
     Copy& Current() { return copies[current]; }
     bool IsRenderTarget() const;

@@ -21,6 +21,9 @@ struct Targets {
     DXGI_FORMAT depthFormat = DXGI_FORMAT_UNKNOWN;
     UINT width = 0;
     UINT height = 0;
+    // Target 0 holds linear light for an 8-bit sRGB target (the frame, Texture::srgbEmulated, the capture's light
+    // target): draws with sRGB writes off store their output decoded.
+    bool linear = false;
 };
 Targets PrepareTargets(bool srgb);
 
@@ -36,6 +39,13 @@ struct CopySurface {
     DXGI_FORMAT format;
     UINT width;
     UINT height;
+    // The same through sRGB views (kInvalid, null and DXGI_FORMAT_UNKNOWN without them).
+    UINT srgbTexture;
+    D3D12_CPU_DESCRIPTOR_HANDLE srgbTarget;
+    DXGI_FORMAT srgbFormat;
+    // Holds linear light for an 8-bit sRGB target (the frame and Texture::srgbEmulated): a copy to or from an 8-bit
+    // texture goes through that texture's sRGB view, so its bytes are what the frame's would have been.
+    bool linear;
 };
 // Copies `sourceRect` of `source` to `destinationRect` of `destination` with linear filtering, as StretchRect with
 // D3DTEXF_LINEAR does: a plain copy when the sizes and formats allow it, otherwise a draw.
