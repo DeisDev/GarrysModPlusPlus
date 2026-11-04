@@ -1332,6 +1332,26 @@ const ColorCorrectionShader& ColorCorrectionOf(std::span<const DWORD> pixelCode)
     return shaders.emplace(pixelCode.data(), shader).first->second;
 }
 
+// Source's passes that measure or bloom the frame read it as its 8-bit target gave it, clipped at white, which their
+// constants were tuned for: the bloom's downsample (downsample_nohdr, Generate8BitBloomTexture in the SDK's
+// viewpostprocess.cpp; it raises each pixel to the bloom exponent, so light far above white blew the bloom up) and the
+// auto exposure histogram's luminance test (its constant table's g_vComparisonMinMaxScale, luminance_compare_ps2x.fxc;
+// its buckets end at 1, so brighter pixels fell out of the histogram).
+bool ReadsClippedFrame(const char* file, std::span<const DWORD> pixelCode)
+{
+    static std::unordered_map<const DWORD*, bool> shaders;
+    auto found = shaders.find(pixelCode.data());
+    if (found != shaders.end())
+        return found->second;
+    bool clipped = file != nullptr && std::string_view(file).starts_with("downsample_nohdr");
+    for (const bytecode::Constant& constant : bytecode::ConstantTable(pixelCode))
+        clipped = clipped || constant.name == "g_vComparisonMinMaxScale";
+    static std::set<std::string> logged;
+    if (clipped && file != nullptr && logged.insert(file).second)
+        log::Info("Native: {} reads the frame clipped at white, as its 8-bit target gave it", file);
+    return shaders.emplace(pixelCode.data(), clipped).first->second;
+}
+
 // Takes the colour correction out of an engine_post draw into the frame: the draw keeps the colour (default weight 1,
 // volume weights 0) and the display mapping applies the volumes after the tone curve (display::SetColorCorrection),
 // where they no longer clip the light above paper white.
@@ -1465,6 +1485,7 @@ void DrawPass(const ShadowState& shadow, const MeshDraw& mesh)
     pixelVariant.markMirror = clearCoverage && pass.marksMirror ? 1 : 0;
     // The 2D sky's own shader writes linear light (sky_draw.hlsl), forward twins too.
     pixelVariant.decodeOutput = targets.linear && shadow.srgbWrite == 0 && pass.forwardFrame == 0 && !proceduralSky ? 1 : 0;
+    pixelVariant.saturateSamples = pass.route == capture::Pass::Route::Game && !depthOnly && ReadsClippedFrame(pixelName, drawnPixelCode) ? 1 : 0;
     if (pass.route == capture::Pass::Route::GBuffer && pass.lightWarpSampler >= 0 && pass.lightWarpSampler < kSamplers) {
         pixelVariant.lightWarpSlot = 1;
         pixelState.alpha[1] = LightWarpSlot(dynamic.textures[static_cast<size_t>(pass.lightWarpSampler)], ((shadow.srgbRead >> pass.lightWarpSampler) & 1) != 0);

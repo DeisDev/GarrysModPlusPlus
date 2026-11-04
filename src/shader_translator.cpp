@@ -919,19 +919,21 @@ std::string Translator::Assemble()
         const std::string name = std::format("gmodpp_sample{}_{}", sampler, static_cast<int>(kind));
         // Variant::encodedSamplers: the colour the 8-bit target's bytes held.
         const bool encoded = m_stage == Stage::Pixel && ((m_variant.encodedSamplers >> sampler) & 1u) != 0;
-        const char* open = encoded ? "gmodpp_encode(" : "(";
+        const bool clipped = m_stage == Stage::Pixel && m_variant.saturateSamples != 0;
+        const char* open = encoded ? (clipped ? "saturate(gmodpp_encode(" : "gmodpp_encode(") : (clipped ? "saturate((" : "(");
+        const char* close = clipped ? ")" : "";
         switch (kind) {
         case SampleKind::Plain:
-            text += std::format("float4 {}({} uv)\n{{\n{}    SamplerState s = SamplerDescriptorHeap[{}];\n    return {}t.Sample(s, uv));\n}}\n", name, coordinate, fetch, samplerIndex, open);
+            text += std::format("float4 {}({} uv)\n{{\n{}    SamplerState s = SamplerDescriptorHeap[{}];\n    return {}t.Sample(s, uv)){};\n}}\n", name, coordinate, fetch, samplerIndex, open, close);
             break;
         case SampleKind::Bias:
-            text += std::format("float4 {}({} uv, float bias)\n{{\n{}    SamplerState s = SamplerDescriptorHeap[{}];\n    return {}t.SampleBias(s, uv, bias));\n}}\n", name, coordinate, fetch, samplerIndex, open);
+            text += std::format("float4 {}({} uv, float bias)\n{{\n{}    SamplerState s = SamplerDescriptorHeap[{}];\n    return {}t.SampleBias(s, uv, bias)){};\n}}\n", name, coordinate, fetch, samplerIndex, open, close);
             break;
         case SampleKind::Level:
-            text += std::format("float4 {}({} uv, float lod)\n{{\n{}    SamplerState s = SamplerDescriptorHeap[{}];\n    return {}t.SampleLevel(s, uv, lod));\n}}\n", name, coordinate, fetch, samplerIndex, open);
+            text += std::format("float4 {}({} uv, float lod)\n{{\n{}    SamplerState s = SamplerDescriptorHeap[{}];\n    return {}t.SampleLevel(s, uv, lod)){};\n}}\n", name, coordinate, fetch, samplerIndex, open, close);
             break;
         case SampleKind::Gradient:
-            text += std::format("float4 {0}({1} uv, {1} dx, {1} dy)\n{{\n{2}    SamplerState s = SamplerDescriptorHeap[{3}];\n    return {4}t.SampleGrad(s, uv, dx, dy));\n}}\n", name, coordinate, fetch, samplerIndex, open);
+            text += std::format("float4 {0}({1} uv, {1} dx, {1} dy)\n{{\n{2}    SamplerState s = SamplerDescriptorHeap[{3}];\n    return {4}t.SampleGrad(s, uv, dx, dy)){5};\n}}\n", name, coordinate, fetch, samplerIndex, open, close);
             break;
         case SampleKind::Compare:
             text += std::format("float4 {}({} uv, float reference)\n{{\n{}    SamplerComparisonState s = SamplerDescriptorHeap[{}];\n    return (float4)t.SampleCmpLevelZero(s, uv, reference);\n}}\n", name, coordinate, fetch, samplerIndex);

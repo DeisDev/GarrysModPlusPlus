@@ -46,8 +46,11 @@ struct Variant {
     // promoted render targets): oC0's colour is display-encoded, so it is stored decoded, as the 8-bit target's bytes
     // stand for.
     std::uint8_t decodeOutput : 1 = 0;
+    // Pixel shaders whose samples are clipped to [0, 1], as an 8-bit target gave them: Source's bloom and auto exposure
+    // passes, tuned on the 8-bit image (shaderapi_pipelines.cpp, ReadsClippedFrame).
+    std::uint8_t saturateSamples : 1 = 0;
     // Zero, so that variants compare equal byte for byte.
-    std::uint8_t unused : 2 = 0;
+    std::uint8_t unused : 1 = 0;
     // Pixel shaders: samplers reading such a target with sRGB reads off, which see its colour encoded as the 8-bit
     // target's bytes were.
     std::uint16_t encodedSamplers = 0;
