@@ -520,6 +520,10 @@ std::uint64_t Key(std::span<const DWORD> code, const translator::Variant& varian
         key = Fnv("lightwarp", 9, key);
     if (variant.opacityMicromaps != 0)
         key = Fnv("micromaps", 9, key);
+    if (variant.decodeOutput != 0)
+        key = Fnv("decode", 6, key);
+    if (variant.encodedSamplers != 0)
+        key = Fnv(&variant.encodedSamplers, sizeof(variant.encodedSamplers), Fnv("encoded", 7, key));
     return Fnv(&kTranslatorVersion, sizeof(kTranslatorVersion), key);
 }
 

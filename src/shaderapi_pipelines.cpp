@@ -193,12 +193,16 @@ struct PipelineKeyEqual {
 // A combo's bytecode never moves once loaded, so its address and the variant find its translation without hashing it.
 struct VariantSlot {
     const DWORD* code;
-    std::uint64_t variant;
+    std::array<std::uint64_t, 2> variant;
     bool operator==(const VariantSlot&) const = default;
 };
 
 struct VariantSlotHash {
-    size_t operator()(const VariantSlot& slot) const { return std::hash<const void*>()(slot.code) ^ std::hash<std::uint64_t>()(slot.variant * 0x9e3779b97f4a7c15ull); }
+    size_t operator()(const VariantSlot& slot) const
+    {
+        return std::hash<const void*>()(slot.code) ^ std::hash<std::uint64_t>()(slot.variant[0] * 0x9e3779b97f4a7c15ull) ^
+            std::hash<std::uint64_t>()(slot.variant[1] * 0xc2b2ae3d27d4eb4full);
+    }
 };
 
 // The last upload of a register file's constants, valid while the command list and the registers are unchanged.
@@ -454,9 +458,9 @@ const CompiledShader* CompiledByHash(std::span<const DWORD> code, const translat
 
 const CompiledShader* Compiled(std::span<const DWORD> code, const translator::Variant& variant, const char* fileName)
 {
-    static_assert(sizeof(translator::Variant) == sizeof(std::uint64_t));
-    VariantSlot slot = { code.data(), 0 };
-    std::memcpy(&slot.variant, &variant, sizeof(slot.variant));
+    static_assert(sizeof(translator::Variant) <= sizeof(VariantSlot::variant));
+    VariantSlot slot = { code.data(), {} };
+    std::memcpy(slot.variant.data(), &variant, sizeof(variant));
     auto found = g_cache.variants.find(slot);
     if (found == g_cache.variants.end())
         found = g_cache.variants.emplace(slot, const_cast<CompiledShader*>(CompiledByHash(code, variant, fileName))).first;

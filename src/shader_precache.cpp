@@ -176,6 +176,11 @@ void Run(const Request& request)
             } else if (request.clipPlanes == 0) {
                 variant.alphaTest = request.alphaTest;
                 Ensure(combo.bytecode, variant, request.name);
+                if (request.decodeOutput) {
+                    translator::Variant decoded = variant;
+                    decoded.decodeOutput = 1;
+                    Ensure(combo.bytecode, decoded, request.name);
+                }
                 // Particles drawn after the capture are fogged by the volumetric light (capture::Prepare).
                 if (request.forwardTwin && twins::IsParticleShader(request.name)) {
                     translator::Variant fogged = variant;
@@ -212,7 +217,7 @@ void Run(const Request& request)
 // A request's identity: the same pass of the same file is compiled once, whichever buffer holds the file (a map's
 // materials read it through the game's filesystem, StartReplay from the game's folder). A copy with other contents (an
 // addon's) is another request, so a replay of one copy does not stand in for the copy the game draws with.
-using RequestId = std::tuple<std::string, std::uint64_t, std::int32_t, std::uint8_t, std::uint8_t, bool, bool, bool, bool>;
+using RequestId = std::tuple<std::string, std::uint64_t, std::int32_t, std::uint8_t, std::uint8_t, bool, bool, bool, bool, bool>;
 
 std::string LowerName(const Request& request)
 {
@@ -224,7 +229,7 @@ std::string LowerName(const Request& request)
 RequestId IdOf(const Request& request)
 {
     return { LowerName(request), request.fileHash, request.staticIndex, request.clipPlanes, request.alphaTest, request.gbufferTwin, request.forwardTwin,
-        request.clearCoverage, request.opacityMicromaps };
+        request.clearCoverage, request.opacityMicromaps, request.decodeOutput };
 }
 
 // Requests run on worker threads below normal priority, one fewer than the logical cores so the game's main thread keeps
@@ -446,7 +451,7 @@ std::uint32_t FlagsOf(const Request& request)
 {
     return request.alphaTest | (request.vertex ? 1u << 8 : 0u) | (static_cast<std::uint32_t>(request.clipPlanes & 7u) << 9)
         | (request.gbufferTwin ? 1u << 12 : 0u) | (request.forwardTwin ? 1u << 13 : 0u) | (request.clearCoverage ? 1u << 14 : 0u)
-        | (request.opacityMicromaps ? 1u << 15 : 0u);
+        | (request.opacityMicromaps ? 1u << 15 : 0u) | (request.decodeOutput ? 1u << 16 : 0u);
 }
 
 void ApplyFlags(std::uint32_t flags, Request& request)
@@ -458,6 +463,7 @@ void ApplyFlags(std::uint32_t flags, Request& request)
     request.forwardTwin = (flags & 1u << 13) != 0;
     request.clearCoverage = (flags & 1u << 14) != 0;
     request.opacityMicromaps = (flags & 1u << 15) != 0;
+    request.decodeOutput = (flags & 1u << 16) != 0;
 }
 
 // The requests of every session so far, in gmodplusplus\cache\precache.txt: a header line with the generation

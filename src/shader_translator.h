@@ -42,8 +42,16 @@ struct Variant {
     // With forwardLighting, on devices with opacity micromaps: compiled for shader model 6.9 with OPACITY_MICROMAPS, so
     // the lighting's ray queries may meet the micromaps of the scene they trace (shaders/scene.hlsli, SCENE_RAY_QUERY).
     std::uint8_t opacityMicromaps : 1 = 0;
+    // Pixel shaders drawing with sRGB writes off into a target that holds linear light for an 8-bit sRGB one (the frame,
+    // promoted render targets): oC0's colour is display-encoded, so it is stored decoded, as the 8-bit target's bytes
+    // stand for.
+    std::uint8_t decodeOutput : 1 = 0;
     // Zero, so that variants compare equal byte for byte.
-    std::uint8_t unused : 3 = 0;
+    std::uint8_t unused : 2 = 0;
+    // Pixel shaders: samplers reading such a target with sRGB reads off, which see its colour encoded as the 8-bit
+    // target's bytes were.
+    std::uint16_t encodedSamplers = 0;
+    std::uint16_t reserved = 0;
 };
 
 // The target a translation compiles for.

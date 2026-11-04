@@ -117,6 +117,8 @@ float gmodpp_rsq(float x) { x = abs(x); return x == 0 ? gmodpp_max : (x == 1 ? 1
 float gmodpp_log(float x) { x = abs(x); return x == 0 ? -gmodpp_max : log2(x); }
 float gmodpp_pow(float x, float y) { return exp2(y * gmodpp_log(x)); }
 float4 gmodpp_nrm(float4 v) { float f = dot(v.xyz, v.xyz); return v * (f != 0 ? rsqrt(f) : gmodpp_max); }
+float4 gmodpp_encode(float4 c) { float3 x = max(c.rgb, 0); return float4(select(x <= 0.0031308, x * 12.92, 1.055 * pow(x, 1.0 / 2.4) - 0.055), c.a); }
+float3 gmodpp_decode(float3 c) { c = max(c, 0); return select(c <= 0.04045, c / 12.92, pow((c + 0.055) / 1.055, 2.4)); }
 float4 gmodpp_lit(float4 s)
 {
     float power = clamp(s.w, -127.9961, 127.9961);
@@ -915,18 +917,21 @@ std::string Translator::Assemble()
         const std::string fetch = std::format("    {} t = ResourceDescriptorHeap[gmodpp_textures[{}].{}];\n", texture, sampler / 4, kComponents[sampler % 4]);
         const std::string samplerIndex = std::format("gmodpp_samplers[{}].{}", sampler / 4, kComponents[sampler % 4]);
         const std::string name = std::format("gmodpp_sample{}_{}", sampler, static_cast<int>(kind));
+        // Variant::encodedSamplers: the colour the 8-bit target's bytes held.
+        const bool encoded = m_stage == Stage::Pixel && ((m_variant.encodedSamplers >> sampler) & 1u) != 0;
+        const char* open = encoded ? "gmodpp_encode(" : "(";
         switch (kind) {
         case SampleKind::Plain:
-            text += std::format("float4 {}({} uv)\n{{\n{}    SamplerState s = SamplerDescriptorHeap[{}];\n    return t.Sample(s, uv);\n}}\n", name, coordinate, fetch, samplerIndex);
+            text += std::format("float4 {}({} uv)\n{{\n{}    SamplerState s = SamplerDescriptorHeap[{}];\n    return {}t.Sample(s, uv));\n}}\n", name, coordinate, fetch, samplerIndex, open);
             break;
         case SampleKind::Bias:
-            text += std::format("float4 {}({} uv, float bias)\n{{\n{}    SamplerState s = SamplerDescriptorHeap[{}];\n    return t.SampleBias(s, uv, bias);\n}}\n", name, coordinate, fetch, samplerIndex);
+            text += std::format("float4 {}({} uv, float bias)\n{{\n{}    SamplerState s = SamplerDescriptorHeap[{}];\n    return {}t.SampleBias(s, uv, bias));\n}}\n", name, coordinate, fetch, samplerIndex, open);
             break;
         case SampleKind::Level:
-            text += std::format("float4 {}({} uv, float lod)\n{{\n{}    SamplerState s = SamplerDescriptorHeap[{}];\n    return t.SampleLevel(s, uv, lod);\n}}\n", name, coordinate, fetch, samplerIndex);
+            text += std::format("float4 {}({} uv, float lod)\n{{\n{}    SamplerState s = SamplerDescriptorHeap[{}];\n    return {}t.SampleLevel(s, uv, lod));\n}}\n", name, coordinate, fetch, samplerIndex, open);
             break;
         case SampleKind::Gradient:
-            text += std::format("float4 {0}({1} uv, {1} dx, {1} dy)\n{{\n{2}    SamplerState s = SamplerDescriptorHeap[{3}];\n    return t.SampleGrad(s, uv, dx, dy);\n}}\n", name, coordinate, fetch, samplerIndex);
+            text += std::format("float4 {0}({1} uv, {1} dx, {1} dy)\n{{\n{2}    SamplerState s = SamplerDescriptorHeap[{3}];\n    return {4}t.SampleGrad(s, uv, dx, dy));\n}}\n", name, coordinate, fetch, samplerIndex, open);
             break;
         case SampleKind::Compare:
             text += std::format("float4 {}({} uv, float reference)\n{{\n{}    SamplerComparisonState s = SamplerDescriptorHeap[{}];\n    return (float4)t.SampleCmpLevelZero(s, uv, reference);\n}}\n", name, coordinate, fetch, samplerIndex);
@@ -1078,6 +1083,8 @@ std::string Translator::Assemble()
             if (m_out.colorOutputs & (1u << i))
                 text += std::format("    gmodpp_target{0} = oC{0};\n", i);
         }
+        if (m_variant.decodeOutput != 0 && (m_out.colorOutputs & 1u))
+            text += "    gmodpp_target0.rgb = gmodpp_decode(gmodpp_target0.rgb);\n";
         if (fogEpilogue && (m_out.colorOutputs & 1u))
             text += std::format("    gmodpp_target0 = gmodpp_FogBlend(gmodpp_target0, input.position, {}, gmodpp_alpha.z);\n", viewportSize);
         if (m_variant.lightWarpSlot != 0 && (m_out.colorOutputs & 8u))
