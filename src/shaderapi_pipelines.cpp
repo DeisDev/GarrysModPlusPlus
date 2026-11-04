@@ -1611,6 +1611,8 @@ void DrawPass(const ShadowState& shadow, const MeshDraw& mesh)
                 viewport.TopLeftX, viewport.TopLeftY, viewport.Width, viewport.Height, c(4), c(5), c(6), c(7), c(8), c(9), c(10), c(11), c(58), c(59), c(60),
                 t0 != nullptr ? t0->name : "none", t0 != nullptr ? t0->width : 0, t0 != nullptr ? t0->height : 0, dynamic.colorTargets[0],
                 vertexShader->info.firstFloatConstant, vertexShader->info.floatConstantCount);
+            log::Info("DIAG   srgb write {} read {:#x} linear target {} decode {} encoded {:#x} clipped {}", shadow.srgbWrite, shadow.srgbRead, targets.linear,
+                static_cast<int>(pixelVariant.decodeOutput), pixelVariant.encodedSamplers, static_cast<int>(pixelVariant.saturateSamples));
             if (mesh.vertexData != nullptr) {
                 const float* p = reinterpret_cast<const float*>(mesh.vertexData);
                 const int stride = mesh.streams[0].StrideInBytes / 4;

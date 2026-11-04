@@ -694,8 +694,12 @@ void Backend::Present()
         if (++presents % kDevFilePollPresents == 0) {
             const std::filesystem::path request = ModDirectory() / L"drawlog.request";
             std::error_code ignored;
-            if (std::filesystem::remove(request, ignored))
-                LogNextDraws(200);
+            if (std::filesystem::exists(request, ignored)) {
+                int count = 200;
+                std::ifstream(request) >> count;
+                std::filesystem::remove(request, ignored);
+                LogNextDraws(count > 0 ? count : 200);
+            }
             const std::filesystem::path limitRequest = ModDirectory() / L"drawlimit.request";
             if (std::filesystem::exists(limitRequest, ignored)) {
                 std::ifstream(limitRequest) >> limit;
