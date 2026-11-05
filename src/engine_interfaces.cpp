@@ -51,6 +51,10 @@ constexpr int kGetFogColorSlot = 50;
 // IMaterial::GetName, slot 0.
 constexpr int kGetShaderNameSlot = 49;
 constexpr int kGetMaterialNameSlot = 0;
+// IMaterial::IsTranslucent, slot 17 as in the SDK: CMaterial's vtable (materialsystem.dll+0xadf08, by RTTI) holds there a
+// function (+0xff00) that precaches and returns the translucency test with the alpha modulation; slot 49 there returns
+// the shader's name or "shader_error" (REA 2026-11-04).
+constexpr int kIsTranslucentSlot = 17;
 // IVEfx::CL_GetActiveDLights (engine.dll+0x143320, CVEfx vtable slot 6 found through RTTI in Ghidra). It fills
 // up to 32 pointers to GMod's 72-byte dlight_t; CL_AllocDlight (engine.dll+0x9a1a0) stores the key at 40,
 // four bytes later than the Source SDK 2013 layout.
@@ -195,6 +199,11 @@ bool IsUnlitMaterial(void* material)
         log::Info("Forward lighting: '{}' ({}) is drawn unlit", materialName != nullptr ? materialName : "?", shader != nullptr ? shader : "?");
     }
     return entry->second;
+}
+
+bool IsTranslucentMaterial(void* material)
+{
+    return Slot<bool(__fastcall*)(void*)>(material, kIsTranslucentSlot)(material);
 }
 
 void TryInitialize()

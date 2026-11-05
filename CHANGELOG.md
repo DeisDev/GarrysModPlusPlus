@@ -27,3 +27,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Fixed
 
 - Clouds no longer repeat in a pattern toward the horizon.
+- Fixed the game crashing when ARC9 weapons draw their icons, such as when opening the weapon selector.
+- Images that addons read back from render targets keep their transparency, so ARC9's weapon icons no longer have a black background.
+- Less noise in the indirect light on the held weapon and hands.
+- Heat distortion from explosions no longer shows a box with part of the map in it.
+- ARC9's customization menu shows the game behind it again instead of a white screen.
+- Fixed dark streaks along the edges of hands and other models.

@@ -107,9 +107,11 @@ float4 PSMain(VertexOutput input) : SV_Target
 {
     int2 pixel = int2(input.position.xy);
     Texture2D<float4> frame = ResourceDescriptorHeap[g_display.frameView];
-    float3 color = max(frame.Load(int3(pixel + g_display.origin, 0)).rgb, 0.0);
+    float4 texel = frame.Load(int3(pixel + g_display.origin, 0));
+    float3 color = max(texel.rgb, 0.0);
+    // A render target read back keeps its alpha, as its 8-bit bytes did (ARC9's icons are cut out by it).
     if (g_display.encoding == kEncodingPlainSrgb)
-        return float4(LinearToSrgb(saturate(color)), 1.0);
+        return float4(LinearToSrgb(saturate(color)), saturate(texel.a));
 
     bool pq = g_display.encoding == kEncodingPq;
     // The frame's 1 in nits and the display's peak in its units.

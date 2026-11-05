@@ -910,8 +910,12 @@ private:
     // Accumulated reflections of the main view (shaders/reflection_temporal.hlsl).
     std::array<Texture, 2> m_reflectionHistory;
     std::array<Texture, 2> m_taaHistory;
-    // Indirect light of the viewmodel, filtered without history so the main view's buffers stay intact.
+    // Indirect light of the viewmodel, filtered in buffers of its own so the main view's stay intact.
     std::array<Texture, 2> m_viewmodelIndirect;
+    // The viewmodel's accumulated indirect light (rgb, sample count) and its record (luminance moments, distance and the
+    // tag of the frame that wrote it), updated in place (shaders/gi_temporal.hlsl).
+    Texture m_viewmodelHistory;
+    Texture m_viewmodelRecord;
     Texture m_resolved;
     // The main view's depth for its translucent surfaces (shaders/translucent_depth.hlsl).
     Texture m_translucentDepth;

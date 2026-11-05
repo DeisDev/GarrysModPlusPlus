@@ -288,10 +288,12 @@ constexpr UINT kTraceMask = kWorldMask | kStaticPropMask | kShadowlessPropMask |
 // The viewmodel is drawn inside the local player's body, which would shadow it.
 constexpr UINT kViewmodelTraceMask = kTraceMask & ~kLocalPlayerMask;
 constexpr UINT kFilterSteps[] = {1, 2, 4, 8, 16};
-// The viewmodel has no history, so it takes several indirect samples per pixel, stratified over each 2 x 2 block
-// (shaders/gi_trace.hlsl): eight directions a block. Eight a pixel cost 2.4 ms on gm_construct at 2560x1440 (2026-11-03)
-// for light its denoiser blends over some 30 pixels anyway.
+// The viewmodel takes several indirect samples per pixel, stratified over each 2 x 2 block (shaders/gi_trace.hlsl):
+// eight directions a block. Eight a pixel cost 2.4 ms on gm_construct at 2560x1440 (2026-11-03); its history
+// (shaders/gi_temporal.hlsl) and denoiser average the rest.
 constexpr UINT kViewmodelIndirectSamples = 2;
+// Frame tags in the viewmodel's record stay exact in its 32-bit floats; 0 marks a texel never written.
+constexpr uint64_t kViewmodelTags = 1u << 24;
 constexpr UINT kPassCount = static_cast<UINT>(GpuPass::Count);
 // A timestamp before the first pass and after each one.
 constexpr UINT kMarkers = kPassCount + 1;
@@ -1884,6 +1886,8 @@ bool Lighting::EnsureTargets(UINT width, UINT height)
         ok = ok && CreateTarget(texture, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT);
     for (Texture& texture : m_viewmodelIndirect)
         ok = ok && CreateTarget(texture, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT);
+    ok = ok && CreateTarget(m_viewmodelHistory, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT);
+    ok = ok && CreateTarget(m_viewmodelRecord, width, height, DXGI_FORMAT_R32G32B32A32_FLOAT);
     ok = ok && CreateTarget(m_resolved, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT);
     ok = ok && CreateTarget(m_translucentDepth, width, height, DXGI_FORMAT_R32_FLOAT);
     // Ray Reconstruction's inputs use the top-left render-size part of these.
@@ -3579,12 +3583,18 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     mark();
     Texture* indirect = nullptr;
     if (traced && !main) {
-        Texture* source = &m_giRaw;
+        Use(m_viewmodelHistory, write);
+        Use(m_viewmodelRecord, write);
+        Dispatch(Pass::GiTemporal, {.input0 = m_giRaw.srv, .output0 = m_viewmodelHistory.uav, .output1 = m_viewmodelRecord.uav,
+            .step = static_cast<UINT>(inputs.frame % kViewmodelTags + 1)});
+        Use(m_viewmodelRecord, read);
+        Texture* source = &m_viewmodelHistory;
         for (size_t i = 0; i < std::size(kFilterSteps) && GetSettings().denoiser; ++i) {
             Texture* target = &m_viewmodelIndirect[i % 2];
             Use(*source, read);
             Use(*target, write);
-            Dispatch(Pass::GiFilter, {.input0 = source->srv, .input2 = i == 0 ? 1u : 0u, .output0 = target->uav, .step = kFilterSteps[i]});
+            Dispatch(Pass::GiFilter, {.input0 = source->srv, .input1 = i == 0 ? m_viewmodelRecord.srv : kInvalidView, .input2 = i == 0 ? 1u : 0u,
+                .output0 = target->uav, .step = kFilterSteps[i]});
             source = target;
         }
         indirect = source;

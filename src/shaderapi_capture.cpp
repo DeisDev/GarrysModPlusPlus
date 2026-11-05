@@ -540,10 +540,13 @@ void EndForward()
 
 int FixedLighting()
 {
-    if (g_state.active)
-        return 2;
-    // Unlit materials keep the game's own shaders during forward lighting: their preview combos leave out vertex
-    // colour (see engine_interfaces.cpp).
+    // Unlit materials keep the game's own shaders where they are no G-buffer surface: their preview combos leave out
+    // vertex colour (see engine_interfaces.cpp). During a capture those are the ones that blend: ARC9 darkens the screen
+    // behind its customization menu with a 2D rect drawn in the viewmodel's pass, which came out white.
+    if (g_state.active) {
+        void* material = BoundMaterial();
+        return material != nullptr && engine::IsUnlitMaterial(material) && engine::IsTranslucentMaterial(material) ? 0 : 2;
+    }
     if (g_state.forwardActive) {
         void* material = BoundMaterial();
         return material != nullptr && engine::IsUnlitMaterial(material) ? 0 : 2;

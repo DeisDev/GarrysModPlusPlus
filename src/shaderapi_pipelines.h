@@ -48,7 +48,8 @@ struct CopySurface {
     bool linear;
 };
 // Copies `sourceRect` of `source` to `destinationRect` of `destination` with linear filtering, as StretchRect with
-// D3DTEXF_LINEAR does: a plain copy when the sizes and formats allow it, otherwise a draw.
+// D3DTEXF_LINEAR does: a plain copy when the sizes and formats allow it, otherwise a draw. A rectangle that leaves its
+// surface copies nothing, as there.
 void StretchRect(const CopySurface& source, const D3D12_RECT& sourceRect, const CopySurface& destination, const D3D12_RECT& destinationRect);
 
 // Copies `size` bytes to memory the frame's commands can read as a constant buffer, and returns its address (0 when

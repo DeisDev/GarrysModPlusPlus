@@ -5,10 +5,18 @@
 // with bilinear taps that are each rejected when the surface there differs (distance or normal). Once a few
 // samples are in, a sample far brighter than the history's spread is scaled down before it is blended in; the
 // moments keep its true luminance, so lasting changes widen the spread and get through.
+// The viewmodel moves with the eye, so its history is the same pixel's, updated in place; its record also keeps the
+// distance and the tag of the frame that wrote it (step is this frame's), and history at another distance, or that
+// last frame did not write, starts again.
 // input0: raw estimate; input1: last frame's history (rgb, sample count); input2: last frame's moments;
 // output0: new history; output1: new moments.
+// Viewmodel: input0: raw estimate; output0: history (rgb, sample count); output1: record (moments, distance, tag).
 
 static const float kMaxSamples = 32.0;
+// The viewmodel's light turns with the eye, so its history is shorter.
+static const float kViewmodelMaxSamples = 16.0;
+// Mirrors kViewmodelTags in src/lighting.cpp: tags run from 1 to this.
+static const uint kViewmodelTags = 1u << 24;
 static const float kClampSamples = 4.0;
 static const float kClampDeviations = 4.0;
 
@@ -16,18 +24,22 @@ static const float kClampDeviations = 4.0;
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID)
 {
+    id.xy = DispatchPixel(id.xy);
     if (any(id.xy >= g_frame.size))
         return;
     int2 pixel = int2(id.xy);
+    bool viewmodel = g_frame.viewmodel != 0;
     RWTexture2D<float4> output = ResourceDescriptorHeap[g_pass.output0];
     RWTexture2D<float2> momentsOutput = ResourceDescriptorHeap[g_pass.output1];
+    RWTexture2D<float4> record = ResourceDescriptorHeap[g_pass.output1];
     Texture2D<float4> raw = ResourceDescriptorHeap[g_pass.input0];
-    Texture2D<float4> history = ResourceDescriptorHeap[g_pass.input1];
-    Texture2D<float2> historyMoments = ResourceDescriptorHeap[g_pass.input2];
     float4 surface = SurfaceAt(g_frame.surfaceView, pixel);
     if (surface.w <= 0.0) {
         output[pixel] = 0.0;
-        momentsOutput[pixel] = 0.0;
+        if (viewmodel)
+            record[pixel] = 0.0;
+        else
+            momentsOutput[pixel] = 0.0;
         return;
     }
     float3 current = raw.Load(int3(pixel, 0)).rgb;
@@ -36,7 +48,17 @@ void main(uint3 id : SV_DispatchThreadID)
     float4 accumulated = 0.0;
     float2 moments = 0.0;
     float weightSum = 0.0;
-    if (g_frame.historyValid != 0) {
+    if (viewmodel) {
+        float4 previous = record[pixel];
+        float previousTag = float(g_pass.step > 1 ? g_pass.step - 1 : kViewmodelTags);
+        if (previous.w == previousTag && abs(previous.z - surface.w) <= 0.5 + surface.w * 0.01) {
+            accumulated = output[pixel];
+            moments = previous.xy;
+            weightSum = 1.0;
+        }
+    } else if (g_frame.historyValid != 0) {
+        Texture2D<float4> history = ResourceDescriptorHeap[g_pass.input1];
+        Texture2D<float2> historyMoments = ResourceDescriptorHeap[g_pass.input2];
         Texture2D<float2> motion = ResourceDescriptorHeap[g_frame.motionView];
         Texture2D<float> previousDistance = ResourceDescriptorHeap[g_frame.previousDistanceView];
         float2 previous = float2(pixel) + motion.Load(int3(pixel, 0));
@@ -57,19 +79,23 @@ void main(uint3 id : SV_DispatchThreadID)
             weightSum += weight;
         }
     }
-    if (weightSum < 1e-3) {
-        output[pixel] = float4(current, 1.0);
-        momentsOutput[pixel] = float2(luminance, luminance * luminance);
-        return;
+    float4 result = float4(current, 1.0);
+    float2 resultMoments = float2(luminance, luminance * luminance);
+    if (weightSum >= 1e-3) {
+        accumulated /= weightSum;
+        moments /= weightSum;
+        float samples = min(accumulated.a + 1.0, viewmodel ? kViewmodelMaxSamples : kMaxSamples);
+        if (accumulated.a >= kClampSamples) {
+            float limit = moments.x + kClampDeviations * sqrt(max(moments.y - moments.x * moments.x, 0.0));
+            if (luminance > limit)
+                current *= limit / luminance;
+        }
+        result = float4(lerp(accumulated.rgb, current, 1.0 / samples), samples);
+        resultMoments = lerp(moments, resultMoments, 1.0 / samples);
     }
-    accumulated /= weightSum;
-    moments /= weightSum;
-    float samples = min(accumulated.a + 1.0, kMaxSamples);
-    if (accumulated.a >= kClampSamples) {
-        float limit = moments.x + kClampDeviations * sqrt(max(moments.y - moments.x * moments.x, 0.0));
-        if (luminance > limit)
-            current *= limit / luminance;
-    }
-    output[pixel] = float4(lerp(accumulated.rgb, current, 1.0 / samples), samples);
-    momentsOutput[pixel] = lerp(moments, float2(luminance, luminance * luminance), 1.0 / samples);
+    output[pixel] = result;
+    if (viewmodel)
+        record[pixel] = float4(resultMoments, surface.w, float(g_pass.step));
+    else
+        momentsOutput[pixel] = resultMoments;
 }

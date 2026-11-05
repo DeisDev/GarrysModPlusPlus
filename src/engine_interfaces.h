@@ -64,6 +64,8 @@ ComputeLightingFn ComputeLightingFunction();
 // Whether a material draws unlit (UnlitGeneric, UnlitTwoTexture, MonitorScreen), whose preview combos leave out vertex
 // colour.
 bool IsUnlitMaterial(void* material);
+// IMaterial::IsTranslucent: whether the material blends as it is drawn now (its render state or alpha modulation).
+bool IsTranslucentMaterial(void* material);
 
 // The fog of the view being drawn (IMatRenderContext::GetFogMode and GetFogColor): its MaterialFogMode_t (0 without fog)
 // and its colour as the game sets it (gamma bytes).

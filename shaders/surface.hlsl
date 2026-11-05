@@ -69,13 +69,18 @@ void main(uint3 id : SV_DispatchThreadID)
     float3 position = WorldPositionFromDepth(pixel, depth);
     float3 toEye = g_frame.eyePosition - position;
     float4 stored = gbufferNormal.Load(int3(pixel, 0));
+    float3 face = DepthNormal(pixel, depth, position);
+    if (dot(face, toEye) < 0.0)
+        face = -face;
     float3 normal;
     if (IsWaterSurface(MaterialBits(coverage)))
         normal = WaterNormal(stored.xy, stored.w, normalize(toEye), 1.0);
     else
-        normal = dot(stored.xyz, stored.xyz) > 0.25 ? normalize(stored.xyz) : DepthNormal(pixel, depth, position);
-    // Two-sided materials report the front-face normal on back faces.
-    if (dot(normal, toEye) < 0.0)
+        normal = dot(stored.xyz, stored.xyz) > 0.25 ? normalize(stored.xyz) : face;
+    // Two-sided materials report the front-face normal on back faces: it points away from the eye and the visible face.
+    // Normal maps and smoothed normals lean away from the eye near silhouettes of front faces too; turned around there,
+    // the viewmodel's hands showed dark streaks along their sides (2026-11-04).
+    if (dot(normal, toEye) < 0.0 && dot(normal, face) < 0.0)
         normal = -normal;
     output[pixel] = float4(normal, length(toEye));
 }

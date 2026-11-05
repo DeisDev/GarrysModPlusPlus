@@ -75,10 +75,12 @@ bool KeepSkin(const Values& values) { return ValueOf(values, "FLASHLIGHT") != 0;
 
 bool KeepNone(const Values&) { return false; }
 
-// Refract's masked frame buffer copy is an effect, not glass: it keeps the game's shader. Its blur (a 3x3 box of 1/512
-// of the screen) and its fade towards the plain copy at silhouettes, both on by default, give way to the traced
-// refraction and Fresnel's equations.
-bool KeepRefractEffects(const Values& values) { return ValueOf(values, "MASKED") != 0; }
+// Refract's masked frame buffer copy is an effect, not glass, and so is $vertexcolormodulate (COLORMODULATE; GMod's
+// Refract draw, stdshader_dx9.dll 0x180044070, REA 2026-11-04): particles' heat warps (HL2's particle/warp*), whose
+// vertex colour and alpha drive the distortion. Those keep the game's shader: traced as glass, a warp sprite showed a
+// box of the map seen through it instead of the frame behind it, distorted (2026-11-04). Glass's blur (a 3x3 box of 1/512 of the screen) and its fade
+// towards the plain copy at silhouettes, both on by default, give way to the traced refraction and Fresnel's equations.
+bool KeepRefractEffects(const Values& values) { return ValueOf(values, "MASKED") != 0 || ValueOf(values, "COLORMODULATE") != 0; }
 
 constexpr Family kFamilies[] = {
     { "vertexlit_and_unlit_generic_ps20b", "vertexlit_and_unlit_generic_ps2x.fxc", "ps20b", "ps_2_b", "SHADER_MODEL_PS_2_B", 377487360, 12, 0x6e13aa07,

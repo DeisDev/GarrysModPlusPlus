@@ -811,10 +811,30 @@ DXGI_FORMAT Family(DXGI_FORMAT format)
     }
 }
 
+// Direct3D 9's StretchRect copies nothing for a rectangle that is inverted or leaves its surface (D3DERR_INVALIDCALL,
+// as DXVK's IsBlitRegionInvalid checks), and shaderapidx9 passes the rectangles through and ignores the result
+// (CopyRenderTargetToTextureEx 0x180013ff0, CopyTextureToRenderTargetEx 0x1800141d0; REA 2026-11-04). Addons rely on
+// it: render.UpdateScreenEffectTexture (client.dll 0x1800c2140) copies the HUD's size from whatever target is pushed,
+// and CopyTextureRegion past the source is undefined (it removed the device).
+bool InsideSurface(const D3D12_RECT& rect, UINT width, UINT height)
+{
+    return rect.left >= 0 && rect.top >= 0 && rect.right >= rect.left && rect.bottom >= rect.top && rect.right <= static_cast<LONG>(width)
+        && rect.bottom <= static_cast<LONG>(height);
+}
+
 }
 
 void StretchRect(const CopySurface& source, const D3D12_RECT& sourceRect, const CopySurface& destination, const D3D12_RECT& destinationRect)
 {
+    if (!InsideSurface(sourceRect, source.width, source.height) || !InsideSurface(destinationRect, destination.width, destination.height)) {
+        static bool logged = false;
+        if (!std::exchange(logged, true))
+            log::Info("Native: a copy of ({}, {})-({}, {}) of a {}x{} surface into ({}, {})-({}, {}) of a {}x{} one leaves a surface and was skipped, as "
+                      "Direct3D 9 refuses it",
+                sourceRect.left, sourceRect.top, sourceRect.right, sourceRect.bottom, source.width, source.height, destinationRect.left,
+                destinationRect.top, destinationRect.right, destinationRect.bottom, destination.width, destination.height);
+        return;
+    }
     Backend& backend = GetBackend();
     ID3D12GraphicsCommandList* commands = backend.Commands();
     const LONG width = sourceRect.right - sourceRect.left;
