@@ -39,8 +39,13 @@ void CapUnfocusedFrames(bool cap);
 // Reads a file through the game's filesystem (loose files, mounted content and addons), at most `maxBytes`.
 bool ReadGameFile(const std::string& path, std::vector<std::byte>& data, size_t maxBytes = SIZE_MAX);
 
-// An engine dynamic light (dlight_t): muzzle flashes, explosions, the light tool. Colour is linear, in
-// lightmap units; a zero outer angle means a point light.
+// dlight_t::flags (the SDK's public/dlight.h): the light leaves out lightmapped surfaces, or models.
+inline constexpr uint32_t kDlightNoWorld = 0x1;
+inline constexpr uint32_t kDlightNoModel = 0x2;
+
+// An engine dynamic light (dlight_t): explosions, the light tool, Lua's DynamicLight. Colour is linear, in lightmap
+// units; a zero outer angle means a point light. `identity` is its slot in the engine's list, which it keeps while it
+// lives.
 struct DynamicLight {
     float origin[3];
     float radius;
@@ -49,10 +54,19 @@ struct DynamicLight {
     float innerAngle;
     float outerAngle;
     int key;
+    uint32_t flags;
+    uint64_t identity;
 };
 
 // The engine's active dynamic lights (IVEfx::CL_GetActiveDLights).
 void ActiveDynamicLights(std::vector<DynamicLight>& lights);
+// The engine's live entity lights (elights), which Source applies to models alone: HL2's muzzle flashes and some impact
+// effects.
+void ActiveEntityLights(std::vector<DynamicLight>& lights);
+
+// Sets the ConVar gmodpp_lights, which client Lua reads to know the mod lights the scene (1) or not (0). It is registered
+// with the client's ConVars the first time this is called after the client registered its own; never archived.
+void PublishLightsActive(bool active);
 
 // IVEngineClient::ComputeLighting(point, normal or null, clamp to 1, colour out, ambient cube out or null), which
 // GetLightForPoint also calls through the vtable; particles and client effects light themselves with it.
@@ -66,6 +80,12 @@ ComputeLightingFn ComputeLightingFunction();
 bool IsUnlitMaterial(void* material);
 // IMaterial::IsTranslucent: whether the material blends as it is drawn now (its render state or alpha modulation).
 bool IsTranslucentMaterial(void* material);
+
+// A material's vector variable as it is now ("$selfillumtint", which proxies set as entities are drawn), or nothing when
+// the material or variable does not exist. `material` is its name ("models/weapons/w_physics"). Variables are found once;
+// ForgetMaterials drops them when materials may have been unloaded (a map change).
+std::optional<std::array<float, 3>> MaterialVector(const std::string& material, const char* variable);
+void ForgetMaterials();
 
 // The fog of the view being drawn (IMatRenderContext::GetFogMode and GetFogColor): its MaterialFogMode_t (0 without fog)
 // and its colour as the game sets it (gamma bytes).

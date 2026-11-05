@@ -34,10 +34,12 @@ struct RestirConstants {
     float emitterPower;
     uint32_t historyValid;
     uint32_t regirLightSlots;
+    // The sampled dynamic lights' indices in last frame's and back (SceneFrame::dynamicLightMapView).
+    uint32_t dynamicLightMapView;
 };
 
-// What RTXDI lights in a frame: the map's lights, its glowing triangles, the engine's dynamic lights and the projected
-// lights, in that order in one index space.
+// What RTXDI lights in a frame: the map's lights, its glowing triangles, the sampled dynamic lights (engine lights and
+// glowing model patches, SceneFrame::dynamicExactFirst) and the projected lights, in that order in one index space.
 struct RestirLights {
     uint32_t mapLights = 0;
     uint32_t emitters = 0;
@@ -73,7 +75,8 @@ public:
     // view-projection inverted; `rayReconstruction` follows RTXPT and the DLSS-RR guide (no visibility reuse, which
     // correlates frames).
     void FillConstants(RestirConstants& constants, uint32_t frameIndex, RestirMode mode, bool rayReconstruction, const float eye[3],
-        const float previousInvViewProj[4][4], const RestirLights& lights, float emitterPower, UINT previousLightStylesView, bool historyValid);
+        const float previousInvViewProj[4][4], const RestirLights& lights, float emitterPower, UINT previousLightStylesView, bool historyValid,
+        UINT dynamicLightMapView);
     // Last frame's light style values, for the next frame's temporal reuse; returns their view for `slot`.
     UINT UploadPreviousStyles(UINT slot, const float* values, size_t count);
 

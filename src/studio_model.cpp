@@ -462,6 +462,17 @@ std::optional<bsp::Float3> TextureReflectivity(std::span<const std::byte> vtfHea
     return vtf.At<bsp::Float3>(kReflectivityOffset);
 }
 
+bool TextureHasAlpha(std::span<const std::byte> vtfHeader)
+{
+    // The header's flags (vtf.h in the Source SDK): TEXTUREFLAGS_ONEBITALPHA and TEXTUREFLAGS_EIGHTBITALPHA.
+    constexpr size_t kFlagsOffset = 20;
+    constexpr uint32_t kAlphaFlags = 0x1000 | 0x2000;
+    Reader vtf(vtfHeader);
+    if (vtfHeader.size() < kFlagsOffset + sizeof(uint32_t) || std::memcmp(vtfHeader.data(), "VTF", 4) != 0)
+        return false;
+    return (vtf.At<uint32_t>(kFlagsOffset).value_or(0u) & kAlphaFlags) != 0;
+}
+
 namespace {
 
 // VTF image formats (ImageFormat in the Source SDK's bitmap/imageformat.h; channels are named in memory order).
@@ -599,6 +610,112 @@ std::optional<TextureImage> ReadTexture(std::span<const std::byte> bytes, uint32
         }
     }
     return image;
+}
+
+namespace {
+
+// A 4x4 block's colour (BC1-BC3) in DXGI's decoding: four colours, or with BC1 and c0 <= c1 three and transparent black.
+void DecodeColorBlock(const std::byte* block, bool threeColor, std::array<std::array<uint8_t, 4>, 16>& texels)
+{
+    uint16_t endpoints[2];
+    uint32_t indices;
+    std::memcpy(endpoints, block, sizeof(endpoints));
+    std::memcpy(&indices, block + 4, sizeof(indices));
+    std::array<std::array<int, 4>, 4> palette = {};
+    for (int e = 0; e < 2; ++e) {
+        const int r = (endpoints[e] >> 11) & 31;
+        const int g = (endpoints[e] >> 5) & 63;
+        const int b = endpoints[e] & 31;
+        palette[e] = {r << 3 | r >> 2, g << 2 | g >> 4, b << 3 | b >> 2, 255};
+    }
+    const bool four = !threeColor || endpoints[0] > endpoints[1];
+    for (int c = 0; c < 3; ++c) {
+        palette[2][c] = four ? (2 * palette[0][c] + palette[1][c]) / 3 : (palette[0][c] + palette[1][c]) / 2;
+        palette[3][c] = four ? (palette[0][c] + 2 * palette[1][c]) / 3 : 0;
+    }
+    palette[2][3] = 255;
+    palette[3][3] = four ? 255 : 0;
+    for (int t = 0; t < 16; ++t) {
+        const std::array<int, 4>& color = palette[(indices >> (2 * t)) & 3];
+        texels[t] = {static_cast<uint8_t>(color[0]), static_cast<uint8_t>(color[1]), static_cast<uint8_t>(color[2]), static_cast<uint8_t>(color[3])};
+    }
+}
+
+// A BC2 block's explicit alpha or a BC3 block's interpolated alpha.
+void DecodeAlphaBlock(const std::byte* block, bool interpolated, std::array<std::array<uint8_t, 4>, 16>& texels)
+{
+    uint64_t bits;
+    std::memcpy(&bits, block, sizeof(bits));
+    if (!interpolated) {
+        for (int t = 0; t < 16; ++t)
+            texels[t][3] = static_cast<uint8_t>(((bits >> (4 * t)) & 15) * 17);
+        return;
+    }
+    const int a0 = static_cast<int>(bits & 0xFF);
+    const int a1 = static_cast<int>((bits >> 8) & 0xFF);
+    int alphas[8] = {a0, a1};
+    for (int i = 1; i < 7; ++i)
+        alphas[i + 1] = a0 > a1 ? ((7 - i) * a0 + i * a1) / 7 : i < 5 ? ((5 - i) * a0 + i * a1) / 5 : (i == 5 ? 0 : 255);
+    for (int t = 0; t < 16; ++t)
+        texels[t][3] = static_cast<uint8_t>(alphas[(bits >> (16 + 3 * t)) & 7]);
+}
+
+}
+
+std::vector<uint8_t> DecodeChannel(const TextureImage& image, size_t mip, uint32_t channel)
+{
+    const uint32_t width = std::max(image.width >> mip, 1u);
+    const uint32_t height = std::max(image.height >> mip, 1u);
+    std::vector<uint8_t> values(static_cast<size_t>(width) * height);
+    if (mip >= image.mips.size() || channel > 3)
+        return {};
+    const std::span<const std::byte> data = image.mips[mip];
+    const auto byteAt = [&](size_t i) { return i < data.size() ? std::to_integer<uint8_t>(data[i]) : uint8_t{0}; };
+    switch (image.format) {
+    case TextureFormat::Rgba8:
+    case TextureFormat::Bgra8:
+    case TextureFormat::Bgrx8: {
+        // The byte of each channel in memory, or -1 for one that reads as 1.
+        constexpr int kRgba[] = {0, 1, 2, 3};
+        constexpr int kBgra[] = {2, 1, 0, 3};
+        constexpr int kBgrx[] = {2, 1, 0, -1};
+        const int* order = image.format == TextureFormat::Rgba8 ? kRgba : image.format == TextureFormat::Bgra8 ? kBgra : kBgrx;
+        for (size_t t = 0; t < values.size(); ++t)
+            values[t] = order[channel] < 0 ? uint8_t{255} : byteAt(t * 4 + static_cast<size_t>(order[channel]));
+        break;
+    }
+    case TextureFormat::R8:
+        for (size_t t = 0; t < values.size(); ++t)
+            values[t] = channel == 0 ? byteAt(t) : channel == 3 ? uint8_t{255} : uint8_t{0};
+        break;
+    case TextureFormat::Bc1:
+    case TextureFormat::Bc2:
+    case TextureFormat::Bc3: {
+        const size_t blockBytes = image.format == TextureFormat::Bc1 ? 8 : 16;
+        const uint32_t blocksX = (width + 3) / 4;
+        const uint32_t blocksY = (height + 3) / 4;
+        std::array<std::array<uint8_t, 4>, 16> texels;
+        for (uint32_t by = 0; by < blocksY; ++by) {
+            for (uint32_t bx = 0; bx < blocksX; ++bx) {
+                const size_t offset = (static_cast<size_t>(by) * blocksX + bx) * blockBytes;
+                if (offset + blockBytes > data.size())
+                    return {};
+                const std::byte* block = data.data() + offset;
+                DecodeColorBlock(image.format == TextureFormat::Bc1 ? block : block + 8, image.format == TextureFormat::Bc1, texels);
+                if (image.format != TextureFormat::Bc1)
+                    DecodeAlphaBlock(block, image.format == TextureFormat::Bc3, texels);
+                for (uint32_t t = 0; t < 16; ++t) {
+                    const uint32_t x = bx * 4 + t % 4;
+                    const uint32_t y = by * 4 + t / 4;
+                    if (x < width && y < height)
+                        values[static_cast<size_t>(y) * width + x] = texels[t][channel];
+                }
+            }
+        }
+        break;
+    }
+    }
+    return values;
 }
 
 }

@@ -29,6 +29,8 @@ struct SkinnedEntity {
     std::shared_ptr<SkinnedModel> model;
     std::vector<studio::Matrix3x4> boneToWorld;
     UINT mask;
+    // SceneInstance::flags of its instance.
+    uint32_t flags = 0;
 };
 
 // Animated shadow casters: shaders/skin.hlsl skins each entity's vertices on the GPU every frame, into a buffer of the
@@ -97,6 +99,7 @@ private:
         int sceneModel;
         UINT mask;
         UINT previousPositions;
+        uint32_t flags;
     };
 
     Microsoft::WRL::ComPtr<ID3D12Resource> CreateBuffer(UINT64 size, D3D12_HEAP_TYPE heap, D3D12_RESOURCE_FLAGS flags, D3D12_RESOURCE_STATES state);

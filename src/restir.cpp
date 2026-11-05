@@ -1,6 +1,7 @@
 #include "restir.h"
 
 #include "log.h"
+#include "scene.h"
 
 #include <Rtxdi/RtxdiUtils.h>
 
@@ -16,8 +17,8 @@ namespace {
 
 // RTXDI's neighbour offsets for spatial reuse (ReSTIRDIStaticParameters::NeighborOffsetCount).
 constexpr uint32_t kNeighborOffsets = 8192;
-// Room in the light PDF for the engine's dynamic lights and the projected lights (Scene's and Lighting's maxima).
-constexpr uint32_t kFrameLights = 32 + 8;
+// Room in the light PDF for the dynamic lights and the projected lights (Scene's and Lighting's maxima).
+constexpr uint32_t kFrameLights = Scene::kMaxDynamicLights + 8;
 constexpr uint32_t kStyles = 128;
 
 ComPtr<ID3D12Resource> CreateBuffer(ID3D12Device* device, D3D12_HEAP_TYPE heap, UINT64 size, D3D12_RESOURCE_FLAGS flags, D3D12_RESOURCE_STATES state)
@@ -195,7 +196,8 @@ void Restir::FillRegir(ReGIR_Parameters& parameters) const
 }
 
 void Restir::FillConstants(RestirConstants& constants, uint32_t frameIndex, RestirMode mode, bool rayReconstruction, const float eye[3],
-    const float previousInvViewProj[4][4], const RestirLights& lights, float emitterPower, UINT previousLightStylesView, bool historyValid)
+    const float previousInvViewProj[4][4], const RestirLights& lights, float emitterPower, UINT previousLightStylesView, bool historyValid,
+    UINT dynamicLightMapView)
 {
     m_context->SetFrameIndex(frameIndex);
     m_context->SetResamplingMode(mode == RestirMode::Reuse ? rtxdi::ReSTIRDI_ResamplingMode::TemporalAndSpatial : rtxdi::ReSTIRDI_ResamplingMode::None);
@@ -253,6 +255,7 @@ void Restir::FillConstants(RestirConstants& constants, uint32_t frameIndex, Rest
     constants.emitterPower = emitterPower;
     constants.historyValid = historyValid ? 1u : 0u;
     constants.regirLightSlots = RegirLightSlots();
+    constants.dynamicLightMapView = dynamicLightMapView;
 }
 
 UINT Restir::UploadPreviousStyles(UINT slot, const float* values, size_t count)

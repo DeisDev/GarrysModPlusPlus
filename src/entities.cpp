@@ -86,6 +86,33 @@ constexpr int kRopeDefaultSubdiv = 2;
 constexpr int kRopeMaxSubdiv = 7;
 constexpr float kWorldLimit = 65536.0f;
 
+// Sprite entities (C_Sprite, ClientClass "CSprite", and C_SpriteOriented, "CSpriteOriented"), as C_Sprite::DrawModel
+// (client.dll+0x2dadc0) draws them (REA 2026-11-05): at its renderable's GetRenderOrigin (slot 1, +0x2db170: the attached
+// entity's attachment, else its origin), sized by GetRenderScale (entity vtable slot 206, +0x2dacd0), divided by the
+// smaller of its sprite's width and height with m_bWorldSpaceScale, as bright as GetRenderBrightness (slot 207,
+// +0x2dad40; 0-255), coloured by m_clrRender and $HDRCOLORSCALE (m_flHDRColorScale). DrawSpriteModel (+0x1fae00) spans
+// the quad from the origin by the scale times the CEngineSprite's up, down, left and right extents (+0x80, +0x84, +0x88,
+// +0x8c), which IVModelInfo::GetModelExtraData (slot 10) gives for a sprite model (GetModelType, slot 9, 2), and draws
+// it with the CEngineSprite's material for its render mode (+0x18 + 8 * mode). Additive render modes (the SDK's
+// RenderMode_t): glow 3, add 5, add with frame blend 7, alpha add 8, world glow 9.
+constexpr char kSpriteClass[] = "CSprite";
+constexpr char kOrientedSpriteClass[] = "CSpriteOriented";
+constexpr int kGetRenderOriginSlot = 1;
+constexpr int kGetRenderScaleSlot = 206;
+constexpr int kGetRenderBrightnessSlot = 207;
+constexpr int kGetModelExtraDataSlot = 10;
+constexpr int kModelTypeSprite = 2;
+constexpr size_t kEngineSpriteWidth = 0x8;
+constexpr size_t kEngineSpriteHeight = 0xC;
+constexpr size_t kEngineSpriteMaterials = 0x18;
+constexpr size_t kEngineSpriteExtents = 0x80;
+constexpr int kRenderModes = 11;
+constexpr int kGetMaterialNameSlot = 0;
+constexpr char kRenderModeProp[] = "m_nRenderMode";
+constexpr char kRenderColorProp[] = "m_clrRender";
+constexpr char kWorldSpaceScaleProp[] = "m_bWorldSpaceScale";
+constexpr char kHdrColorScaleProp[] = "m_flHDRColorScale";
+
 // env_sun's client class, C_Sun in GMod's client.dll (ClientClass "CSun" at 0x87F2C8, DT_Sun built at 0x30380):
 // m_vDirection is a vector, m_bOn a one-byte bool, m_clrRender a color32, m_nSize an int. Its OnDataChanged (0x1FCC10)
 // gives the sun's sprite the half size m_nSize and m_clrRender divided by its largest component (REA, 2026-11-02).
@@ -311,6 +338,76 @@ std::optional<gbuffer::EnvSun> FindSun()
             found = std::move(sun);
     }
     return found;
+}
+
+void CollectGlowSprites(std::vector<GlowSprite>& sprites)
+{
+    sprites.clear();
+    if (!Ready())
+        return;
+    static std::unordered_map<const void*, int> renderModes;
+    static std::unordered_map<const void*, int> colors;
+    static std::unordered_map<const void*, int> worldScales;
+    static std::unordered_map<const void*, int> colorScales;
+    const int highest = Slot<int(__fastcall*)(void*)>(g_entityList, kGetHighestEntityIndexSlot)(g_entityList);
+    for (int index = 1; index <= highest; ++index) {
+        void* entity = Slot<void*(__fastcall*)(void*, int)>(g_entityList, kGetClientEntitySlot)(g_entityList, index);
+        if (entity == nullptr)
+            continue;
+        void* networkable = Slot<void*(__fastcall*)(void*)>(entity, kGetClientNetworkableSlot)(entity);
+        const void* clientClass = networkable != nullptr ? Slot<const void*(__fastcall*)(void*)>(networkable, kGetClientClassSlot)(networkable) : nullptr;
+        if (clientClass == nullptr)
+            continue;
+        const char* className = Field<const char*>(clientClass, kClientClassName);
+        if (className == nullptr || (std::strcmp(className, kSpriteClass) != 0 && std::strcmp(className, kOrientedSpriteClass) != 0))
+            continue;
+        void* renderable = Slot<void*(__fastcall*)(void*)>(entity, kGetClientRenderableSlot)(entity);
+        if (renderable == nullptr || !Slot<bool(__fastcall*)(void*)>(renderable, kShouldDrawSlot)(renderable))
+            continue;
+        const int renderModeAt = ClassProp(renderModes, clientClass, kRenderModeProp);
+        const int colorAt = ClassProp(colors, clientClass, kRenderColorProp);
+        const int worldScaleAt = ClassProp(worldScales, clientClass, kWorldSpaceScaleProp);
+        const int colorScaleAt = ClassProp(colorScales, clientClass, kHdrColorScaleProp);
+        if (renderModeAt == kNoProp || colorAt == kNoProp)
+            continue;
+        const int mode = Field<uint8_t>(entity, static_cast<size_t>(renderModeAt));
+        if (mode != 3 && mode != 5 && mode != 7 && mode != 8 && mode != 9)
+            continue;
+        const void* model = Slot<const void*(__fastcall*)(void*)>(renderable, kGetModelSlot)(renderable);
+        if (model == nullptr || Slot<int(__fastcall*)(void*, const void*)>(g_modelInfo, kGetModelTypeSlot)(g_modelInfo, model) != kModelTypeSprite)
+            continue;
+        const std::byte* sprite = Slot<const std::byte*(__fastcall*)(void*, const void*)>(g_modelInfo, kGetModelExtraDataSlot)(g_modelInfo, model);
+        if (sprite == nullptr || mode >= kRenderModes)
+            continue;
+        void* material = Field<void*>(sprite, kEngineSpriteMaterials + 8 * static_cast<size_t>(mode));
+        const char* materialName = material != nullptr ? Slot<const char*(__fastcall*)(void*)>(material, kGetMaterialNameSlot)(material) : nullptr;
+        if (materialName == nullptr)
+            continue;
+        float scale = Slot<float(__fastcall*)(void*)>(entity, kGetRenderScaleSlot)(entity);
+        if (scale <= 0.0f)
+            scale = 1.0f;
+        if (worldScaleAt != kNoProp && Field<uint8_t>(entity, static_cast<size_t>(worldScaleAt)) != 0) {
+            const int smaller = std::min(Field<int>(sprite, kEngineSpriteWidth), Field<int>(sprite, kEngineSpriteHeight));
+            if (smaller > 0)
+                scale /= static_cast<float>(smaller);
+        }
+        const float up = Field<float>(sprite, kEngineSpriteExtents);
+        const float down = Field<float>(sprite, kEngineSpriteExtents + 4);
+        const float left = Field<float>(sprite, kEngineSpriteExtents + 8);
+        const float right = Field<float>(sprite, kEngineSpriteExtents + 12);
+        const int brightness = Slot<int(__fastcall*)(void*)>(entity, kGetRenderBrightnessSlot)(entity);
+        const float* origin = Slot<const float*(__fastcall*)(void*)>(renderable, kGetRenderOriginSlot)(renderable);
+        if (origin == nullptr || brightness <= 0)
+            continue;
+        GlowSprite& out = sprites.emplace_back();
+        std::copy_n(origin, 3, out.origin);
+        const float colorScale = colorScaleAt != kNoProp ? Field<float>(entity, static_cast<size_t>(colorScaleAt)) : 1.0f;
+        for (int c = 0; c < 3; ++c)
+            out.color[c] = Field<uint8_t>(entity, static_cast<size_t>(colorAt) + static_cast<size_t>(c)) / 255.0f * colorScale;
+        out.brightness = std::min(brightness, 255) / 255.0f;
+        out.area = std::fabs((up - down) * (right - left)) * scale * scale;
+        out.material = materialName;
+    }
 }
 
 std::string WeaponWorldModel(const ModelEntity& weapon)

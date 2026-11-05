@@ -259,7 +259,10 @@ struct FrameConstants {
     float particleShadowCentre[2];
     // Aerial perspective's volume spans the view widened by this share on each side (as the clouds' history does).
     float aerialOverscan;
-    uint32_t padding11;
+    // Where the dynamic lights' exactly lit glowing patches and flashes start (Scene::SetDynamicLights).
+    uint32_t dynamicExactFirst;
+    uint32_t dynamicFlashFirst;
+    uint32_t padding11[3];
 };
 
 // Mirrors SamplingConstants in shaders/nvidia/sharc_common.hlsli: the radiance cache's parameters, bound to every pass

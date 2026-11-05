@@ -274,7 +274,12 @@ struct FrameConstants
     float2 particleShadowCentre;
     // Aerial perspective's volume spans the view widened by this share on each side (as the clouds' history does).
     float aerialOverscan;
-    uint padding11;
+    // The dynamic lights (dynamicLightsView) in three runs: lights sampled with the map's, then from dynamicExactFirst the
+    // strongest glowing model patches, lit exactly, then from dynamicFlashFirst the flashes of effects, lit exactly and
+    // only directly (Scene::SetDynamicLights).
+    uint dynamicExactFirst;
+    uint dynamicFlashFirst;
+    uint3 padding11;
 };
 
 // Per-pass descriptor indices and parameters; mirrors Lighting::PassArgs in src/lighting.h.

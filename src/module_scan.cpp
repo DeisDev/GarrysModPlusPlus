@@ -14,6 +14,7 @@ namespace {
 struct Section {
     std::span<const std::byte> bytes;
     bool executable;
+    bool writable;
 };
 
 std::vector<Section> Sections(HMODULE module)
@@ -25,7 +26,7 @@ std::vector<Section> Sections(HMODULE module)
     std::vector<Section> sections;
     for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section) {
         sections.push_back({std::span<const std::byte>(base + section->VirtualAddress, section->Misc.VirtualSize),
-            (section->Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0});
+            (section->Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0, (section->Characteristics & IMAGE_SCN_MEM_WRITE) != 0});
     }
     return sections;
 }
@@ -62,6 +63,22 @@ DWORD64 PrimaryFunctionStart(DWORD64 address)
     }
 }
 
+}
+
+std::vector<const std::byte*> FindObjectsWithVtable(HMODULE module, const void* vtable)
+{
+    std::vector<const std::byte*> objects;
+    for (const Section& section : Sections(module)) {
+        if (!section.writable)
+            continue;
+        for (size_t i = 0; i + sizeof(void*) <= section.bytes.size(); i += sizeof(void*)) {
+            const void* word;
+            std::memcpy(&word, section.bytes.data() + i, sizeof(word));
+            if (word == vtable)
+                objects.push_back(section.bytes.data() + i);
+        }
+    }
+    return objects;
 }
 
 std::vector<const std::byte*> FindStringReferences(HMODULE module, std::string_view text)
@@ -148,6 +165,42 @@ void* FindFunctionWithPattern(HMODULE module, std::string_view pattern)
 // MSVC's x64 RTTI (rttidata.h, ehdata_forceinclude.h in MSVC 14.51): a TypeDescriptor is { vftable, spare, name },
 // and a complete object locator { signature = COL_SIG_REV1, offset, cdOffset, then image-relative pTypeDescriptor,
 // pClassDescriptor, pSelf } is referenced by the slot before each vtable of the class.
+bool DerivesFrom(HMODULE module, const void* vtable, std::string_view decoratedName)
+{
+    // x64 RTTI (MSVC): the vtable's complete object locator, its class hierarchy descriptor and the base class array,
+    // whose descriptors start with their type descriptor's RVA; a type descriptor's name follows two pointers.
+    const auto base = reinterpret_cast<uintptr_t>(module);
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+    const uintptr_t end = base + nt->OptionalHeader.SizeOfImage;
+    const auto inside = [&](uintptr_t address, size_t size) { return address >= base && address + size <= end; };
+    const auto vtableAddress = reinterpret_cast<uintptr_t>(vtable);
+    if (!inside(vtableAddress - sizeof(void*), sizeof(void*)))
+        return false;
+    const auto locator = reinterpret_cast<uintptr_t>(static_cast<const void* const*>(vtable)[-1]);
+    if (!inside(locator, 6 * sizeof(DWORD)) || reinterpret_cast<const DWORD*>(locator)[0] != 1)
+        return false;
+    const uintptr_t hierarchy = base + reinterpret_cast<const DWORD*>(locator)[4];
+    if (!inside(hierarchy, 4 * sizeof(DWORD)))
+        return false;
+    const DWORD count = reinterpret_cast<const DWORD*>(hierarchy)[2];
+    const uintptr_t bases = base + reinterpret_cast<const DWORD*>(hierarchy)[3];
+    if (count > 256 || !inside(bases, count * sizeof(DWORD)))
+        return false;
+    for (DWORD i = 0; i < count; ++i) {
+        const uintptr_t descriptor = base + reinterpret_cast<const DWORD*>(bases)[i];
+        if (!inside(descriptor, sizeof(DWORD)))
+            return false;
+        const uintptr_t type = base + *reinterpret_cast<const DWORD*>(descriptor);
+        if (!inside(type + 2 * sizeof(void*), decoratedName.size() + 1))
+            return false;
+        const char* name = reinterpret_cast<const char*>(type + 2 * sizeof(void*));
+        if (std::memcmp(name, decoratedName.data(), decoratedName.size()) == 0 && name[decoratedName.size()] == '\0')
+            return true;
+    }
+    return false;
+}
+
 const void* const* FindVtable(HMODULE module, std::string_view decoratedName, DWORD offset)
 {
     struct Locator {

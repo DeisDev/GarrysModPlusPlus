@@ -56,4 +56,16 @@ std::string WeaponWorldModel(const ModelEntity& weapon);
 // Bone-to-world matrices for a renderable from Collect; returns false when the entity has no bones.
 bool SetupBones(void* renderable, float (*boneToWorld)[3][4], int maxBones);
 
+// A drawn sprite entity (env_sprite and its kin, such as the manhack's eye glow) whose render mode adds its colour to
+// the image: where it is drawn, its colour (m_clrRender, 0-1, times its HDR colour scale), its brightness (0-1), the area
+// it covers in units and the name of the material it is drawn with.
+struct GlowSprite {
+    float origin[3];
+    float color[3];
+    float brightness;
+    float area;
+    std::string material;
+};
+void CollectGlowSprites(std::vector<GlowSprite>& sprites);
+
 }

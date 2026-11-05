@@ -55,11 +55,23 @@ constexpr int kGetMaterialNameSlot = 0;
 // function (+0xff00) that precaches and returns the translucency test with the alpha modulation; slot 49 there returns
 // the shader's name or "shader_error" (REA 2026-11-04).
 constexpr int kIsTranslucentSlot = 17;
+// A material's variable as it is now (MaterialVector), as Lua's IMaterial:GetVector (client.dll+0x12c740) reads it:
+// IMaterialSystem::FindMaterial (slot 71, materialsystem.dll+0x1b760: name, group, complain, prefix; the error material
+// when the material does not exist), IMaterial::FindVar (slot 11, +0xe370: name, found, complain; a shared dummy with
+// found false when the variable does not exist) and IMaterialVar::GetVecValue (slot 28, +0x26fa0: values, count), which
+// reads the render thread's copy under queued rendering. REA 2026-11-05.
+constexpr int kFindMaterialSlot = 71;
+constexpr int kMaterialFindVarSlot = 11;
+constexpr int kGetVecValueSlot = 28;
 // IVEfx::CL_GetActiveDLights (engine.dll+0x143320, CVEfx vtable slot 6 found through RTTI in Ghidra). It fills
 // up to 32 pointers to GMod's 72-byte dlight_t; CL_AllocDlight (engine.dll+0x9a1a0) stores the key at 40,
 // four bytes later than the Source SDK 2013 layout.
 constexpr int kGetActiveDLightsSlot = 6;
 constexpr int kMaxDynamicLights = 32;
+// dlight_t::flags, where the engine's world lighting (engine.dll+0xd7de0) tests DLIGHT_NO_WORLD_ILLUMINATION and its model
+// lighting (+0x1ded20) DLIGHT_NO_MODEL_ILLUMINATION, and Lua's DynamicLight sets them for "noworld" and "nomodel"
+// (client.dll+0xf6050). REA 2026-11-04.
+constexpr size_t kDlightFlags = 0;
 constexpr size_t kDlightOrigin = 4;
 constexpr size_t kDlightRadius = 16;
 constexpr size_t kDlightColor = 20;
@@ -68,6 +80,25 @@ constexpr size_t kDlightDirection = 48;
 constexpr size_t kDlightInnerAngle = 60;
 constexpr size_t kDlightOuterAngle = 64;
 constexpr size_t kDlightSize = 72;
+// Entity lights (elights), which Source applies to models alone (HL2's muzzle flashes): CVEfx::CL_AllocElight (vtable
+// slot 5, engine.dll+0x9a230) passes the array cl_elights (+0x6501a0) and its 64 records of dlight_t to the engine's light
+// finder (+0x9a290): mov [rsp+8], rbx; push rdi; sub rsp, 20h; mov ebx, ecx; lea rdi, [cl_elights]; mov r8d, ecx; mov
+// edx, 40h. CL_DecayLights (+0x9aae0) zeroes a record's radius once its die time has passed, so the live ones are those
+// with a radius, as the engine's model lighting (+0x1ded20) takes them. REA 2026-11-04.
+constexpr int kAllocElightSlot = 5;
+constexpr int kElightPattern[] = {0x48, 0x89, 0x5C, 0x24, 0x08, 0x57, 0x48, 0x83, 0xEC, 0x20, 0x8B, 0xD9, 0x48, 0x8D, 0x3D, -1, -1, -1, -1, 0x44,
+    0x8B, 0xC1, 0xBA};
+constexpr size_t kElightArrayDisplacement = 15;
+constexpr size_t kElightCount = 23;
+// The ConVar client Lua reads to know the mod lights the scene (PublishLightsActive). It is built with client.dll's own
+// ConVar constructor (this, name, default, flags; client.dll+0x527120), which links it into client.dll's list and, once
+// the client has registered its own, registers it at once (tier1's CreateBase and Init). A ConVar is 0x80 bytes (the
+// deleting destructor, +0x526360, frees that much). The constructor is the call in muzzleflash_light's static
+// initializer (+0x54460): lea rdx, [name]; lea rcx, [object]; call. REA 2026-11-04.
+constexpr const char* kLightsConVar = "gmodpp_lights";
+constexpr size_t kConVarBytes = 0x80;
+// FCVAR_DONTRECORD: left out of demos. Not FCVAR_ARCHIVE, so config.cfg never keeps it.
+constexpr int kLightsConVarFlags = 0x20000;
 // d_lightstylevalue (engine.dll+0x7dfdd0): the current value of each light style, 0..25 * 22 with 264 for 'm'.
 // The engine's world light intensity (engine.dll+0x1e0fa0 and +0x1e0810; Ghidra) scales a light by
 // d_lightstylevalue[style] / 264 for styles below 128 and by 1 otherwise:
@@ -200,6 +231,30 @@ bool IsUnlitMaterial(void* material)
     }
     return entry->second;
 }
+
+static std::unordered_map<std::string, void*> g_materialVars;
+
+std::optional<std::array<float, 3>> MaterialVector(const std::string& material, const char* variable)
+{
+    if (g_materialSystem == nullptr)
+        return std::nullopt;
+    const std::string key = material + '|' + variable;
+    auto cached = g_materialVars.find(key);
+    if (cached == g_materialVars.end()) {
+        void* found = Slot<void*(__fastcall*)(void*, const char*, const char*, bool, const char*)>(g_materialSystem, kFindMaterialSlot)(
+            g_materialSystem, material.c_str(), "Model textures", false, nullptr);
+        bool exists = false;
+        void* var = found != nullptr ? Slot<void*(__fastcall*)(void*, const char*, bool*, bool)>(found, kMaterialFindVarSlot)(found, variable, &exists, false) : nullptr;
+        cached = g_materialVars.emplace(key, exists ? var : nullptr).first;
+    }
+    if (cached->second == nullptr)
+        return std::nullopt;
+    std::array<float, 3> value = {};
+    Slot<void(__fastcall*)(void*, float*, int)>(cached->second, kGetVecValueSlot)(cached->second, value.data(), 3);
+    return value;
+}
+
+void ForgetMaterials() { g_materialVars.clear(); }
 
 bool IsTranslucentMaterial(void* material)
 {
@@ -337,6 +392,30 @@ bool ReadGameFile(const std::string& path, std::vector<std::byte>& data, size_t 
     return !data.empty();
 }
 
+namespace {
+
+// A dlight_t record (dlights and elights alike).
+DynamicLight ReadLight(const std::byte* record)
+{
+    DynamicLight light;
+    std::memcpy(light.origin, record + kDlightOrigin, sizeof(light.origin));
+    std::memcpy(&light.radius, record + kDlightRadius, sizeof(light.radius));
+    // ColorRGBExp32: linear value = channel * 2^exponent / 255.
+    const auto* color = reinterpret_cast<const uint8_t*>(record + kDlightColor);
+    const float scale = std::ldexp(1.0f, static_cast<int8_t>(color[3])) / 255.0f;
+    for (int c = 0; c < 3; ++c)
+        light.color[c] = color[c] * scale;
+    std::memcpy(light.direction, record + kDlightDirection, sizeof(light.direction));
+    std::memcpy(&light.innerAngle, record + kDlightInnerAngle, sizeof(light.innerAngle));
+    std::memcpy(&light.outerAngle, record + kDlightOuterAngle, sizeof(light.outerAngle));
+    std::memcpy(&light.key, record + kDlightKey, sizeof(light.key));
+    std::memcpy(&light.flags, record + kDlightFlags, sizeof(light.flags));
+    light.identity = reinterpret_cast<uintptr_t>(record);
+    return light;
+}
+
+}
+
 void ActiveDynamicLights(std::vector<DynamicLight>& lights)
 {
     lights.clear();
@@ -346,18 +425,7 @@ void ActiveDynamicLights(std::vector<DynamicLight>& lights)
     const int count = Slot<int(__fastcall*)(void*, const std::byte**)>(g_effects, kGetActiveDLightsSlot)(g_effects, active);
     for (int i = 0; i < count && i < kMaxDynamicLights; ++i) {
         const std::byte* record = active[i];
-        DynamicLight& light = lights.emplace_back();
-        std::memcpy(light.origin, record + kDlightOrigin, sizeof(light.origin));
-        std::memcpy(&light.radius, record + kDlightRadius, sizeof(light.radius));
-        // ColorRGBExp32: linear value = channel * 2^exponent / 255.
-        const auto* color = reinterpret_cast<const uint8_t*>(record + kDlightColor);
-        const float scale = std::ldexp(1.0f, static_cast<int8_t>(color[3])) / 255.0f;
-        for (int c = 0; c < 3; ++c)
-            light.color[c] = color[c] * scale;
-        std::memcpy(light.direction, record + kDlightDirection, sizeof(light.direction));
-        std::memcpy(&light.innerAngle, record + kDlightInnerAngle, sizeof(light.innerAngle));
-        std::memcpy(&light.outerAngle, record + kDlightOuterAngle, sizeof(light.outerAngle));
-        std::memcpy(&light.key, record + kDlightKey, sizeof(light.key));
+        const DynamicLight& light = lights.emplace_back(ReadLight(record));
         if (GetOptions().devMode && std::find(g_loggedLightKeys.begin(), g_loggedLightKeys.end(), light.key) == g_loggedLightKeys.end()) {
             g_loggedLightKeys.push_back(light.key);
             std::string bytes;
@@ -367,6 +435,76 @@ void ActiveDynamicLights(std::vector<DynamicLight>& lights)
                 light.origin[0], light.origin[1], light.origin[2], light.radius, light.color[0], light.color[1], light.color[2], light.outerAngle, bytes);
         }
     }
+}
+
+void ActiveEntityLights(std::vector<DynamicLight>& lights)
+{
+    lights.clear();
+    static const std::byte* records = nullptr;
+    static int32_t count = 0;
+    static bool attempted = false;
+    if (!attempted && g_effects != nullptr) {
+        attempted = true;
+        const auto* code = reinterpret_cast<const uint8_t*>(Slot<const void*>(g_effects, kAllocElightSlot));
+        bool matches = true;
+        for (size_t i = 0; i < std::size(kElightPattern); ++i)
+            matches = matches && (kElightPattern[i] < 0 || code[i] == kElightPattern[i]);
+        if (matches) {
+            int32_t displacement;
+            std::memcpy(&displacement, code + kElightArrayDisplacement, sizeof(displacement));
+            records = reinterpret_cast<const std::byte*>(code + kElightArrayDisplacement + sizeof(displacement) + displacement);
+            std::memcpy(&count, code + kElightCount, sizeof(count));
+        } else {
+            log::Info("Entity lights: CL_AllocElight is not as expected; elights (HL2's muzzle flashes) light nothing");
+        }
+    }
+    for (int32_t i = 0; records != nullptr && i < count; ++i) {
+        const std::byte* record = records + static_cast<size_t>(i) * kDlightSize;
+        float radius;
+        std::memcpy(&radius, record + kDlightRadius, sizeof(radius));
+        if (radius > 0.0f)
+            lights.push_back(ReadLight(record));
+    }
+}
+
+void PublishLightsActive(bool active)
+{
+    static bool registered = false;
+    static bool failed = false;
+    if (!registered) {
+        // Built once the client has registered its own ConVars, so it is registered at once too.
+        HMODULE client = GetModuleHandleW(L"client.dll");
+        if (failed || client == nullptr || FindConVar("muzzleflash_light") == nullptr)
+            return;
+        using ConstructorFn = void*(__fastcall*)(void* self, const char* name, const char* defaultValue, int flags);
+        ConstructorFn constructor = nullptr;
+        for (const std::byte* reference : FindStringReferences(client, "muzzleflash_light")) {
+            const auto* code = reinterpret_cast<const uint8_t*>(reference);
+            // lea rdx, [name]; lea rcx, [object]; call constructor
+            if (code[0] != 0x48 || code[1] != 0x8D || code[2] != 0x15 || code[7] != 0x48 || code[8] != 0x8D || code[9] != 0x0D || code[14] != 0xE8)
+                continue;
+            int32_t displacement;
+            std::memcpy(&displacement, code + 15, sizeof(displacement));
+            auto found = reinterpret_cast<ConstructorFn>(const_cast<uint8_t*>(code + 19 + displacement));
+            if (constructor != nullptr && constructor != found) {
+                constructor = nullptr;
+                break;
+            }
+            constructor = found;
+        }
+        if (constructor == nullptr) {
+            failed = true;
+            log::Info("Addon signal: client.dll's ConVar constructor was not found; {} is not registered", kLightsConVar);
+            return;
+        }
+        alignas(16) static std::byte storage[kConVarBytes] = {};
+        constructor(storage, kLightsConVar, "0", kLightsConVarFlags);
+        registered = true;
+        log::Info("Addon signal: {} registered", kLightsConVar);
+    }
+    const char* wanted = active ? "1" : "0";
+    if (ConVarString(kLightsConVar) != wanted)
+        ExecuteCommand(std::format("{} {}", kLightsConVar, wanted));
 }
 
 std::optional<FogState> CurrentFog()

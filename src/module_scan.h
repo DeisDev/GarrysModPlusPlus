@@ -20,6 +20,13 @@ std::vector<const std::byte*> FindCodePattern(HMODULE module, std::string_view p
 // The function holding the only match of `pattern` (as FindCodePattern takes it), or nullptr without exactly one.
 void* FindFunctionWithPattern(HMODULE module, std::string_view pattern);
 
+// Whether the class whose vtable (in the module) this is derives from, or is, the class with the RTTI name
+// `decoratedName` (".?AVCSimpleEmitter@@").
+bool DerivesFrom(HMODULE module, const void* vtable, std::string_view decoratedName);
+
+// The objects in the module's writable data whose first word is `vtable`: its global and static instances of a class.
+std::vector<const std::byte*> FindObjectsWithVtable(HMODULE module, const void* vtable);
+
 // The virtual function table of the class with the RTTI name `decoratedName` (".?AVCMeshDX8@@") for its subobject at
 // `offset`, or nullptr when the module has no unique one.
 const void* const* FindVtable(HMODULE module, std::string_view decoratedName, DWORD offset);

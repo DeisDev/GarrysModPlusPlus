@@ -602,6 +602,9 @@ add_library(gmodpp SHARED
     src/studio_model.cpp
     src/opacity_micromaps.cpp
     src/skinned_casters.cpp
+    src/glow_patches.cpp
+    src/effect_lights.cpp
+    src/glow_draws.cpp
     src/viewmodel_casters.cpp
     src/particle_shadows.cpp
     src/swaying_props.cpp

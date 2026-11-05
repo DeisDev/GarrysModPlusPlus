@@ -3,6 +3,7 @@
 #include "busy_window.h"
 #include "command_line.h"
 #include "display_output.h"
+#include "glow_draws.h"
 #include "log.h"
 #include "night_sky.h"
 #include "particle_shadows.h"
@@ -1648,6 +1649,38 @@ void RecordParticles(const MeshDraw& mesh, float density)
     particle_shadows::Record(mesh.vertexData, static_cast<std::uint32_t>(std::max(mesh.vertexCount, 0)), layout, mesh.indexData, mesh.primitives, density);
 }
 
+// ShaderBlendFactor_t (shaderapi/ishaderdynamic.h): SHADER_BLEND_ONE and SHADER_BLEND_SRC_ALPHA.
+constexpr int kBlendOne = 1;
+constexpr int kBlendSourceAlpha = 4;
+
+// The glow of an additive draw of the main view's translucent pass, which gives light next frame (src/glow_draws.h): its
+// vertices by its vertex format's elements, SpriteCard's (`spriteCard`) sprites by their centres and radii.
+void RecordGlow(const MeshDraw& mesh, bool alphaBlend, bool spriteCard)
+{
+    const Settings& settings = GetSettings();
+    if (!settings.effectLights || !settings.realtimeLighting || mesh.vertexData == nullptr)
+        return;
+    const bool strip = mesh.topology == D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP;
+    if (!strip && mesh.topology != D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST)
+        return;
+    const glow_draws::MaterialGlow& glow = glow_draws::GlowOf(BoundMaterialName());
+    if (!glow.known)
+        return;
+    glow_draws::Layout layout = {mesh.streams[0].StrideInBytes, glow_draws::kAbsent, glow_draws::kAbsent, glow_draws::kAbsent};
+    for (const VertexElement& element : VertexElements(mesh.vertexFormat, false, 0)) {
+        if (element.stream != 0)
+            continue;
+        if (element.usage == D3DDECLUSAGE_POSITION && element.usageIndex == 0 && element.format == DXGI_FORMAT_R32G32B32_FLOAT)
+            layout.position = element.offset;
+        else if (element.usage == D3DDECLUSAGE_COLOR && element.usageIndex == 0)
+            layout.color = element.offset;
+        else if (spriteCard && element.usage == D3DDECLUSAGE_TEXCOORD && element.usageIndex == 2 && element.format == DXGI_FORMAT_R32G32B32A32_FLOAT)
+            layout.parameters = element.offset;
+    }
+    glow_draws::Record(mesh.vertexData, static_cast<std::uint32_t>(std::max(mesh.vertexCount, 0)), layout, mesh.indexData, mesh.primitives, strip,
+        alphaBlend ? glow.alphaWeighted : glow.plain, alphaBlend);
+}
+
 // The game's bloom chain in DoEnginePostProcessing (client.dll's Generate8BitBloomTexture, 0x180303090, REA 2026-11-04):
 // dev/downsample_non_hdr into _rt_SmallFB0, dev/blurfilterx_nohdr into _rt_SmallFB1, then dev/blurfiltery_nohdr, whose
 // $bloomamount is the bloom scale (GetBloomAmount: mat_bloomscale or env_tonemap_controller's, smoothed by
@@ -1743,6 +1776,9 @@ void DrawPass(const ShadowState& shadow, const MeshDraw& mesh)
         return;
     if (pass.waterSurface)
         capture::RecordWaterMapping(mesh);
+    // Additive draws of the main view's translucent pass give light next frame.
+    if (capture::MainViewForwardActive() && blendEnabled && destination == kBlendOne && (source == kBlendOne || source == kBlendSourceAlpha))
+        RecordGlow(mesh, source == kBlendSourceAlpha, pass.fogEpilogue);
     // Sprites that blend by their alpha shadow the sun's light next frame; added ones only give light.
     if (pass.fogEpilogue && (pass.fogBlend == 1.0f || pass.fogBlend == 2.0f)) {
         const Settings& settings = GetSettings();

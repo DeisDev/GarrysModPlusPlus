@@ -133,6 +133,12 @@ struct Settings {
     // The light glowing surfaces cast on others, times this; their own look stays.
     float emissiveIntensity = 1.0f;
     bool dynamicLights = true;
+    // Light from effects: the engine's elights (HL2's muzzle flashes) and glowing particle systems, times
+    // effectLightStrength.
+    bool effectLights = true;
+    float effectLightStrength = 1.0f;
+    // Glows drawn at a map light (its halo sprite) give no light of their own.
+    bool skipLampGlows = false;
     bool projectedLights = true;
     bool indirectLight = true;
     bool denoiser = true;

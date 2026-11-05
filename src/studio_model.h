@@ -67,6 +67,8 @@ inline constexpr size_t kVtfReflectivityHeaderSize = 44;
 
 // The average linear colour vtex stores in a VTF header.
 std::optional<bsp::Float3> TextureReflectivity(std::span<const std::byte> vtfHeader);
+// Whether a VTF header marks its texture as having alpha (one-bit or eight-bit), which ITexture::IsTranslucent reports.
+bool TextureHasAlpha(std::span<const std::byte> vtfHeader);
 
 enum class TextureFormat { Bc1, Bc2, Bc3, Bgra8, Rgba8, Bgrx8, R8 };
 
@@ -88,5 +90,9 @@ struct TextureImage {
 
 // A 2D VTF's mips no bigger than `maxSize` texels on a side, of its frame `frame`, or nothing with a reason.
 std::optional<TextureImage> ReadTexture(std::span<const std::byte> vtf, uint32_t maxSize, std::string& error, uint32_t frame = 0);
+
+// One channel (0-3: red, green, blue, alpha) of a mip of a texture as the GPU reads its format (DXGI's BC1-BC3 decoding;
+// R8 reads 0 in green and blue, formats without alpha 1), a byte per texel in rows; empty when the mip is incomplete.
+std::vector<uint8_t> DecodeChannel(const TextureImage& image, size_t mip, uint32_t channel);
 
 }

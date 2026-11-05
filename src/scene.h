@@ -43,6 +43,9 @@ constexpr uint32_t kInstanceSelfIllum = 0x02;
 // Set by Scene for dynamic models (kDynamicMask, kLocalPlayerMask), whose back faces shadow rays may skip (their
 // instances allow culling; shaders/direct.hlsl).
 constexpr uint32_t kInstanceModel = 0x04;
+// Studio models (static props and models of entities), which the engine lights as models: dynamic lights may leave
+// them or the rest out (kLightNoModel, kLightNoWorld).
+constexpr uint32_t kInstanceStudio = 0x08;
 // Instances whose self-illuminated triangles are emitters (Scene::LoadMap): with EmissiveLighting::Full their
 // glow reaches surfaces directly, so indirect rays from the G-buffer take none at them.
 constexpr uint32_t kInstanceEmitter = 0x10;
@@ -50,6 +53,9 @@ constexpr uint32_t kInstanceEmitter = 0x10;
 constexpr uint32_t kInstanceCharacter = 0x20;
 // The water surfaces' instance (kWaterMask).
 constexpr uint32_t kInstanceWater = 0x40;
+// Dynamic models whose glowing patches are all lights this frame (FrameLight::Kind::Glow): indirect rays from the
+// G-buffer take no glow at them, as at kInstanceEmitter.
+constexpr uint32_t kInstanceGlowLights = 0x80;
 
 // A body of water for shaders (WaterBody in shaders/water_body.hlsli): the medium its water is, its surface's height,
 // tints and normal map (frames from `framesFirst` in Scene::Water's frame list, animated at `frameRate`; bumpS and bumpT
@@ -105,11 +111,47 @@ constexpr uint32_t kLightSealed = 0x01;
 // Map lights have no size in Hammer; they are lit as spheres of this radius, about a bulb's.
 constexpr float kBulbRadius = 2.0f;
 
+// A light reaches as far as its irradiance can reach 1/1024 of white with up to 4x light intensity and a 4x tonemap
+// scale: map lights are binned that far, glowing patches fade out there.
+constexpr float kLightThreshold = 1.0f / 16384.0f;
+
 // What the scene adds to a map light (bsp::Light): kLightSealed, and the radius it is lit with (kBulbRadius, or its
 // lamp shell's).
 struct MapLightShape {
     uint32_t flags = 0;
     float radius = kBulbRadius;
+};
+
+// Dynamic light flags (Light::flags in shaders/scene.hlsli): the light leaves out the world's surfaces or the models'
+// (kInstanceStudio), as the engine's DLIGHT_NO_WORLD_ILLUMINATION and DLIGHT_NO_MODEL_ILLUMINATION do, or it sits on what
+// the local player holds, which its shadow rays pass.
+constexpr uint32_t kLightNoWorld = 0x02;
+constexpr uint32_t kLightNoModel = 0x04;
+constexpr uint32_t kLightOnLocalPlayer = 0x08;
+
+// A light of the frame's dynamic light buffer (Scene::SetDynamicLights).
+struct FrameLight {
+    // Engine: an engine light (dlight or elight) with Source's falloff to `radius`. Glow: a glowing patch of a model, an
+    // area light whose light falls off with the inverse square and fades out at `radius`. Particles: a glowing particle
+    // system, lit as a patch that shows its area every direction alike, at its own brightness.
+    enum class Kind : uint32_t { Engine = 3, Glow = 4, Particles = 5 };
+    Kind kind = Kind::Engine;
+    float origin[3] = {};
+    // Engine: linear colour in lightmap units. Glow: the patch's emission, as HitEmission gives it (shaders/scene.hlsli).
+    float color[3] = {};
+    float radius = 0.0f;
+    // Engine: a spot light's axis. Glow: its triangles' areas times their front normals, summed.
+    float direction[3] = {};
+    // Engine: the cosines of a spot light's inner and outer cones, outer -1 for a point light. Glow: `innerCosine` holds
+    // the area the patch shows every direction alike, (area - |direction|) / 4.
+    float innerCosine = 0.0f;
+    float outerCosine = -1.0f;
+    // Glow: the radius of the sphere around the patch, which its light is capped by up close and its shadows are soft by.
+    float size = 0.0f;
+    // kLightNoWorld, kLightNoModel, kLightOnLocalPlayer.
+    uint32_t flags = 0;
+    // Names the light from frame to frame, for RTXDI's temporal reuse.
+    uint64_t key = 0;
 };
 
 // Triangles for Scene::AddModel. Alpha-tested and translucent triangles come last, from `opaqueTriangles` on; each
@@ -232,6 +274,12 @@ struct SceneFrame {
     UINT instancesView = DescriptorHeap::kInvalid;
     UINT dynamicLightsView = DescriptorHeap::kInvalid;
     UINT dynamicLightCount = 0;
+    // Where the exactly lit glowing patches and the flashes start among the dynamic lights (Scene::SetDynamicLights).
+    UINT dynamicExactFirst = 0;
+    UINT dynamicFlashFirst = 0;
+    // Each sampled dynamic light's index among the last main view's (Scene::kNoLight for none), then each of the last main
+    // view's index among this one's, Scene::kMaxDynamicLights apiece.
+    UINT dynamicLightMapView = DescriptorHeap::kInvalid;
     // The light style values of Scene::SetLightStyles, as floats.
     UINT lightStylesView = DescriptorHeap::kInvalid;
     // The bodies of water with the brush entities' where Scene::PlaceBrushWater put them (kInvalid when the map has
@@ -352,8 +400,15 @@ public:
     UINT EmitterCount() const { return m_emitterCount; }
     float EmitterPower() const { return m_emitterPower; }
     bool HasSkybox() const { return m_hasSkybox; }
-    // The engine's dynamic lights for the next RecordFrame.
-    void SetDynamicLights(std::span<const engine::DynamicLight> lights) { m_dynamicLights.assign(lights.begin(), lights.end()); }
+    // The most dynamic lights a frame holds, and how many of them may be glowing patches and flashes.
+    static constexpr UINT kMaxDynamicLights = 96;
+    static constexpr UINT kMaxGlowLights = 48;
+    static constexpr UINT kMaxFlashLights = 16;
+    static constexpr uint32_t kNoLight = 0xFFFFFFFFu;
+    // The dynamic lights for the next RecordFrame, in three runs: those sampled with the map's lights, from `exactFirst`
+    // those lit exactly (the strongest glowing patches), from `flashFirst` the flashes of effects (lit exactly and only
+    // directly). For the main view (`mainView`) the sampled lights are matched by key with the last main view's.
+    void SetDynamicLights(std::span<const FrameLight> lights, size_t exactFirst, size_t flashFirst, bool mainView);
     // The engine's light style values for the next RecordFrame; every style stays at 1 until they are set.
     void SetLightStyles(const std::array<float, engine::kLightStyles>& values) { m_lightStyles = values; }
     const std::array<float, engine::kLightStyles>& LightStyles() const { return m_lightStyles; }
@@ -443,6 +498,9 @@ private:
         Microsoft::WRL::ComPtr<ID3D12Resource> dynamicLights;
         GpuLight* mappedDynamicLights = nullptr;
         UINT dynamicLightsView = DescriptorHeap::kInvalid;
+        // After the lights: Scene::m_dynamicLightMap.
+        uint32_t* mappedDynamicLightMap = nullptr;
+        UINT dynamicLightMapView = DescriptorHeap::kInvalid;
         Microsoft::WRL::ComPtr<ID3D12Resource> lightStyles;
         float* mappedLightStyles = nullptr;
         UINT lightStylesView = DescriptorHeap::kInvalid;
@@ -539,7 +597,13 @@ private:
     uint32_t m_worldFlags = 0;
     std::vector<std::pair<int, UINT>> m_recorded;
     bool m_hasSkybox = false;
-    std::vector<engine::DynamicLight> m_dynamicLights;
+    std::vector<FrameLight> m_dynamicLights;
+    UINT m_dynamicExactFirst = 0;
+    UINT m_dynamicFlashFirst = 0;
+    // The sampled dynamic lights' indices in the last main view's (kNoLight for none) and the reverse, kMaxDynamicLights
+    // apiece, and the keys of the last main view's sampled lights.
+    std::vector<uint32_t> m_dynamicLightMap = std::vector<uint32_t>(2 * kMaxDynamicLights, kNoLight);
+    std::vector<uint64_t> m_previousLightKeys;
     std::array<float, engine::kLightStyles> m_lightStyles = [] {
         std::array<float, engine::kLightStyles> values;
         values.fill(1.0f);

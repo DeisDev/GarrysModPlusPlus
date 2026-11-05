@@ -264,7 +264,7 @@ std::optional<SkinnedCasters::Jobs> SkinnedCasters::BeginUpdate(ID3D12GraphicsCo
         records[m_pending.size()] = {source->view, vertexCount, slot.verticesUav, static_cast<uint32_t>(bonesAt)};
         bonesAt += sizeof(studio::Matrix3x4) * model.poseToBone.size();
         maxVertices = std::max(maxVertices, vertexCount);
-        m_pending.push_back({&state, entity.sceneModel, entity.mask, previousPositions});
+        m_pending.push_back({&state, entity.sceneModel, entity.mask, previousPositions, entity.flags});
     }
     if (!barriers.empty())
         list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
@@ -306,6 +306,7 @@ void SkinnedCasters::FinishUpdate(ID3D12GraphicsCommandList4* list, const Scene&
         instance.positionsView = slot.verticesView;
         instance.previousPositionsView = pending.previousPositions;
         instance.mask = pending.mask;
+        instance.flags = pending.flags;
         std::memset(instance.transform, 0, sizeof(instance.transform));
         instance.transform[0][0] = instance.transform[1][1] = instance.transform[2][2] = 1.0f;
     }

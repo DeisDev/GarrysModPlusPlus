@@ -22,6 +22,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Ice halos, sun dogs, the 46° halo, the circumzenithal arc and coloured coronas around the sun and Moon, from the clouds (Sky page).
 - Smoke and other particles that blend cast soft shadows from the sun on the ground, in the haze and mist, and on the particles born under them (Lighting page, on by default).
 - Local exposure on the Image page (off by default): brightens dark areas and darkens bright ones while keeping their detail.
+- Glowing parts of moving models light their surroundings: Combine eyes, the AR2's core and other glowing models, including the weapon in first person, following colours set by the game such as the physics gun's.
+- Light from effects (Lighting page, on by default): muzzle flashes, explosions, fire, sparks, glowing sprites such as the manhack's eye, the combine ball and other glowing effects light the scene.
+- A "Skip glows at map lights" option leaves out the glow of lamp halos, whose light the map already has.
+- Addons can read the `gmodpp_lights` console variable to know the mod lights effects itself and turn their own lights off.
 
 ### Changed
 
@@ -38,6 +42,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Fixed
 
 - Clouds no longer repeat in a pattern toward the horizon.
+- Dynamic lights from Lua set to light only models or only the world (`noworld`, `nomodel`) now do so.
+- Models whose glow the game turns off no longer glow.
 - Fixed the game crashing when ARC9 weapons draw their icons, such as when opening the weapon selector.
 - Images that addons read back from render targets keep their transparency, so ARC9's weapon icons no longer have a black background.
 - Less noise in the indirect light on the held weapon and hands.

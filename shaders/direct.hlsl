@@ -4,7 +4,9 @@
 // each; the other lights share g_frame.sampledLightRays shadow rays, picked in proportion to their light in one pass
 // (weighted reservoir sampling) and weighted to keep the sum unbiased. The exact part stays sharp; the noisy
 // remainder is added to the indirect estimate (gi_trace.hlsl) and denoised with it. The SUN_ONLY variant lights with
-// the sun alone, for local lights sampled by RTXDI (shaders/restir.hlsl), which writes the remainder.
+// the sun alone, for local lights sampled by RTXDI (shaders/restir.hlsl), which writes the remainder. Both light the
+// dynamic lights' exact run (LightSet::exactFirst: the strongest glowing patches and the flashes of effects) with a
+// shadow ray each.
 // input0: the sun's visibility when traced softly beforehand (SunShadowAt), else it is traced here, to the sun's centre.
 // output0: exact direct irradiance (rgb) and sun visibility (a); output1: sampled remainder; output2: highlights.
 
@@ -160,7 +162,9 @@ void main(uint3 id : SV_DispatchThreadID)
     if (lit) {
         Texture2D<uint4> visibility = ResourceDescriptorHeap[g_frame.visibilityView];
         uint instance = visibility.Load(int3(pixel, 0)).x;
-        onModel = instance != kNoView && (LoadInstance(instance).flags & kInstanceModel) != 0;
+        uint instanceFlags = instance != kNoView ? LoadInstance(instance).flags : 0u;
+        onModel = (instanceFlags & kInstanceModel) != 0;
+        g_receiverStudio = (instanceFlags & kInstanceStudio) != 0;
         Texture2D<float4> gbufferFlags = ResourceDescriptorHeap[g_frame.flagsView];
         float4 marks = gbufferFlags.Load(int3(pixel, 0));
         g_halfLambert = (MaterialBits(marks) & kMaterialHalfLambert) != 0;
@@ -191,10 +195,10 @@ void main(uint3 id : SV_DispatchThreadID)
     }
 
     float3 sampled = 0.0;
-#if !SUN_ONLY
     LightSet set = (LightSet)0;
     if (lit)
         set = LightSetAt(position);
+#if !SUN_ONLY
     uint top[kExactLights];
     float topWeight[kExactLights];
     uint picked[kRemainderSamples];
@@ -247,7 +251,12 @@ void main(uint3 id : SV_DispatchThreadID)
         }
         pending = pending && !mine;
     }
-    for (uint i = set.mapLights; i < set.count; ++i) {
+    // The dynamic lights before the exact run, and the projected lights.
+    uint attachedCount = (set.exactFirst - set.mapLights) + (set.count - set.pointLights);
+    for (uint a = 0; a < attachedCount; ++a) {
+        uint i = set.mapLights + a;
+        if (i >= set.exactFirst)
+            i += set.pointLights - set.exactFirst;
         float3 toLight;
         float distance;
         ConsiderLight(i, SetLightIrradiance(set, i, position, lightNormal, toLight, distance), true, top, topWeight, picked, pickedWeight, remainder,
@@ -305,6 +314,21 @@ void main(uint3 id : SV_DispatchThreadID)
         }
     }
 #endif
+    // The exact run of the dynamic lights, each with its own shadow ray: RTXDI leaves them out, and the flashes of
+    // effects must never reach the denoised remainder, whose history would keep them after they are gone.
+    [loop]
+    for (uint e = set.exactFirst; e < set.pointLights; ++e) {
+        float3 toLight;
+        float distance;
+        float3 light = SetLightIrradiance(set, e, position, lightNormal, toLight, distance);
+        if (all(light <= 0.0))
+            continue;
+        float3 shadowed = light * ExactLightTransmittance(set, e, ShadowOrigin(origin, behind, faceNormal, toLight), position + toLight * distance,
+            SelfShadowFlags(onModel, faceNormal, toLight), seed);
+        exact += shadowed * LightWarp(lightNormal, toLight);
+        specular += ModelHighlight(phong, shadowed, toLight);
+        rim += ModelRim(phong, shadowed, toLight);
+    }
     if (!inside)
         return;
     RWTexture2D<float4> exactOutput = ResourceDescriptorHeap[g_pass.output0];

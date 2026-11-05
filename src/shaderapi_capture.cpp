@@ -94,6 +94,8 @@ struct State {
     SkyCube sky;
     bool active = false;
     bool forwardActive = false;
+    // BeginForward's `mainView`: the main view's own translucent pass.
+    bool forwardMainView = false;
     bool skipView = false;
     std::array<float, 2> jitter = {};
     gbuffer::Matrix4 viewProj = {};
@@ -516,12 +518,15 @@ void BeginForward(const gbuffer::ForwardConstants& constants, bool mainView)
     g_state.twinFrame = constants.twinFrame;
     g_state.twinScene = constants.twinScene;
     g_state.fogFrame = mainView ? constants.fogFrame : 0;
+    g_state.forwardMainView = mainView;
     g_state.forwardActive = true;
     g_state.forwardDraws = 0;
     g_state.forwardTwinDraws = 0;
 }
 
 bool ForwardActive() { return g_state.forwardActive; }
+
+bool MainViewForwardActive() { return g_state.forwardActive && g_state.forwardMainView; }
 
 void SkipView(bool skip) { g_state.skipView = skip; }
 

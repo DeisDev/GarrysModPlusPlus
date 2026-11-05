@@ -33,6 +33,8 @@ bool End(gbuffer::ViewKind kind, ViewInputs& inputs);
 void BeginForward(const gbuffer::ForwardConstants& constants, bool mainView);
 void EndForward();
 bool ForwardActive();
+// Whether the main view's own translucent pass is being drawn (BeginForward's `mainView`).
+bool MainViewForwardActive();
 // Whether every draw until EndForward is dropped, set as each view begins: the water's reflection view, whose texture
 // traced water never shows.
 void SkipView(bool skip);

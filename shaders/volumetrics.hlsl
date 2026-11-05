@@ -125,7 +125,8 @@ float3 SampledLampAlong(float3 direction, float near, float far, bool water, ino
 {
     float3 eye = g_frame.eyePosition;
     LightSet set = LightSetAt(eye + direction * (0.5 * (near + far)));
-    set.count = set.pointLights;
+    // The volume keeps its light for frames, so the flashes of effects are left out.
+    set.count = set.flashFirst;
     bool exhaustive = set.count <= kLightCandidates;
     uint draws = exhaustive ? set.count : kLightCandidates;
     // Uniform draws weigh each candidate by count / draws.

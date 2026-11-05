@@ -174,7 +174,8 @@ void AddDirectLight(float3 position, inout float4 value[3])
         top[k] = 0;
         topWeight[k] = 0.0;
     }
-    for (uint i = 0; i < set.pointLights; ++i) {
+    // The flashes of effects are left out: the volume keeps its light for frames.
+    for (uint i = 0; i < set.flashFirst; ++i) {
         Light light = LoadLight(i >= set.mapLights ? g_frame.lightCount + i - set.mapLights : LightRangeIndex(set.ranges, i));
         float3 toLight;
         float distance;

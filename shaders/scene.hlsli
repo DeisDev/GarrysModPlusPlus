@@ -29,7 +29,7 @@ struct InstanceRecord
     uint previousPositions;
     // Last frame's object-to-world transform.
     float4 previousTransform[3];
-    // kInstanceIgnoreNormals, kInstanceSelfIllum, kInstanceModel.
+    // kInstanceIgnoreNormals, kInstanceSelfIllum, kInstanceModel, kInstanceStudio, kInstanceGlowLights.
     uint flags;
     // For instances with emitters: each triangle's emitter index (Scene::EmittersView) plus one, 0 for none; kNoView
     // for instances without.
@@ -44,10 +44,14 @@ struct InstanceRecord
 static const uint kInstanceIgnoreNormals = 0x01;
 static const uint kInstanceSelfIllum = 0x02;
 static const uint kInstanceModel = 0x04;
+// kInstanceStudio in src/scene.h: static props and entities' models, which dynamic lights may leave out.
+static const uint kInstanceStudio = 0x08;
 static const uint kInstanceEmitter = 0x10;
 static const uint kInstanceCharacter = 0x20;
 // kInstanceWater in src/scene.h: the water surfaces (kWaterMask).
 static const uint kInstanceWater = 0x40;
+// kInstanceGlowLights in src/scene.h: a dynamic model whose glowing patches are all lights this frame.
+static const uint kInstanceGlowLights = 0x80;
 
 // EmissiveLighting in src/settings.h.
 static const uint kEmissiveOff = 0;
@@ -67,7 +71,7 @@ struct Light
     float3 origin;
     uint type;
     float3 intensity;
-    // Where an engine dynamic light's light ends; 0 for map lights.
+    // Where an engine dynamic light's light ends, or a glowing patch's fades out; 0 for map lights.
     float radius;
     float3 normal;
     float stopdot;
@@ -76,9 +80,9 @@ struct Light
     float constantAttn;
     float linearAttn;
     float quadraticAttn;
-    // kLightSealed.
+    // kLightSealed for map lights; kLightNoWorld, kLightNoModel and kLightOnLocalPlayer for dynamic lights.
     uint flags;
-    // The radius of the sphere a map light is lit as: kBulbRadius in src/scene.h, or its lamp shell's.
+    // The radius of the sphere a map light or glowing patch is lit as: kBulbRadius in src/scene.h, or its lamp shell's.
     float size;
     // Light style (switchable and animated lights), or kNoLightStyle.
     uint style;
@@ -103,6 +107,23 @@ static const uint kLightPoint = 1;
 static const uint kLightSpot = 2;
 // An engine dynamic light: stopdot/stopdot2 are the cosines of its inner/outer cone, exponent 1 marks a spot.
 static const uint kLightDynamic = 3;
+// A glowing patch of a model (FrameLight::Kind::Glow in src/scene.h): `normal` sums its triangles' areas times their
+// front normals, `stopdot` holds the area it shows every direction alike, (area - |normal|) / 4, and `intensity` its
+// emission as HitEmission gives it.
+static const uint kLightGlow = 4;
+// The light of a glowing particle system (src/effect_lights.cpp): lit as a glowing patch that shows only the area it
+// shows every direction alike, at its own brightness (not the glowing surfaces' strength).
+static const uint kLightParticles = 5;
+
+// Dynamic light flags (src/scene.h): the light leaves out surfaces that are not studio models (kInstanceStudio), or
+// those that are, as the engine's DLIGHT_NO_WORLD_ILLUMINATION and DLIGHT_NO_MODEL_ILLUMINATION; or it sits on what the
+// local player holds.
+static const uint kLightNoWorld = 0x02;
+static const uint kLightNoModel = 0x04;
+static const uint kLightOnLocalPlayer = 0x08;
+
+// Whether the surface a pass lights is a studio model (kInstanceStudio), for dynamic lights' flags.
+static bool g_receiverStudio = false;
 
 // Mirrors GpuProjector in src/lighting.cpp: a flashlight or projected texture in Source's DoFlashlight terms.
 struct Projector
@@ -576,10 +597,12 @@ float3 HitEmission(HitSurface surface, HitInfo hit, float distance, bool lightin
 }
 
 // The glow an indirect ray meets at a hit, which lights the surface the ray left (EmissiveLighting): none when off,
-// and at the ray's first hit from the G-buffer none from emitters when they are sampled directly (SampleEmitter).
+// and at the ray's first hit from the G-buffer none from emitters when they are sampled directly (SampleEmitter) nor
+// from models whose glowing patches are lights (kInstanceGlowLights).
 float3 BounceEmission(HitSurface surface, HitInfo hit, bool firstHit)
 {
-    if (g_frame.emissiveLighting == kEmissiveOff || (firstHit && g_frame.emitterCount != 0 && (surface.flags & kInstanceEmitter) != 0))
+    if (g_frame.emissiveLighting == kEmissiveOff || (firstHit && ((g_frame.emitterCount != 0 && (surface.flags & kInstanceEmitter) != 0) ||
+        (surface.flags & kInstanceGlowLights) != 0)))
         return 0.0;
     return HitEmission(surface, hit, hit.t, true);
 }
@@ -1289,6 +1312,13 @@ uint2 MapLightShape(uint index)
     return lights.Load2(index * kLightStride + 68);
 }
 
+// The same of a dynamic light.
+uint2 DynamicLightShape(uint index)
+{
+    ByteAddressBuffer lights = ResourceDescriptorHeap[g_frame.dynamicLightsView];
+    return lights.Load2(index * kLightStride + 68);
+}
+
 // A point of the disc a sphere of `radius` at `centre` shows `origin`, by two numbers in [0, 1).
 float3 DiscPoint(float3 centre, float radius, float3 origin, float2 jitter)
 {
@@ -1339,6 +1369,18 @@ float3 LightIrradiance(Light light, float3 position, float3 normal, out float3 t
     if (lambert <= 0.0)
         return 0.0;
     float falloff;
+    if (light.type >= kLightDynamic && (light.flags & (g_receiverStudio ? kLightNoModel : kLightNoWorld)) != 0)
+        return 0.0;
+    if (light.type >= kLightGlow) {
+        // The patch's area seen from the point (its flat part's by the cosine, plus the part it shows every direction
+        // alike) times its emission over pi, with the inverse square up to its sphere, faded out over the last of its reach
+        // (the window of Karis 2013, "Real Shading in Unreal Engine 4").
+        float projected = max(dot(light.normal, -toLight), 0.0) + light.stopdot;
+        float reach = distanceSquared / (light.radius * light.radius);
+        float fade = saturate(1.0 - reach * reach);
+        float scale = light.type == kLightGlow ? g_frame.emissiveScale : 1.0;
+        return light.intensity * (lambert * projected * fade * fade / (3.14159265 * max(distanceSquared, light.size * light.size)) * scale);
+    }
     if (light.type == kLightDynamic) {
         float r = distance / light.radius;
         falloff = saturate(1.0 - r * r);
@@ -1547,12 +1589,17 @@ float3 ProjectorIrradiance(Projector projector, float3 position, float3 normal, 
     return cookie * projector.color * (attenuation * lambert * endFalloff);
 }
 
-// The lights that can reach a point, in one index space: its grid cell's listed map lights, then the engine's dynamic
-// lights, then the projected lights; from `count` on, any map light by its index, as the cell's tail samples them.
+// The lights that can reach a point, in one index space: its grid cell's listed map lights, then the dynamic lights
+// (from `exactFirst` those lit exactly, from `flashFirst` the flashes of effects, which light surfaces directly and
+// nothing else), then the projected lights; from `count` on, any map light by its index, as the cell's tail samples
+// them. Passes that gather light for later frames (indirect light, the radiance cache, probes, fog) end their sets at
+// `flashFirst`.
 struct LightSet
 {
     LightRanges ranges;
     uint mapLights;
+    uint exactFirst;
+    uint flashFirst;
     uint pointLights;
     uint count;
 };
@@ -1562,6 +1609,8 @@ LightSet LightSetAt(float3 position)
     LightSet set;
     set.ranges = LightsAt(position);
     set.mapLights = LightRangeCount(set.ranges);
+    set.exactFirst = set.mapLights + g_frame.dynamicExactFirst;
+    set.flashFirst = set.mapLights + g_frame.dynamicFlashFirst;
     set.pointLights = set.mapLights + g_frame.dynamicLightCount;
     set.count = set.pointLights + g_frame.projectorCount;
     return set;
@@ -1597,17 +1646,26 @@ float3 SetLightIrradiance(LightSet set, uint i, float3 position, float3 normal, 
 float3 LightTransmittance(LightSet set, uint i, float3 origin, float3 lightPosition, float2 jitter, uint rayFlags = RAY_FLAG_NONE)
 {
     bool attached = IsAttachedLight(set, i);
-    float clearance = !attached ? kLightClearance : i >= set.pointLights ? ProjectorClearance(LoadProjector(i - set.pointLights))
-        : g_frame.viewmodel == 2 ? kViewmodelAttachedClearance : kAttachedLightClearance;
+    float clearance = kLightClearance;
     bool sealed = false;
-    if (!attached) {
-        uint2 shape = MapLightShape(SetMapLight(set, i));
-        sealed = (shape.x & kLightSealed) != 0;
-        if (jitter.x >= 0.0)
-            lightPosition = DiscPoint(lightPosition, asfloat(shape.y), origin, jitter);
+    // Engine lights and projectors sit in what holds them, mostly the local player.
+    bool skipsPlayer = attached;
+    if (!attached || i < set.pointLights) {
+        // Map lights and glowing patches are spheres (an engine light has no size).
+        uint2 shape = attached ? DynamicLightShape(i - set.mapLights) : MapLightShape(SetMapLight(set, i));
+        float size = asfloat(shape.y);
+        sealed = !attached && (shape.x & kLightSealed) != 0;
+        if (attached && size <= 0.0)
+            clearance = g_frame.viewmodel == 2 ? kViewmodelAttachedClearance : kAttachedLightClearance;
+        else if (attached)
+            skipsPlayer = (shape.x & kLightOnLocalPlayer) != 0;
+        if (size > 0.0 && jitter.x >= 0.0)
+            lightPosition = DiscPoint(lightPosition, size, origin, jitter);
+    } else {
+        clearance = ProjectorClearance(LoadProjector(i - set.pointLights));
     }
     float3 toLight;
-    float3 share = LightPath(origin, lightPosition, clearance, ShadowMask(attached, sealed), rayFlags, toLight);
+    float3 share = LightPath(origin, lightPosition, clearance, ShadowMask(skipsPlayer, sealed), rayFlags, toLight);
     if (all(share <= 0.0))
         return share;
     if (!attached)
@@ -1688,10 +1746,12 @@ float3 HitLampIrradiance(HitSurface hit, float3 origin, inout uint seed)
     LightSet set = LightSetAt(hit.position);
     // Projected lights (the flashlight) are few and bright, and each is traced: picked as one light among a cell's many,
     // their rare, heavily weighted samples were clamped (ClampSample), and the flashlight barely lit the floor under
-    // water or what mirrors show. The others are sampled. One shadow ray call serves both.
+    // water or what mirrors show. The others are sampled, the flashes of effects left out. One shadow ray call serves
+    // both.
     uint projectors = set.count - set.pointLights;
     LightSet sampled = set;
-    sampled.count = set.pointLights;
+    sampled.count = set.flashFirst;
+    g_receiverStudio = (hit.flags & kInstanceStudio) != 0;
     for (uint k = 0; k <= projectors; ++k) {
         float3 light;
         float3 toLight;
@@ -1714,6 +1774,7 @@ float3 HitLampIrradiance(HitSurface hit, float3 origin, inout uint seed)
             projector ? kLightCentre : float2(Random(seed), Random(seed)));
         g_receiverNormal = 0.0;
     }
+    g_receiverStudio = false;
     return irradiance;
 }
 
@@ -1734,7 +1795,7 @@ float3 WaterLampLight(float3 position, WaterBody body, float3 direction, inout u
     LightSet set = LightSetAt(position);
     uint projectors = set.count - set.pointLights;
     LightSet sampled = set;
-    sampled.count = set.pointLights;
+    sampled.count = set.flashFirst;
     float3 scattered = 0.0;
     for (uint k = 0; k <= projectors; ++k) {
         float3 light;

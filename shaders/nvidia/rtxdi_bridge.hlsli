@@ -6,9 +6,10 @@
 // RTXDI_SHADER_OPTIONS); nothing here is compiled at runtime.
 //
 // Local lights, in one index space: the map's lights (Light), its glowing triangles (Emitter, with
-// EmissiveLighting::Full), the engine's dynamic lights and the projected lights. The sun stays outside RTXDI. A light's
-// sample is a point picked by two numbers in [0, 1): on the disc a map light's sphere shows the surface, uniformly on a
-// glowing triangle, or the light's own origin.
+// EmissiveLighting::Full), the sampled dynamic lights (engine lights and glowing model patches, before
+// g_frame.dynamicExactFirst) and the projected lights. The sun and the dynamic lights' exact run stay outside RTXDI
+// (shaders/direct.hlsl lights them). A light's sample is a point picked by two numbers in [0, 1): on the disc a map
+// light's or glowing patch's sphere shows the surface, uniformly on a glowing triangle, or the light's own origin.
 
 #include "../scene.hlsli"
 
@@ -45,7 +46,14 @@ struct RestirConstants
     uint historyValid;
     // ReGIR's light slots (ReGIRContext::GetReGIRLightSlotCount).
     uint regirLightSlots;
+    // Each sampled dynamic light's index among last frame's, then each of last frame's among this frame's
+    // (SceneFrame::dynamicLightMapView), kMaxDynamicLights apiece; kNoView for none.
+    uint dynamicLightMapView;
 };
+
+// Scene::kMaxDynamicLights and Scene::kNoLight in src/scene.h.
+static const uint kMaxDynamicLights = 96;
+static const uint kNoDynamicLight = 0xFFFFFFFFu;
 
 ConstantBuffer<RestirConstants> g_restir : register(b3);
 RWStructuredBuffer<uint2> g_risBuffer : register(u1, space2);
@@ -60,6 +68,8 @@ StructuredBuffer<float2> g_neighborOffsets : register(t1, space2);
 static const uint kRestirHalfLambert = 1;
 static const uint kRestirTwoSided = 2;
 static const uint kRestirOnModel = 4;
+// The surface is a studio model's (kInstanceStudio), for dynamic lights' flags.
+static const uint kRestirStudio = 8;
 
 struct RAB_Material
 {
@@ -179,8 +189,10 @@ RAB_Surface RAB_GetGBufferSurface(int2 pixel, bool previous)
     Texture2D<float4> gbufferFlags = ResourceDescriptorHeap[g_frame.flagsView];
     Texture2D<uint4> visibility = ResourceDescriptorHeap[g_frame.visibilityView];
     uint instance = visibility.Load(int3(pixel, 0)).x;
+    uint instanceFlags = instance != kNoView ? LoadInstance(instance).flags : 0u;
     surface.material = ((MaterialBits(gbufferFlags.Load(int3(pixel, 0))) & kMaterialHalfLambert) != 0 ? kRestirHalfLambert : 0u) |
-        (twoSided ? kRestirTwoSided : 0u) | (instance != kNoView && (LoadInstance(instance).flags & kInstanceModel) != 0 ? kRestirOnModel : 0u);
+        (twoSided ? kRestirTwoSided : 0u) | ((instanceFlags & kInstanceModel) != 0 ? kRestirOnModel : 0u) |
+        ((instanceFlags & kInstanceStudio) != 0 ? kRestirStudio : 0u);
     return surface;
 }
 
@@ -189,6 +201,7 @@ void UseSurface(RAB_Surface surface)
 {
     g_twoSided = (surface.material & kRestirTwoSided) != 0;
     g_halfLambert = (surface.material & kRestirHalfLambert) != 0;
+    g_receiverStudio = (surface.material & kRestirStudio) != 0;
     g_toEye = surface.toEye;
     g_inAir = false;
 }
@@ -205,11 +218,19 @@ RAB_LightInfo RAB_LoadLightInfo(uint index, bool previous)
 bool RAB_StoreCompactLightInfo(uint linearIndex, RAB_LightInfo light) { return false; }
 RAB_LightInfo RAB_LoadCompactLightInfo(uint linearIndex) { return RAB_EmptyLightInfo(); }
 
-// Map lights and glowing triangles keep their indices from frame to frame; the engine's dynamic lights and projected
-// lights are listed anew each frame and are not reused across frames.
+// Map lights and glowing triangles keep their indices from frame to frame; dynamic lights are listed anew each frame and
+// found again by their keys (Scene::SetDynamicLights); projected lights are not reused across frames.
 int RAB_TranslateLightIndex(uint index, bool currentToPrevious)
 {
-    return index < g_restir.mapLights + g_restir.emitters ? int(index) : -1;
+    uint dynamicFirst = g_restir.mapLights + g_restir.emitters;
+    if (index < dynamicFirst)
+        return int(index);
+    uint dynamic = index - dynamicFirst;
+    if (g_restir.dynamicLightMapView == kNoView || dynamic >= kMaxDynamicLights || (currentToPrevious && dynamic >= g_restir.dynamicLights))
+        return -1;
+    ByteAddressBuffer map = ResourceDescriptorHeap[g_restir.dynamicLightMapView];
+    uint translated = map.Load(((currentToPrevious ? 0u : kMaxDynamicLights) + dynamic) * 4);
+    return translated == kNoDynamicLight ? -1 : int(dynamicFirst + translated);
 }
 
 // A map light with the style values of this frame or the last.
@@ -294,11 +315,19 @@ RAB_LightSample RAB_SamplePolymorphicLight(RAB_LightInfo info, RAB_Surface surfa
         return sample;
     }
     index -= g_restir.emitters;
-    if (index < g_restir.dynamicLights) {
+    if (index < g_restir.dynamicLights || info.previous != 0) {
+        // Last frame's dynamic lights are taken as they are now.
+        if (info.previous != 0) {
+            int current = RAB_TranslateLightIndex(info.index, false);
+            if (current < 0)
+                return RAB_EmptyLightSample();
+            index = uint(current) - g_restir.mapLights - g_restir.emitters;
+            sample.light = uint(current);
+        }
         ByteAddressBuffer dynamicLights = ResourceDescriptorHeap[g_frame.dynamicLightsView];
         Light light = dynamicLights.Load<Light>(index * kLightStride);
         sample.irradiance = LightIrradiance(light, surface.position, surface.normal, sample.toLight, sample.distance);
-        sample.position = light.origin;
+        sample.position = light.type == kLightGlow ? DiscPoint(light.origin, light.size, surface.position, uv) : light.origin;
         return sample;
     }
     index -= g_restir.dynamicLights;
@@ -357,6 +386,12 @@ float3 SampleTransmittance(RAB_Surface surface, RAB_LightSample sample)
         uint attached = index - g_restir.mapLights - g_restir.emitters;
         clearance = attached < g_restir.dynamicLights ? kAttachedLightClearance : ProjectorClearance(LoadProjector(attached - g_restir.dynamicLights));
         mask = ShadowMask(true);
+        // A glowing patch (with a size) is a sphere on a model, whose shadow rays pass only the local player's own.
+        uint2 shape = attached < g_restir.dynamicLights ? DynamicLightShape(attached) : uint2(0, 0);
+        if (asfloat(shape.y) > 0.0) {
+            clearance = kLightClearance;
+            mask = ShadowMask((shape.x & kLightOnLocalPlayer) != 0);
+        }
     }
     bool onModel = (surface.material & kRestirOnModel) != 0;
     // Under water the light follows its bent path through the surface (LightPath).
@@ -434,6 +469,9 @@ float LightPower(uint index)
     if (index < g_restir.dynamicLights) {
         ByteAddressBuffer dynamicLights = ResourceDescriptorHeap[g_frame.dynamicLightsView];
         Light light = dynamicLights.Load<Light>(index * kLightStride);
+        // A glowing patch gives its emission times its area (LightIrradiance's projected area over the sphere, over pi).
+        if (light.type == kLightGlow)
+            return Luminance(max(light.intensity, 0.0)) * g_frame.emissiveScale * (length(light.normal) + 4.0 * light.stopdot);
         return Luminance(max(light.intensity, 0.0)) * g_frame.lightScale * light.radius * light.radius;
     }
     index -= g_restir.dynamicLights;
@@ -522,7 +560,14 @@ float RAB_GetLightTargetPdfForVolume(RAB_LightInfo info, float3 centre, float ra
     if (index < g_restir.dynamicLights) {
         ByteAddressBuffer dynamicLights = ResourceDescriptorHeap[g_frame.dynamicLightsView];
         Light light = dynamicLights.Load<Light>(index * kLightStride);
-        float nearest = max(length(centre - light.origin) - radius, 0.0) / max(light.radius, 1e-3);
+        float nearest = max(length(centre - light.origin) - radius, 0.0);
+        if (light.type == kLightGlow) {
+            if (nearest >= light.radius)
+                return 0.0;
+            return Luminance(max(light.intensity, 0.0)) * g_frame.emissiveScale * (length(light.normal) + light.stopdot) /
+                (3.14159265 * max(nearest * nearest, light.size * light.size));
+        }
+        nearest /= max(light.radius, 1e-3);
         float falloff = saturate(1.0 - nearest * nearest);
         return Luminance(max(light.intensity, 0.0)) * g_frame.lightScale * falloff * falloff;
     }

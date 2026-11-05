@@ -1196,6 +1196,8 @@ void DrawLightingPage(Settings& settings)
             StrengthRow("lighting.map_lights", &Settings::mapLights, &Settings::lightIntensity);
             ColorRow("lighting.light_tint", &Settings::lightTint, true, settings.mapLights, Text("lighting.map_lights_reason"));
             SwitchRow("lighting.dynamic_lights", &Settings::dynamicLights);
+            StrengthRow("lighting.effect_lights", &Settings::effectLights, &Settings::effectLightStrength);
+            SwitchRow("lighting.skip_lamp_glows", &Settings::skipLampGlows, settings.effectLights, Text("lighting.effect_lights_reason"));
             StrengthRow("lighting.projected_lights", &Settings::projectedLights, &Settings::projectedIntensity);
             StrengthRow("lighting.emissive_intensity", nullptr, &Settings::emissiveIntensity, settings.emissiveLighting != EmissiveLighting::Off,
                 Text("lighting.emissive_reason"));

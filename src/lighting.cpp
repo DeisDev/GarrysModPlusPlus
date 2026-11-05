@@ -3469,7 +3469,10 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     if (frame.waterBodiesView != kInvalidView)
         constants.waterBodiesView = frame.waterBodiesView;
     constants.waterTop = frame.waterTop;
-    constants.dynamicLightCount = GetSettings().dynamicLights && inputs.kind != gbuffer::ViewKind::Skybox ? frame.dynamicLightCount : 0u;
+    const bool dynamicLights = inputs.kind != gbuffer::ViewKind::Skybox;
+    constants.dynamicLightCount = dynamicLights ? frame.dynamicLightCount : 0u;
+    constants.dynamicExactFirst = dynamicLights ? frame.dynamicExactFirst : 0u;
+    constants.dynamicFlashFirst = dynamicLights ? frame.dynamicFlashFirst : 0u;
     Statistics& statistics = GetStatistics();
     if (main) {
         statistics.mapLights = constants.lightCount;
@@ -3724,7 +3727,8 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     Use(direct, write);
     Use(m_directRemainder, write);
     Use(m_specular, write);
-    const RestirLights restirLights{constants.lightCount, constants.emitterCount, constants.dynamicLightCount, constants.projectorCount};
+    // RTXDI samples the dynamic lights before the exactly lit ones.
+    const RestirLights restirLights{constants.lightCount, constants.emitterCount, constants.dynamicExactFirst, constants.projectorCount};
     restir = restir && constants.traceMask != 0;
     if (restir) {
         float previousInvViewProj[4][4] = {};
@@ -3734,7 +3738,7 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
         RestirConstants& restirConstants = *reinterpret_cast<RestirConstants*>(m_samplingMapped + slot * kSamplingStride + kRestirConstantsOffset);
         const UINT previousStyles = m_restir.UploadPreviousStyles(slot, m_lastLightStyles.data(), m_lastLightStyles.size());
         m_restir.FillConstants(restirConstants, static_cast<uint32_t>(inputs.frame), restirMode, rayReconstruction, constants.eyePosition, previousInvViewProj,
-            restirLights, scene.EmitterPower(), previousStyles, restirHistory);
+            restirLights, scene.EmitterPower(), previousStyles, restirHistory, frame.dynamicLightMapView);
         m_restirLastMode = restirMode;
         m_restirLastSize[0] = m_gridWidth;
         m_restirLastSize[1] = m_gridHeight;

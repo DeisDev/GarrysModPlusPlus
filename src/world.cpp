@@ -4,7 +4,9 @@
 #include "client_hooks.h"
 #include "command_line.h"
 #include "engine_interfaces.h"
+#include "effect_lights.h"
 #include "entities.h"
+#include "glow_patches.h"
 #include "light_queries.h"
 #include "loading_screen.h"
 #include "log.h"
@@ -62,6 +64,16 @@ constexpr uint32_t kDroppedTriangle = 0x7FFFFFFF;
 
 constexpr uint32_t kJitterSamples = 8;
 
+// Self-illumination masks are read on the CPU at this size to find where models glow; a patch's light needs no more.
+constexpr uint32_t kGlowMaskSize = 64;
+// Triangles whose mask covers less than this share of them glow too faintly to light anything.
+constexpr float kGlowCoverage = 0.05f;
+// How many of the view's glowing patches are lit exactly (the rest are sampled with the other lights).
+constexpr size_t kExactGlowLights = 4;
+// Dynamic light keys (FrameLight::key) carry what made the light in their top bits (engine and particle lights':
+// src/effect_lights.cpp).
+constexpr uint64_t kGlowLightKey = 2ull << 62;
+
 unsigned Hex(HRESULT hr) { return static_cast<unsigned>(hr); }
 
 float Halton(uint32_t index, uint32_t base)
@@ -91,6 +103,15 @@ struct ModelEntry {
     // Its kRightHandBone, if it has one: a holder's hand, or where a weapon merged onto that hand is held.
     int rightHand = -1;
     std::optional<studio::Matrix3x4> rightHandPoseToBone;
+    // Its glowing patches, which light the scene from its moving instances (FrameLight::Kind::Glow), and for each texture
+    // (glow::Patch::material) its material's name and the $selfillumtint the patches were made with, which proxies may
+    // change as the game draws (ModelEntry::glowPatches' tinted ones follow it).
+    std::shared_ptr<const std::vector<glow::Patch>> glowPatches;
+    struct GlowMaterial {
+        std::string name;
+        bsp::Float3 tint;
+    };
+    std::vector<GlowMaterial> glowMaterials;
 };
 
 struct MaterialInfo {
@@ -114,6 +135,23 @@ struct MaterialInfo {
     float opacity = 1.0f;
     std::string baseTexture;
     bsp::Float3 reflectivity = kDefaultReflectivity;
+    // The material's name, as the material system knows it ("models/weapons/w_physics").
+    std::string name;
+    // $selfillum: its mask's texture and channel (the base texture's alpha, or $selfillummask's red, as VertexLitGeneric
+    // reads them) and $selfillumtint.
+    bool selfIllum = false;
+    std::string selfIllumMask;
+    uint32_t selfIllumChannel = 0;
+    bsp::Float3 selfIllumTint = {1.0f, 1.0f, 1.0f};
+    // $selfillumtint as the VMT gives it (selfIllumTint may hold more: $selfillumfresnel's mean).
+    bsp::Float3 selfIllumVmtTint = {1.0f, 1.0f, 1.0f};
+    // VertexLitGeneric's $emissiveblend layer, an additive pass of $emissiveblendbasetexture times $emissiveblendtexture
+    // (scrolled by a flow map) times $emissiveblendtint and $emissiveblendstrength (0-1).
+    bool emissiveBlend = false;
+    std::string emissiveBlendBase;
+    std::string emissiveBlendTexture;
+    bsp::Float3 emissiveBlendTint = {1.0f, 1.0f, 1.0f};
+    float emissiveBlendStrength = 0.0f;
     // Reflections and self-illumination, for Scene::AddMaterial.
     uint32_t sceneMaterial = Scene::kNoMaterial;
     // Index of its $treesway parameters in State::swayMaterials.
@@ -141,6 +179,24 @@ struct ModelEmitter {
 struct SceneTexture {
     UINT view = DescriptorHeap::kInvalid;
     bool alpha = false;
+};
+
+// One channel of a self-illumination mask at kGlowMaskSize, as the GPU reads it; empty when it cannot be read.
+struct MaskImage {
+    uint32_t width = 0;
+    uint32_t height = 0;
+    std::vector<uint8_t> values;
+};
+
+// A glowing patch of a moving model placed for the main view (glow::Place): its light, how much it matters to the view
+// (its power over its squared distance from the eye), and its instance: an index in State::dynamicInstances (Rigid) or
+// State::skinnedEntities (Skinned), or none (the view model, which is not in the scene).
+struct GlowCandidate {
+    enum class Owner { Rigid, Skinned, None };
+    FrameLight light;
+    float score = 0.0f;
+    size_t owner = 0;
+    Owner kind = Owner::None;
 };
 
 struct State {
@@ -180,6 +236,8 @@ struct State {
     std::unordered_map<uint32_t, uint32_t> lightTextureMaterials;
     // The self-illuminated triangles of each scene model (ModelEmitters), for the emitters of its static instances.
     std::unordered_map<int, std::vector<ModelEmitter>> modelEmitters;
+    // Self-illumination masks read on the CPU for glowing patches (MaskImageFor), by texture and channel.
+    std::unordered_map<std::string, MaskImage> maskImages;
     uint32_t modelErrors = 0;
     std::vector<entities::ModelEntity> entities;
     std::vector<SceneInstance> dynamicInstances;
@@ -194,6 +252,25 @@ struct State {
     std::vector<SkinnedEntity> skinnedEntities;
     std::vector<studio::Matrix3x4> bones;
     std::vector<engine::DynamicLight> dynamicLights;
+    // The main view's glowing patches of moving models (CollectEntities), and its dynamic lights in Scene's runs
+    // (Scene::SetDynamicLights).
+    std::vector<GlowCandidate> glowCandidates;
+    // The held weapon's world model in the player's hand (AddHeldWeapon), whose glow lights the scene unless the view
+    // model's does.
+    struct HeldGlow {
+        const ModelEntry* model;
+        studio::Matrix3x4 transform;
+        int index;
+        size_t instance;
+    };
+    std::optional<HeldGlow> heldWeaponGlow;
+    // TintChange's reading of each material's $selfillumtint, and the frame it was read in.
+    std::unordered_map<std::string, std::pair<uint64_t, std::array<float, 3>>> tintChanges;
+    std::vector<FrameLight> frameLights;
+    // Where the map's point and spot lights are, whose halo sprites effect lights may leave out.
+    std::vector<bsp::Float3> mapLightOrigins;
+    size_t frameExactFirst = 0;
+    size_t frameFlashFirst = 0;
     // The local player's origin from the last main view's entities.
     std::optional<std::array<float, 3>> localPlayer;
     // env_sun as the last 3D skybox or main view found it, for every view's sunlight.
@@ -444,17 +521,131 @@ std::vector<ModelEmitter> ModelEmitters(std::span<const bsp::Float3> positions, 
     return emitters;
 }
 
+// A self-illumination mask's channel (MaterialInfo::selfIllumMask), read once.
+const MaskImage& MaskImageFor(const std::string& vtfPath, uint32_t channel)
+{
+    const auto [entry, added] = g_state.maskImages.try_emplace(std::format("{}#{}", vtfPath, channel));
+    if (!added || vtfPath.empty())
+        return entry->second;
+    std::string error;
+    const std::vector<std::byte> file = ReadOptional(vtfPath);
+    if (const std::optional<studio::TextureImage> image = studio::ReadTexture(file, kGlowMaskSize, error)) {
+        entry->second.values = studio::DecodeChannel(*image, 0, channel);
+        entry->second.width = image->width;
+        entry->second.height = image->height;
+    }
+    return entry->second;
+}
+
+// The mean of a mask over a triangle with these texture coordinates (0-1), from seven points spread over it; 0 for a
+// mask that cannot be read, which glows nowhere on the GPU either.
+float MaskCoverage(const MaskImage& mask, const bsp::Float2 (&uv)[3])
+{
+    if (mask.values.empty() || mask.width == 0 || mask.height == 0)
+        return 0.0f;
+    constexpr float kPoints[7][2] = {{1.0f / 3.0f, 1.0f / 3.0f}, {0.6f, 0.2f}, {0.2f, 0.6f}, {0.2f, 0.2f}, {0.1f, 0.45f}, {0.45f, 0.1f}, {0.45f, 0.45f}};
+    float sum = 0.0f;
+    for (const auto& point : kPoints) {
+        const float b0 = 1.0f - point[0] - point[1];
+        float u = uv[0].u * b0 + uv[1].u * point[0] + uv[2].u * point[1];
+        float v = uv[0].v * b0 + uv[1].v * point[0] + uv[2].v * point[1];
+        u -= std::floor(u);
+        v -= std::floor(v);
+        const uint32_t x = std::min(static_cast<uint32_t>(u * static_cast<float>(mask.width)), mask.width - 1);
+        const uint32_t y = std::min(static_cast<uint32_t>(v * static_cast<float>(mask.height)), mask.height - 1);
+        sum += static_cast<float>(mask.values[static_cast<size_t>(y) * mask.width + x]) / 255.0f;
+    }
+    return sum / static_cast<float>(std::size(kPoints));
+}
+
+float SrgbToLinear(float c) { return c <= 0.04045f ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f); }
+
+// A texture's mean linear colour (read as sRGB) at kGlowMaskSize.
+bsp::Float3 TextureMean(const std::string& vtfPath)
+{
+    float mean[3] = {};
+    for (uint32_t c = 0; c < 3; ++c) {
+        const MaskImage& image = MaskImageFor(vtfPath, c);
+        double sum = 0.0;
+        for (const uint8_t value : image.values)
+            sum += SrgbToLinear(static_cast<float>(value) / 255.0f);
+        mean[c] = image.values.empty() ? 0.0f : static_cast<float>(sum / static_cast<double>(image.values.size()));
+    }
+    return {mean[0], mean[1], mean[2]};
+}
+
+// A model's glowing patches (glow::BuildPatches, grouped by texture: glow::Patch::material) from its triangles in BLAS
+// order. $selfillum glows as HitEmission has it, its albedo times $selfillumtint times its mask averaged over the
+// triangle; those patches follow $selfillumtint as it changes (glow::Patch::tinted). An $emissiveblend layer glows by its
+// base texture's colour over the triangle times the emissive texture's mean (its flow scrolls it over the model), its
+// tint and strength.
+std::shared_ptr<const std::vector<glow::Patch>> GlowPatches(const studio::Geometry& geometry, std::span<const uint32_t> triangleAlbedo,
+    std::span<const MaterialInfo* const> textureInfo, bool skinned)
+{
+    const size_t triangles = std::min(geometry.triangleTextures.size(), triangleAlbedo.size());
+    std::vector<bsp::Float3> selfIllum(triangles);
+    std::vector<bsp::Float3> blend(triangles);
+    std::vector<uint32_t> textures(triangles);
+    bool glowing[2] = {};
+    for (size_t t = 0; t < triangles && !geometry.uvs.empty(); ++t) {
+        const uint16_t texture = geometry.triangleTextures[t];
+        textures[t] = texture;
+        const MaterialInfo* info = texture < textureInfo.size() ? textureInfo[texture] : nullptr;
+        if (info == nullptr)
+            continue;
+        const bsp::Float2 uv[3] = {geometry.uvs[geometry.indices[t * 3]], geometry.uvs[geometry.indices[t * 3 + 1]], geometry.uvs[geometry.indices[t * 3 + 2]]};
+        if (info->selfIllum) {
+            const float coverage = MaskCoverage(MaskImageFor(info->selfIllumMask, info->selfIllumChannel), uv);
+            if (coverage >= kGlowCoverage) {
+                const uint32_t albedo = triangleAlbedo[t];
+                selfIllum[t] = {static_cast<float>(albedo & 0xFF) / 255.0f * info->selfIllumTint.x * coverage,
+                    static_cast<float>((albedo >> 8) & 0xFF) / 255.0f * info->selfIllumTint.y * coverage,
+                    static_cast<float>((albedo >> 16) & 0xFF) / 255.0f * info->selfIllumTint.z * coverage};
+                glowing[0] = true;
+            }
+        }
+        if (info->emissiveBlend) {
+            const bsp::Float3 emissive = TextureMean(info->emissiveBlendTexture);
+            float base[3];
+            for (uint32_t c = 0; c < 3; ++c)
+                base[c] = SrgbToLinear(MaskCoverage(MaskImageFor(info->emissiveBlendBase, c), uv));
+            const float strength = info->emissiveBlendStrength;
+            blend[t] = {base[0] * emissive.x * info->emissiveBlendTint.x * strength, base[1] * emissive.y * info->emissiveBlendTint.y * strength,
+                base[2] * emissive.z * info->emissiveBlendTint.z * strength};
+            glowing[1] = glowing[1] || 0.2126f * blend[t].x + 0.7152f * blend[t].y + 0.0722f * blend[t].z > 0.0f;
+        }
+    }
+    if (!glowing[0] && !glowing[1])
+        return nullptr;
+    const std::span<const studio::VertexWeights> weights = skinned ? std::span<const studio::VertexWeights>(geometry.weights) : std::span<const studio::VertexWeights>();
+    std::vector<glow::Patch> patches;
+    if (glowing[0]) {
+        patches = glow::BuildPatches(geometry.positions, geometry.indices, selfIllum, textures, weights);
+        for (glow::Patch& patch : patches)
+            patch.tinted = true;
+    }
+    if (glowing[1]) {
+        for (glow::Patch& patch : glow::BuildPatches(geometry.positions, geometry.indices, blend, textures, weights)) {
+            patch.tinted = false;
+            patches.push_back(patch);
+        }
+    }
+    return patches.empty() ? nullptr : std::make_shared<const std::vector<glow::Patch>>(std::move(patches));
+}
+
 // The scene material for a VMT's env_cubemap reflection and self-illumination (as LightmappedGeneric and
 // VertexLitGeneric compute their masks) and whether it is unlit, or Scene::kNoMaterial when it has none of them.
-uint32_t SceneMaterial(std::string_view vmt, std::string_view shader, const std::string& baseTexture, const bsp::Float3& reflectivity, bool unlit)
+uint32_t SceneMaterial(std::string_view vmt, std::string_view shader, const MaterialInfo& info, bool unlit)
 {
+    const std::string& baseTexture = info.baseTexture;
+    const bsp::Float3& reflectivity = info.reflectivity;
     auto enabled = [&](std::string_view key) {
         const std::optional<std::string> value = studio::MaterialValue(vmt, key);
         return value && !value->empty() && value->front() != '0';
     };
     const std::optional<std::string> envmap = studio::MaterialValue(vmt, "$envmap");
     const bool reflective = envmap && !envmap->empty();
-    const bool selfIllum = enabled("$selfillum");
+    const bool selfIllum = info.selfIllum;
     const UINT baseView = baseTexture.empty() ? DescriptorHeap::kInvalid : FullTextureFor(baseTexture);
     if (!reflective && !selfIllum && !unlit && baseView == DescriptorHeap::kInvalid)
         return Scene::kNoMaterial;
@@ -502,12 +693,10 @@ uint32_t SceneMaterial(std::string_view vmt, std::string_view shader, const std:
     }
     material.selfIllumMask = Scene::kMaskOff;
     if (selfIllum) {
-        const std::string selfIllumMask = studio::MaterialTexture(vmt, "$selfillummask");
-        material.selfIllumMask = selfIllumMask.empty() ? mask(baseTexture, 3, false) : mask(selfIllumMask, 0, false);
-        const bsp::Float3 tint = MaterialColor(vmt, "$selfillumtint", {1.0f, 1.0f, 1.0f});
-        material.selfIllumTint[0] = tint.x;
-        material.selfIllumTint[1] = tint.y;
-        material.selfIllumTint[2] = tint.z;
+        material.selfIllumMask = mask(info.selfIllumMask, info.selfIllumChannel, false);
+        material.selfIllumTint[0] = info.selfIllumTint.x;
+        material.selfIllumTint[1] = info.selfIllumTint.y;
+        material.selfIllumTint[2] = info.selfIllumTint.z;
     }
     if (material.envmapMask == Scene::kMaskOff && material.selfIllumMask == Scene::kMaskOff && !unlit && baseView == DescriptorHeap::kInvalid)
         return Scene::kNoMaterial;
@@ -577,13 +766,64 @@ const std::optional<MaterialInfo>& MaterialFor(const std::string& vmtPath)
         if (std::from_chars(reference->data(), reference->data() + reference->size(), value).ec == std::errc() && value > 0.0f)
             entry->alphaReference = value;
     }
+    entry->name = vmtPath.substr(vmtPath.starts_with("materials/") ? 10 : 0);
+    if (entry->name.ends_with(".vmt"))
+        entry->name.resize(entry->name.size() - 4);
     entry->baseTexture = studio::MaterialTexture(text, "$basetexture");
+    bool baseAlpha = false;
     if (!entry->baseTexture.empty()) {
         std::vector<std::byte> header = ReadOptional(entry->baseTexture, studio::kVtfReflectivityHeaderSize);
         if (std::optional<bsp::Float3> reflectivity = studio::TextureReflectivity(header))
             entry->reflectivity = *reflectivity;
+        baseAlpha = studio::TextureHasAlpha(header);
     }
-    entry->sceneMaterial = SceneMaterial(text, shader, entry->baseTexture, entry->reflectivity, IsUnlitShader(shader));
+    entry->selfIllum = enabled("$selfillum");
+    if (entry->selfIllum) {
+        const std::string selfIllumMask = studio::MaterialTexture(text, "$selfillummask");
+        const std::string envmapMask = studio::MaterialTexture(text, "$envmapmask");
+        // VertexLitGeneric's init (stdshader_dx9.dll+0x613f0) drops $selfillum when the base texture has no alpha and there
+        // is neither $selfillumfresnel nor $selfillummask; without a bump map its draw (+0x59a00) takes the mask from
+        // $envmapmask's alpha with $selfillum_envmapmask_alpha (SELFILLUM_ENVMAPMASK_ALPHA). $phong materials go to the
+        // skin shader instead (+0x4d990), which was not checked. REA 2026-11-04.
+        if (shader == "vertexlitgeneric" && !enabled("$phong")) {
+            entry->selfIllum = baseAlpha || !selfIllumMask.empty() || enabled("$selfillumfresnel");
+            if (entry->selfIllum && enabled("$selfillum_envmapmask_alpha") && !envmapMask.empty() && studio::MaterialTexture(text, "$bumpmap").empty()) {
+                entry->selfIllumMask = envmapMask;
+                entry->selfIllumChannel = 3;
+            }
+        }
+        if (entry->selfIllumMask.empty()) {
+            entry->selfIllumMask = selfIllumMask.empty() ? entry->baseTexture : selfIllumMask;
+            entry->selfIllumChannel = selfIllumMask.empty() ? 3u : 0u;
+        }
+        entry->selfIllumTint = MaterialColor(text, "$selfillumtint", {1.0f, 1.0f, 1.0f});
+        entry->selfIllumVmtTint = entry->selfIllumTint;
+        // $selfillumfresnel (bumped VertexLitGeneric without $detail, whose shader alone has the SELFILLUMFRESNEL combo)
+        // scales the glow by the angle it is seen at: the draw (stdshader_dx9.dll+0x59a00) sets c11 to (1 - min / max,
+        // min / max, exp, max) from $selfillumfresnelminmaxexp (default 0 1 1; REA 2026-11-04), which the SDK's
+        // vertexlit_and_unlit_generic_bump_ps2x.fxc turns into max * saturate(min / max + (1 - min / max) cos^exp) =
+        // min + (max - min) cos^exp of the view's angle to the vertex normal. The light the glow gives others is its mean
+        // over the directions it leaves in, weighted by their cosine: min + (max - min) * 2 / (exp + 2).
+        if (shader == "vertexlitgeneric" && enabled("$selfillumfresnel") && studio::MaterialTexture(text, "$detail").empty() &&
+            !studio::MaterialTexture(text, "$bumpmap").empty()) {
+            const bsp::Float3 fresnel = MaterialColor(text, "$selfillumfresnelminmaxexp", {0.0f, 1.0f, 1.0f});
+            const float mean = fresnel.x + (fresnel.y - fresnel.x) * 2.0f / (std::max(fresnel.z, 0.0f) + 2.0f);
+            entry->selfIllumTint = {entry->selfIllumTint.x * mean, entry->selfIllumTint.y * mean, entry->selfIllumTint.z * mean};
+        }
+    }
+    // VertexLitGeneric draws the layer after its own passes when $emissiveblendenabled is set and $emissiveblendstrength
+    // is above 0 (OnDrawElements, stdshader_dx9.dll+0x591d0; the pass +0x223d0 adds s0 $emissiveblendbasetexture times
+    // s2 $emissiveblendtexture, its coordinates moved by s1 $emissiveblendflowtexture and c1 $emissiveblendscrollvector,
+    // times c2 $emissiveblendtint and c0 $emissiveblendstrength clamped to 0-1, base and emissive textures read as sRGB;
+    // the SDK's emissive_scroll_blended_pass_ps2x.fxc. REA 2026-11-05).
+    if (shader == "vertexlitgeneric" && enabled("$emissiveblendenabled")) {
+        entry->emissiveBlendStrength = std::clamp(MaterialFloat(text, "$emissiveblendstrength", 0.0f), 0.0f, 1.0f);
+        entry->emissiveBlendBase = studio::MaterialTexture(text, "$emissiveblendbasetexture");
+        entry->emissiveBlendTexture = studio::MaterialTexture(text, "$emissiveblendtexture");
+        entry->emissiveBlendTint = MaterialColor(text, "$emissiveblendtint", {1.0f, 1.0f, 1.0f});
+        entry->emissiveBlend = entry->emissiveBlendStrength > 0.0f && !entry->emissiveBlendBase.empty() && !entry->emissiveBlendTexture.empty();
+    }
+    entry->sceneMaterial = SceneMaterial(text, shader, *entry, IsUnlitShader(shader));
     if (const std::optional<SwayMaterial> sway = MaterialSway(text)) {
         entry->swayMaterial = static_cast<uint32_t>(g_state.swayMaterials.size());
         g_state.swayMaterials.push_back(*sway);
@@ -965,8 +1205,10 @@ const ModelEntry& ModelFor(const std::string& mdlPath, int skin = 0)
         std::vector<uint32_t> textureTint(texturePaths.size(), 0);
         std::vector<uint32_t> textureMaterial(texturePaths.size(), Scene::kNoMaterial);
         std::vector<uint32_t> textureSway(texturePaths.size(), SwayingModel::kNoSway);
+        std::vector<const MaterialInfo*> textureInfo(texturePaths.size(), nullptr);
         for (size_t t = 0; t < texturePaths.size(); ++t) {
             const MaterialInfo* material = TextureMaterial(texturePaths[t]);
+            textureInfo[t] = material;
             if (material == nullptr)
                 continue;
             skip[t] = material->clear;
@@ -994,6 +1236,11 @@ const ModelEntry& ModelFor(const std::string& mdlPath, int skin = 0)
             if (entry.sceneModel >= 0) {
                 if (std::vector<ModelEmitter> emitters = ModelEmitters(geometry.positions, geometry.indices, triangleAlbedo, triangles.materials); !emitters.empty())
                     g_state.modelEmitters[entry.sceneModel] = std::move(emitters);
+                entry.glowPatches = GlowPatches(geometry, triangleAlbedo, textureInfo, studio::BoneCount(mdl) > 1);
+                if (entry.glowPatches) {
+                    for (const MaterialInfo* info : textureInfo)
+                        entry.glowMaterials.push_back({info != nullptr ? info->name : std::string(), info != nullptr ? info->selfIllumVmtTint : bsp::Float3{}});
+                }
             }
             if (entry.sceneModel >= 0 && std::any_of(textureSway.begin(), textureSway.end(), [](uint32_t sway) { return sway != SwayingModel::kNoSway; })) {
                 auto swaying = std::make_shared<SwayingModel>();
@@ -1365,6 +1612,12 @@ void ClearScene()
     g_state.sceneMaterials.clear();
     g_state.lightTextureMaterials.clear();
     g_state.modelEmitters.clear();
+    g_state.maskImages.clear();
+    g_state.tintChanges.clear();
+    engine::ForgetMaterials();
+    g_state.glowCandidates.clear();
+    g_state.frameLights.clear();
+    g_state.mapLightOrigins.clear();
     g_state.swayMaterials.clear();
     g_state.ropeModels.clear();
     g_state.loggedRopes = false;
@@ -1436,7 +1689,7 @@ void LoadScene(const std::string& level, const std::function<void(float)>& repor
                     instance.mask = kLampShellMask;
                 else
                     instance.mask = mask == 0 && prop.noShadow ? kShadowlessPropMask : mask;
-                instance.flags = prop.ignoreNormals ? kInstanceIgnoreNormals : 0;
+                instance.flags = kInstanceStudio | (prop.ignoreNormals ? kInstanceIgnoreNormals : 0);
                 std::memcpy(instance.transform, prop.transform, sizeof(instance.transform));
                 // The 3D skybox's scaled-down props sway too little to matter.
                 if (model.swaying && mask != kSkyboxMask)
@@ -1465,6 +1718,10 @@ void LoadScene(const std::string& level, const std::function<void(float)>& repor
             ModelEmitters(world.mesh.positions, world.mesh.indices, world.mesh.triangleAlbedo, worldTriangles.materials), instances, worldEmits, emitterPower);
         if (g_state.scene.LoadMap(level, world, lightShapes, worldGeometry, emitters, worldEmits, emitterPower)) {
             report(0.75f);
+            for (const bsp::Light& light : world.lights) {
+                if (light.type != bsp::LightType::Surface)
+                    g_state.mapLightOrigins.push_back(light.origin);
+            }
             if (!world.water.indices.empty() || !world.brushWater.empty()) {
                 std::vector<GpuWaterBody> bodies;
                 std::vector<uint32_t> frameViews;
@@ -1653,6 +1910,97 @@ void CollectRopes()
 
 // In first person the local player's weapons show their view models (c_ or v_), which are rigged to the camera, so the
 // held one's world model is placed in the player's hand as Source merges it onto the holder's hand bone.
+// How a material's $selfillumtint now compares with the one its patches were made with, per colour channel: proxies
+// (GMod's PlayerWeaponColor on the physics gun) set it as the game draws, so this is what the last entity drawn with it
+// set. Read once a frame per material.
+std::array<float, 3> TintChange(const ModelEntry& model, uint32_t texture)
+{
+    constexpr std::array<float, 3> kSame = {1.0f, 1.0f, 1.0f};
+    if (texture >= model.glowMaterials.size() || model.glowMaterials[texture].name.empty())
+        return kSame;
+    const ModelEntry::GlowMaterial& material = model.glowMaterials[texture];
+    auto [entry, added] = g_state.tintChanges.try_emplace(material.name);
+    if (added || entry->second.first != g_state.frame) {
+        entry->second.first = g_state.frame;
+        entry->second.second = kSame;
+        if (const std::optional<std::array<float, 3>> now = engine::MaterialVector(material.name, "$selfillumtint")) {
+            const float made[3] = {material.tint.x, material.tint.y, material.tint.z};
+            for (int c = 0; c < 3; ++c)
+                entry->second.second[c] = made[c] > 0.0f ? std::max((*now)[c], 0.0f) / made[c] : 1.0f;
+        }
+    }
+    return entry->second.second;
+}
+
+// The glowing patches of a moving model, as candidates for the main view's lights (GlowCandidate): placed by `transform`,
+// or for a skinned model (`boneToWorld` not empty) by each patch's bones. `owner` and `kind` name its instance.
+void AddGlowCandidates(const ModelEntry& model, int entityIndex, const studio::Matrix3x4* transform, std::span<const studio::Matrix3x4> boneToWorld,
+    size_t owner, GlowCandidate::Owner kind, uint32_t flags)
+{
+    const Settings& settings = GetSettings();
+    if (!model.glowPatches || settings.emissiveLighting != EmissiveLighting::Full || settings.emissiveIntensity <= 0.0f)
+        return;
+    const std::vector<glow::Patch>& patches = *model.glowPatches;
+    for (size_t p = 0; p < patches.size(); ++p) {
+        studio::Matrix3x4 placement = {};
+        if (!boneToWorld.empty() && model.skinned) {
+            // The bones' transforms blended by their shares, as shaders/skin.hlsl blends a vertex's.
+            bool placed = true;
+            for (size_t b = 0; b < glow::Patch::kBones && placed; ++b) {
+                const uint32_t bone = patches[p].bones[b];
+                const float weight = patches[p].boneWeights[b];
+                if (weight <= 0.0f)
+                    continue;
+                placed = bone < boneToWorld.size() && bone < model.skinned->poseToBone.size();
+                if (!placed)
+                    break;
+                const studio::Matrix3x4 matrix = studio::Multiply(boneToWorld[bone], model.skinned->poseToBone[bone]);
+                for (int r = 0; r < 3; ++r) {
+                    for (int c = 0; c < 4; ++c)
+                        placement[r][c] += weight * matrix[r][c];
+                }
+            }
+            if (!placed)
+                continue;
+        } else if (transform != nullptr) {
+            placement = *transform;
+        } else {
+            continue;
+        }
+        const std::array<float, 3> tint = patches[p].tinted ? TintChange(model, patches[p].material) : std::array<float, 3>{1.0f, 1.0f, 1.0f};
+        if (tint[0] + tint[1] + tint[2] <= 0.0f)
+            continue;
+        GlowCandidate& candidate = g_state.glowCandidates.emplace_back();
+        const uint64_t key = kGlowLightKey | static_cast<uint64_t>(static_cast<uint32_t>(entityIndex)) << 20 | p;
+        candidate.light = glow::Place(patches[p], placement, settings.emissiveIntensity, key, flags);
+        for (int c = 0; c < 3; ++c)
+            candidate.light.color[c] *= tint[c];
+        candidate.score = glow::Power(patches[p], placement);
+        candidate.owner = owner;
+        candidate.kind = kind;
+    }
+}
+
+// The view model the local player sees in first person (a view model entity, not carried by the player): its glowing
+// patches light the scene from where it is drawn. Returns whether it has any.
+bool AddViewModelGlow(const entities::ModelEntity& entity)
+{
+    const ModelEntry& model = ModelFor(entity.model, entity.skin);
+    if (!model.glowPatches)
+        return false;
+    if (model.skinned) {
+        g_state.bones.resize(kMaxBones);
+        if (!entities::SetupBones(entity.renderable, reinterpret_cast<float (*)[3][4]>(g_state.bones.data()), kMaxBones))
+            return false;
+        AddGlowCandidates(model, entity.index, nullptr, g_state.bones, 0, GlowCandidate::Owner::None, kLightOnLocalPlayer);
+    } else {
+        studio::Matrix3x4 transform;
+        std::memcpy(transform.data(), entity.transform, sizeof(transform));
+        AddGlowCandidates(model, entity.index, &transform, {}, 0, GlowCandidate::Owner::None, kLightOnLocalPlayer);
+    }
+    return true;
+}
+
 void AddHeldWeapon(const entities::ModelEntity& weapon, const studio::Matrix3x4& hand)
 {
     const std::string worldModel = entities::WeaponWorldModel(weapon);
@@ -1665,8 +2013,11 @@ void AddHeldWeapon(const entities::ModelEntity& weapon, const studio::Matrix3x4&
     SceneInstance& instance = g_state.dynamicInstances.emplace_back();
     instance.model = model.sceneModel;
     instance.mask = kLocalPlayerMask;
+    instance.flags = kInstanceStudio;
     std::memcpy(instance.transform, transform.data(), sizeof(instance.transform));
     TrackMotion(instance, weapon.index);
+    // Its glow lights the scene unless the view model's does (CollectEntities).
+    g_state.heldWeaponGlow = State::HeldGlow{&model, transform, weapon.index, g_state.dynamicInstances.size() - 1};
 }
 
 // A brush entity's water surface (func_water_analog) where its entity is: an instance carrying its body of water, which
@@ -1699,6 +2050,9 @@ void CollectEntities()
 {
     g_state.dynamicInstances.clear();
     g_state.skinnedEntities.clear();
+    g_state.glowCandidates.clear();
+    g_state.heldWeaponGlow.reset();
+    bool viewModelGlows = false;
     g_state.currentTransforms.clear();
     g_state.brushWaterPlacements.clear();
     entities::Collect(g_state.entities);
@@ -1722,6 +2076,8 @@ void CollectEntities()
         if (IsFirstPersonModel(entity.model)) {
             if (carried && playerHand)
                 AddHeldWeapon(entity, *playerHand);
+            else if (!carried)
+                viewModelGlows = AddViewModelGlow(entity) || viewModelGlows;
             continue;
         }
         AddBrushWater(entity);
@@ -1729,12 +2085,19 @@ void CollectEntities()
         if (model.sceneModel < 0)
             continue;
         const UINT mask = carried ? kLocalPlayerMask : InSkybox(entity, model.center) ? kSkyboxMask : kDynamicMask;
+        const uint32_t flags = entity.model.starts_with('*') ? 0u : kInstanceStudio;
+        // The 3D skybox's models are scaled down; their glow lights nothing in the map.
+        const bool glows = mask != kSkyboxMask;
+        const uint32_t lightFlags = carried ? kLightOnLocalPlayer : 0u;
         if (model.skinned) {
             g_state.bones.resize(kMaxBones);
             if (!entities::SetupBones(entity.renderable, reinterpret_cast<float (*)[3][4]>(g_state.bones.data()), kMaxBones))
                 continue;
             g_state.bones.resize(std::min<size_t>(model.skinned->poseToBone.size(), kMaxBones));
-            g_state.skinnedEntities.push_back({entity.index, model.sceneModel, model.skinned, g_state.bones, mask});
+            g_state.skinnedEntities.push_back({entity.index, model.sceneModel, model.skinned, g_state.bones, mask, flags});
+            if (glows)
+                AddGlowCandidates(model, entity.index, nullptr, g_state.skinnedEntities.back().boneToWorld, g_state.skinnedEntities.size() - 1,
+                    GlowCandidate::Owner::Skinned, lightFlags);
             continue;
         }
         studio::Matrix3x4 transform;
@@ -1758,8 +2121,15 @@ void CollectEntities()
         SceneInstance& instance = g_state.dynamicInstances.emplace_back();
         instance.model = model.sceneModel;
         instance.mask = mask;
+        instance.flags = flags;
         std::memcpy(instance.transform, transform.data(), sizeof(instance.transform));
         TrackMotion(instance, entity.index);
+        if (glows)
+            AddGlowCandidates(model, entity.index, &transform, {}, g_state.dynamicInstances.size() - 1, GlowCandidate::Owner::Rigid, lightFlags);
+    }
+    if (g_state.heldWeaponGlow && !viewModelGlows) {
+        const State::HeldGlow& held = *g_state.heldWeaponGlow;
+        AddGlowCandidates(*held.model, held.index, &held.transform, {}, held.instance, GlowCandidate::Owner::Rigid, kLightOnLocalPlayer);
     }
     CollectRopes();
     g_state.scene.PlaceBrushWater(g_state.brushWaterPlacements);
@@ -1780,6 +2150,56 @@ std::optional<std::array<float, 3>> EyePosition(const gbuffer::Matrix4& m)
         return std::nullopt;
     return std::array<float, 3>{det(-a[3], a[1], a[2], -b[3], b[1], b[2], -c[3], c[1], c[2]) / d,
         det(a[0], -a[3], a[2], b[0], -b[3], b[2], c[0], -c[3], c[2]) / d, det(a[0], a[1], -a[3], b[0], b[1], -b[3], c[0], c[1], -c[3]) / d};
+}
+
+// The main view's dynamic lights in Scene's runs (Scene::SetDynamicLights): the engine's dlights and the glowing patches
+// it samples, then the patches that matter most to the view, lit exactly, then the flashes of effects. Patches are
+// ranked by their power over their squared distance from the eye; a model whose patches all made it takes no glow at
+// indirect rays' first hits (kInstanceGlowLights), as its light already arrives directly.
+void BuildFrameLights(const std::array<float, 3>& eye)
+{
+    std::vector<FrameLight>& lights = g_state.frameLights;
+    lights.clear();
+    if (GetSettings().dynamicLights) {
+        for (const engine::DynamicLight& light : g_state.dynamicLights) {
+            if (light.radius > 0.0f && (light.flags & (engine::kDlightNoWorld | engine::kDlightNoModel)) != (engine::kDlightNoWorld | engine::kDlightNoModel))
+                lights.push_back(effect_lights::FromEngineLight(light, 1.0f));
+        }
+    }
+    std::vector<GlowCandidate>& candidates = g_state.glowCandidates;
+    for (GlowCandidate& candidate : candidates) {
+        const float d[3] = {candidate.light.origin[0] - eye[0], candidate.light.origin[1] - eye[1], candidate.light.origin[2] - eye[2]};
+        candidate.score /= std::max(d[0] * d[0] + d[1] * d[1] + d[2] * d[2], candidate.light.size * candidate.light.size);
+    }
+    const size_t kept = std::min(candidates.size(), static_cast<size_t>(Scene::kMaxGlowLights));
+    std::partial_sort(candidates.begin(), candidates.begin() + kept, candidates.end(),
+        [](const GlowCandidate& a, const GlowCandidate& b) { return a.score > b.score; });
+    const size_t exact = std::min(kept, kExactGlowLights);
+    for (size_t c = exact; c < kept; ++c)
+        lights.push_back(candidates[c].light);
+    g_state.frameExactFirst = lights.size();
+    for (size_t c = 0; c < exact; ++c)
+        lights.push_back(candidates[c].light);
+    g_state.frameFlashFirst = lights.size();
+    effect_lights::Collect({eye, g_state.dynamicLights, g_state.mapLightOrigins, g_state.localPlayer}, Scene::kMaxFlashLights, lights);
+
+    std::vector<std::pair<uint32_t, uint32_t>> rigid(g_state.dynamicInstances.size());
+    std::vector<std::pair<uint32_t, uint32_t>> skinned(g_state.skinnedEntities.size());
+    for (size_t c = 0; c < candidates.size(); ++c) {
+        if (candidates[c].kind == GlowCandidate::Owner::None)
+            continue;
+        auto& [total, lit] = candidates[c].kind == GlowCandidate::Owner::Skinned ? skinned[candidates[c].owner] : rigid[candidates[c].owner];
+        ++total;
+        lit += c < kept ? 1u : 0u;
+    }
+    for (size_t i = 0; i < rigid.size(); ++i) {
+        if (rigid[i].first != 0 && rigid[i].first == rigid[i].second)
+            g_state.dynamicInstances[i].flags |= kInstanceGlowLights;
+    }
+    for (size_t i = 0; i < skinned.size(); ++i) {
+        if (skinned[i].first != 0 && skinned[i].first == skinned[i].second)
+            g_state.skinnedEntities[i].flags |= kInstanceGlowLights;
+    }
 }
 
 
@@ -1838,6 +2258,11 @@ void OnPresent(UINT width, UINT height, bool consoleRequests)
     loading::TryInstall();
     engine::TryInitialize();
     engine::CapUnfocusedFrames(!GetSettings().backgroundFullSpeed);
+    // Addons that make their own lights (Better Lights) read gmodpp_lights to step aside while the mod lights effects.
+    if (g_state.frame % kMapPollInterval == 0) {
+        const Settings& settings = GetSettings();
+        engine::PublishLightsActive(g_state.lighting && g_state.lighting->Usable() && settings.realtimeLighting && settings.effectLights);
+    }
     light_queries::TryInstall();
     entities::TryInitialize();
     if (g_state.frame % kMapPollInterval == 0)
@@ -1935,6 +2360,7 @@ void LightView(ViewInputs& inputs)
     case gbuffer::ViewKind::Main:
         CollectEntities();
         engine::ActiveDynamicLights(g_state.dynamicLights);
+        BuildFrameLights(EyePosition(inputs.viewProj).value_or(std::array<float, 3>{}));
         inputs.localPlayer = g_state.localPlayer;
         g_state.envSun = entities::FindSun();
         break;
@@ -1942,13 +2368,15 @@ void LightView(ViewInputs& inputs)
         g_state.dynamicInstances.clear();
         g_state.skinnedEntities.clear();
         g_state.dynamicLights.clear();
+        g_state.frameLights.clear();
+        g_state.frameExactFirst = g_state.frameFlashFirst = 0;
         g_state.envSun = entities::FindSun();
         break;
     case gbuffer::ViewKind::Viewmodel:
         // Same scene as the main view; characters are not skinned a second time.
         break;
     }
-    g_state.scene.SetDynamicLights(g_state.dynamicLights);
+    g_state.scene.SetDynamicLights(g_state.frameLights, g_state.frameExactFirst, g_state.frameFlashFirst, inputs.kind == gbuffer::ViewKind::Main);
     if (std::array<float, engine::kLightStyles> styles; engine::LightStyleValues(styles))
         g_state.scene.SetLightStyles(styles);
     inputs.envSun = g_state.envSun;

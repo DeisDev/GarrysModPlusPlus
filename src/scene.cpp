@@ -74,13 +74,7 @@ static_assert(sizeof(bsp::BspNode) == 24);
 
 namespace {
 
-constexpr UINT kMaxDynamicLights = 32;
-constexpr uint32_t kDynamicLightType = 3;
 constexpr uint32_t kNoLightStyle = 0xFFFFFFFF;
-constexpr float kDegreesToRadians = 3.14159265358979f / 180.0f;
-// A light is binned as far as its irradiance can reach 1/1024 of white with up to 4x light intensity and a 4x
-// tonemap scale.
-constexpr float kLightThreshold = 1.0f / 16384.0f;
 
 // The light grid (Scene::BuildLightGrid): at most kGridCells cubic cells of at least kGridCellMin units over the world,
 // and few enough that their tails hold about kGridTailEntries lights in all.
@@ -834,6 +828,11 @@ void Scene::Clear()
     m_emitterLights.clear();
     m_worldFlags = 0;
     m_hasSkybox = false;
+    m_dynamicLights.clear();
+    m_dynamicExactFirst = 0;
+    m_dynamicFlashFirst = 0;
+    m_previousLightKeys.clear();
+    std::fill(m_dynamicLightMap.begin(), m_dynamicLightMap.end(), kNoLight);
     m_worldModel = -1;
     m_name.clear();
     m_sun = {};
@@ -1262,17 +1261,44 @@ bool Scene::BuildLightGrid(std::span<const GpuLight> lights, std::span<const bsp
     return true;
 }
 
+void Scene::SetDynamicLights(std::span<const FrameLight> lights, size_t exactFirst, size_t flashFirst, bool mainView)
+{
+    const size_t count = std::min<size_t>(lights.size(), kMaxDynamicLights);
+    m_dynamicLights.assign(lights.begin(), lights.begin() + count);
+    m_dynamicFlashFirst = static_cast<UINT>(std::min(flashFirst, count));
+    m_dynamicExactFirst = static_cast<UINT>(std::min<size_t>(exactFirst, m_dynamicFlashFirst));
+    if (!mainView)
+        return;
+    // RTXDI reuses last frame's samples of the lights it samples: each is found again by its key.
+    std::fill(m_dynamicLightMap.begin(), m_dynamicLightMap.end(), kNoLight);
+    for (uint32_t current = 0; current < m_dynamicExactFirst; ++current) {
+        const auto found = std::find(m_previousLightKeys.begin(), m_previousLightKeys.end(), m_dynamicLights[current].key);
+        if (found == m_previousLightKeys.end())
+            continue;
+        const auto previous = static_cast<uint32_t>(found - m_previousLightKeys.begin());
+        m_dynamicLightMap[current] = previous;
+        m_dynamicLightMap[kMaxDynamicLights + previous] = current;
+    }
+    m_previousLightKeys.clear();
+    for (uint32_t current = 0; current < m_dynamicExactFirst; ++current)
+        m_previousLightKeys.push_back(m_dynamicLights[current].key);
+}
+
 bool Scene::EnsureDynamicLights(FrameTlas& frame)
 {
     if (frame.dynamicLights)
         return true;
-    frame.dynamicLights = CreateBuffer(sizeof(GpuLight) * kMaxDynamicLights, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+    constexpr UINT64 kLightBytes = sizeof(GpuLight) * kMaxDynamicLights;
+    constexpr UINT64 kMapBytes = sizeof(uint32_t) * 2 * kMaxDynamicLights;
+    frame.dynamicLights = CreateBuffer(kLightBytes + kMapBytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
     if (!frame.dynamicLights || FAILED(frame.dynamicLights->Map(0, nullptr, reinterpret_cast<void**>(&frame.mappedDynamicLights)))) {
         frame.dynamicLights.Reset();
         return false;
     }
-    frame.dynamicLightsView = m_descriptors->CreateRawView(frame.dynamicLights.Get());
-    return frame.dynamicLightsView != DescriptorHeap::kInvalid;
+    frame.mappedDynamicLightMap = reinterpret_cast<uint32_t*>(reinterpret_cast<std::byte*>(frame.mappedDynamicLights) + kLightBytes);
+    frame.dynamicLightsView = m_descriptors->CreateRawView(frame.dynamicLights.Get(), 0, kLightBytes);
+    frame.dynamicLightMapView = m_descriptors->CreateRawView(frame.dynamicLights.Get(), kLightBytes, kMapBytes);
+    return frame.dynamicLightsView != DescriptorHeap::kInvalid && frame.dynamicLightMapView != DescriptorHeap::kInvalid;
 }
 
 bool Scene::EnsureLightStyles(FrameTlas& frame)
@@ -1465,17 +1491,19 @@ SceneFrame Scene::RecordFrame(ID3D12GraphicsCommandList4* list, UINT slot, std::
     list->ResourceBarrier(1, &barrier);
 
     SceneFrame result{frame.tlas->GetGPUVirtualAddress(), frame.recordsView};
-    if (!m_dynamicLights.empty() && EnsureDynamicLights(frame)) {
-        for (const engine::DynamicLight& light : m_dynamicLights) {
-            if (result.dynamicLightCount == kMaxDynamicLights || light.radius <= 0.0f)
-                continue;
+    if (EnsureDynamicLights(frame)) {
+        for (const FrameLight& light : m_dynamicLights) {
             GpuLight& gpu = frame.mappedDynamicLights[result.dynamicLightCount++];
-            const bool spot = light.outerAngle > 0.0f;
-            gpu = {{light.origin[0], light.origin[1], light.origin[2]}, kDynamicLightType, {light.color[0], light.color[1], light.color[2]},
-                light.radius, {light.direction[0], light.direction[1], light.direction[2]}, spot ? std::cos(light.innerAngle * kDegreesToRadians) : 0.0f,
-                spot ? std::cos(light.outerAngle * kDegreesToRadians) : -1.0f, spot ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f, 0u, 0.0f, kNoLightStyle, 0.0f, {}};
+            const bool spot = light.kind == FrameLight::Kind::Engine && light.outerCosine > -1.0f;
+            gpu = {{light.origin[0], light.origin[1], light.origin[2]}, static_cast<uint32_t>(light.kind), {light.color[0], light.color[1], light.color[2]},
+                light.radius, {light.direction[0], light.direction[1], light.direction[2]}, light.innerCosine, spot ? light.outerCosine : -1.0f,
+                spot ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f, light.flags, light.size, kNoLightStyle, 0.0f, {}};
         }
+        std::copy(m_dynamicLightMap.begin(), m_dynamicLightMap.end(), frame.mappedDynamicLightMap);
         result.dynamicLightsView = frame.dynamicLightsView;
+        result.dynamicLightMapView = frame.dynamicLightMapView;
+        result.dynamicExactFirst = m_dynamicExactFirst;
+        result.dynamicFlashFirst = m_dynamicFlashFirst;
     }
     if (EnsureLightStyles(frame)) {
         std::memcpy(frame.mappedLightStyles, m_lightStyles.data(), sizeof(m_lightStyles));

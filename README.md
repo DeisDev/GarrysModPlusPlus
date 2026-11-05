@@ -30,7 +30,7 @@ Everything is in the menu (Insert). Settings are saved in `gmodplusplus\settings
 
 The mod replaces the game's lighting, sky, fog and post-processing. Addons that do the same job will conflict: they may do nothing, light things twice or draw over the image. Turn them off while the mod is on. Likely conflicts:
 
-- Dynamic light addons, such as [Better Lights](https://steamcommunity.com/sharedfiles/filedetails/?id=3597784225).
+- Dynamic light addons, such as [Better Lights](https://steamcommunity.com/sharedfiles/filedetails/?id=3597784225). The mod lights muzzle flashes, glowing models and effects itself; addons can check `GetConVar("gmodpp_lights"):GetBool()` and turn their own lights off while it is true.
 - Screen-space shader and post-processing addons, such as gShader (ambient occlusion, bloom, reflections, sharpening, colour grading).
 - Shadow addons built on projected textures, and lightmap or relighting addons.
 - Sky and weather addons that paint the sky or move the sun, such as StormFox 2. The sun follows them; the painted sky, fog and night darkening do not.
