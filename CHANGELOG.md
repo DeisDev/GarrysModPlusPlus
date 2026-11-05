@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.9.1-alpha] - 2026-11-05
+
 ### Changed
 
 - The mod no longer needs `-insecure` in the launch options; it loads with any launch options.
@@ -46,5 +48,6 @@ First public release. This is an early alpha: expect bugs, crashes and addons th
 - Fixed sharpening skipping everything brighter than paper white in HDR.
 - Fixed Escape closing the menu while typing in a text field.
 
-[Unreleased]: https://github.com/DeisDev/GarrysModPlusPlus/compare/v0.9.0-alpha...HEAD
+[Unreleased]: https://github.com/DeisDev/GarrysModPlusPlus/compare/v0.9.1-alpha...HEAD
+[0.9.1-alpha]: https://github.com/DeisDev/GarrysModPlusPlus/releases/tag/v0.9.1-alpha
 [0.9.0-alpha]: https://github.com/DeisDev/GarrysModPlusPlus/releases/tag/v0.9.0-alpha

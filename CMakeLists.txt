@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.25)
 
 # The mod's version (Semantic Versioning 2.0.0), set here only: src/gmodpp_version.h.in takes it to the code, the
 # version resources of both DLLs and the log.
-set(GMODPP_VERSION 0.9.0-alpha)
+set(GMODPP_VERSION 0.9.1-alpha)
 if(NOT GMODPP_VERSION MATCHES "^([0-9]+)\\.([0-9]+)\\.([0-9]+)(-[0-9A-Za-z.-]+)?$")
     message(FATAL_ERROR "GMODPP_VERSION '${GMODPP_VERSION}' is not a semantic version")
 endif()
