@@ -302,10 +302,10 @@ bool FrameGenerationWanted()
     return g_state.active && g_state.frameGeneration && GetSettings().frameGeneration == FrameGeneration::Dlss && !overlay::Open();
 }
 
-void TagFrame(ID3D12GraphicsCommandList* list, const FrameInputs& inputs, const PostView& post)
+bool TagFrame(ID3D12GraphicsCommandList* list, const FrameInputs& inputs, const PostView& post)
 {
     if (!FrameGenerationWanted() || g_state.frame == nullptr)
-        return;
+        return false;
     const UINT width = static_cast<UINT>(inputs.view.right - inputs.view.left);
     const UINT height = static_cast<UINT>(inputs.view.bottom - inputs.view.top);
     const uint32_t state = static_cast<uint32_t>(inputs.state);
@@ -320,7 +320,7 @@ void TagFrame(ID3D12GraphicsCommandList* list, const FrameInputs& inputs, const 
         sl::ResourceTag(&hudless, sl::kBufferTypeHUDLessColor, sl::ResourceLifecycle::eValidUntilPresent, &view),
     };
     if (slSetTagForFrame(*g_state.frame, kViewport, tags, static_cast<uint32_t>(std::size(tags)), list) != sl::Result::eOk)
-        return;
+        return false;
 
     // The camera, row-major for row vectors as Streamline's matrices (sl_matrix_helpers.h) are.
     sl::Constants constants = {};
@@ -369,8 +369,20 @@ void TagFrame(ID3D12GraphicsCommandList* list, const FrameInputs& inputs, const 
     constants.orthographicProjection = sl::Boolean::eFalse;
     constants.motionVectorsDilated = sl::Boolean::eFalse;
     constants.motionVectorsJittered = sl::Boolean::eFalse;
-    if (slSetConstants(constants, *g_state.frame, kViewport) == sl::Result::eOk)
-        g_state.lastTagged = g_state.frameCount;
+    if (slSetConstants(constants, *g_state.frame, kViewport) != sl::Result::eOk)
+        return false;
+    g_state.lastTagged = g_state.frameCount;
+    return true;
+}
+
+void TagUiAlpha(ID3D12GraphicsCommandList* list, ID3D12Resource* alpha, D3D12_RESOURCE_STATES state, UINT width, UINT height)
+{
+    if (!FrameGenerationWanted() || g_state.frame == nullptr || g_state.lastTagged != g_state.frameCount)
+        return;
+    sl::Resource resource(sl::ResourceType::eTex2d, alpha, nullptr, nullptr, static_cast<uint32_t>(state));
+    const sl::Extent extent = {0, 0, width, height};
+    const sl::ResourceTag tag(&resource, sl::kBufferTypeUIAlpha, sl::ResourceLifecycle::eValidUntilPresent, &extent);
+    slSetTagForFrame(*g_state.frame, kViewport, &tag, 1, list);
 }
 
 bool ReflexAvailable() { return g_state.active && g_state.reflex; }

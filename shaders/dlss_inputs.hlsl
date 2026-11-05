@@ -1,7 +1,7 @@
 #include "common.hlsli"
 
 // Render-resolution inputs for DLSS Ray Reconstruction, taken from the native-resolution G-buffer: each render
-// pixel uses the native pixel under its centre, and the depth at the centre itself.
+// pixel uses the native pixel under its centre, and the depth and the game's own shading at the centre itself.
 // input0, input1: render width and height; output0: first of eight consecutive UAVs: colour, depth, normal,
 // flags, light, albedo, self-illumination and Ray Reconstruction's albedo guide, whose traced water pixels
 // shaders/deferred_lighting.hlsl overwrites.
@@ -24,6 +24,37 @@ float DepthAtPoint(float2 centre, int2 nearest)
     if (any(depths >= 1.0) || farthestDistance > nearestDistance * 1.05 + 1.0)
         return DepthAt(nearest);
     return lerp(lerp(depths.x, depths.y, blend.x), lerp(depths.z, depths.w, blend.x), blend.y);
+}
+
+// Native pixels the game shaded itself, which the lighting shows as they are: no G-buffer surface (flags r) or water
+// (flags g without r). Mirrors (flags b) are among them.
+bool GameShaded(float4 flags)
+{
+    return flags.r <= 0.0 && flags.g <= 0.5;
+}
+
+// The game's own shading at a point between native pixel centres (`centre` in native pixels), interpolated between the
+// native pixels around it that hold it (GameShaded). Ray Reconstruction takes each render pixel's colour to lie at its
+// centre; the native pixel under the centre lies up to half a native pixel off it, and at 1.5 times upscaling one native
+// row and column in three was never read, so lines thinner than a pixel that the game draws itself (ropes, wires) came
+// out in a fixed pattern of dashes (2026-11-04).
+float4 GameColorAt(Texture2D<float4> color, Texture2D<float4> flags, float2 centre, float4 nearest)
+{
+    int2 base = int2(floor(centre - 0.5));
+    float2 blend = centre - 0.5 - float2(base);
+    float4 sum = 0.0;
+    float weight = 0.0;
+    [unroll]
+    for (int i = 0; i < 4; ++i) {
+        int2 offset = int2(i & 1, i >> 1);
+        int2 at = clamp(base + offset, int2(0, 0), int2(g_frame.size) - 1);
+        if (!GameShaded(flags.Load(int3(at, 0))))
+            continue;
+        float w = (offset.x != 0 ? blend.x : 1.0 - blend.x) * (offset.y != 0 ? blend.y : 1.0 - blend.y);
+        sum += color.Load(int3(at, 0)) * w;
+        weight += w;
+    }
+    return weight > 0.0 ? sum / weight : nearest;
 }
 
 [RootSignature(ROOT_SIGNATURE)]
@@ -56,6 +87,8 @@ void main(uint3 id : SV_DispatchThreadID)
     RWTexture2D<float4> emissiveOut = ResourceDescriptorHeap[g_pass.output0 + 6];
     RWTexture2D<float4> guideOut = ResourceDescriptorHeap[g_pass.output0 + 7];
     float4 colour = color.Load(load);
+    if (GameShaded(coverage))
+        colour = GameColorAt(color, flags, centre, colour);
     colorOut[pixel] = colour;
     depthOut[pixel] = depth;
     normalOut[pixel] = normal.Load(load);

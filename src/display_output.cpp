@@ -11,6 +11,7 @@
 
 #include <g_displayOutputPS.h>
 #include <g_displayOutputVS.h>
+#include <g_displayUiAlphaPS.h>
 
 #include <algorithm>
 #include <cstdlib>
@@ -46,7 +47,9 @@ struct DisplayConstants {
     float tvMax;
     std::uint32_t debugView;
     float displayPeak;
-    std::uint32_t padding[3];
+    std::uint32_t hudlessView;
+    float codeSteps;
+    std::uint32_t padding;
 };
 static_assert(sizeof(DisplayConstants) == 80);
 
@@ -71,7 +74,8 @@ struct UiTarget {
 
 struct State {
     ComPtr<ID3D12RootSignature> root;
-    std::unordered_map<DXGI_FORMAT, ComPtr<ID3D12PipelineState>> pipelines;
+    // By target format, and with frame generation's UI alpha as a second target (PipelineKey).
+    std::unordered_map<UINT, ComPtr<ID3D12PipelineState>> pipelines;
     bool failed = false;
     GammaRamp gamma;
     unsigned presents = 0;
@@ -104,7 +108,9 @@ const GammaRamp& Gamma()
     return g_state.gamma;
 }
 
-ID3D12PipelineState* Pipeline(DXGI_FORMAT format)
+UINT PipelineKey(DXGI_FORMAT format, bool uiAlpha) { return static_cast<UINT>(format) | (uiAlpha ? 0x10000u : 0u); }
+
+ID3D12PipelineState* Pipeline(DXGI_FORMAT format, bool uiAlpha)
 {
     if (g_state.failed)
         return nullptr;
@@ -117,25 +123,29 @@ ID3D12PipelineState* Pipeline(DXGI_FORMAT format)
             return nullptr;
         }
     }
-    ComPtr<ID3D12PipelineState>& pipeline = g_state.pipelines[format];
+    ComPtr<ID3D12PipelineState>& pipeline = g_state.pipelines[PipelineKey(format, uiAlpha)];
     if (!pipeline) {
         D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = {};
         desc.pRootSignature = g_state.root.Get();
         desc.VS = {g_displayOutputVS, sizeof(g_displayOutputVS)};
-        desc.PS = {g_displayOutputPS, sizeof(g_displayOutputPS)};
+        desc.PS = uiAlpha ? D3D12_SHADER_BYTECODE{g_displayUiAlphaPS, sizeof(g_displayUiAlphaPS)}
+                          : D3D12_SHADER_BYTECODE{g_displayOutputPS, sizeof(g_displayOutputPS)};
         desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        desc.BlendState.RenderTarget[1].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
         desc.SampleMask = UINT_MAX;
         desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
         desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
         desc.RasterizerState.DepthClipEnable = TRUE;
         desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-        desc.NumRenderTargets = 1;
+        desc.NumRenderTargets = uiAlpha ? 2 : 1;
         desc.RTVFormats[0] = format;
+        if (uiAlpha)
+            desc.RTVFormats[1] = DXGI_FORMAT_R8_UNORM;
         desc.SampleDesc.Count = 1;
         const HRESULT hr = backend.Device()->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pipeline));
         if (FAILED(hr)) {
             log::Info("Display: creating the pipeline for format {} failed: {:#010x}", static_cast<int>(format), static_cast<unsigned>(hr));
-            g_state.pipelines.erase(format);
+            g_state.pipelines.erase(PipelineKey(format, uiAlpha));
             return nullptr;
         }
     }
@@ -178,7 +188,8 @@ Mapping ForScreenshot()
 bool Map(ID3D12GraphicsCommandList* commands, UINT frameView, D3D12_CPU_DESCRIPTOR_HANDLE target, DXGI_FORMAT format, UINT width, UINT height,
     int originX, int originY, const Mapping& mapping)
 {
-    ID3D12PipelineState* pipeline = Pipeline(format);
+    const bool uiAlpha = mapping.uiAlphaTarget.ptr != 0 && mapping.hudlessView != kInvalid;
+    ID3D12PipelineState* pipeline = Pipeline(format, uiAlpha);
     if (pipeline == nullptr || width == 0 || height == 0)
         return false;
     Backend& backend = GetBackend();
@@ -205,6 +216,8 @@ bool Map(ID3D12GraphicsCommandList* commands, UINT frameView, D3D12_CPU_DESCRIPT
     }
     c.debugView = mapping.debugView;
     c.displayPeak = mapping.displayPeak;
+    c.hudlessView = uiAlpha ? mapping.hudlessView : kInvalid;
+    c.codeSteps = format == DXGI_FORMAT_R10G10B10A2_UNORM ? 1023.0f : 255.0f;
     const D3D12_GPU_VIRTUAL_ADDRESS constants = UploadConstants(&c, sizeof(c));
     if (constants == 0)
         return false;
@@ -213,7 +226,8 @@ bool Map(ID3D12GraphicsCommandList* commands, UINT frameView, D3D12_CPU_DESCRIPT
     commands->SetGraphicsRootSignature(g_state.root.Get());
     commands->SetPipelineState(pipeline);
     commands->SetGraphicsRootConstantBufferView(0, constants);
-    commands->OMSetRenderTargets(1, &target, FALSE, nullptr);
+    const D3D12_CPU_DESCRIPTOR_HANDLE targets[2] = {target, mapping.uiAlphaTarget};
+    commands->OMSetRenderTargets(uiAlpha ? 2 : 1, targets, FALSE, nullptr);
     const D3D12_VIEWPORT viewport = {0.0f, 0.0f, static_cast<float>(width), static_cast<float>(height), 0.0f, 1.0f};
     const D3D12_RECT scissor = {0, 0, static_cast<LONG>(width), static_cast<LONG>(height)};
     commands->RSSetViewports(1, &viewport);

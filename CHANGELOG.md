@@ -33,3 +33,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Heat distortion from explosions no longer shows a box with part of the map in it.
 - ARC9's customization menu shows the game behind it again instead of a white screen.
 - Fixed dark streaks along the edges of hands and other models.
+- Distant power lines and ropes against the sky no longer break into dashes with DLSS Ray Reconstruction or FSR.
+- Lamps in fog and water are much less noisy in the distance.
+- The HUD no longer smears in generated frames with DLSS Frame Generation.
+- Light shafts in haze no longer stop at the edges of things against the sky with DLSS Ray Reconstruction or FSR.
+- Under water with DLSS Ray Reconstruction or FSR, the far water no longer shows the unlit view above the surface.

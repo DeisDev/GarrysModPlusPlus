@@ -256,7 +256,7 @@ struct PassConstants
     uint output3;
     uint step;
     uint output4;
-    uint padding;
+    uint input5;
 };
 
 static const uint kNoView = 0xFFFFFFFFu;

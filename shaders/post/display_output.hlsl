@@ -44,7 +44,11 @@ struct DisplayConstants
     // The display's peak in nits (PQ).
     uint debugView;
     float displayPeak;
-    uint3 padding;
+    // UiAlphaMain: the view without the HUD, mapped to this target's format (frame generation's, src/post_effects.cpp),
+    // and the target's code values over its range (255 or 1023).
+    uint hudlessView;
+    float codeSteps;
+    uint padding;
 };
 
 ConstantBuffer<DisplayConstants> g_display : register(b0);
@@ -102,10 +106,9 @@ float3 FalseColor(float nits)
     return ramp;
 }
 
-[RootSignature(DISPLAY_ROOT_SIGNATURE)]
-float4 PSMain(VertexOutput input) : SV_Target
+// What the target shows at `pixel`, before it rounds to its code values.
+float4 Display(int2 pixel)
 {
-    int2 pixel = int2(input.position.xy);
     Texture2D<float4> frame = ResourceDescriptorHeap[g_display.frameView];
     float4 texel = frame.Load(int3(pixel + g_display.origin, 0));
     float3 color = max(texel.rgb, 0.0);
@@ -165,3 +168,34 @@ float4 PSMain(VertexOutput input) : SV_Target
         encoded += DitherNoise(uint2(pixel)) / g_display.ditherSteps;
     return float4(encoded, 1.0);
 }
+
+[RootSignature(DISPLAY_ROOT_SIGNATURE)]
+float4 PSMain(VertexOutput input) : SV_Target
+{
+    return Display(int2(input.position.xy));
+}
+
+struct UiAlphaOutput
+{
+    float4 color : SV_Target0;
+    float uiAlpha : SV_Target1;
+};
+
+// PSMain, and DLSS Frame Generation's UI alpha (Streamline's kBufferTypeUIAlpha): 1 where what the target shows differs
+// from the view without the HUD by more than a code value (rounding to the target keeps the two within one elsewhere),
+// which only what was drawn after it changes (the HUD, menus, the performance overlay), as both take the same mapping
+// and dither. Without it, Frame Generation warped the HUD
+// with the view's motion (NVIDIA's DLSS-G guide 5.1: a hudless and a UI buffer are critical for the HUD; 2026-11-04).
+// Translucent HUD counts as opaque, so what lies behind it is shown as rendered, not generated.
+[RootSignature(DISPLAY_ROOT_SIGNATURE)]
+UiAlphaOutput UiAlphaMain(VertexOutput input)
+{
+    int2 pixel = int2(input.position.xy);
+    UiAlphaOutput output;
+    output.color = Display(pixel);
+    Texture2D<float4> hudless = ResourceDescriptorHeap[g_display.hudlessView];
+    float3 difference = abs(saturate(output.color.rgb) - hudless.Load(int3(pixel, 0)).rgb);
+    output.uiAlpha = any(difference * g_display.codeSteps > 1.0) ? 1.0 : 0.0;
+    return output;
+}
+

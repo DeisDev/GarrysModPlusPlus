@@ -1889,6 +1889,9 @@ bool Lighting::EnsureTargets(UINT width, UINT height)
     ok = ok && CreateTarget(m_viewmodelHistory, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT);
     ok = ok && CreateTarget(m_viewmodelRecord, width, height, DXGI_FORMAT_R32G32B32A32_FLOAT);
     ok = ok && CreateTarget(m_resolved, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT);
+    for (Texture& texture : m_skyGeometry)
+        ok = ok && CreateTarget(texture, width, height, DXGI_FORMAT_R8_UINT);
+    m_skyGeometryValid = false;
     ok = ok && CreateTarget(m_translucentDepth, width, height, DXGI_FORMAT_R32_FLOAT);
     // Ray Reconstruction's inputs use the top-left render-size part of these.
     constexpr DXGI_FORMAT kRrFormats[] = {DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R16G16B16A16_FLOAT,
@@ -2790,6 +2793,12 @@ AntiAliasing Lighting::AntiAliasingMode() const
     if ((chosen == AntiAliasing::RayReconstruction && !m_rayReconstruction.Usable()) || (chosen == AntiAliasing::Fsr && !m_fsr.Usable()))
         return AntiAliasing::Temporal;
     return chosen;
+}
+
+uint32_t Lighting::JitterPhases(UINT outputWidth, UINT renderWidth)
+{
+    const float ratio = static_cast<float>(outputWidth) / static_cast<float>(std::max(renderWidth, 1u));
+    return std::max(32u, static_cast<uint32_t>(std::ceil(8.0f * ratio * ratio)));
 }
 
 Lighting::Upscaler Lighting::RenderSize(UINT outputWidth, UINT outputHeight, UINT& width, UINT& height)
@@ -3786,6 +3795,26 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     }
     Dispatch(Pass::Lighting, lighting);
     mark();
+    // The upscalers' resolve remembers where geometry came near each output pixel within the jitter's last cycle
+    // (shaders/dlss_resolve.hlsl).
+    const bool lastSkyGeometry = m_skyGeometryValid && m_historyValid;
+    if (main)
+        m_skyGeometryValid = false;
+    const auto resolveUpscaled = [&] {
+        Texture& lastGeometry = m_skyGeometry[previous];
+        Texture& geometry = m_skyGeometry[current];
+        Use(m_rrOutput, read);
+        Use(m_motion, read);
+        Use(lastGeometry, read);
+        Use(geometry, write);
+        Use(m_resolved, write);
+        if (resolveSkyboxDistance)
+            Use(m_skyboxDistance, read);
+        Dispatch(Pass::DlssResolve, {.input0 = m_rrOutput.srv, .input1 = shiftX, .input2 = shiftY, .input3 = resolveSkybox,
+            .input4 = lastSkyGeometry ? lastGeometry.srv : kInvalidView, .output0 = m_resolved.uav, .output1 = geometry.uav,
+            .step = renderWidth | (renderHeight << 16), .input5 = JitterPhases(m_width, renderWidth)});
+        m_skyGeometryValid = true;
+    };
     // The 3D skybox is drawn before the main view, which covers it again, so only the main view is resolved.
     Texture* output = &m_lit;
     bool rayReconstructed = false;
@@ -3808,11 +3837,7 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
         m_gridWidth = m_width;
         m_gridHeight = m_height;
         if (rayReconstructed) {
-            Use(m_rrOutput, read);
-            Use(m_resolved, write);
-            if (resolveSkyboxDistance)
-                Use(m_skyboxDistance, read);
-            Dispatch(Pass::DlssResolve, {.input0 = m_rrOutput.srv, .input1 = shiftX, .input2 = shiftY, .input3 = resolveSkybox, .output0 = m_resolved.uav});
+            resolveUpscaled();
             output = &m_resolved;
         }
     } else if (upscaler == Upscaler::Fsr) {
@@ -3846,11 +3871,7 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
         m_gridWidth = m_width;
         m_gridHeight = m_height;
         if (upscaledLight) {
-            Use(m_rrOutput, read);
-            Use(m_resolved, write);
-            if (resolveSkyboxDistance)
-                Use(m_skyboxDistance, read);
-            Dispatch(Pass::DlssResolve, {.input0 = m_rrOutput.srv, .input1 = shiftX, .input2 = shiftY, .input3 = resolveSkybox, .output0 = m_resolved.uav});
+            resolveUpscaled();
             output = &m_resolved;
         }
     } else if (main && AntiAliasingMode() == AntiAliasing::Temporal) {

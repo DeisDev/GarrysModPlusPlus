@@ -9,6 +9,7 @@
 #include "native_lighting.h"
 #include "options.h"
 #include "overlay.h"
+#include "post_effects.h"
 #include "settings.h"
 #include "shader_cache.h"
 #include "shader_precache.h"
@@ -911,8 +912,11 @@ void Backend::MapToOutput()
     Transition(m_frameBuffer, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     TrackedResource& presented = SwapChainBuffer();
     Transition(presented, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    const bool uiAlpha = PrepareUiAlpha(mapping, m_width, m_height);
     display::Map(m_commandList.Get(), m_frameBufferTexture, m_backBufferViews[m_swapChain->GetCurrentBackBufferIndex()], m_outputFormat, m_width, m_height,
         0, 0, mapping);
+    if (uiAlpha)
+        TagUiAlpha();
     display::ClearColorCorrection();
 }
 

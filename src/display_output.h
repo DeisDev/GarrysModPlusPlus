@@ -41,6 +41,10 @@ struct Mapping {
     // Settings::debugView 16 and 17, and the display's peak in nits.
     std::uint32_t debugView = 0;
     float displayPeak = 80.0f;
+    // DLSS Frame Generation's UI alpha: an R8_UNORM target it is drawn into and the view without the HUD, in the target's
+    // format, it compares the output with (UiAlphaMain in shaders/post/display_output.hlsl); none by default.
+    D3D12_CPU_DESCRIPTOR_HANDLE uiAlphaTarget = {};
+    UINT hudlessView = DescriptorHeap::kInvalid;
 };
 
 // The mapping the swap chain's buffers take: SDR in `bits` (8 or 10) or HDR10, with the display's paper white and peak

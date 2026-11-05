@@ -52,4 +52,11 @@ float4 FroxelLightAt(float3 position)
     return FroxelLight(float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5), clip.w);
 }
 
+// FroxelLight in front of the open 2D sky at screen position `uv`, `direction` from the eye: as far as kHazeSkyDistance.
+float4 FroxelLightOverSky(float2 uv, float3 direction)
+{
+    float3 position = g_frame.eyePosition + direction * kHazeSkyDistance;
+    return FroxelLight(uv, mul(g_frame.viewProj, float4(position, 1.0)).w);
+}
+
 #endif
