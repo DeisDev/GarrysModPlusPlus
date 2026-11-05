@@ -27,3 +27,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Fixed
 
 - Clouds no longer repeat in a pattern toward the horizon.
+- Distant power lines and ropes against the sky no longer break into dashes with DLSS Ray Reconstruction or FSR.
+- Lamps in fog and water are much less noisy in the distance.
+- The HUD no longer smears in generated frames with DLSS Frame Generation.
+- Light shafts in haze no longer stop at the edges of things against the sky with DLSS Ray Reconstruction or FSR.
+- Under water with DLSS Ray Reconstruction or FSR, the far water no longer shows the unlit view above the surface.

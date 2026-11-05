@@ -61,7 +61,6 @@ constexpr uint32_t kOpaqueTriangle = 0x00FFFFFF;
 constexpr uint32_t kDroppedTriangle = 0x7FFFFFFF;
 
 constexpr uint32_t kJitterSamples = 8;
-constexpr uint32_t kRayReconstructionPhases = 32;
 
 unsigned Hex(HRESULT hr) { return static_cast<unsigned>(hr); }
 
@@ -1915,11 +1914,7 @@ std::array<float, 2> ViewJitter(UINT width, UINT height)
     UINT renderWidth = 0;
     UINT renderHeight = 0;
     if (g_state.lighting && g_state.lighting->RenderSize(width, height, renderWidth, renderHeight) != Lighting::Upscaler::None) {
-        // Upscalers want many phases, more as the upscale grows: 8 times its square (DLSS programming guide 3.7.1; FSR's
-        // super-resolution-upscaler.md, Camera jitter).
-        const float ratio = static_cast<float>(width) / static_cast<float>(renderWidth);
-        const uint32_t phases = std::max(kRayReconstructionPhases, static_cast<uint32_t>(std::ceil(8.0f * ratio * ratio)));
-        const uint32_t sample = static_cast<uint32_t>(g_state.frame % phases) + 1;
+        const uint32_t sample = static_cast<uint32_t>(g_state.frame % Lighting::JitterPhases(width, renderWidth)) + 1;
         g_state.pixelOffset[0] = Halton(sample, 2) - 0.5f;
         g_state.pixelOffset[1] = Halton(sample, 3) - 0.5f;
         // DLSS and FSR take the image shift themselves, as NVIDIA's Donut samples pass it (PlanarView pixel offset).

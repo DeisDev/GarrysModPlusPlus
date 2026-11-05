@@ -8,9 +8,10 @@
 //
 // Scatter (step 0, a thread per froxel): the light the medium scatters towards the eye per unit of its opacity, before
 // the tonemap scale, at a point jittered within the froxel each frame (froxelJitter): the sun's with its shadow, the fog's
-// and the water's own, and in the main view's fog and water one map or dynamic light picked by SampleLight with its
-// shadow ray. It is blended into last frame's light at the point's place in last frame's volume, 5% new once enough
-// frames are in (Hillaire's), which averages the jitter and the light sampling. Projected lights (flashlights) move with
+// and the water's own, and in the main view's fog and water one map or dynamic light with its shadow ray, averaged over
+// the froxel's stretch of the eye ray (SampledLampAlong). It is blended into last frame's light at the point's place in
+// last frame's volume, 5% new once enough frames are in (Hillaire's), which averages the jitter and the light sampling.
+// Projected lights (flashlights) move with
 // the player and would leave trails in that history: they are traced at each froxel's centre every frame, into a volume
 // of their own. input0: last frame's light (rgb, frames averaged); input1-3: the main view's indirect light volume
 // (shaders/probes.hlsl) or kNoView; input4: 1 when last frame's light may be used, plus 2 to sample map and dynamic
@@ -59,38 +60,104 @@ float3 MediumTransmittance(float viewDepth, float rayScale)
     return exp(-g_frame.volumetricDensity * min(viewDepth * rayScale, kMaxDistance));
 }
 
-// One map or dynamic light picked by SampleLight, with its shadow ray, scattered towards a ray along `direction` by the
-// air's phase function or, in water, by the water's.
-float3 SampledLamp(float3 position, float3 direction, bool water, inout uint seed)
+// A distance along the ray from `origin` along `direction`, within [near, far], drawn with a density proportional to the
+// inverse square of its point's distance to `light` (equiangular sampling: Kulla and Fajardo 2012, "Importance Sampling
+// Techniques for Path Tracing in Participating Media"), which cancels a point light's falloff along the ray. The density
+// is taken as if the ray passed at least `spread` from the light, so it stays finite where the ray meets the light.
+// `density` is the draw's probability density per unit of distance.
+float EquiangularDistance(float3 light, float spread, float3 origin, float3 direction, float near, float far, float u, out float density)
 {
-    LightSet set = LightSetAt(position);
-    set.count = set.pointLights;
-    float3 irradiance;
-    float3 toLight;
-    float distance;
-    uint picked;
-    if (!SampleLight(set, position, 0.0, seed, irradiance, toLight, distance, picked))
-        return 0.0;
-    float phase = water ? WaterPhase(dot(direction, toLight)) : Phase(dot(direction, toLight));
-    return irradiance * phase * LightTransmittance(set, picked, position, position + toLight * distance, float2(Random(seed), Random(seed)));
+    float closest = dot(light - origin, direction);
+    float offset = max(length(origin + direction * closest - light), spread);
+    float first = atan((near - closest) / offset);
+    float last = atan((far - closest) / offset);
+    float along = offset * tan(lerp(first, last, u));
+    density = offset / (max(last - first, 1e-7) * (offset * offset + along * along));
+    return closest + along;
 }
 
-// The light the medium scatters towards the eye at a point per unit of its opacity, without projected lights. Radiance
-// scattered from irradiance E is opacity * phase * pi * E in the units the lighting uses; the water's phase function
-// already averages 1 over all directions (WaterLampLight).
-float3 MediumLight(float3 position, float3 direction, uint3 volume, bool lamps, inout uint seed)
+// The light of one map or dynamic light scattered towards the eye by the air's phase function or, in water, the water's,
+// averaged over the stretch from `near` to `far` (distances) of the eye ray along `direction`, with its shadow ray.
+// Lights and points of the stretch are picked together by resampled importance sampling (Talbot 2005, as SampleLight
+// picks lights): up to kLightCandidates lights drawn uniformly and one from the cell's tail, each at a distance drawn
+// equiangularly towards it, one kept in proportion to its unshadowed light there, phase function included, over the
+// density of its draw. Picked by their light at one point jittered through a froxel, lights flickered in distant froxels,
+// which reach hundreds of units deep: the point fell near a lamp in a few frames and far from it in the rest, and the
+// air's phase function (g = 0.8) weighs lights in front of the eye some 700 times those behind it.
+float3 SampledLampAlong(float3 direction, float near, float far, bool water, inout uint seed)
+{
+    float3 eye = g_frame.eyePosition;
+    LightSet set = LightSetAt(eye + direction * (0.5 * (near + far)));
+    set.count = set.pointLights;
+    bool exhaustive = set.count <= kLightCandidates;
+    uint draws = exhaustive ? set.count : kLightCandidates;
+    // Uniform draws weigh each candidate by count / draws.
+    float drawWeight = exhaustive ? 1.0 : float(set.count) / float(max(draws, 1u));
+    uint tailLight;
+    float tailProbability;
+    bool tail = SampleTailLight(set.ranges, Random(seed), tailLight, tailProbability);
+    float total = 0.0;
+    uint picked = 0;
+    float3 pickedPoint = 0.0;
+    float3 pickedLight = 0.0;
+    float3 pickedIrradiance = 0.0;
+    [loop]
+    for (uint d = 0; d <= draws; ++d) {
+        uint i;
+        float weight;
+        if (d < draws) {
+            i = exhaustive ? d : min(uint(Random(seed) * set.count), set.count - 1);
+            weight = drawWeight;
+        } else {
+            if (!tail)
+                break;
+            i = set.count + tailLight;
+            weight = 1.0 / tailProbability;
+        }
+        Light light = SetPointLight(set, i);
+        float density;
+        float3 position = eye + direction * EquiangularDistance(light.origin, max(light.size, 1.0), eye, direction, near, far, Random(seed), density);
+        float3 toLight;
+        float distance;
+        float3 irradiance = LightIrradiance(light, position, 0.0, toLight, distance);
+        float cosine = dot(direction, toLight);
+        float target = Luminance(irradiance) * (water ? WaterPhase(cosine) : Phase(cosine));
+        if (target <= 0.0)
+            continue;
+        float resampling = target * weight / density;
+        total += resampling;
+        if (Random(seed) * total < resampling) {
+            picked = i;
+            pickedPoint = position;
+            pickedLight = light.origin;
+            pickedIrradiance = irradiance;
+        }
+    }
+    if (total <= 0.0)
+        return 0.0;
+    // The picked light's irradiance and phase over its target leave its colour; the total over the stretch's length makes
+    // the estimate the stretch's average.
+    float3 shadow = LightTransmittance(set, picked, pickedPoint, pickedLight, float2(Random(seed), Random(seed)));
+    return pickedIrradiance / Luminance(pickedIrradiance) * shadow * (total / max(far - near, 1e-4));
+}
+
+// The light the medium scatters towards the eye at a point per unit of its opacity, without projected lights; the lamps'
+// is averaged over the stretch [near, far] (distances) of the eye ray the point lies on. Radiance scattered from
+// irradiance E is opacity * phase * pi * E in the units the lighting uses; the water's phase function already averages 1
+// over all directions (WaterLampLight).
+float3 MediumLight(float3 position, float3 direction, float near, float far, uint3 volume, bool lamps, inout uint seed)
 {
     if (g_frame.eyeWater != kNoView) {
         WaterBody body = LoadWaterBody(g_frame.eyeWater);
         float3 light = LitWater(position, body, direction);
         if (lamps)
-            light += SampledLamp(position, direction, true, seed) * WaterAlbedo(body);
+            light += SampledLampAlong(direction, near, far, true, seed) * WaterAlbedo(body);
         return light;
     }
     if (g_frame.volumetricFog != 0) {
         float3 light = LitFog(position, volume);
         if (lamps)
-            light += 3.14159265 * SampledLamp(position, direction, false, seed);
+            light += 3.14159265 * SampledLampAlong(direction, near, far, false, seed);
         return light;
     }
     if (g_frame.sunEnabled == 0.0)
@@ -135,11 +202,11 @@ void Scatter(uint3 id)
     float3 direction = normalize(ray);
     uint seed = PixelSeed(uint2(id.x + id.z * g_frame.froxelDims.x, id.y), 0xB1u);
     uint3 volume = uint3(g_pass.input1, g_pass.input2, g_pass.input3);
-    float3 light = MediumLight(position, direction, volume, (g_pass.input4 & 2u) != 0, seed);
-    // A sample brighter on screen than ClampSample allows, over the opacity its froxel adds, is scaled down to it.
     float rayScale = length(ray);
     float near = FroxelDepth(float(id.z) / slices, g_frame.froxelStart, g_frame.froxelRange);
     float far = FroxelDepth(float(id.z + 1) / slices, g_frame.froxelStart, g_frame.froxelRange);
+    float3 light = MediumLight(position, direction, near * rayScale, far * rayScale, volume, (g_pass.input4 & 2u) != 0, seed);
+    // A sample brighter on screen than ClampSample allows, over the opacity its froxel adds, is scaled down to it.
     float gained = Luminance(max(MediumTransmittance(near, rayScale) - MediumTransmittance(far, rayScale), 0.0));
     light = gained > 0.0 ? ClampSample(light * gained) / gained : light;
 

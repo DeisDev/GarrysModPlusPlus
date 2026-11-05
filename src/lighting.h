@@ -378,6 +378,10 @@ public:
     // The upscaler the main view uses at this output size and the resolution its lighting then runs at; Upscaler::None
     // when it is lit at the output resolution.
     Upscaler RenderSize(UINT outputWidth, UINT outputHeight, UINT& width, UINT& height);
+    // How many frames the upscalers' jitter pattern takes to come round, for a render width under an output width: 8
+    // times the upscale's square (DLSS programming guide 3.7.1; FSR's super-resolution-upscaler.md, Camera jitter), and
+    // at least 32.
+    static uint32_t JitterPhases(UINT outputWidth, UINT renderWidth);
     // The anti-aliasing the main view gets: DLSS Ray Reconstruction and AMD FSR fall back to TAA where they cannot run
     // (DLSS without an NVIDIA RTX GPU, either after failing), as settings files and presets made elsewhere may still
     // choose them.
@@ -490,7 +494,7 @@ private:
         UINT output3 = DescriptorHeap::kInvalid;
         UINT step = 0;
         UINT output4 = DescriptorHeap::kInvalid;
-        UINT padding = 0;
+        UINT input5 = DescriptorHeap::kInvalid;
     };
     // Render-resolution copies of the G-buffer for Ray Reconstruction, written together by Pass::DlssInputs, and its
     // diffuse albedo guide, whose traced water pixels Pass::Lighting overwrites.
@@ -913,6 +917,10 @@ private:
     // Indirect light of the viewmodel, filtered without history so the main view's buffers stay intact.
     std::array<Texture, 2> m_viewmodelIndirect;
     Texture m_resolved;
+    // The frames since the upscalers' resolve last saw geometry near an output pixel (shaders/dlss_resolve.hlsl), and
+    // whether last frame's may be used.
+    std::array<Texture, 2> m_skyGeometry;
+    bool m_skyGeometryValid = false;
     // The main view's depth for its translucent surfaces (shaders/translucent_depth.hlsl).
     Texture m_translucentDepth;
     std::array<Texture, RrInputCount> m_rrInputs;

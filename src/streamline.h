@@ -53,7 +53,11 @@ struct FrameInputs {
     // The view in the back buffer.
     D3D12_RECT view;
 };
-void TagFrame(ID3D12GraphicsCommandList* list, const FrameInputs& inputs, const PostView& post);
+// False when Frame Generation takes no inputs this frame.
+bool TagFrame(ID3D12GraphicsCommandList* list, const FrameInputs& inputs, const PostView& post);
+// The frame's UI alpha (kBufferTypeUIAlpha: R8_UNORM, the back buffer's size, 1 where the HUD is), in `state` and left
+// alone until the present; only on frames TagFrame tagged.
+void TagUiAlpha(ID3D12GraphicsCommandList* list, ID3D12Resource* alpha, D3D12_RESOURCE_STATES state, UINT width, UINT height);
 // Whether Frame Generation wants this frame's inputs.
 bool FrameGenerationWanted();
 

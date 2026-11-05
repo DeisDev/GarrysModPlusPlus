@@ -199,8 +199,15 @@ struct State {
     Target frameDepth;
     TrackedResource hudless;
     D3D12_CPU_DESCRIPTOR_HANDLE hudlessTarget = {};
+    UINT hudlessView = kInvalid;
     UINT hudlessSize[2] = {};
     DXGI_FORMAT hudlessFormat = DXGI_FORMAT_UNKNOWN;
+    // DLSS Frame Generation's UI alpha, drawn by the display mapping at the present of frames whose view without the HUD
+    // was tagged (uiAlphaWanted).
+    TrackedResource uiAlpha;
+    D3D12_CPU_DESCRIPTOR_HANDLE uiAlphaTarget = {};
+    UINT uiAlphaSize[2] = {};
+    bool uiAlphaWanted = false;
     // The camera's state across frames (CameraMain in shaders/post/post.hlsl).
     Target camera;
     // The HDR brightness boost (ExposureHistogramMain and ExposureMain): the view's luminance bins, its gain across frames,
@@ -426,6 +433,9 @@ bool EnsureHudless(UINT width, UINT height, DXGI_FORMAT format)
     if (g_state.hudlessTarget.ptr == 0)
         g_state.hudlessTarget = backend.RenderTargetViews().Allocate();
     backend.Device()->CreateRenderTargetView(g_state.hudless.resource.Get(), nullptr, g_state.hudlessTarget);
+    if (g_state.hudlessView == kInvalid)
+        g_state.hudlessView = backend.Descriptors().Allocate();
+    backend.Device()->CreateShaderResourceView(g_state.hudless.resource.Get(), nullptr, backend.Descriptors().Cpu(g_state.hudlessView));
     g_state.hudlessSize[0] = width;
     g_state.hudlessSize[1] = height;
     g_state.hudlessFormat = format;
@@ -809,7 +819,7 @@ void PostProcessView(D3D12_RECT rect, bool postVgui)
                 mapping.peak * mapping.paperWhite};
             fsrGeneration->Prepare(commands, inputs, *post);
         } else {
-            streamline::TagFrame(commands, {depth, motion, hudless, read, rect}, *post);
+            g_state.uiAlphaWanted = streamline::TagFrame(commands, {depth, motion, hudless, read, rect}, *post);
         }
     };
     backend.Transition(backBuffer, read);
@@ -911,6 +921,56 @@ void PostProcessView(D3D12_RECT rect, bool postVgui)
     commands->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     commands->DrawInstanced(3, 1, 0, 0);
     tagFrame();
+}
+
+bool PrepareUiAlpha(display::Mapping& mapping, UINT width, UINT height)
+{
+    Backend& backend = GetBackend();
+    if (!std::exchange(g_state.uiAlphaWanted, false) || !g_state.hudless.resource || g_state.hudlessSize[0] != width || g_state.hudlessSize[1] != height ||
+        g_state.hudlessFormat != backend.OutputFormat())
+        return false;
+    if (!g_state.uiAlpha.resource || g_state.uiAlphaSize[0] != width || g_state.uiAlphaSize[1] != height) {
+        if (g_state.uiAlpha.resource)
+            backend.Retire(std::move(g_state.uiAlpha.resource));
+        g_state.uiAlpha = {};
+        D3D12_RESOURCE_DESC desc = {};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        desc.Width = width;
+        desc.Height = height;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = 1;
+        desc.Format = DXGI_FORMAT_R8_UNORM;
+        desc.SampleDesc.Count = 1;
+        desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        const D3D12_HEAP_PROPERTIES heap = {D3D12_HEAP_TYPE_DEFAULT};
+        const HRESULT hr = backend.Device()->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+            IID_PPV_ARGS(&g_state.uiAlpha.resource));
+        if (FAILED(hr)) {
+            log::Info("Post effects: creating frame generation's UI alpha failed: {:#010x}", static_cast<unsigned>(hr));
+            return false;
+        }
+        g_state.uiAlpha.state = D3D12_RESOURCE_STATE_COMMON;
+        if (g_state.uiAlphaTarget.ptr == 0)
+            g_state.uiAlphaTarget = backend.RenderTargetViews().Allocate();
+        backend.Device()->CreateRenderTargetView(g_state.uiAlpha.resource.Get(), nullptr, g_state.uiAlphaTarget);
+        g_state.uiAlphaSize[0] = width;
+        g_state.uiAlphaSize[1] = height;
+    }
+    backend.Transition(g_state.uiAlpha, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    backend.Transition(g_state.hudless, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    mapping.uiAlphaTarget = g_state.uiAlphaTarget;
+    mapping.hudlessView = g_state.hudlessView;
+    return true;
+}
+
+void TagUiAlpha()
+{
+    Backend& backend = GetBackend();
+    constexpr D3D12_RESOURCE_STATES read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    // TagFrame left the view without the HUD in this state until the present.
+    backend.Transition(g_state.hudless, read);
+    backend.Transition(g_state.uiAlpha, read);
+    streamline::TagUiAlpha(backend.Commands(), g_state.uiAlpha.resource.Get(), read, g_state.uiAlphaSize[0], g_state.uiAlphaSize[1]);
 }
 
 }

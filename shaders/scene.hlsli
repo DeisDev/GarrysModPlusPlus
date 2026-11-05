@@ -1582,13 +1582,18 @@ bool IsAttachedLight(LightSet set, uint i) { return i >= set.mapLights && i < se
 // The index in the map's lights of a LightSet's i-th light that is a map light.
 uint SetMapLight(LightSet set, uint i) { return i >= set.count ? i - set.count : LightRangeIndex(set.ranges, i); }
 
+// The i-th light of a LightSet that is a map or dynamic light (not a projector).
+Light SetPointLight(LightSet set, uint i)
+{
+    return LoadLight(IsAttachedLight(set, i) ? g_frame.lightCount + i - set.mapLights : SetMapLight(set, i));
+}
+
 // Unshadowed irradiance from the i-th light of a LightSet.
 float3 SetLightIrradiance(LightSet set, uint i, float3 position, float3 normal, out float3 toLight, out float distance)
 {
     if (i >= set.pointLights && i < set.count)
         return ProjectorIrradiance(LoadProjector(i - set.pointLights), position, normal, toLight, distance);
-    uint index = IsAttachedLight(set, i) ? g_frame.lightCount + i - set.mapLights : SetMapLight(set, i);
-    return LightIrradiance(LoadLight(index), position, normal, toLight, distance);
+    return LightIrradiance(SetPointLight(set, i), position, normal, toLight, distance);
 }
 
 // The share of the i-th light of a LightSet, centred at `lightPosition`, that reaches `origin`. The ray aims at the light
