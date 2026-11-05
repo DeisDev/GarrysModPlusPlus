@@ -674,7 +674,7 @@ void StrengthRow(const char* key, bool Settings::* on, float Settings::* member,
     }
     ImGui::SetCursorPosX(rightToLeft ? start : start + widgets::SwitchSpan());
     ImGui::BeginDisabled(on != nullptr && !(Edited().*on));
-    widgets::Slider("##value", &value, range.minimum, range.maximum, ui::Number(value, 2).c_str(), ValueWidth(), width);
+    widgets::Slider("##value", &value, range.minimum, range.maximum, 0.01f, ui::Number(value, 2).c_str(), ValueWidth(), width);
     ImGui::EndDisabled();
     if (EndRow(on != nullptr))
         Edited().*on = !(Edited().*on);
@@ -686,10 +686,9 @@ void SliderRow(const char* key, float Settings::* member, bool enabled = true, c
     float& value = Edited().*member;
     const SettingRange range = RangeOf(member);
     BeginRow(key, {FieldOf(member)}, enabled, reason);
-    if (widgets::Slider("##value", &value, range.minimum, range.maximum, ui::Number(value, decimals).c_str(), ValueWidth())) {
-        const float step = std::pow(10.0f, static_cast<float>(decimals));
-        value = std::clamp(std::round(value * step) / step, range.minimum, range.maximum);
-    }
+    const float scale = std::pow(10.0f, static_cast<float>(decimals));
+    if (widgets::Slider("##value", &value, range.minimum, range.maximum, 1.0f / scale, ui::Number(value, decimals).c_str(), ValueWidth()))
+        value = std::clamp(std::round(value * scale) / scale, range.minimum, range.maximum);
     EndRow();
 }
 
@@ -890,9 +889,9 @@ void GameSliderRow(const char* key, const char* name, float minimum, float maxim
     const bool available = ConsoleReady() && text.has_value();
     float value = std::clamp(text ? std::strtof(text->c_str(), nullptr) : minimum, minimum, maximum);
     BeginRow(key, {}, available && enabled, available ? reason : ConsoleReason());
-    if (widgets::Slider("##value", &value, minimum, maximum, ui::Number(value, decimals).c_str(), ValueWidth())) {
-        const float step = std::pow(10.0f, static_cast<float>(decimals));
-        value = std::clamp(std::round(value * step) / step, minimum, maximum);
+    const float scale = std::pow(10.0f, static_cast<float>(decimals));
+    if (widgets::Slider("##value", &value, minimum, maximum, 1.0f / scale, ui::Number(value, decimals).c_str(), ValueWidth())) {
+        value = std::clamp(std::round(value * scale) / scale, minimum, maximum);
         WriteVar(name, std::format("{:.{}f}", value, decimals), save);
     }
     EndRow();
@@ -943,7 +942,7 @@ void FollowRows(const char* followKey, bool Settings::* follow, const char* valu
     const SettingRange range = RangeOf(member);
     BeginRow(valueKey, {FieldOf(member)}, enabled && !following, following ? followReason : reason);
     float shown = following ? followed : value;
-    if (widgets::Slider("##value", &shown, range.minimum, range.maximum, ui::Number(shown, 0).c_str(), ValueWidth()) && !following)
+    if (widgets::Slider("##value", &shown, range.minimum, range.maximum, 1.0f, ui::Number(shown, 0).c_str(), ValueWidth()) && !following)
         value = std::clamp(std::round(shown), range.minimum, range.maximum);
     EndRow();
 }
@@ -989,7 +988,7 @@ void DrawHdrCard()
             Edited().uiBrightness = atPaperWhite ? 0.0f : std::clamp(std::round(paperWhite), 80.0f, 480.0f);
         BeginRow("display.ui_brightness", {FieldOf(&Settings::uiBrightness)}, hdr && !atPaperWhite, atPaperWhite && hdr ? Text("display.ui_follow_reason") : hdrReason);
         float shown = atPaperWhite ? paperWhite : settings.uiBrightness;
-        if (widgets::Slider("##value", &shown, 80.0f, 480.0f, ui::Number(shown, 0).c_str(), ValueWidth()) && !atPaperWhite)
+        if (widgets::Slider("##value", &shown, 80.0f, 480.0f, 1.0f, ui::Number(shown, 0).c_str(), ValueWidth()) && !atPaperWhite)
             Edited().uiBrightness = std::clamp(std::round(shown), 80.0f, 480.0f);
         EndRow();
         widgets::EndRows();
@@ -1079,7 +1078,7 @@ void DrawDisplayPage(Settings&)
             ImGui::SameLine();
             ImGui::SetCursorPosX(rightToLeft ? start : start + widgets::SwitchSpan());
             ImGui::BeginDisabled(!limited);
-            const bool moved = widgets::Slider("##value", &limit, 30.0f, 300.0f, ui::Number(limit, 0).c_str(), ValueWidth(), width);
+            const bool moved = widgets::Slider("##value", &limit, 30.0f, 300.0f, 1.0f, ui::Number(limit, 0).c_str(), ValueWidth(), width);
             ImGui::EndDisabled();
             const bool labelClicked = EndRow(true);
             if (labelClicked)
@@ -2987,9 +2986,10 @@ bool DrawMenu()
     if (ImGui::Begin("###gmodpp_menu", nullptr, kFlags)) {
         const std::string closeHint = ui::Format("menu.close_hint", {{"key", KeyName(static_cast<UINT>(GetSettings().menuKey))}});
         keepOpen = !widgets::Header(Text("menu.title"), closeHint.c_str());
-        // Escape closes the menu unless a popup or dialog takes it, or a key is being picked.
+        // Escape closes the menu unless a popup or dialog takes it, a key is being picked or text typed (a typed slider
+        // value is dropped instead).
         if (GetSettings().menuEscapeCloses && ImGui::IsKeyPressed(ImGuiKey_Escape, false) && !ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId) &&
-            !g_state.listeningForKey)
+            !g_state.listeningForKey && !ImGui::GetIO().WantTextInput)
             keepOpen = false;
 
         const ImGuiStyle& style = ImGui::GetStyle();

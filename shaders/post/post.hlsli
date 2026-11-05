@@ -45,8 +45,9 @@ struct PostConstants
     uint maxRings;
     float manualFocus;
     float focusTime;
-    // FidelityFX DoF's working textures: the half-resolution colour (an SRV of all its mips, each mip's UAV), the tiles'
-    // circle of confusion range and its dilation, the near and far fields (UAV, then SRV) and its global maximum.
+    // FidelityFX DoF's working textures: the half-resolution colour (an SRV of all its mips, each mip's UAV, the last two
+    // in dofBilatMipsHigh), the tiles' circle of confusion range and its dilation, the near and far fields (UAV, then SRV)
+    // and its global maximum.
     uint dofBilat;
     uint4 dofBilatMips;
     uint dofTileRadiusUav;
@@ -143,7 +144,7 @@ struct PostConstants
     uint flareAperture;
     uint flareBlades;
     float flareStarburstSize;
-    uint2 padding8;
+    uint2 dofBilatMipsHigh;
 };
 
 // Per pass: descriptor indices and a parameter.

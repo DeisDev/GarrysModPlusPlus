@@ -54,6 +54,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -153,7 +154,7 @@ struct PostConstants {
     std::uint32_t flareAperture;
     std::uint32_t flareBlades;
     float flareStarburstSize;
-    std::uint32_t padding8[2];
+    std::uint32_t dofBilatMipsHigh[2];
 };
 static_assert(sizeof(PostConstants) == 28 * 16);
 
@@ -182,8 +183,9 @@ static_assert(std::size(kComputeShaders) == static_cast<size_t>(Compute::Count))
 // exposure target is read again from its console variables.
 constexpr UINT kExposureBins = 128;
 constexpr unsigned kExposureTargetPollFrames = 30;
-// FidelityFX DoF's half-resolution colour has 4 mips (FFX_DOF_INTERNAL_BILAT_MIP_COUNT in ffx_dof_resources.h).
-constexpr UINT kDofMips = 4;
+// FidelityFX DoF's half-resolution colour's mips (FFX_DOF_OPTION_MAX_MIP in shaders/amd/dof.hlsl; the SDK makes 4).
+constexpr UINT kDofMips = 6;
+static_assert(kDofMips == std::extent_v<decltype(PostConstants::dofBilatMips)> + std::extent_v<decltype(PostConstants::dofBilatMipsHigh)>);
 // Source's DepthRange(0, 0.1) for the held weapon (IsViewmodelRange in src/native_lighting.cpp).
 constexpr float kViewmodelDepth = 0.1f;
 // A full-frame sensor's height in millimetres, and Hammer units in millimetres (Valve Developer Community, "Hammer
@@ -239,7 +241,7 @@ struct State {
     UINT height = 0;
     std::array<Target, 2> scene;
     Target bilateral;
-    std::array<UINT, kDofMips> bilateralMips = {kInvalid, kInvalid, kInvalid, kInvalid};
+    std::array<UINT, kDofMips> bilateralMips = {kInvalid, kInvalid, kInvalid, kInvalid, kInvalid, kInvalid};
     // The bloom's down and up chains, made when it first runs at this size, in smallHdrFormat (R11G11B10_FLOAT, or
     // RGBA16F where the device cannot store or draw it).
     std::array<Target, kBloomLevels> bloomDown;
@@ -529,6 +531,15 @@ void ReleaseTargets()
     g_state.width = g_state.height = 0;
 }
 
+// The most mips a texture of this size can have: D3D12 allows log2 of its larger side, plus one.
+UINT MipsFor(UINT width, UINT height)
+{
+    UINT mips = 1;
+    for (UINT size = std::max(width, height); size > 1; size >>= 1)
+        ++mips;
+    return mips;
+}
+
 // The working textures for a view `width` x `height`: the colour twice (each pass reads one and writes the other),
 // FidelityFX DoF's at the sizes its SDK makes them (ffx_dof.cpp, ffxDofContextCreate), and motion blur's tiles.
 bool EnsureTargets(UINT width, UINT height)
@@ -544,9 +555,10 @@ bool EnsureTargets(UINT width, UINT height)
     g_state.blurTile = std::clamp((static_cast<UINT>(std::ceil(height * 0.025f)) + 7) / 8 * 8, 8u, 64u);
     const UINT blurTilesX = (width + g_state.blurTile - 1) / g_state.blurTile;
     const UINT blurTilesY = (height + g_state.blurTile - 1) / g_state.blurTile;
+    const UINT bilateralMips = std::min(kDofMips, MipsFor(halfWidth, halfHeight));
     bool ok = CreateTexture(g_state.scene[0], width, height, DXGI_FORMAT_R16G16B16A16_FLOAT) &&
         CreateTexture(g_state.scene[1], width, height, DXGI_FORMAT_R16G16B16A16_FLOAT) &&
-        CreateTexture(g_state.bilateral, halfWidth, halfHeight, DXGI_FORMAT_R16G16B16A16_FLOAT, kDofMips) &&
+        CreateTexture(g_state.bilateral, halfWidth, halfHeight, DXGI_FORMAT_R16G16B16A16_FLOAT, bilateralMips) &&
         CreateTexture(g_state.tileRadius, tileWidth, tileHeight, DXGI_FORMAT_R16G16_FLOAT) &&
         CreateTexture(g_state.dilated, tileWidth, tileHeight, DXGI_FORMAT_R16G16_FLOAT) &&
         CreateTexture(g_state.nearField, halfWidth, halfHeight, DXGI_FORMAT_R16G16B16A16_FLOAT) &&
@@ -564,7 +576,8 @@ bool EnsureTargets(UINT width, UINT height)
         uav.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
         uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
         uav.Texture2D.MipSlice = mip;
-        backend.Device()->CreateUnorderedAccessView(g_state.bilateral.texture.resource.Get(), nullptr, &uav,
+        // Mips a small view has no room for get null descriptors, whose writes are discarded.
+        backend.Device()->CreateUnorderedAccessView(mip < bilateralMips ? g_state.bilateral.texture.resource.Get() : nullptr, nullptr, &uav,
             backend.Descriptors().Cpu(g_state.bilateralMips[mip]));
     }
     if (!ok) {
@@ -1132,7 +1145,9 @@ void PostProcessView(D3D12_RECT rect, bool postVgui)
         c.viewmodelDepth = kViewmodelDepth;
     }
     c.dofBilat = g_state.bilateral.srv;
-    std::copy(g_state.bilateralMips.begin(), g_state.bilateralMips.end(), c.dofBilatMips);
+    const auto highMips = g_state.bilateralMips.begin() + std::size(c.dofBilatMips);
+    std::copy(g_state.bilateralMips.begin(), highMips, c.dofBilatMips);
+    std::copy(highMips, g_state.bilateralMips.end(), c.dofBilatMipsHigh);
     c.dofTileRadiusUav = g_state.tileRadius.uav;
     c.dofTileRadius = g_state.tileRadius.srv;
     c.dofDilatedUav = g_state.dilated.uav;

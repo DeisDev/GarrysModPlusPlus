@@ -284,16 +284,23 @@ void NeighborMaxMain(uint2 tile : SV_DispatchThreadID)
 
 static const uint kBlurSamples = 15;
 
-// How much of a sample's colour the pixel sees as the sample's object, `distance` pixels away, moves `speed` pixels
-// across it (McGuire et al.'s cone), or while both stand still across the gap (their cylinder).
-float Cone(float distance, float speed)
+// McGuire et al.'s velocities are half spreads: a point moving m pixels over the exposure blurs over half of m to each
+// side of where it is drawn, and at least half a pixel.
+float HalfSpread(float2 motion)
 {
-    return saturate(1.0 - distance / max(speed, 1e-3));
+    return max(0.5 * length(motion), 0.5);
 }
 
-float Cylinder(float distance, float speed)
+// How much of a sample's colour the pixel sees as the sample's object, `distance` pixels away, spreads `spread` pixels
+// across it (McGuire et al.'s cone), or while both stand still across the gap (their cylinder).
+float Cone(float distance, float spread)
 {
-    return 1.0 - smoothstep(0.95 * speed, 1.05 * speed, distance);
+    return saturate(1.0 - distance / spread);
+}
+
+float Cylinder(float distance, float spread)
+{
+    return 1.0 - smoothstep(0.95 * spread, 1.05 * spread, distance);
 }
 
 // 1 where a surface at view depth `a` lies in front of one at `b`, fading over 2% of the depth.
@@ -326,29 +333,31 @@ void MotionBlurMain(uint2 pixel : SV_DispatchThreadID)
     RWTexture2D<float4> output = ResourceDescriptorHeap[g_postPass.output0];
     float4 centre = color.Load(int3(pixel, 0));
     float2 dominant = neighbourhood.Load(int3(pixel / g_post.blurTile, 0));
-    float dominantLength = length(dominant);
-    if (dominantLength < 0.5) {
+    // Nothing in the neighbourhood spreads more than half a pixel each way.
+    if (length(dominant) <= 1.0) {
         output[pixel] = centre;
         return;
     }
-    float2 centreMotion = ExposedMotion(int2(pixel));
-    float centreSpeed = max(length(centreMotion), 0.5);
+    float centreSpread = HalfSpread(ExposedMotion(int2(pixel)));
     float centreDepth = ViewDepth(int2(pixel));
-    float weight = 1.0 / centreSpeed;
+    float weight = 1.0 / centreSpread;
     float3 sum = centre.rgb * weight;
     float jitter = InterleavedGradientNoise(float2(pixel)) - 0.5;
     [loop]
     for (uint i = 0; i < kBlurSamples; ++i) {
+        // The middle tap would land on the pixel itself, which is counted above.
+        if (i == (kBlurSamples - 1) / 2)
+            continue;
         float t = lerp(-1.0, 1.0, (float(i) + jitter + 1.0) / float(kBlurSamples + 1));
         float2 offset = dominant * (0.5 * t);
         int2 sample = clamp(int2(round(float2(pixel) + offset)), 0, int2(g_post.size) - 1);
         float distance = length(offset);
-        float sampleSpeed = max(length(ExposedMotion(sample)), 0.5);
+        float sampleSpread = HalfSpread(ExposedMotion(sample));
         float sampleDepth = ViewDepth(sample);
         float front = SoftDepthCompare(sampleDepth, centreDepth);
         float back = SoftDepthCompare(centreDepth, sampleDepth);
-        float alpha = front * Cone(distance, sampleSpeed) + back * Cone(distance, centreSpeed) +
-            2.0 * Cylinder(distance, sampleSpeed) * Cylinder(distance, centreSpeed);
+        float alpha = front * Cone(distance, sampleSpread) + back * Cone(distance, centreSpread) +
+            2.0 * Cylinder(distance, sampleSpread) * Cylinder(distance, centreSpread);
         weight += alpha;
         sum += alpha * color.Load(int3(sample, 0)).rgb;
     }

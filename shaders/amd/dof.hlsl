@@ -3,6 +3,14 @@
 // 0 the tiles' circle of confusion range, 1 the half-resolution colour and its mips, 2 the tiles' dilation, 3 the near
 // and far blur, 4 the composite at full resolution.
 
+// No ring merging (the SDK's FFX_DOF_DISABLE_RING_MERGE): merged rings read their point samples two mips coarser,
+// which left flat out-of-focus areas in blocks of 8 pixels.
+#define FFX_DOF_OPTION_MAX_RING_MERGE_LOG 0
+// The half-resolution colour's mips (kDofMips in src/post_effects.cpp): six, the most SPD makes without its atomic
+// counter, so blur up to 64 pixels per ring finds the mip its samples' spacing asks for (four ran out at 16, and the
+// sparse rings of a low quality setting skipped texels).
+#define FFX_DOF_OPTION_MAX_MIP 6
+
 #include "../post/post.hlsli"
 #include "ffx_core.h"
 #include "ffx_dof_common.h"
@@ -47,7 +55,7 @@ FfxHalfOpt4 FfxDofLoadSource(FfxInt32x2 tex)
 
 void FfxDofStoreBilatMip(FfxUInt32 mip, FfxInt32x2 tex, FfxHalfOpt4 value)
 {
-    RWTexture2D<float4> output = ResourceDescriptorHeap[g_post.dofBilatMips[mip]];
+    RWTexture2D<float4> output = ResourceDescriptorHeap[mip < 4 ? g_post.dofBilatMips[mip] : g_post.dofBilatMipsHigh[mip - 4]];
     output[tex] = value;
 }
 

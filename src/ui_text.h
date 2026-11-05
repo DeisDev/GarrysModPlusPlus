@@ -1,6 +1,7 @@
 #pragma once
 
 #include <initializer_list>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -40,5 +41,10 @@ std::string Format(const char* key, std::initializer_list<Argument> arguments);
 
 // A number in the user's regional format, with `decimals` digits after the decimal separator.
 std::string Number(double value, int decimals);
+// The same for typing it again: no digit grouping, a leading minus sign.
+std::string TypedNumber(double value, int decimals);
+// A number typed in the user's format, a comma or a point taken as the decimal separator; nullopt when the text is not
+// one.
+std::optional<double> ParseNumber(std::string_view text);
 
 }

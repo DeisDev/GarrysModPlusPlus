@@ -6,6 +6,8 @@
 #include "text_layout.h"
 #include "ui_text.h"
 
+#include <imgui_internal.h>
+
 #include <dwrite.h>
 
 #include <algorithm>
@@ -14,6 +16,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <map>
+#include <optional>
 #include <set>
 #include <string>
 #include <type_traits>
@@ -252,17 +255,58 @@ std::array<float, 3> BlackbodySwatch(float kelvin)
     return color;
 }
 
+// The slider under the mouse in the last frame and the one under it so far in this frame: the arrow keys go to it, or
+// with none there, to the slider last clicked (focused).
+struct SliderKeys {
+    int frame = -1;
+    ImGuiID hovered = 0;
+    ImGuiID hoveredNow = 0;
+};
+SliderKeys g_sliderKeys;
+
+// The slider whose value is being typed (its field's id), the text and the frame typing started.
+struct SliderTyping {
+    ImGuiID field = 0;
+    char text[32] = {};
+    int frame = 0;
+};
+SliderTyping g_typing;
+
+// The digits after the decimal separator a step needs: 0 for whole steps.
+int StepDecimals(double step)
+{
+    int decimals = 0;
+    for (double unit = 1.0; step < unit * 0.999 && decimals < 6; unit *= 0.1)
+        ++decimals;
+    return decimals;
+}
+
+// `value` moved by `steps` steps onto the steps' grid, within the range. Dividing by the steps per unit keeps decimal
+// steps the nearest floats to their decimals (0.29, not 0.29000002).
 template <class T>
-bool SliderOf(const char* id, T* value, T minimum, T maximum, const char* text, float textWidth, float width)
+T Stepped(T value, int steps, T step, T minimum, T maximum)
+{
+    if constexpr (std::is_integral_v<T>) {
+        return std::clamp(value + steps * step, minimum, maximum);
+    } else {
+        const T perUnit = T(1) / step;
+        return std::clamp(std::round(value * perUnit + static_cast<T>(steps)) / perUnit, minimum, maximum);
+    }
+}
+
+template <class T>
+bool SliderOf(const char* id, T* value, T minimum, T maximum, T step, const char* text, float textWidth, float width)
 {
     ImGui::PushID(id);
     const ImGuiStyle& style = ImGui::GetStyle();
     const bool rightToLeft = RightToLeft();
     const ImVec2 origin = ImGui::GetCursorScreenPos();
     const float total = width > 0.0f ? width : ImGui::GetContentRegionAvail().x;
+    // The value sits in a field with a control's padding on both sides, which shows when it is hovered or typed into.
     const float valueWidth = std::max(textWidth, ImGui::CalcTextSize(text).x);
-    const float spacing = style.ItemInnerSpacing.x * 1.5f;
-    const float trackWidth = std::max(total - valueWidth - spacing, ImGui::GetFontSize() * 4.0f);
+    const float fieldPadding = style.FramePadding.x;
+    const float fieldWidth = valueWidth + fieldPadding * 2.0f;
+    const float trackWidth = std::max(total - fieldWidth - style.ItemInnerSpacing.x, ImGui::GetFontSize() * 4.0f);
     const float trackX = rightToLeft ? origin.x + total - trackWidth : origin.x;
     ImGui::SetCursorScreenPos(ImVec2(trackX, origin.y));
     ImGui::SetNextItemWidth(trackWidth);
@@ -275,6 +319,13 @@ bool SliderOf(const char* id, T* value, T minimum, T maximum, const char* text, 
     float position = rightToLeft ? low + high - static_cast<float>(*value) : static_cast<float>(*value);
     const bool moved = ImGui::SliderFloat("##slider", &position, low, high, "", ImGuiSliderFlags_NoInput);
     ImGui::PopStyleColor(5);
+    const ImGuiID slider = ImGui::GetItemID();
+    const bool hovered = ImGui::IsItemHovered();
+    const bool active = ImGui::IsItemActive();
+    const bool focused = ImGui::IsItemFocused() && (ImGui::GetItemFlags() & ImGuiItemFlags_Disabled) == 0;
+    // The knob sits where ImGui's SliderBehaviorT puts its grab (2-pixel padding), so it stays under the cursor.
+    const ImVec2 min = ImGui::GetItemRectMin();
+    const ImVec2 max = ImGui::GetItemRectMax();
     const T previous = *value;
     if (moved) {
         const float picked = rightToLeft ? low + high - position : position;
@@ -283,12 +334,77 @@ bool SliderOf(const char* id, T* value, T minimum, T maximum, const char* text, 
         else
             *value = std::clamp(std::round(picked * 100.0f) / 100.0f, minimum, maximum);
     }
+
+    // Arrow keys move it a step at a time (Shift: ten), unless something takes typing or another control is held.
+    if (const int frame = ImGui::GetFrameCount(); frame != g_sliderKeys.frame) {
+        g_sliderKeys.hovered = g_sliderKeys.hoveredNow;
+        g_sliderKeys.hoveredNow = 0;
+        g_sliderKeys.frame = frame;
+    }
+    if (hovered)
+        g_sliderKeys.hoveredNow = slider;
+    const ImGuiIO& io = ImGui::GetIO();
+    if ((hovered || (focused && g_sliderKeys.hovered == 0)) && !io.WantTextInput && (active || !ImGui::IsAnyItemActive())) {
+        // Right to left, the slider's maximum is on the left.
+        const int forward = rightToLeft ? -1 : 1;
+        int steps = 0;
+        steps += ImGui::IsKeyPressed(ImGuiKey_RightArrow) ? forward : 0;
+        steps -= ImGui::IsKeyPressed(ImGuiKey_LeftArrow) ? forward : 0;
+        steps += ImGui::IsKeyPressed(ImGuiKey_UpArrow) ? 1 : 0;
+        steps -= ImGui::IsKeyPressed(ImGuiKey_DownArrow) ? 1 : 0;
+        if (steps != 0)
+            *value = Stepped(*value, steps * (io.KeyShift ? 10 : 1), step, minimum, maximum);
+    }
+
+    // The value: a field to type into once clicked.
+    const ImVec2 fieldMin(rightToLeft ? origin.x : origin.x + total - fieldWidth, origin.y);
+    const ImVec2 fieldSize(fieldWidth, ImGui::GetFrameHeight());
+    const ImGuiID field = ImGui::GetID("##typed");
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    bool valueHovered = false;
+    if (g_typing.field != field) {
+        ImGui::SetCursorScreenPos(fieldMin);
+        if (ImGui::InvisibleButton("##type", fieldSize)) {
+            g_typing.field = field;
+            g_typing.frame = ImGui::GetFrameCount();
+            const std::string typed = std::is_integral_v<T> ? ui::TypedNumber(static_cast<double>(*value), 0)
+                                                            : ui::TypedNumber(static_cast<double>(*value), StepDecimals(static_cast<double>(step)));
+            std::snprintf(g_typing.text, sizeof(g_typing.text), "%s", typed.c_str());
+        }
+        valueHovered = ImGui::IsItemHovered();
+        if (valueHovered) {
+            ImGui::SetMouseCursor(ImGuiMouseCursor_TextInput);
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
+                Tooltip(ui::Text("menu.slider_type"));
+        }
+    }
+    if (g_typing.field == field) {
+        ImGui::SetCursorScreenPos(fieldMin);
+        ImGui::SetNextItemWidth(fieldWidth);
+        if (ImGui::GetFrameCount() == g_typing.frame)
+            ImGui::SetKeyboardFocusHere();
+        ImGui::InputText("##typed", g_typing.text, sizeof(g_typing.text), ImGuiInputTextFlags_AutoSelectAll);
+        if (ImGui::IsItemDeactivated()) {
+            // Enter or a click elsewhere takes the value; Escape keeps the old one.
+            if (!ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+                if (const std::optional<double> typed = ui::ParseNumber(g_typing.text)) {
+                    const double clamped = std::clamp(*typed, static_cast<double>(minimum), static_cast<double>(maximum));
+                    if constexpr (std::is_integral_v<T>)
+                        *value = static_cast<T>(std::llround(clamped));
+                    else
+                        *value = Stepped(static_cast<T>(clamped), 0, step, minimum, maximum);
+                }
+            }
+            g_typing.field = 0;
+        } else if (!ImGui::IsItemActive() && ImGui::GetFrameCount() > g_typing.frame + 2) {
+            // It never took the keyboard, or lost it without being closed (the page changed).
+            g_typing.field = 0;
+        }
+    }
+    const bool typing = g_typing.field == field;
     const bool changed = *value != previous;
 
-    // The knob sits where ImGui's SliderBehaviorT puts its grab (2-pixel padding), so it stays under the cursor.
-    const ImVec2 min = ImGui::GetItemRectMin();
-    const ImVec2 max = ImGui::GetItemRectMax();
-    const bool hot = ImGui::IsItemHovered() || ImGui::IsItemActive();
+    const bool hot = hovered || active;
     constexpr float kPadding = 2.0f;
     const float range = static_cast<float>(maximum - minimum);
     const float grab = std::min(style.GrabMinSize, max.x - min.x - kPadding * 2.0f);
@@ -298,7 +414,6 @@ bool SliderOf(const char* id, T* value, T minimum, T maximum, const char* text, 
     const float x = std::round(rightToLeft ? right - t * (right - left) : left + t * (right - left));
     const float y = std::round((min.y + max.y) * 0.5f);
     const float track = std::max(1.0f, std::round(ImGui::GetFontSize() * 0.1f));
-    ImDrawList* draw = ImGui::GetWindowDrawList();
     draw->AddRectFilled(ImVec2(left, y - track), ImVec2(right, y + track), Color(kFrameActive));
     const ImU32 fill = Color(hot ? kAccentHover : kAccent);
     if (rightToLeft)
@@ -312,9 +427,13 @@ bool SliderOf(const char* id, T* value, T minimum, T maximum, const char* text, 
         draw->AddRect(ImVec2(x - ring, y - ring), ImVec2(x + ring, y + ring), Color(WithAlpha(kAccent, 0.6f)), 0.0f, 0, std::max(1.0f, 1.5f * g_scale));
     }
 
-    // The value is right-aligned in its space, after the track in the line's direction.
-    const float textX = rightToLeft ? origin.x + valueWidth - ImGui::CalcTextSize(text).x : origin.x + total - ImGui::CalcTextSize(text).x;
-    draw->AddText(ImVec2(std::floor(textX), std::floor(origin.y + style.FramePadding.y)), ImGui::GetColorU32(ImGuiCol_Text), text);
+    // The value is right-aligned in its field, after the track in the line's direction; hovered, the field shows.
+    if (!typing) {
+        if (valueHovered)
+            draw->AddRectFilled(fieldMin, ImVec2(fieldMin.x + fieldSize.x, fieldMin.y + fieldSize.y), Color(kFrameHover));
+        const float textX = fieldMin.x + fieldWidth - fieldPadding - ImGui::CalcTextSize(text).x;
+        draw->AddText(ImVec2(std::floor(textX), std::floor(origin.y + style.FramePadding.y)), ImGui::GetColorU32(ImGuiCol_Text), text);
+    }
     ImGui::SetCursorScreenPos(origin);
     ImGui::Dummy(ImVec2(total, ImGui::GetFrameHeight()));
     ImGui::PopID();
@@ -863,14 +982,14 @@ bool Combo(const char* id, int* value, std::span<const char* const> options)
     return changed;
 }
 
-bool Slider(const char* id, float* value, float minimum, float maximum, const char* text, float textWidth, float width)
+bool Slider(const char* id, float* value, float minimum, float maximum, float step, const char* text, float textWidth, float width)
 {
-    return SliderOf(id, value, minimum, maximum, text, textWidth, width);
+    return SliderOf(id, value, minimum, maximum, step, text, textWidth, width);
 }
 
 bool Slider(const char* id, int* value, int minimum, int maximum, const char* text, float textWidth, float width)
 {
-    return SliderOf(id, value, minimum, maximum, text, textWidth, width);
+    return SliderOf(id, value, minimum, maximum, 1, text, textWidth, width);
 }
 
 bool EndButton(const char* label)
@@ -1001,7 +1120,7 @@ bool ColorButton(const char* id, std::array<float, 3>* color, const char* temper
             Text(temperatureLabel);
             const std::string value = ui::Format("menu.kelvin", {{"value", ui::Number(kelvin, 0)}});
             const float valueWidth = ImGui::CalcTextSize(ui::Format("menu.kelvin", {{"value", ui::Number(12000.0, 0)}}).c_str()).x;
-            if (Slider("##temperature", &kelvin, 1700.0f, 12000.0f, value.c_str(), valueWidth, pickerWidth)) {
+            if (Slider("##temperature", &kelvin, 1700.0f, 12000.0f, 50.0f, value.c_str(), valueWidth, pickerWidth)) {
                 kelvin = std::round(kelvin / 50.0f) * 50.0f;
                 *color = BlackbodySwatch(kelvin);
                 changed = true;

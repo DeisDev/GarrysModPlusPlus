@@ -9,6 +9,8 @@
 #include <icu.h>
 
 #include <algorithm>
+#include <charconv>
+#include <cmath>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -276,18 +278,54 @@ std::string Format(const char* key, std::initializer_list<Argument> arguments)
     return result;
 }
 
-std::string Number(double value, int decimals)
+namespace {
+
+// `value` in the user's format; for typing, without digit grouping and with a leading minus sign (negative order 1).
+std::string FormatNumber(double value, int decimals, bool typed)
 {
     NumberFormat& locale = UserNumberFormat();
     const std::string plain = std::format("{:.{}f}", value, decimals);
     const std::wstring digits(plain.begin(), plain.end());
-    NUMBERFMTW format = {static_cast<UINT>(decimals), locale.leadingZero, locale.grouping, locale.decimal.data(), locale.thousand.data(), locale.negativeOrder};
+    NUMBERFMTW format = {static_cast<UINT>(decimals), locale.leadingZero, typed ? 0u : locale.grouping, locale.decimal.data(), locale.thousand.data(),
+        typed ? 1u : locale.negativeOrder};
     wchar_t buffer[64];
     const int length = GetNumberFormatEx(LOCALE_NAME_USER_DEFAULT, 0, digits.c_str(), &format, buffer, static_cast<int>(std::size(buffer)));
     // Only non-finite values ("inf", "nan") fail to format.
     if (length <= 0)
         return plain;
     return Utf8(std::wstring_view(buffer, static_cast<size_t>(length) - 1));
+}
+
+}
+
+std::string Number(double value, int decimals) { return FormatNumber(value, decimals, false); }
+
+std::string TypedNumber(double value, int decimals) { return FormatNumber(value, decimals, true); }
+
+std::optional<double> ParseNumber(std::string_view text)
+{
+    const std::string decimal = Utf8(UserNumberFormat().decimal);
+    std::string plain;
+    for (size_t i = 0; i < text.size();) {
+        if (!decimal.empty() && text.substr(i).starts_with(decimal)) {
+            plain += '.';
+            i += decimal.size();
+            continue;
+        }
+        if (text[i] == ',')
+            plain += '.';
+        else if (text[i] != ' ')
+            plain += text[i];
+        ++i;
+    }
+    std::string_view number = plain;
+    if (number.starts_with('+'))
+        number.remove_prefix(1);
+    double value = 0.0;
+    const auto [end, error] = std::from_chars(number.data(), number.data() + number.size(), value);
+    if (number.empty() || error != std::errc() || end != number.data() + number.size() || !std::isfinite(value))
+        return std::nullopt;
+    return value;
 }
 
 }

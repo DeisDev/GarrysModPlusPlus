@@ -30,8 +30,17 @@ First public release. This is an early alpha: expect bugs, crashes and addons th
 - Camera effects, off by default: depth of field, motion blur, lens flare, vignette, sharpening, film grain, chromatic aberration and lens distortion.
 - Quality presets from Low to Ultra; Low bakes bounce light when a map loads, for slower GPUs.
 - A settings menu (Insert) with per-map settings, your own presets, a performance overlay and a log viewer.
+- Menu sliders take typed values (click the number) and step with the arrow keys, ten steps with Shift.
 - A check at launch that warns about GPUs that can't run the mod and offers to play without it.
 - Addons can read the `gmodpp_lights` console variable to turn off their own dynamic lights while the mod lights effects itself.
+
+### Fixed
+
+- Fixed depth of field turning out-of-focus areas into blocky, low-resolution squares.
+- Fixed wide depth of field blur breaking up at low quality settings.
+- Fixed motion blur streaks ending in a hard edge instead of fading out.
+- Fixed sharpening skipping everything brighter than paper white in HDR.
+- Fixed Escape closing the menu while typing in a text field.
 
 [Unreleased]: https://github.com/DeisDev/GarrysModPlusPlus/compare/v0.9.0-alpha...HEAD
 [0.9.0-alpha]: https://github.com/DeisDev/GarrysModPlusPlus/releases/tag/v0.9.0-alpha

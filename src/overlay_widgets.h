@@ -113,8 +113,10 @@ float SwitchSpan();
 bool Segmented(const char* id, int* value, std::span<const char* const> options, std::span<const bool> available = {});
 // A full-width drop-down list.
 bool Combo(const char* id, int* value, std::span<const char* const> options);
-// Sliders `width` wide (0: the available width) with `text` (the value) in `textWidth` after them.
-bool Slider(const char* id, float* value, float minimum, float maximum, const char* text, float textWidth, float width = 0.0f);
+// Sliders `width` wide (0: the available width) with `text` (the value) in `textWidth` after them. The arrow keys move
+// the slider under the mouse, or the one last clicked, by `step` (whole sliders by 1; Shift: ten steps), and clicking the
+// value types one in.
+bool Slider(const char* id, float* value, float minimum, float maximum, float step, const char* text, float textWidth, float width = 0.0f);
 bool Slider(const char* id, int* value, int minimum, int maximum, const char* text, float textWidth, float width = 0.0f);
 // A button at the end of the line.
 bool EndButton(const char* label);
