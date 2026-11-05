@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- The mod no longer needs `-insecure` in the launch options; it loads with any launch options.
+
 ## [0.9.0-alpha] - 2026-11-05
 
 First public release. This is an early alpha: expect bugs, crashes and addons that don't work with it.

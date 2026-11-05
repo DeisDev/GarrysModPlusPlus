@@ -17,12 +17,11 @@ GarrysMod++ is an unofficial fan project. It is not affiliated with or endorsed 
 
 1. Download `GarrysModPP.zip` from the releases page and extract it.
 2. Copy `winmm.dll` and the `gmodplusplus` folder into the game folder (the one with `gmod_win64.exe`).
-3. Add `-insecure` to the game's launch options in Steam. The mod only loads with it, so VAC-secured servers are off limits while it is on.
-4. Start the game. Press **Insert** for the settings menu.
+3. Start the game. Press **Insert** for the settings menu.
 
 The first launch compiles shaders for a while; later launches reuse them.
 
-To uninstall, delete `winmm.dll` and the `gmodplusplus` folder and remove `-insecure`.
+To uninstall, delete `winmm.dll` and the `gmodplusplus` folder.
 
 ## Settings
 

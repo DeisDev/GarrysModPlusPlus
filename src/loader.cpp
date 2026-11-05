@@ -8,6 +8,7 @@
 
 #include <cstring>
 #include <filesystem>
+#include <string_view>
 
 extern "C" void* gmodpp_winmm_table[];
 extern "C" const char* const gmodpp_winmm_names[];
@@ -64,10 +65,17 @@ HMODULE WINAPI LoadLibraryExAHook(LPCSTR fileName, HANDLE file, DWORD flags)
     return module;
 }
 
+// gmod_win64.exe's WinMain (0x140056a30) runs as a Chromium child (CefExecuteProcess, 0x140057100) when its command
+// line contains "--type=", a case-sensitive substring search; otherwise it loads launcher.dll. Confirmed with REA.
+bool IsChromiumChild()
+{
+    return std::wstring_view(GetCommandLineW()).find(L"--type=") != std::wstring_view::npos;
+}
+
 void InstallShaderApiRedirect()
 {
     std::filesystem::path exe = ExecutablePath();
-    if (!IsGameExecutable(exe) || !HasArgument(L"-insecure"))
+    if (!IsGameExecutable(exe) || IsChromiumChild())
         return;
     std::error_code error;
     std::filesystem::create_directories(ModDirectory() / L"logs", error);

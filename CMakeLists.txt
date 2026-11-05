@@ -504,7 +504,7 @@ target_include_directories(lzma_dec PUBLIC "${LZMA_SDK_DIR}")
 
 
 # winmm.dll loader for the game root: forwards every export of the system winmm.dll (winmm_exports.txt holds
-# their ordinals and names) and, with -insecure, sends the game's shaderapidx9.dll load to gmodpp.dll.
+# their ordinals and names) and, in the game's own process, sends its shaderapidx9.dll load to gmodpp.dll.
 file(STRINGS src/winmm_exports.txt WINMM_EXPORTS)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS src/winmm_exports.txt)
 list(LENGTH WINMM_EXPORTS WINMM_COUNT)
