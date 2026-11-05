@@ -4,6 +4,8 @@ A graphics mod for the 64-bit version of Garry's Mod. It replaces the Direct3D 9
 
 > **This is a proof of concept.** It is one person's experiment in how far Garry's Mod can be pushed, not a finished product. Expect bugs, crashes, broken addons, visual glitches and performance problems. Use it at your own risk and keep a backup of your settings.
 
+GarrysMod++ is an unofficial fan project. It is not affiliated with or endorsed by Facepunch Studios, Valve, NVIDIA or AMD.
+
 ## Requirements
 
 - Garry's Mod, 64-bit (the default public version, `gmod_win64.exe`), Windows 10 or 11.
@@ -40,7 +42,7 @@ Addons that only add content (maps, models, weapons, NPCs, gamemodes) mostly wor
 
 ## Building from source
 
-Visual Studio 2026 Build Tools (MSVC 14.51+), Windows 11 SDK 10.0.26100, CMake 3.28+ and Ninja. CMake downloads the other dependencies pinned by hash; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+Visual Studio 2026 Build Tools (MSVC 14.51+), Windows 11 SDK 10.0.26100, CMake 3.30+ and Ninja. CMake downloads the other dependencies pinned by hash; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 From a shell with `vcvars64.bat` loaded:
 
