@@ -67,7 +67,7 @@ float3 DrawnWaterNormal(float2 tangentSlope, float eyeAngle, float3 toEye, float
 }
 
 // The sun's specular highlight on the water, before the tonemap scale.
-float3 SunGlint(float3 position, float3 normal, float3 toEye)
+float3 SunGlint(float3 position, float3 normal, float3 toEye, float roughness)
 {
     float3 toSun = g_frame.sunDirection;
     float nl = dot(normal, toSun);
@@ -76,9 +76,9 @@ float3 SunGlint(float3 position, float3 normal, float3 toEye)
         return 0.0;
     float3 halfway = normalize(toSun + toEye);
     float nh = saturate(dot(normal, halfway));
-    float a2 = kGlintRoughness * kGlintRoughness;
+    float a2 = roughness * roughness;
     float d = a2 / (3.14159265 * pow(nh * nh * (a2 - 1.0) + 1.0, 2.0));
-    float k = kGlintRoughness * 0.5;
+    float k = roughness * 0.5;
     float g = (nl / (nl * (1.0 - k) + k)) * (nv / (nv * (1.0 - k) + k));
     float f = Fresnel(dot(halfway, toEye), kWaterIor);
     float3 visibility = SunVisibility(position + normal * 2.0, g_frame.sunShadowMask);
@@ -217,7 +217,8 @@ WaterResult ShadeWater(int2 pixel, float3 position)
         result.diffuseAlbedo = saturate((1.0 - fresnel) * lerp(seenAlbedo, waterGuide, shore));
     }
     if (!below)
-        result.color += SunGlint(surface, normal, toEye) * (g_frame.reflectionScale * (traced ? shore : marks.a));
+        result.color += SunGlint(surface, normal, toEye, WidenAlpha(kGlintRoughness, KernelRoughness2At(pixel))) *
+            (g_frame.reflectionScale * (traced ? shore : marks.a));
     result.specularAlbedo = saturate(fresnel * tint);
     return result;
 }

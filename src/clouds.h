@@ -68,8 +68,14 @@ struct CloudConstants {
     float cirrusStrandFrequency;
     uint32_t shapesView;
     uint32_t traceBlock;
+    float haloShare;
+    float wideHalos;
+    float parheliaShare;
+    float coronaSpread;
+    float dropletX[3];
+    float corona;
 };
-static_assert(sizeof(CloudConstants) == 512);
+static_assert(sizeof(CloudConstants) == 544);
 
 // What CloudConstants::layerMask draws (kLayer... in shaders/clouds.hlsl).
 inline constexpr uint32_t kCloudLayerLow = 1;

@@ -14,6 +14,7 @@
 #include "shaderapi_textures.h"
 #include "streamline.h"
 #include "video_menu.h"
+#include "viewmodel_casters.h"
 #include "view_events.h"
 #include "world.h"
 
@@ -126,8 +127,11 @@ bool IsWaterReflectionView()
 void Finish(gbuffer::ViewKind kind)
 {
     ViewInputs inputs = {};
+    const std::optional<viewmodel_casters::Geometry> viewmodelGeometry = viewmodel_casters::EndCapture();
     if (!capture::End(kind, inputs))
         return;
+    if (kind == gbuffer::ViewKind::Viewmodel)
+        inputs.viewmodelGeometry = viewmodelGeometry;
     inputs.depthMin = kind == gbuffer::ViewKind::Viewmodel ? g_state.viewmodelDepth[0] : 0.0f;
     inputs.depthMax = kind == gbuffer::ViewKind::Viewmodel ? g_state.viewmodelDepth[1] : 1.0f;
     // Lighting submits its own commands, which must follow the game's that drew the view.
@@ -189,6 +193,8 @@ void OnViewport(float minDepth, float maxDepth)
     g_state.viewmodelDepth[0] = minDepth;
     g_state.viewmodelDepth[1] = maxDepth;
     g_state.viewmodelCapture = capture::Begin({0.0f, 0.0f});
+    if (g_state.viewmodelCapture)
+        viewmodel_casters::BeginCapture();
 }
 
 void OnBackBufferRead()

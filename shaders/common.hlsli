@@ -59,14 +59,16 @@ struct FrameConstants
     uint emissiveView;
     uint materialsView;
     float reflectionScale;
-    uint padding9;
+    // Specular anti-aliasing's strength (Settings::specularAntialiasingStrength), 0 when off (KernelRoughness2At).
+    float specularAntialiasing;
     // Scene::LightLists.
     uint lightRangesView;
     uint lightIndicesView;
     uint bspNodesView;
     uint leafClustersView;
     uint clusterCount;
-    // 1 for the first-person viewmodel's run.
+    // 1 for the first-person viewmodel's run, 2 when it traces its own scene with its own triangles (kLocalPlayerMask),
+    // so it shadows itself (src/viewmodel_casters.h).
     uint viewmodel;
     // Written by shaders/primary.hlsl.
     uint visibilityView;
@@ -238,8 +240,41 @@ struct FrameConstants
     float cloudShadowFineScale;
     float cloudShadowCoarseScale;
     float cloudShadowEdge;
-    uint padding7;
-    uint4 padding10;
+    // How much the cloud shadows darken (Settings::cloudShadowStrength, 0 without them).
+    float cloudShadowStrength;
+    // Ground mist (Settings::groundMist; MistSigma in shaders/froxels.hlsli): its albedo, extinction per unit at
+    // mistBase, 1 / the height over which it thins by e, its noise's turbulence, 1 / its scale and drift, its phase
+    // function's g, the light it scatters per unit of opacity beyond the froxel volume (MistFarLight), and whether it is on.
+    float3 mistColor;
+    float mistDensity;
+    float mistBase;
+    float mistInvFalloff;
+    float mistTurbulence;
+    float mistInvScale;
+    float3 mistOffset;
+    float mistPhaseG;
+    float3 mistFarColor;
+    float mistEnabled;
+    // Aerial perspective (shaders/sky_atmosphere.hlsl step 7, AerialAt): its volume over the view (light and
+    // transmittance) and the cloud shadows' change of the 2D sky's light, or kNoView; the 3D skybox's distances this
+    // frame (shaders/primary.hlsl), or kNoView; the volume's reach in kilometres.
+    uint aerialView;
+    uint aerialSkyView;
+    uint skyboxDistanceView;
+    float aerialRangeKm;
+    // Particle shadows (shaders/particle_shadows.hlsl, ParticleShadowAt): the shadow map over the plane across the sun, or
+    // kNoView, and the eye's place along the sun its depths are measured from; the map's scale (1 / its width in units)
+    // and centre on the plane, the extinction volume's cells per unit and corner, and the sprites splatted into it.
+    uint particleShadowView;
+    float particleShadowAlong;
+    float particleShadowScale;
+    float particleVolumeInvCell;
+    float3 particleVolumeOrigin;
+    uint particleCount;
+    float2 particleShadowCentre;
+    // Aerial perspective's volume spans the view widened by this share on each side (as the clouds' history does).
+    float aerialOverscan;
+    uint padding11;
 };
 
 // Per-pass descriptor indices and parameters; mirrors Lighting::PassArgs in src/lighting.h.
@@ -460,11 +495,97 @@ static const float kMirrorRoughness = 0.02;
 // target's alpha (negative for models, positive for GMod's brush Phong, 0 for none), by the Blinn-Phong to Beckmann
 // relation alpha = sqrt(2 / (n + 2)) (Walter et al. 2007) carried over to GGX. Source gives no roughness; without an
 // exponent, or without glossy reflections, its env_cubemap reflections are mirrors (0).
+// Source's units are inches (Valve Developer Community, "Dimensions"): kilometres per unit.
+static const float kKilometresPerUnit = 2.54e-5;
+// The least spread along the sun a cloud's optical depth is taken to have (shaders/clouds.hlsl), in kilometres.
+static const float kCloudShadowMinSpread = 0.1;
+
+// A point in the map's space, or for `inSkybox` in the 3D skybox's (scaled about its camera).
+float3 MapSpace(float3 position, bool inSkybox)
+{
+    if (inSkybox && g_frame.worldToSky > 0.0)
+        return (position - float3(g_frame.skyCameraX, g_frame.skyCameraY, g_frame.skyCameraZ)) / g_frame.worldToSky;
+    return position;
+}
+
+// The share of the sun's light the clouds let through to a point (shaders/clouds.hlsl's shadow map: the fine cascade
+// where it covers the point, else the coarse one). The map holds each line's optical depth toward the sun and where
+// along the sun it lies (mean and spread), so a point takes the share of the depth beyond it: the whole depth below the
+// clouds, less within them, little above them.
+float CloudShadowAt(float3 origin, bool inSkybox)
+{
+    if (g_frame.cloudShadowView == kNoView)
+        return 1.0;
+    float3 position = MapSpace(origin, inSkybox);
+    float2 plane = float2(dot(position, g_frame.cloudShadowU.xyz) + g_frame.cloudShadowU.w, dot(position, g_frame.cloudShadowV.xyz) + g_frame.cloudShadowV.w);
+    Texture2D<float4> shadow = ResourceDescriptorHeap[g_frame.cloudShadowView];
+    float edge = g_frame.cloudShadowEdge;
+    float2 uv = plane * g_frame.cloudShadowFineScale + 0.5;
+    float cascade = 0.0;
+    if (any(abs(uv - 0.5) > 0.5 - edge)) {
+        uv = plane * g_frame.cloudShadowCoarseScale + 0.5;
+        cascade = 1.0;
+    }
+    uv = clamp(uv, edge, 1.0 - edge);
+    float4 texel = shadow.SampleLevel(g_linearClamp, float2((uv.x + cascade) * 0.5, uv.y), 0.0);
+    float along = kKilometresPerUnit * dot(position, g_frame.sunDirection);
+    float beyond = saturate(0.5 + (texel.y - along) / (2.0 * max(texel.z, kCloudShadowMinSpread)));
+    return lerp(1.0, exp(-texel.x * beyond), g_frame.cloudShadowStrength);
+}
+
+// The share of the sun's light last frame's smoke lets through to a point (shaders/particle_shadows.hlsl): the map holds
+// each line's optical depth toward the sun and where along it that lies, so the point takes the part beyond it.
+float ParticleShadowAt(float3 position)
+{
+    if (g_frame.particleShadowView == kNoView)
+        return 1.0;
+    float2 plane = float2(dot(position, g_frame.cloudShadowU.xyz), dot(position, g_frame.cloudShadowV.xyz)) - g_frame.particleShadowCentre;
+    float2 uv = plane * g_frame.particleShadowScale + 0.5;
+    if (any(abs(uv - 0.5) > 0.5))
+        return 1.0;
+    Texture2D<float4> shadow = ResourceDescriptorHeap[g_frame.particleShadowView];
+    float4 texel = shadow.SampleLevel(g_linearClamp, uv, 0.0);
+    float along = dot(position, g_frame.sunDirection) - g_frame.particleShadowAlong;
+    return exp(-texel.x * saturate(0.5 + (texel.y - along) / (2.0 * max(texel.z, 1.0))));
+}
+
+// The share of the sun's light clouds and smoke let through to a point (in the 3D skybox's space with `inSkybox`, where no
+// smoke is).
+float SunOcclusionAt(float3 position, bool inSkybox)
+{
+    float shade = CloudShadowAt(position, inSkybox);
+    return inSkybox ? shade : shade * ParticleShadowAt(position);
+}
+
+// Specular anti-aliasing (Tokuyoshi and Kaplanyan, "Stable Geometric Specular Antialiasing with Projected-Space NDF
+// Filtering", JCGT 2021): the squared roughness of the filter kernel over the normals one pixel covers, which
+// shaders/primary.hlsl keeps in the face normal target's alpha, times the setting's strength.
+float KernelRoughness2At(int2 pixel)
+{
+    if (g_frame.specularAntialiasing <= 0.0)
+        return 0.0;
+    Texture2D<float4> normals = ResourceDescriptorHeap[g_frame.geometricNormalView];
+    return g_frame.specularAntialiasing * normals.Load(int3(clamp(pixel, int2(0, 0), int2(g_frame.size) - 1), 0)).w;
+}
+
+// A GGX alpha widened by the kernel: the two lobes convolved, their squared roughnesses added.
+float WidenAlpha(float alpha, float kernel2)
+{
+    return sqrt(saturate(alpha * alpha + kernel2));
+}
+
+// A pixel's reflection lobe: GGX from its Phong exponent (alpha = sqrt(2 / (n + 2))), a mirror without one, both
+// widened by the specular anti-aliasing kernel, so a mirror whose normals vary within the pixel turns glossy.
 float PhongRoughness(int2 pixel)
 {
+    if (g_frame.glossyReflections == 0)
+        return 0.0;
     Texture2D<float4> emissive = ResourceDescriptorHeap[g_frame.emissiveView];
     float exponent = abs(emissive.Load(int3(pixel, 0)).a);
-    return exponent > 0.0 && g_frame.glossyReflections != 0 ? clamp(sqrt(2.0 / (exponent + 2.0)), kMirrorRoughness, 1.0) : 0.0;
+    float kernel2 = KernelRoughness2At(pixel);
+    if (exponent > 0.0)
+        return clamp(WidenAlpha(sqrt(2.0 / (exponent + 2.0)), kernel2), kMirrorRoughness, 1.0);
+    return kernel2 > kMirrorRoughness * kMirrorRoughness ? sqrt(kernel2) : 0.0;
 }
 
 uint Hash(uint x)

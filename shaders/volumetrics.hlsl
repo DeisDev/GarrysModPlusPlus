@@ -4,7 +4,9 @@
 // Volumetric light in a froxel volume (shaders/froxels.hlsli), a grid fitted to the view's frustum, as in Wronski 2014
 // ("Volumetric Fog", Assassin's Creed IV) and Hillaire 2015 ("Physically Based and Unified Volumetric Rendering in
 // Frostbite"). The medium is the water the eye is in (g_frame.eyeWater), the map's fog, lit (g_frame.volumetricFog:
-// LitFog), or else a thin, even haze.
+// LitFog), or else a thin, even haze, with ground mist over it where that is on (g_frame.mistEnabled): an exponential
+// height fog broken up by noise that drifts with the wind (MistSigma), whose extinction varies, so the scatter keeps
+// each froxel's in a volume of its own (output2, last frame's in input5), which the integration then takes.
 //
 // Scatter (step 0, a thread per froxel): the light the medium scatters towards the eye per unit of its opacity, before
 // the tonemap scale, at a point jittered within the froxel each frame (froxelJitter): the sun's with its shadow, the fog's
@@ -15,12 +17,13 @@
 // the player and would leave trails in that history: they are traced at each froxel's centre every frame, into a volume
 // of their own. input0: last frame's light (rgb, frames averaged); input1-3: the main view's indirect light volume
 // (shaders/probes.hlsl) or kNoView; input4: 1 when last frame's light may be used, plus 2 to sample map and dynamic
-// lights; output0: this frame's light; output1: the projected lights' (rgb).
+// lights; output0: this frame's light; output1: the projected lights' (rgb); with ground mist, input5: last frame's
+// extinction, output2: this frame's.
 //
 // Integrate (step 1, a thread per froxel column): walks the column from the eye, adding each froxel's light times the
 // opacity the medium gains across it (Hillaire's energy-conserving integration: the transmittance before the froxel
 // minus after it), and writes the light gathered by each froxel's far side and the transmittance there. input0, input1:
-// the scatter's outputs; output0: the integrated volume (FroxelLight).
+// the scatter's outputs; with ground mist, input2: the froxels' extinction; output0: the integrated volume (FroxelLight).
 
 // The haze reaches this far at most.
 static const float kMaxDistance = 4096.0;
@@ -41,13 +44,47 @@ float2 FroxelUv(float2 cell)
     return cell / float2(g_frame.froxelDims.xy) / g_frame.froxelUvScale;
 }
 
-// The eye ray through screen position `uv`: the step along it per unit of view depth.
-float3 FroxelRay(float2 uv)
+// Gradient noise (Perlin 2002's quintic fade) in [-1, 1], mean 0, from a hash of the lattice.
+float3 LatticeGradient(int3 cell)
 {
-    float4 toPoint = mul(g_frame.clipToEye, float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0.5, 1.0));
-    float3 offset = toPoint.xyz / toPoint.w;
-    return offset / max(dot(g_frame.viewProj[3].xyz, offset), 1e-6);
+    uint h = Hash(uint(cell.x) * 73856093u ^ uint(cell.y) * 19349663u ^ uint(cell.z) * 83492791u);
+    float3 g = float3(h & 1023u, (h >> 10) & 1023u, (h >> 20) & 1023u) / 511.5 - 1.0;
+    return g / max(length(g), 1e-4);
 }
+
+float GradientNoise(float3 p)
+{
+    int3 cell = int3(floor(p));
+    float3 f = p - float3(cell);
+    float3 fade = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+    float corners[8];
+    [unroll]
+    for (uint i = 0; i < 8; ++i) {
+        int3 corner = int3(i & 1, (i >> 1) & 1, i >> 2);
+        corners[i] = dot(LatticeGradient(cell + corner), f - float3(corner));
+    }
+    float4 x = lerp(float4(corners[0], corners[2], corners[4], corners[6]), float4(corners[1], corners[3], corners[5], corners[7]), fade.x);
+    float2 y = lerp(x.xz, x.yw, fade.y);
+    return lerp(y.x, y.y, fade.z);
+}
+
+// Ground mist's extinction per unit at a point: thinning by e every 1 / mistInvFalloff units above mistBase, broken up by
+// three octaves of noise mistTurbulence strong, mistInvScale per unit, carried by the wind (mistOffset).
+float MistSigma(float3 position)
+{
+    float3 p = (position + g_frame.mistOffset) * g_frame.mistInvScale;
+    float noise = 0.5714 * GradientNoise(p) + 0.2857 * GradientNoise(p * 2.03 + 17.1) + 0.1429 * GradientNoise(p * 4.01 + 41.7);
+    float above = clamp((position.z - g_frame.mistBase) * g_frame.mistInvFalloff, -60.0, 60.0);
+    return g_frame.mistDensity * exp(-above) * max(0.0, 1.0 + 2.0 * g_frame.mistTurbulence * noise);
+}
+
+float MistPhase(float cosine)
+{
+    float g = g_frame.mistPhaseG;
+    float g2 = g * g;
+    return (1.0 - g2) / (4.0 * 3.14159265 * pow(max(1.0 + g2 - 2.0 * g * cosine, 1e-4), 1.5));
+}
+
 
 // The share of the light from view depth `viewDepth` along a ray (`rayScale` units per unit of view depth) that the
 // medium lets through to the eye: water's by colour (Beer-Lambert), Source's fog's (1 - FogOpacity) or the haze's.
@@ -141,6 +178,26 @@ float3 SampledLampAlong(float3 direction, float near, float far, bool water, ino
     return pickedIrradiance / Luminance(pickedIrradiance) * shadow * (total / max(far - near, 1e-4));
 }
 
+// The light ground mist scatters towards the eye per unit of its opacity: the sun's with its shadow, the sky's as much as
+// reaches the point (the indirect light volume against the open sky's, as LitFog takes it, so mist under a roof is dark)
+// and, in the main view, a lamp's, all times its albedo.
+float3 MistLight(float3 position, float3 direction, float near, float far, uint3 volume, bool lamps, inout uint seed)
+{
+    float3 light = 0.0;
+    if (g_frame.sunEnabled != 0.0)
+        light += 3.14159265 * g_frame.sunColor * MistPhase(dot(direction, g_frame.sunDirection)) * SunVisibility(position, g_frame.sunShadowMask);
+    float ambient = 1.0;
+    if (volume.r != kNoView) {
+        float3 indirect = VolumeIrradiance(volume, position, 0.0);
+        if (indirect.r >= 0.0)
+            ambient = saturate(Luminance(indirect) / max(0.5 * Luminance(g_frame.skyColor), 1e-6));
+    }
+    light += 0.5 * g_frame.skyColor * ambient;
+    if (lamps)
+        light += 3.14159265 * SampledLampAlong(direction, near, far, false, seed);
+    return g_frame.mistColor * light;
+}
+
 // The light the medium scatters towards the eye at a point per unit of its opacity, without projected lights; the lamps'
 // is averaged over the stretch [near, far] (distances) of the eye ray the point lies on. Radiance scattered from
 // irradiance E is opacity * phase * pi * E in the units the lighting uses; the water's phase function already averages 1
@@ -208,6 +265,16 @@ void Scatter(uint3 id)
     float3 light = MediumLight(position, direction, near * rayScale, far * rayScale, volume, (g_pass.input4 & 2u) != 0, seed);
     // A sample brighter on screen than ClampSample allows, over the opacity its froxel adds, is scaled down to it.
     float gained = Luminance(max(MediumTransmittance(near, rayScale) - MediumTransmittance(far, rayScale), 0.0));
+    // With ground mist, the haze and the mist share the froxel by their extinction.
+    float sigma = 0.0;
+    if (g_frame.mistEnabled != 0.0) {
+        float haze = viewDepth * rayScale < kMaxDistance ? g_frame.volumetricDensity : 0.0;
+        float mist = MistSigma(position);
+        sigma = haze + mist;
+        float3 mistLight = MistLight(position, direction, near * rayScale, far * rayScale, volume, (g_pass.input4 & 2u) != 0, seed);
+        light = sigma > 0.0 ? (haze * light + mist * mistLight) / sigma : 0.0;
+        gained = 1.0 - exp(-sigma * (far - near) * rayScale);
+    }
     light = gained > 0.0 ? ClampSample(light * gained) / gained : light;
 
     float frames = 1.0;
@@ -217,13 +284,22 @@ void Scatter(uint3 id)
         float previousSlice = FroxelSlice(clip.w, g_frame.prevFroxelStart, g_frame.prevFroxelRange);
         if (clip.w > 0.0 && all(previousUv >= 0.0) && all(previousUv <= 1.0) && clip.w >= g_frame.prevFroxelStart && previousSlice <= 1.0) {
             Texture3D<float4> history = ResourceDescriptorHeap[g_pass.input0];
-            float4 previous = history.SampleLevel(g_linearClamp, float3(previousUv * g_frame.froxelUvScale, previousSlice), 0.0);
+            float3 previousPoint = float3(previousUv * g_frame.froxelUvScale, previousSlice);
+            float4 previous = history.SampleLevel(g_linearClamp, previousPoint, 0.0);
             frames = min(previous.a + 1.0, 1.0 / kHistoryShare);
             light = lerp(previous.rgb, light, 1.0 / frames);
+            if (g_frame.mistEnabled != 0.0) {
+                Texture3D<float> sigmaHistory = ResourceDescriptorHeap[g_pass.input5];
+                sigma = lerp(sigmaHistory.SampleLevel(g_linearClamp, previousPoint, 0.0), sigma, 1.0 / frames);
+            }
         }
     }
     RWTexture3D<float4> output = ResourceDescriptorHeap[g_pass.output0];
     output[id] = float4(light, frames);
+    if (g_frame.mistEnabled != 0.0) {
+        RWTexture3D<float> sigmas = ResourceDescriptorHeap[g_pass.output2];
+        sigmas[id] = sigma;
+    }
 
     float3 projected = 0.0;
     if (g_frame.projectorCount != 0) {
@@ -246,10 +322,22 @@ void Integrate(uint2 column)
     RWTexture3D<float4> output = ResourceDescriptorHeap[g_pass.output0];
     float3 before = MediumTransmittance(g_frame.froxelStart, rayScale);
     float3 gathered = 0.0;
+    bool mist = g_frame.mistEnabled != 0.0;
+    if (mist)
+        before = 1.0;
     [loop]
     for (uint k = 0; k < slices; ++k) {
-        float3 after = MediumTransmittance(FroxelDepth(float(k + 1) / float(slices), g_frame.froxelStart, g_frame.froxelRange), rayScale);
         int4 texel = int4(column, k, 0);
+        float3 after;
+        if (mist) {
+            // Ground mist's extinction varies within the volume: each froxel's, over its stretch of the ray.
+            Texture3D<float> sigmas = ResourceDescriptorHeap[g_pass.input2];
+            float near = FroxelDepth(float(k) / float(slices), g_frame.froxelStart, g_frame.froxelRange);
+            float far = FroxelDepth(float(k + 1) / float(slices), g_frame.froxelStart, g_frame.froxelRange);
+            after = before * exp(-sigmas.Load(texel) * (far - near) * rayScale);
+        } else {
+            after = MediumTransmittance(FroxelDepth(float(k + 1) / float(slices), g_frame.froxelStart, g_frame.froxelRange), rayScale);
+        }
         gathered += max(before - after, 0.0) * (light.Load(texel).rgb + projected.Load(texel).rgb);
         output[uint3(column, k)] = float4(gathered, Luminance(after));
         before = after;

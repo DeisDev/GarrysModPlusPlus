@@ -43,6 +43,36 @@ float3 SeenThroughMedium(float3 color, float3 position, int2 pixel)
     return lerp(color, g_frame.fogColor * FogDaylight(), fog) + inscatter;
 }
 
+// The distance in the map's units of the 3D skybox's surface a pixel shows (shaders/primary.hlsl, its view's distances
+// scaled to the map), or 0 for none.
+float SkyboxDistanceAt(int2 pixel)
+{
+    if (g_frame.skyboxDistanceView == kNoView)
+        return 0.0;
+    Texture2D<float> distances = ResourceDescriptorHeap[g_frame.skyboxDistanceView];
+    uint2 size;
+    distances.GetDimensions(size.x, size.y);
+    int2 source = min(int2((float2(pixel) + 0.5) * float2(size) / float2(g_frame.size)), int2(size) - 1);
+    return distances.Load(int3(source, 0));
+}
+
+// The air between the eye and what lies `distance` units away through `pixel` (aerial perspective, shaders/
+// sky_atmosphere.hlsl step 7): `color` (after the tonemap scale) as far as the air lets it through, plus the light the
+// air scatters toward the eye on the way.
+float3 AerialPerspective(float3 color, int2 pixel, float distance)
+{
+    if (g_frame.aerialView == kNoView)
+        return color;
+    float2 ndc = ((float2(pixel) + 0.5) * g_frame.invSize * 2.0 - 1.0) / (1.0 + 2.0 * g_frame.aerialOverscan);
+    float2 uv = ndc * 0.5 + 0.5;
+    float slices = 32.0;
+    float boundary = sqrt(saturate(distance * kKilometresPerUnit / g_frame.aerialRangeKm)) * slices;
+    Texture3D<float4> volume = ResourceDescriptorHeap[g_frame.aerialView];
+    float4 air = volume.SampleLevel(g_linearClamp, float3(uv, (boundary - 0.5) / slices), 0.0);
+    air = boundary < 1.0 ? lerp(float4(0.0, 0.0, 0.0, 1.0), air, boundary) : air;
+    return color * air.a + air.rgb * g_frame.tonemapScale;
+}
+
 // Source's rim light also adds the ambient light seen along the view (vRimAmbientCubeColor in skin_ps20b) times its
 // boost where the surface faces up; the indirect light at the pixel stands in for the ambient cube.
 float3 AmbientRim(int2 pixel, float3 normal, float3 indirect)
@@ -203,8 +233,14 @@ void main(uint3 id : SV_DispatchThreadID)
             else
                 sky = beyond + SeenThroughMedium(0.0, WorldPositionFromDepth(pixel, depth), pixel);
         } else if (g_frame.fogEnabled == 0) {
+            // The 3D skybox's pixels, which the main view leaves without depth, lie at its distances: its distant land is
+            // seen through the air between (aerial perspective) where its view has no fog.
+            float skyboxDistance = depth >= 1.0 ? SkyboxDistanceAt(pixel) : 0.0;
+            if (skyboxDistance > 0.0 && g_frame.skyboxFogEnabled == 0)
+                beyond = AerialPerspective(beyond, pixel, skyboxDistance);
             // The haze over what the game drew unlit, and over the sky as far as the sky does not already show it.
-            sky = SeenThroughMedium(beyond, depth >= 1.0 ? g_frame.eyePosition + direction * kHazeSkyDistance : WorldPositionFromDepth(pixel, depth), pixel);
+            float reach = skyboxDistance > 0.0 ? min(skyboxDistance, SkyMediumDistance()) : SkyMediumDistance();
+            sky = SeenThroughMedium(beyond, depth >= 1.0 ? g_frame.eyePosition + direction * reach : WorldPositionFromDepth(pixel, depth), pixel);
         }
         output[pixel] = float4(sky, color.a);
         MirrorGuides(pixel);
@@ -311,7 +347,11 @@ void main(uint3 id : SV_DispatchThreadID)
             Texture2D<float4> highlights = ResourceDescriptorHeap[g_frame.specularView];
             specular += highlights.Load(int3(pixel, 0)).rgb;
         }
-        float3 shaded = SeenThroughMedium((albedo * light + emissive + added + specular) * g_frame.tonemapScale, position, pixel);
+        float3 shaded = (albedo * light + emissive + added + specular) * g_frame.tonemapScale;
+        // The air's light and transmittance out to the surface (aerial perspective), then the haze or fog near the eye.
+        if (g_frame.fogEnabled == 0 && g_frame.eyeWater == kNoView)
+            shaded = AerialPerspective(shaded, pixel, length(position - g_frame.eyePosition));
+        shaded = SeenThroughMedium(shaded, position, pixel);
         result = shaded + additive;
         // NRD's validation overlay (debug view 15) over the image.
         if (g_frame.debugView == 15 && g_frame.nrdValidationView != kNoView) {

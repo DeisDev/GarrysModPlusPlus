@@ -5,6 +5,7 @@
 #include "light_queries.h"
 #include "log.h"
 #include "options.h"
+#include "particle_shadows.h"
 #include "parallel_jobs.h"
 #include "settings.h"
 
@@ -18,6 +19,7 @@
 #include <g_flareVisibilityOmmCS.h>
 #include <g_regenInputsCS.h>
 #include <g_regenResolveCS.h>
+#include <g_particleShadowsCS.h>
 #include <g_deferredLightingCacheOmmCS.h>
 #include <g_deferredLightingOmmCS.h>
 #include <g_translucentDepthOmmCS.h>
@@ -105,6 +107,11 @@ static_assert(offsetof(FrameConstants, lightWarpViews) % 16 == 0);
 static_assert(offsetof(FrameConstants, skyboxFogParams) % 16 == 0);
 static_assert(offsetof(FrameConstants, causticsOrigin) % 16 == 0);
 static_assert(offsetof(FrameConstants, cloudShadowU) % 16 == 0);
+// HLSL starts each float3 and each row of four at a 16-byte boundary.
+static_assert(offsetof(FrameConstants, mistColor) % 16 == 0 && offsetof(FrameConstants, mistOffset) % 16 == 0 &&
+    offsetof(FrameConstants, mistFarColor) % 16 == 0 && offsetof(FrameConstants, aerialView) % 16 == 0 &&
+    offsetof(FrameConstants, particleShadowView) % 16 == 0 && offsetof(FrameConstants, particleVolumeOrigin) % 16 == 0 &&
+    offsetof(FrameConstants, particleShadowCentre) % 16 == 0);
 // Each slot has the view's constants and a copy for the passes Ray Reconstruction runs at render resolution.
 constexpr UINT kConstantsPerSlot = 2;
 // Per slot: colour copy, depth, G-buffer normal, flags, light, albedo and self-illumination views, then projector cookies.
@@ -180,6 +187,31 @@ constexpr float kCloudShadowCoarseWidth = 16.0f * kCloudShadowFineWidth;
 constexpr UINT kCloudLightTexels = 3;
 constexpr UINT kCloudCubeSize = kProceduralSkySize;
 constexpr float kCloudOverscan = 0.1f;
+// Aerial perspective's volume over the view (shaders/sky_atmosphere.hlsl step 7): texels across, up and in depth, and its
+// reach in kilometres (the 3D skybox, a 16th of the map's scale, reaches about 26 km).
+constexpr UINT kAerialSize = 32;
+constexpr float kAerialRangeKm = 32.0f;
+// Particle shadows (shaders/particle_shadows.hlsl): the extinction volume's cells (units) and size, 4096 x 4096 x 2048
+// units around the eye, and the shadow map's texels and width in units (16 units a texel).
+constexpr float kParticleCell = 32.0f;
+constexpr UINT kParticleVolume[3] = {128, 128, 64};
+constexpr UINT kParticleShadowSize = 512;
+constexpr float kParticleShadowWidth = 8192.0f;
+// Mirrors AerialConstants in shaders/sky_atmosphere.hlsl.
+struct AerialConstants {
+    float clipToDirection[3][4];
+    float lightDirection[3];
+    float lightScale;
+    uint32_t transmittanceView;
+    uint32_t multipleScatteringView;
+    uint32_t bandsView;
+    float rangeKm;
+    float strength;
+    uint32_t crepuscular;
+    float shadowMean;
+    float glowScale;
+};
+static_assert(sizeof(AerialConstants) == 96);
 // The clouds are lit by the sun until it is this far below the horizon (sin(4 degrees)), as seen from the ground: clouds
 // up to 15 km high see it a while longer, which the planet's shadow (LightAt in shaders/clouds.hlsl) takes care of.
 constexpr float kCloudSunBelow = -0.0698f;
@@ -191,7 +223,13 @@ constexpr UINT kFroxelRows = 160;
 constexpr float kHazeDistance = 4096.0f;
 constexpr float kMaxFogDistance = 65536.0f;
 // What the froxel volume's light was gathered in; its history is kept only while that stays the same.
-enum class FroxelMedium { Haze, Fog, Water };
+enum class FroxelMedium { Haze, Fog, Water, Mist };
+// Ground mist: the visibility at its level gives its extinction by Koschmieder's law (sigma = 3.912 / visibility); the
+// volume reaches four mean free paths at the eye's height, between the haze's reach and kMaxMistDistance; Source's units
+// per metre (inches).
+constexpr float kKoschmieder = 3.912f;
+constexpr float kMaxMistDistance = 32768.0f;
+constexpr float kUnitsPerMetre = 1.0f / 0.0254f;
 static_assert(sizeof(SamplingConstants) <= kSamplingStride);
 // The radiance cache (NVIDIA SHaRC): 2^22 entries of 8 + 16 + 16 bytes (160 MiB), SHaRC's recommended size. Voxels are
 // about their distance from the camera over kCacheSceneScale across (a ratio, so Source's units need no conversion);
@@ -292,6 +330,9 @@ constexpr UINT kFilterSteps[] = {1, 2, 4, 8, 16};
 // eight directions a block. Eight a pixel cost 2.4 ms on gm_construct at 2560x1440 (2026-11-03); its history
 // (shaders/gi_temporal.hlsl) and denoiser average the rest.
 constexpr UINT kViewmodelIndirectSamples = 2;
+// With the viewmodel's own triangles in its scene, its rays leave its surfaces this far along the normal (FrameConstants::
+// normalBias; 2 units elsewhere): fingers are about 1.5 units thick, and its triangles match its depth to about 1e-3 units.
+constexpr float kViewmodelNormalBias = 0.15f;
 // Frame tags in the viewmodel's record stay exact in its 32-bit floats; 0 marks a texel never written.
 constexpr uint64_t kViewmodelTags = 1u << 24;
 constexpr UINT kPassCount = static_cast<UINT>(GpuPass::Count);
@@ -573,7 +614,7 @@ HRESULT Lighting::CreatePipelines(std::stop_token stop)
         g_swayCS, g_translucentDepthCS, g_viewRectCS, g_bakedBounceCS, g_skyCS, cache ? std::span<const BYTE>(g_sharcUpdateCS) : none,
         cache ? std::span<const BYTE>(g_sharcResolveCS) : none, g_directSunCS, g_restirPdfCS, g_restirPresampleCS, g_restirRegirCS, g_restirInitialCS,
         g_restirTemporalCS, g_restirSpatialCS, g_restirShadeCS, g_nrdInputsCS, g_nrdResolveCS, g_sunShadowCS, g_causticsCS, g_skinCS,
-        g_skyAtmosphereCS, g_flareVisibilityCS, g_cloudsCS, g_regenInputsCS, g_regenResolveCS};
+        g_skyAtmosphereCS, g_flareVisibilityCS, g_cloudsCS, g_regenInputsCS, g_regenResolveCS, g_particleShadowsCS};
     static_assert(std::size(shaders) == static_cast<size_t>(Pass::Count));
     for (size_t i = 0; i < m_pipelines.size(); ++i)
         compute(shaders[i], m_pipelines[i]);
@@ -929,10 +970,14 @@ bool Lighting::EnsureFroxels(const std::array<UINT, 3>& dims)
     bool ok = true;
     for (Texture& texture : m_froxelLight)
         ok = ok && CreateTarget(texture, dims[0], dims[1], DXGI_FORMAT_R16G16B16A16_FLOAT, dims[2]);
+    for (Texture& texture : m_froxelSigma)
+        ok = ok && CreateTarget(texture, dims[0], dims[1], DXGI_FORMAT_R16_FLOAT, dims[2]);
     ok = ok && CreateTarget(m_froxelProjected, dims[0], dims[1], DXGI_FORMAT_R11G11B10_FLOAT, dims[2]);
     ok = ok && CreateTarget(m_froxelIntegrated, dims[0], dims[1], DXGI_FORMAT_R16G16B16A16_FLOAT, dims[2]);
     if (!ok) {
         for (Texture& texture : m_froxelLight)
+            texture.resource.Reset();
+        for (Texture& texture : m_froxelSigma)
             texture.resource.Reset();
         m_froxelProjected.resource.Reset();
         m_froxelIntegrated.resource.Reset();
@@ -1469,7 +1514,7 @@ float Lighting::CloudSkyFactor(const ViewInputs& inputs, const Scene& scene) con
 void Lighting::ReadCloudLight(UINT slot)
 {
     void* mapped = nullptr;
-    float texels[2][4];
+    float texels[3][4];
     const D3D12_RANGE range = {0, sizeof(texels)};
     if (FAILED(m_cloudReadback[slot]->Map(0, &range, &mapped)))
         return;
@@ -1478,17 +1523,259 @@ void Lighting::ReadCloudLight(UINT slot)
     m_cloudReadback[slot]->Unmap(0, &written);
     m_skyScale = std::isfinite(texels[0][3]) ? std::max(texels[0][3], 0.0f) : 0.0f;
     m_cloudSkyFactor = std::isfinite(texels[1][3]) && texels[1][3] > 0.0f ? texels[1][3] : 1.0f;
+    m_cloudShadowMean = std::isfinite(texels[2][3]) ? std::clamp(texels[2][3], 0.0f, 1.0f) : 1.0f;
 }
 
 void Lighting::SetCloudConstants(FrameConstants& constants) const
 {
     constants.cloudCubeView = m_cloudsReady ? m_cloudCube.srv : kInvalidView;
     constants.cloudShadowView = m_cloudsReady && m_cloudShadowReady ? m_cloudShadow.srv : kInvalidView;
-    std::copy_n(m_cloudShadowU, 4, constants.cloudShadowU);
-    std::copy_n(m_cloudShadowV, 4, constants.cloudShadowV);
+    // The plane's axes (PlaceSunPlane) serve the particles' shadow map too; the offsets place the clouds'.
+    std::copy_n(m_sunPlaneU, 3, constants.cloudShadowU);
+    std::copy_n(m_sunPlaneV, 3, constants.cloudShadowV);
+    constants.cloudShadowU[3] = m_cloudShadowU[3];
+    constants.cloudShadowV[3] = m_cloudShadowV[3];
     constants.cloudShadowFineScale = 1.0f / kCloudShadowFineWidth;
     constants.cloudShadowCoarseScale = 1.0f / kCloudShadowCoarseWidth;
     constants.cloudShadowEdge = 0.5f / static_cast<float>(kCloudShadowSize);
+    constants.cloudShadowStrength = m_cloudShadowStrength;
+}
+
+std::optional<Lighting::WidenedView> Lighting::WidenedSkyView(const FrameConstants& constants, const ViewInputs& inputs)
+{
+    // The view's clip space as its G-buffer was drawn (jittered), widened by the overscan; and back from it to directions
+    // in double precision, as the sky's draw finds its directions (ClipToEye in shaderapi_pipelines.cpp).
+    WidenedView view;
+    std::memcpy(view.rows, constants.viewProj, sizeof(view.rows));
+    for (int c = 0; c < 4; ++c) {
+        view.rows[0][c] = (view.rows[0][c] + inputs.jitter[0] * view.rows[3][c]) / (1.0f + 2.0f * kCloudOverscan);
+        view.rows[1][c] = (view.rows[1][c] + inputs.jitter[1] * view.rows[3][c]) / (1.0f + 2.0f * kCloudOverscan);
+    }
+    const float (&rows)[4][4] = view.rows;
+    const double a[3][3] = {{rows[0][0], rows[0][1], rows[0][2]}, {rows[1][0], rows[1][1], rows[1][2]}, {rows[3][0], rows[3][1], rows[3][2]}};
+    const double determinant = a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1]) - a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0]) +
+        a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0]);
+    if (std::fabs(determinant) < 1e-30)
+        return std::nullopt;
+    for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 3; ++c) {
+            // The inverse's (r, c) is the cofactor of (c, r) over the determinant.
+            const int r1 = (c + 1) % 3;
+            const int r2 = (c + 2) % 3;
+            const int c1 = (r + 1) % 3;
+            const int c2 = (r + 2) % 3;
+            view.clipToDirection[r][c] = static_cast<float>((a[r1][c1] * a[r2][c2] - a[r1][c2] * a[r2][c1]) / determinant);
+        }
+        view.clipToDirection[r][3] = 0.0f;
+    }
+    return view;
+}
+
+Lighting::SkyLightSource Lighting::SkyLightFor(const FrameConstants& constants, const ViewInputs& inputs, const Scene& scene) const
+{
+    // The sun the sky shows until it has set below the clouds, then the Moon of day maps at its share of the night's sky.
+    SkyLightSource light;
+    const std::optional<std::array<float, 3>> sun = SkySun(inputs, scene);
+    light.direction = sun.value_or(std::array<float, 3>{0.0f, 0.0f, 1.0f});
+    if (light.direction[2] < kCloudSunBelow) {
+        const std::optional<MoonState> moon = MoonFor(inputs, scene);
+        light.scale = moon ? moon->scale : 0.0f;
+        if (moon)
+            light.direction = moon->direction;
+    }
+    // In the map's sun's hue, the air's colouring taken out of it: what it lights is passed through the air on its own.
+    if (constants.sunEnabled != 0.0f) {
+        const std::array<float, 4> toSun = DaylightAt(constants.sunDirection[2]);
+        float color[3];
+        for (size_t i = 0; i < 3; ++i)
+            color[i] = toSun[i] > 1e-6f ? constants.sunColor[i] / toSun[i] : 0.0f;
+        const float luminance = Luminance(color);
+        if (luminance > 0.0f) {
+            for (size_t i = 0; i < 3; ++i)
+                light.tint[i] = color[i] / luminance;
+        }
+    }
+    return light;
+}
+
+void Lighting::RecordAerial(FrameConstants& constants, const ViewInputs& inputs, const Scene& scene, UINT slot)
+{
+    const Settings& settings = GetSettings();
+    if (!settings.aerialPerspective || !settings.physicalSky || !m_proceduralSkyReady || !m_atmosphereTables || !EnsureAerial())
+        return;
+    const std::optional<WidenedView> widened = WidenedSkyView(constants, inputs);
+    if (!widened)
+        return;
+    const SkyLightSource light = SkyLightFor(constants, inputs, scene);
+    AerialConstants aerial = {};
+    std::memcpy(aerial.clipToDirection, widened->clipToDirection, sizeof(aerial.clipToDirection));
+    std::copy(light.direction.begin(), light.direction.end(), aerial.lightDirection);
+    aerial.lightScale = constants.sunEnabled != 0.0f ? light.scale : 0.0f;
+    aerial.rangeKm = kAerialRangeKm;
+    aerial.transmittanceView = m_transmittance.srv;
+    aerial.multipleScatteringView = m_multipleScattering.srv;
+    aerial.bandsView = m_skyBands.srv;
+    aerial.strength = settings.aerialStrength;
+    aerial.crepuscular = settings.crepuscularRays && settings.cloudShadows ? 1u : 0u;
+    aerial.shadowMean = m_cloudShadowMean;
+    aerial.glowScale = settings.sunGlow;
+    std::memcpy(m_aerialConstantsMapped + slot * sizeof(AerialConstants), &aerial, sizeof(aerial));
+    Use(m_aerialLut, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    Use(m_aerialSky, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    DispatchGroups(Pass::SkyAtmosphere, {.input0 = m_aerialConstantViews[slot], .output0 = m_aerialLut.uav, .output1 = m_aerialSky.uav, .step = 7},
+        kAerialSize / 16, kAerialSize / 16, 1);
+    Use(m_aerialLut, kVolumeRead);
+    Use(m_aerialSky, kVolumeRead);
+    constants.aerialView = m_aerialLut.srv;
+    constants.aerialRangeKm = kAerialRangeKm;
+    constants.aerialOverscan = kCloudOverscan;
+    // The sky's draws next frame add the cloud shadows' change of its light (shaders/sky_draw.hlsl), over the same
+    // widened view the clouds' history covers.
+    if (aerial.crepuscular != 0) {
+        m_skyDraw.aerialSkyView = m_aerialSky.srv;
+        for (size_t r = 0; r < 4; ++r)
+            std::copy(std::begin(widened->rows[r]), std::end(widened->rows[r]), m_skyDraw.cloudViewProj[r].begin());
+        m_skyDraw.cloudOverscan = kCloudOverscan;
+    }
+}
+
+bool Lighting::EnsureAerial()
+{
+    if (m_aerialLut.resource)
+        return true;
+    if (m_aerialFailed)
+        return false;
+    m_aerialFailed = true;
+    if (!CreateTarget(m_aerialLut, kAerialSize, kAerialSize, DXGI_FORMAT_R16G16B16A16_FLOAT, kAerialSize) ||
+        !CreateTarget(m_aerialSky, kAerialSize, kAerialSize, DXGI_FORMAT_R16G16B16A16_FLOAT)) {
+        m_aerialLut.resource.Reset();
+        log::Info("Lighting: aerial perspective's volume could not be made; it is off");
+        return false;
+    }
+    m_aerialConstants = CreateBuffer(m_device, D3D12_HEAP_TYPE_UPLOAD, sizeof(AerialConstants) * kSlots, D3D12_RESOURCE_STATE_GENERIC_READ);
+    if (!m_aerialConstants || FAILED(m_aerialConstants->Map(0, nullptr, reinterpret_cast<void**>(&m_aerialConstantsMapped)))) {
+        m_aerialLut.resource.Reset();
+        return false;
+    }
+    for (UINT slot = 0; slot < kSlots; ++slot) {
+        m_aerialConstantViews[slot] = m_descriptors->Allocate();
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+        srv.Format = DXGI_FORMAT_UNKNOWN;
+        srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.Buffer.FirstElement = slot;
+        srv.Buffer.NumElements = 1;
+        srv.Buffer.StructureByteStride = sizeof(AerialConstants);
+        m_device->CreateShaderResourceView(m_aerialConstants.Get(), &srv, m_descriptors->Cpu(m_aerialConstantViews[slot]));
+    }
+    m_aerialFailed = false;
+    return true;
+}
+
+void Lighting::SetParticleConstants(FrameConstants& constants) const
+{
+    if (!m_particleShadowReady)
+        return;
+    constants.particleShadowView = m_particleShadow.srv;
+    constants.particleShadowAlong = m_particleShadowAlong;
+    constants.particleShadowScale = 1.0f / kParticleShadowWidth;
+    std::copy(std::begin(m_particleShadowCentre), std::end(m_particleShadowCentre), constants.particleShadowCentre);
+}
+
+void Lighting::RecordParticles(FrameConstants& constants, UINT slot)
+{
+    const Settings& settings = GetSettings();
+    std::vector<particle_shadows::Particle> particles = particle_shadows::Take();
+    m_particleShadowReady = false;
+    constants.particleShadowView = kInvalidView;
+    if (!settings.particleShadows || particles.empty() || constants.sunEnabled == 0.0f || !EnsureParticles())
+        return;
+    const size_t count = std::min(particles.size(), particle_shadows::kMaxParticles);
+    std::memcpy(m_particleRecordsMapped + slot * particle_shadows::kMaxParticles * sizeof(particle_shadows::Particle), particles.data(),
+        count * sizeof(particle_shadows::Particle));
+    // The volume around the eye in whole cells, and the shadow map over the plane across the sun centred on the eye in
+    // whole texels, so neither crawls as the eye moves.
+    constexpr float kCell = kParticleCell;
+    for (int i = 0; i < 3; ++i) {
+        const float half = 0.5f * static_cast<float>(kParticleVolume[i]) * kCell;
+        constants.particleVolumeOrigin[i] = std::floor(constants.eyePosition[i] / kCell) * kCell - half;
+    }
+    constants.particleVolumeInvCell = 1.0f / kCell;
+    constants.particleCount = static_cast<uint32_t>(count);
+    const float texel = kParticleShadowWidth / static_cast<float>(kParticleShadowSize);
+    m_particleShadowCentre[0] = std::round(Dot(constants.eyePosition, m_sunPlaneU) / texel) * texel;
+    m_particleShadowCentre[1] = std::round(Dot(constants.eyePosition, m_sunPlaneV) / texel) * texel;
+    m_particleShadowAlong = Dot(constants.eyePosition, constants.sunDirection);
+    constants.particleShadowAlong = m_particleShadowAlong;
+    constants.particleShadowScale = 1.0f / kParticleShadowWidth;
+    std::copy(std::begin(m_particleShadowCentre), std::end(m_particleShadowCentre), constants.particleShadowCentre);
+
+    Use(m_particleSums, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    DispatchGroups(Pass::Particles, {.output0 = m_particleSums.uav, .step = 0}, kParticleVolume[0] / 4, kParticleVolume[1] / 4, kParticleVolume[2] / 4);
+    const D3D12_RESOURCE_BARRIER cleared = {D3D12_RESOURCE_BARRIER_TYPE_UAV, D3D12_RESOURCE_BARRIER_FLAG_NONE, {.UAV = {m_particleSums.resource.Get()}}};
+    m_list->ResourceBarrier(1, &cleared);
+    DispatchGroups(Pass::Particles, {.input0 = m_particleRecordViews[slot], .output0 = m_particleSums.uav, .step = 1},
+        static_cast<UINT>((count + 63) / 64), 1, 1);
+    m_list->ResourceBarrier(1, &cleared);
+    Use(m_particleExtinction, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    DispatchGroups(Pass::Particles, {.input0 = m_particleSums.uav, .output1 = m_particleExtinction.uav, .step = 2}, kParticleVolume[0] / 4,
+        kParticleVolume[1] / 4, kParticleVolume[2] / 4);
+    Use(m_particleExtinction, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    Use(m_particleShadow, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    DispatchGroups(Pass::Particles, {.input0 = m_particleExtinction.srv, .output0 = m_particleShadow.uav, .step = 3}, kParticleShadowSize / 8,
+        kParticleShadowSize / 8, 1);
+    Use(m_particleShadow, kVolumeRead);
+    m_particleShadowReady = true;
+    constants.particleShadowView = m_particleShadow.srv;
+}
+
+bool Lighting::EnsureParticles()
+{
+    if (m_particleShadow.resource)
+        return true;
+    if (m_particlesFailed)
+        return false;
+    m_particlesFailed = true;
+    const bool created = CreateTarget(m_particleSums, kParticleVolume[0], kParticleVolume[1], DXGI_FORMAT_R32_UINT, kParticleVolume[2]) &&
+        CreateTarget(m_particleExtinction, kParticleVolume[0], kParticleVolume[1], DXGI_FORMAT_R16_FLOAT, kParticleVolume[2]) &&
+        CreateTarget(m_particleShadow, kParticleShadowSize, kParticleShadowSize, DXGI_FORMAT_R16G16B16A16_FLOAT);
+    const UINT64 bytes = static_cast<UINT64>(kSlots) * particle_shadows::kMaxParticles * sizeof(particle_shadows::Particle);
+    m_particleRecords = created ? CreateBuffer(m_device, D3D12_HEAP_TYPE_UPLOAD, bytes, D3D12_RESOURCE_STATE_GENERIC_READ) : nullptr;
+    if (!m_particleRecords || FAILED(m_particleRecords->Map(0, nullptr, reinterpret_cast<void**>(&m_particleRecordsMapped)))) {
+        m_particleShadow.resource.Reset();
+        log::Info("Lighting: particle shadows' buffers could not be made; smoke casts no shadow");
+        return false;
+    }
+    for (UINT slot = 0; slot < kSlots; ++slot) {
+        m_particleRecordViews[slot] = m_descriptors->Allocate();
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+        srv.Format = DXGI_FORMAT_UNKNOWN;
+        srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.Buffer.FirstElement = slot * particle_shadows::kMaxParticles;
+        srv.Buffer.NumElements = particle_shadows::kMaxParticles;
+        srv.Buffer.StructureByteStride = sizeof(particle_shadows::Particle);
+        m_device->CreateShaderResourceView(m_particleRecords.Get(), &srv, m_descriptors->Cpu(m_particleRecordViews[slot]));
+    }
+    m_particlesFailed = false;
+    return true;
+}
+
+void Lighting::PlaceSunPlane(const FrameConstants& constants)
+{
+    const float* toSun = constants.sunDirection;
+    // Any axis across the sun: x, or y for a sun along x, with its share along the sun taken out.
+    const float axis[3] = {std::fabs(toSun[0]) < 0.9f ? 1.0f : 0.0f, std::fabs(toSun[0]) < 0.9f ? 0.0f : 1.0f, 0.0f};
+    const float along = Dot(axis, toSun);
+    float u[3] = {axis[0] - toSun[0] * along, axis[1] - toSun[1] * along, axis[2] - toSun[2] * along};
+    const float length = std::sqrt(Dot(u, u));
+    if (length < 1e-6f)
+        return;
+    for (float& component : u)
+        component /= length;
+    const float v[3] = {toSun[1] * u[2] - toSun[2] * u[1], toSun[2] * u[0] - toSun[0] * u[2], toSun[0] * u[1] - toSun[1] * u[0]};
+    std::copy(std::begin(u), std::end(u), m_sunPlaneU);
+    std::copy(std::begin(v), std::end(v), m_sunPlaneV);
 }
 
 void Lighting::RecordClouds(FrameConstants& constants, const ViewInputs& inputs, const Scene& scene, UINT slot)
@@ -1501,6 +1788,7 @@ void Lighting::RecordClouds(FrameConstants& constants, const ViewInputs& inputs,
         m_cloudCubeValid = false;
         m_cloudHistoryValid = false;
         m_cloudSkyFactor = 1.0f;
+        m_cloudShadowMean = 1.0f;
         m_cloudReadbackPending = {};
         SetCloudConstants(constants);
     };
@@ -1558,7 +1846,7 @@ void Lighting::RecordClouds(FrameConstants& constants, const ViewInputs& inputs,
             CreateTarget(m_cloudWeatherMap, kCloudWeatherSize, kCloudWeatherSize, DXGI_FORMAT_R8G8B8A8_UNORM) &&
             CreateTarget(m_cloudShapes, kCloudShapesSize, kCloudShapesSize, DXGI_FORMAT_R16G16B16A16_UNORM) &&
             CreateTarget(m_cloudShapeDistribution, kCloudShapeBins, 4, DXGI_FORMAT_R32_FLOAT) &&
-            CreateTarget(m_cloudShadow, 2 * kCloudShadowSize, kCloudShadowSize, DXGI_FORMAT_R16_FLOAT) &&
+            CreateTarget(m_cloudShadow, 2 * kCloudShadowSize, kCloudShadowSize, DXGI_FORMAT_R16G16B16A16_FLOAT) &&
             CreateTarget(m_cloudLight, kCloudLightTexels, 1, DXGI_FORMAT_R32G32B32A32_FLOAT) &&
             CreateCube(m_cloudCube, kCloudCubeSize, DXGI_FORMAT_R16G16B16A16_FLOAT, &m_cloudCubeFaces) &&
             std::ranges::all_of(m_cloudReadback, [&](ComPtr<ID3D12Resource>& readback) {
@@ -1651,32 +1939,10 @@ void Lighting::RecordClouds(FrameConstants& constants, const ViewInputs& inputs,
         none();
         return;
     }
-    // The clouds are lit by the sun the sky shows until it has set below them, then by the Moon of day maps at its share
-    // of the night's sky.
-    const std::optional<std::array<float, 3>> sun = SkySun(inputs, scene);
-    std::array<float, 3> light = sun.value_or(std::array<float, 3>{0.0f, 0.0f, 1.0f});
-    clouds.lightScale = 1.0f;
-    if (light[2] < kCloudSunBelow) {
-        const std::optional<MoonState> moon = MoonFor(inputs, scene);
-        clouds.lightScale = moon ? moon->scale : 0.0f;
-        if (moon)
-            light = moon->direction;
-    }
-    std::copy(light.begin(), light.end(), clouds.lightDirection);
-    // In the map's sun's hue, the air's colouring taken out of it: the clouds' light passes through the air on its own.
-    std::array<float, 3> tint = {1.0f, 1.0f, 1.0f};
-    if (constants.sunEnabled != 0.0f) {
-        const std::array<float, 4> toSun = DaylightAt(constants.sunDirection[2]);
-        float color[3];
-        for (size_t i = 0; i < 3; ++i)
-            color[i] = toSun[i] > 1e-6f ? constants.sunColor[i] / toSun[i] : 0.0f;
-        const float luminance = Luminance(color);
-        if (luminance > 0.0f) {
-            for (size_t i = 0; i < 3; ++i)
-                tint[i] = color[i] / luminance;
-        }
-    }
-    std::copy(tint.begin(), tint.end(), clouds.lightTint);
+    const SkyLightSource light = SkyLightFor(constants, inputs, scene);
+    std::copy(light.direction.begin(), light.direction.end(), clouds.lightDirection);
+    clouds.lightScale = light.scale;
+    std::copy(light.tint.begin(), light.tint.end(), clouds.lightTint);
     clouds.shapeNoiseView = m_cloudShape.srv;
     clouds.detailNoiseView = m_cloudDetail.srv;
     clouds.weatherView = m_cloudWeatherMap.srv;
@@ -1686,31 +1952,13 @@ void Lighting::RecordClouds(FrameConstants& constants, const ViewInputs& inputs,
     clouds.skyView = m_proceduralSky.srv;
     clouds.bandsView = m_skyBands.srv;
     clouds.cubeTexels = kCloudCubeSize;
-    // The history's clip space: the view's as its G-buffer was drawn (jittered), widened by the overscan; and back from it
-    // to directions in double precision, as the sky's draw finds its directions (ClipToEye in shaderapi_pipelines.cpp).
-    float rows[4][4];
-    std::memcpy(rows, constants.viewProj, sizeof(rows));
-    for (int c = 0; c < 4; ++c) {
-        rows[0][c] = (rows[0][c] + inputs.jitter[0] * rows[3][c]) / (1.0f + 2.0f * kCloudOverscan);
-        rows[1][c] = (rows[1][c] + inputs.jitter[1] * rows[3][c]) / (1.0f + 2.0f * kCloudOverscan);
-    }
-    const double a[3][3] = {{rows[0][0], rows[0][1], rows[0][2]}, {rows[1][0], rows[1][1], rows[1][2]}, {rows[3][0], rows[3][1], rows[3][2]}};
-    const double determinant = a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1]) - a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0]) +
-        a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0]);
-    if (std::fabs(determinant) < 1e-30) {
+    const std::optional<WidenedView> widened = WidenedSkyView(constants, inputs);
+    if (!widened) {
         none();
         return;
     }
-    for (int r = 0; r < 3; ++r) {
-        for (int c = 0; c < 3; ++c) {
-            // The inverse's (r, c) is the cofactor of (c, r) over the determinant.
-            const int r1 = (c + 1) % 3;
-            const int r2 = (c + 2) % 3;
-            const int c1 = (r + 1) % 3;
-            const int c2 = (r + 2) % 3;
-            clouds.clipToDirection[r][c] = static_cast<float>((a[r1][c1] * a[r2][c2] - a[r1][c2] * a[r2][c1]) / determinant);
-        }
-    }
+    const float (&rows)[4][4] = widened->rows;
+    std::memcpy(clouds.clipToDirection, widened->clipToDirection, sizeof(clouds.clipToDirection));
     std::memcpy(clouds.viewProj, rows, sizeof(rows));
     std::memcpy(clouds.prevViewProj, m_cloudViewProj, sizeof(m_cloudViewProj));
     clouds.historySize[0] = historySize[0];
@@ -1731,18 +1979,12 @@ void Lighting::RecordClouds(FrameConstants& constants, const ViewInputs& inputs,
 
     // The shadow map over the plane across the sun the map's light comes from, centred on the eye in whole texels of the
     // coarse cascade, so it does not crawl as the eye moves.
-    const float* toSun = constants.sunDirection;
     m_cloudShadowReady = constants.sunEnabled != 0.0f && clouds.shadowStrength > 0.0f && (clouds.layerMask != 0);
+    m_cloudShadowStrength = clouds.shadowStrength;
     bool shadowPlaced = false;
     if (m_cloudShadowReady) {
-        // Any axis across the sun: x, or y for a sun along x, with its share along the sun taken out.
-        const float axis[3] = {std::fabs(toSun[0]) < 0.9f ? 1.0f : 0.0f, std::fabs(toSun[0]) < 0.9f ? 0.0f : 1.0f, 0.0f};
-        const float along = Dot(axis, toSun);
-        float u[3] = {axis[0] - toSun[0] * along, axis[1] - toSun[1] * along, axis[2] - toSun[2] * along};
-        const float length = std::sqrt(Dot(u, u));
-        for (float& component : u)
-            component /= length;
-        const float v[3] = {toSun[1] * u[2] - toSun[2] * u[1], toSun[2] * u[0] - toSun[0] * u[2], toSun[0] * u[1] - toSun[1] * u[0]};
+        const float* u = m_sunPlaneU;
+        const float* v = m_sunPlaneV;
         const float texel = kCloudShadowCoarseWidth / static_cast<float>(kCloudShadowSize);
         const float centreU = std::round(Dot(constants.eyePosition, u) / texel) * texel;
         const float centreV = std::round(Dot(constants.eyePosition, v) / texel) * texel;
@@ -1777,9 +2019,9 @@ void Lighting::RecordClouds(FrameConstants& constants, const ViewInputs& inputs,
         .input2 = m_cloudShadowReady ? m_cloudShadow.srv : kInvalidView, .output0 = m_cloudLight.uav, .step = 4}, 1, 1, 1);
     Use(m_cloudLight, read | D3D12_RESOURCE_STATE_COPY_SOURCE);
     const D3D12_TEXTURE_COPY_LOCATION destination = {m_cloudReadback[slot].Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-        {.PlacedFootprint = {0, {DXGI_FORMAT_R32G32B32A32_FLOAT, 2, 1, 1, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT}}}};
+        {.PlacedFootprint = {0, {DXGI_FORMAT_R32G32B32A32_FLOAT, 3, 1, 1, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT}}}};
     const D3D12_TEXTURE_COPY_LOCATION source = {m_cloudLight.resource.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {.SubresourceIndex = 0}};
-    const D3D12_BOX texels = {0, 0, 0, 2, 1, 1};
+    const D3D12_BOX texels = {0, 0, 0, 3, 1, 1};
     m_list->CopyTextureRegion(&destination, 0, 0, 0, &source, &texels);
     m_cloudReadbackPending[slot] = true;
 
@@ -2432,6 +2674,8 @@ void Lighting::FillSceneConstants(FrameConstants& constants, const Scene& scene)
 bool Lighting::FillConstants(FrameConstants& constants, const Scene& scene, const ViewInputs& inputs)
 {
     constants = {};
+    constants.aerialView = constants.aerialSkyView = constants.skyboxDistanceView = kInvalidView;
+    constants.particleShadowView = kInvalidView;
     std::memcpy(constants.viewProj, inputs.viewProj.data(), sizeof(constants.viewProj));
     // The depth was drawn with the jittered projection; reconstructing with the plain one shifts positions by up to
     // half a pixel, which puts points by a crease behind the other surface.
@@ -2548,6 +2792,7 @@ bool Lighting::FillConstants(FrameConstants& constants, const Scene& scene, cons
     constants.frameIndex = static_cast<uint32_t>(inputs.frame);
     constants.debugView = IsLightingDebugView(settings.debugView) ? static_cast<uint32_t>(settings.debugView) : 0u;
     constants.reflectionScale = settings.reflections ? settings.reflectionIntensity : 0.0f;
+    constants.specularAntialiasing = settings.specularAntialiasing ? settings.specularAntialiasingStrength : 0.0f;
     constants.exactLights = static_cast<uint32_t>(settings.exactLights);
     constants.sampledLightRays = static_cast<uint32_t>(settings.sampledLightRays);
     constants.viewmodelShadowRays = static_cast<uint32_t>(settings.viewmodelShadowRays);
@@ -2590,6 +2835,8 @@ bool Lighting::FillConstants(FrameConstants& constants, const Scene& scene, cons
     SetCloudConstants(constants);
     // The 3D skybox is a scaled-down scene elsewhere in the map: the map's lights do not belong to it.
     const bool skybox = inputs.kind == gbuffer::ViewKind::Skybox;
+    if (!skybox)
+        SetParticleConstants(constants);
     if (m_causticsReady && !skybox)
         SetCausticsConstants(constants);
     constants.lightCount = settings.mapLights && !skybox ? scene.LightCount() : 0u;
@@ -3177,17 +3424,44 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     if (main)
         UpdateSway(scene, slot, inputs.sway, constants.eyePosition, slotConstantsGpu);
     m_sway.Append(m_frameInstances);
-    // The viewmodel, drawn after the main view of its frame, traces the same scene with its own mask
-    // (kViewmodelTraceMask): it reuses the main view's acceleration structure and records, characters included, and
-    // keeps the main view's slot from being rebuilt until it is done (m_slotFenceValues below).
-    const bool reuseScene =
+    // The viewmodel, drawn after the main view of its frame, traces that view's scene: characters included, it keeps the
+    // main view's slot from being rebuilt until it is done (m_slotFenceValues below). Without its own triangles it reuses
+    // the main view's acceleration structure and records with its own mask (kViewmodelTraceMask); with them
+    // (viewmodel_casters) it records its own: the main view's instances without the local player's, and the viewmodel's,
+    // which then shadows itself.
+    const bool followsMain =
         inputs.kind == gbuffer::ViewKind::Viewmodel && m_mainScene.tlas != 0 && m_mainSceneFrame == inputs.frame && m_mainSceneRun + 1 == m_run;
+    D3D12_GPU_VIRTUAL_ADDRESS viewmodelBlas = 0;
+    if (followsMain && inputs.viewmodelGeometry)
+        viewmodelBlas = viewmodel_casters::RecordBlas(m_list.Get(), *inputs.viewmodelGeometry);
+    const bool viewmodelScene = viewmodelBlas != 0;
+    const bool reuseScene = followsMain && !viewmodelScene;
+    if (viewmodelScene) {
+        m_frameInstances.clear();
+        for (const SceneInstance& instance : m_mainInstances) {
+            if ((instance.mask & kLocalPlayerMask) == 0)
+                m_frameInstances.push_back(instance);
+        }
+        const viewmodel_casters::Geometry& geometry = *inputs.viewmodelGeometry;
+        SceneInstance viewmodel;
+        viewmodel.blas = viewmodelBlas;
+        viewmodel.positionsView = geometry.positionsView;
+        viewmodel.indicesView = geometry.indicesView;
+        viewmodel.albedoView = geometry.albedoView;
+        viewmodel.triangleCount = geometry.triangleCount;
+        viewmodel.mask = kLocalPlayerMask;
+        viewmodel.transform[0][0] = viewmodel.transform[1][1] = viewmodel.transform[2][2] = 1.0f;
+        m_frameInstances.push_back(viewmodel);
+        constants.viewmodel = 2;
+        constants.normalBias = kViewmodelNormalBias;
+    }
     const SceneFrame frame = reuseScene ? m_mainScene : scene.RecordFrame(m_list.Get(), slot, m_frameInstances, m_useMicromaps);
     if (main) {
         m_mainScene = frame;
         m_mainSceneFrame = inputs.frame;
         m_mainSceneRun = m_run;
         m_mainSceneSlot = slot;
+        m_mainInstances = m_frameInstances;
     }
     constants.instancesView = frame.instancesView;
     constants.dynamicLightsView = frame.dynamicLightsView;
@@ -3209,11 +3483,12 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     else if (inputs.kind == gbuffer::ViewKind::Skybox)
         constants.traceMask = kSkyboxMask;
     else
-        constants.traceMask = inputs.kind == gbuffer::ViewKind::Viewmodel ? kViewmodelTraceMask : kTraceMask;
+        constants.traceMask = inputs.kind == gbuffer::ViewKind::Viewmodel && !viewmodelScene ? kViewmodelTraceMask : kTraceMask;
     const FoliageShadows foliage = GetSettings().foliageShadows;
     const auto withFoliage = [&](UINT mask, FoliageShadows from) { return foliage >= from ? mask : mask & ~kShadowlessPropMask; };
     constants.sunShadowMask = withFoliage(constants.traceMask, FoliageShadows::Sun);
-    const UINT indirectMask = constants.traceMask & ~kLocalPlayerMask;
+    // The hands and the weapon hide each other's indirect light; elsewhere the local player is left out.
+    const UINT indirectMask = viewmodelScene ? constants.traceMask : constants.traceMask & ~kLocalPlayerMask;
     constants.indirectMask = withFoliage(indirectMask, FoliageShadows::SunAndIndirect);
     constants.bounceMask = withFoliage(indirectMask, FoliageShadows::All);
     constants.lightShadowMask = withFoliage(constants.traceMask, FoliageShadows::All);
@@ -3225,7 +3500,13 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     // The clouds' shadow map comes before everything the sun lights, the caustics' sun maps included.
     if (main) {
         RecordSky(constants, inputs, scene, slot);
+        PlaceSunPlane(constants);
         RecordClouds(constants, inputs, scene, slot);
+        RecordAerial(constants, inputs, scene, slot);
+        RecordParticles(constants, slot);
+        // The 3D skybox's distances when its view drew this frame, which aerial perspective reaches its land by.
+        if (m_skyboxDistanceFrame == inputs.frame && m_skyboxDistance.resource)
+            constants.skyboxDistanceView = m_skyboxDistance.srv;
         RecordCaustics(constants, scene);
     }
     if (bakedIndirect && main && constants.traceMask != 0 && !scene.Baked().Ready())
@@ -3698,6 +3979,35 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
                 start = std::max(constants.fogParams[0] / constants.fogParams[3], 0.0f) / cornerScale;
                 const float end = (std::min(constants.fogParams[2], 1.0f) + constants.fogParams[0]) / constants.fogParams[3];
                 range = std::clamp(end - start, 1.0f, kMaxFogDistance);
+            } else if (main && GetSettings().groundMist && constants.fogEnabled == 0) {
+                // Ground mist over the haze, where the map has no fog of its own and the eye is not under water.
+                medium = FroxelMedium::Mist;
+                const Settings& settings = GetSettings();
+                const float density = kKoschmieder / settings.mistVisibility;
+                const float atEye = density * std::exp(-std::clamp((constants.eyePosition[2] - settings.mistHeight) / settings.mistFalloff, -60.0f, 60.0f));
+                range = std::clamp(4.0f / std::max(atEye, 1e-9f), kHazeDistance, kMaxMistDistance);
+                // It drifts with the clouds' wind (windSpeed metres a second toward windDirection, Hammer's yaw).
+                const auto now = std::chrono::steady_clock::now();
+                const double seconds = m_mistTime.time_since_epoch().count() != 0 ? std::min(std::chrono::duration<double>(now - m_mistTime).count(), 1.0) : 0.0;
+                m_mistTime = now;
+                const float yaw = settings.windDirection * 3.14159265f / 180.0f;
+                const float travel = static_cast<float>(settings.windSpeed * kUnitsPerMetre * seconds);
+                m_mistOffset[0] -= travel * std::cos(yaw);
+                m_mistOffset[1] -= travel * std::sin(yaw);
+                const std::array<float, 3> mistAlbedo = LinearColor(settings.mistColor);
+                const float sunShare = constants.sunEnabled != 0.0f ? 0.25f * m_cloudShadowMean : 0.0f;
+                for (size_t i = 0; i < 3; ++i) {
+                    constants.mistColor[i] = mistAlbedo[i];
+                    constants.mistFarColor[i] = mistAlbedo[i] * (sunShare * constants.sunColor[i] + 0.5f * constants.skyColor[i]);
+                }
+                std::copy_n(m_mistOffset, 3, constants.mistOffset);
+                constants.mistDensity = density;
+                constants.mistBase = settings.mistHeight;
+                constants.mistInvFalloff = 1.0f / settings.mistFalloff;
+                constants.mistTurbulence = settings.mistTurbulence;
+                constants.mistInvScale = 1.0f / settings.mistScale;
+                constants.mistPhaseG = settings.mistPhase;
+                constants.mistEnabled = 1.0f;
             }
             // The main view jitters its sample points within their froxels (Halton 2, 3, 5) and keeps their history
             // while the medium stays the same; the 3D skybox samples the centres afresh.
@@ -3724,6 +4034,18 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
                 block->prevFroxelStart = m_prevFroxelStart;
                 block->prevFroxelRange = m_prevFroxelRange;
                 block->volumetricFog = litFog ? 1u : 0u;
+                if (block != &constants) {
+                    std::copy_n(constants.mistColor, 3, block->mistColor);
+                    std::copy_n(constants.mistFarColor, 3, block->mistFarColor);
+                    std::copy_n(constants.mistOffset, 3, block->mistOffset);
+                    block->mistDensity = constants.mistDensity;
+                    block->mistBase = constants.mistBase;
+                    block->mistInvFalloff = constants.mistInvFalloff;
+                    block->mistTurbulence = constants.mistTurbulence;
+                    block->mistInvScale = constants.mistInvScale;
+                    block->mistPhaseG = constants.mistPhaseG;
+                    block->mistEnabled = constants.mistEnabled;
+                }
             }
             // Lit fog darkens where the irradiance volume's indirect light is weaker than the open sky's.
             const bool indirectVolume = volumeFilled && m_probeIndirect[0].resource;
@@ -3740,14 +4062,24 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
             Use(froxelLight, write);
             Use(m_froxelProjected, write);
             // Map and dynamic lights scatter in the main view's fog and water; the 3D skybox is lit without them.
+            const bool mist = medium == FroxelMedium::Mist;
+            Texture& lastSigma = m_froxelSigma[previous];
+            Texture& sigma = m_froxelSigma[current];
+            if (mist) {
+                Use(lastSigma, read);
+                Use(sigma, write);
+            }
             DispatchGroups(Pass::Volumetrics, {.input0 = last.srv, .input1 = indirectVolume ? m_probeIndirect[0].srv : kInvalidView,
                 .input2 = indirectVolume ? m_probeIndirect[1].srv : kInvalidView, .input3 = indirectVolume ? m_probeIndirect[2].srv : kInvalidView,
-                .input4 = (history ? 1u : 0u) | (main ? 2u : 0u), .output0 = froxelLight.uav, .output1 = m_froxelProjected.uav, .step = 0}, groupsX, groupsY, dims[2]);
+                .input4 = (history ? 1u : 0u) | (main ? 2u : 0u), .output0 = froxelLight.uav, .output1 = m_froxelProjected.uav,
+                .output2 = mist ? sigma.uav : kInvalidView, .step = 0, .input5 = mist ? lastSigma.srv : kInvalidView}, groupsX, groupsY, dims[2]);
             Use(froxelLight, read);
             Use(m_froxelProjected, read);
+            if (mist)
+                Use(sigma, read);
             Use(m_froxelIntegrated, write);
-            DispatchGroups(Pass::Volumetrics, {.input0 = froxelLight.srv, .input1 = m_froxelProjected.srv, .output0 = m_froxelIntegrated.uav, .step = 1},
-                groupsX, groupsY, 1);
+            DispatchGroups(Pass::Volumetrics, {.input0 = froxelLight.srv, .input1 = m_froxelProjected.srv, .input2 = mist ? sigma.srv : kInvalidView,
+                .output0 = m_froxelIntegrated.uav, .step = 1}, groupsX, groupsY, 1);
             // The game's translucent draws read it too (shaders/game_fog.hlsli).
             Use(m_froxelIntegrated, kVolumeRead);
             for (FrameConstants* block : blocks) {
@@ -4009,8 +4341,10 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     }
     queue->Signal(m_fence.Get(), ++m_fenceValue);
     m_slotFenceValues[slot] = m_fenceValue;
-    if (reuseScene)
+    if (followsMain)
         m_slotFenceValues[m_mainSceneSlot] = m_fenceValue;
+    if (viewmodelScene)
+        viewmodel_casters::MarkUsed(inputs.viewmodelGeometry->entry, m_fence.Get(), m_fenceValue);
     if (std::exchange(m_bakeLogPending, false))
         FinishBake(scene);
     if (probe) {

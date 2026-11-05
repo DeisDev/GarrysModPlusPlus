@@ -12,6 +12,7 @@
 #include "skinned_casters.h"
 #include "swaying_props.h"
 #include "view_types.h"
+#include "viewmodel_casters.h"
 
 #include <d3d12.h>
 #include <wrl/client.h>
@@ -78,7 +79,7 @@ struct FrameConstants {
     uint32_t emissiveView;
     uint32_t materialsView;
     float reflectionScale;
-    uint32_t padding9;
+    float specularAntialiasing;
     uint32_t lightRangesView;
     uint32_t lightIndicesView;
     uint32_t bspNodesView;
@@ -226,7 +227,39 @@ struct FrameConstants {
     float cloudShadowFineScale;
     float cloudShadowCoarseScale;
     float cloudShadowEdge;
-    uint32_t padding7[5];
+    float cloudShadowStrength;
+    // Ground mist (Settings::groundMist; shaders/froxels.hlsli): its albedo, extinction per unit at mistBase, how fast it
+    // thins with height (1 / the e-folding height), its noise's turbulence, scale and drift, its phase function's g, the
+    // light it scatters per unit of opacity beyond the froxel volume, and whether it is on.
+    float mistColor[3];
+    float mistDensity;
+    float mistBase;
+    float mistInvFalloff;
+    float mistTurbulence;
+    float mistInvScale;
+    float mistOffset[3];
+    float mistPhaseG;
+    float mistFarColor[3];
+    float mistEnabled;
+    // Aerial perspective (shaders/sky_atmosphere.hlsl step 7): its volume over the view and the cloud shadows' change of
+    // the sky's light, or kInvalidView; the 3D skybox's distances this frame, and the volume's reach in kilometres.
+    uint32_t aerialView;
+    uint32_t aerialSkyView;
+    uint32_t skyboxDistanceView;
+    float aerialRangeKm;
+    // Particle shadows (shaders/particle_shadows.hlsl): their shadow map over the plane across the sun, or kInvalidView,
+    // and the eye's place along the sun its depths are measured from; the map's scale (1 / its width) and centre on the
+    // plane, the volume's cells per unit and corner, and the sprites splatted into it.
+    uint32_t particleShadowView;
+    float particleShadowAlong;
+    float particleShadowScale;
+    float particleVolumeInvCell;
+    float particleVolumeOrigin[3];
+    uint32_t particleCount;
+    float particleShadowCentre[2];
+    // Aerial perspective's volume spans the view widened by this share on each side (as the clouds' history does).
+    float aerialOverscan;
+    uint32_t padding11;
 };
 
 // Mirrors SamplingConstants in shaders/nvidia/sharc_common.hlsli: the radiance cache's parameters, bound to every pass
@@ -315,6 +348,9 @@ struct ViewInputs {
     // env_sun's direction too (Lighting::FillConstants).
     std::optional<gbuffer::EnvSun> envSun;
     std::optional<std::array<float, 3>> paintedSun;
+    // The viewmodel's triangles as its draws placed them (src/viewmodel_casters.h), with which its run traces its own
+    // scene so the weapon and hands shadow each other; none leaves it the main view's scene without them.
+    std::optional<viewmodel_casters::Geometry> viewmodelGeometry;
 };
 
 // What the camera effects (src/post_effects.cpp) read of a main view in the game's command list, which follows its
@@ -403,6 +439,7 @@ public:
         m_cloudCubeValid = false;
         m_cloudHistoryValid = false;
         m_cloudSkyFactor = 1.0f;
+        m_cloudShadowMean = 1.0f;
     }
     // Whether the last main view filled the irradiance volume for translucent surfaces, and the volume's first cell.
     bool VolumeReady() const { return m_volumeReady; }
@@ -479,6 +516,7 @@ private:
         Clouds,
         RegenInputs,
         RegenResolve,
+        Particles,
         Count
     };
     // Mirrors PassConstants in shaders/common.hlsli: descriptor indices (none by default) and a parameter.
@@ -587,6 +625,33 @@ private:
     // How much the clouds change the sky's light (FrameConstants::skyColor): the cloudy sky's irradiance on a surface
     // facing up over the clear sky's, as the clouds' light last read back (1 without clouds).
     float CloudSkyFactor(const ViewInputs& inputs, const Scene& scene) const;
+    // The plane across FrameConstants::sunDirection the cloud and particle shadow maps cover (m_sunPlaneU, m_sunPlaneV).
+    void PlaceSunPlane(const FrameConstants& constants);
+    // The main view's clip space as drawn, widened by the clouds' overscan: its rows, and from its x and y over w back to
+    // directions (the clouds' history and aerial perspective cover it).
+    struct WidenedView {
+        float rows[4][4];
+        float clipToDirection[3][4];
+    };
+    static std::optional<WidenedView> WidenedSkyView(const FrameConstants& constants, const ViewInputs& inputs);
+    // The light of the sky: the sun it shows, or the Moon once the sun has set, at its share (scale), in the map's sun's
+    // hue without the air's colouring (tint).
+    struct SkyLightSource {
+        std::array<float, 3> direction = {0.0f, 0.0f, 1.0f};
+        float scale = 1.0f;
+        std::array<float, 3> tint = {1.0f, 1.0f, 1.0f};
+    };
+    SkyLightSource SkyLightFor(const FrameConstants& constants, const ViewInputs& inputs, const Scene& scene) const;
+    // Aerial perspective over the main view (shaders/sky_atmosphere.hlsl step 7), after RecordClouds: the light the air
+    // scatters toward the eye and its transmittance to each distance, with the cloud shadows in it, and the change those
+    // shadows make to the sky's light; points `constants` at them and publishes the latter in m_skyDraw.
+    void RecordAerial(FrameConstants& constants, const ViewInputs& inputs, const Scene& scene, UINT slot);
+    bool EnsureAerial();
+    // Last frame's smoke (particle_shadows::Take) into the particle shadow map (shaders/particle_shadows.hlsl), main view
+    // only; SetParticleConstants points other views of the frame at it.
+    void RecordParticles(FrameConstants& constants, UINT slot);
+    void SetParticleConstants(FrameConstants& constants) const;
+    bool EnsureParticles();
     // Makes the main view's clouds over the procedural sky (shaders/clouds.hlsl), after RecordSky: their shadow map,
     // light, cube and history; points `constants` at the cube and shadow map and publishes the clouds in m_skyDraw.
     // Without the physical sky or clouds there are none.
@@ -798,6 +863,30 @@ private:
     float m_cloudShadowU[4] = {};
     float m_cloudShadowV[4] = {};
     bool m_cloudShadowReady = false;
+    // Particle shadows: the extinction sums and extinction, the shadow map and where it lies, and the sprites per slot.
+    Texture m_particleSums;
+    Texture m_particleExtinction;
+    Texture m_particleShadow;
+    bool m_particleShadowReady = false;
+    float m_particleShadowCentre[2] = {};
+    float m_particleShadowAlong = 0.0f;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_particleRecords;
+    std::byte* m_particleRecordsMapped = nullptr;
+    std::array<UINT, kSlots> m_particleRecordViews = {};
+    bool m_particlesFailed = false;
+    // Aerial perspective: its volume and the sky's change (RecordAerial), and its constants per slot (AerialConstants in
+    // shaders/sky_atmosphere.hlsl).
+    Texture m_aerialLut;
+    Texture m_aerialSky;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_aerialConstants;
+    std::byte* m_aerialConstantsMapped = nullptr;
+    std::array<UINT, kSlots> m_aerialConstantViews = {};
+    bool m_aerialFailed = false;
+    // The plane across the sun's direction the cloud and particle shadow maps cover (PlaceSunPlane): its axes.
+    float m_sunPlaneU[3] = {1.0f, 0.0f, 0.0f};
+    float m_sunPlaneV[3] = {0.0f, 1.0f, 0.0f};
+    // How much the cloud shadows darken (FrameConstants::cloudShadowStrength), as RecordClouds last set it.
+    float m_cloudShadowStrength = 0.0f;
     // The shadow map holds this placement's transmittance in every row (so later frames may refresh half of them).
     bool m_cloudShadowValid = false;
     Texture m_cloudLight;
@@ -880,6 +969,13 @@ private:
     std::array<Texture, 2> m_froxelLight;
     Texture m_froxelProjected;
     Texture m_froxelIntegrated;
+    // With ground mist: each froxel's extinction per unit, this frame's and last frame's (shaders/volumetrics.hlsl).
+    std::array<Texture, 2> m_froxelSigma;
+    // Ground mist's drift with the wind (FrameConstants::mistOffset) and the time it was last advanced.
+    float m_mistOffset[3] = {};
+    std::chrono::steady_clock::time_point m_mistTime;
+    // The mean share of the sun's light the clouds let through to the ground (the clouds' light, read back), or 1.
+    float m_cloudShadowMean = 1.0f;
     std::array<UINT, 3> m_froxelDims = {};
     // The size the main view's grid asks for, which the other views (lit at other resolutions) share, so the volume is
     // not made again for each view.
@@ -966,6 +1062,9 @@ private:
     float m_swayTime = 0.0f;
     float m_swayWind[2] = {};
     std::vector<SceneInstance> m_frameInstances;
+    // The last main view's instances as its scene recorded them (skinned and swaying copies included), which the
+    // viewmodel's own scene takes without the local player's.
+    std::vector<SceneInstance> m_mainInstances;
     // The scene the main view of frame m_mainSceneFrame (run m_mainSceneRun) traced, from slot m_mainSceneSlot, which the
     // viewmodel reuses when it is the next run: no other run has rebuilt that slot since.
     SceneFrame m_mainScene = {};

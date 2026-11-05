@@ -19,6 +19,38 @@ float3 InterpolatedPosition(uint positionsView, uint3 index, float2 barycentrics
     return p0 + barycentrics.x * (positions.Load<float3>(index.y * 12) - p0) + barycentrics.y * (positions.Load<float3>(index.z * 12) - p0);
 }
 
+// Specular anti-aliasing's kernel (Tokuyoshi and Kaplanyan 2021): the change of the normal to the neighbour along
+// `axis`, on the side that stays on this pixel's surface (PlaneStep's choice in shaders/surface.hlsl: the side whose
+// depth runs on in a line), within the pixel's own plane of the normal; 0 where that neighbour shows another surface.
+static const float kKernelVariance = 0.25;
+static const float kKernelLimit = 0.18;
+
+float3 SameSurfaceNormalStep(int2 pixel, int2 axis, float depth, float4 centre)
+{
+    float after = DepthAt(pixel + axis);
+    float before = DepthAt(pixel - axis);
+    bool forward = abs(DepthAt(pixel + axis * 2) - 2.0 * after + depth) < abs(DepthAt(pixel - axis * 2) - 2.0 * before + depth);
+    float4 other = SurfaceAt(g_frame.surfaceView, forward ? pixel + axis : pixel - axis);
+    float4 opposite = SurfaceAt(g_frame.surfaceView, forward ? pixel - axis : pixel + axis);
+    // A surface's distance changes by about as much on both sides.
+    float slope = opposite.w * centre.w > 0.0 ? abs(abs(centre.w) - abs(opposite.w)) : 0.0;
+    if (other.w * centre.w <= 0.0 || abs(abs(other.w) - abs(centre.w)) > 0.5 + 0.004 * abs(centre.w) + slope || dot(other.xyz, centre.xyz) <= 0.5)
+        return 0.0;
+    float3 step = other.xyz - centre.xyz;
+    return step - centre.xyz * dot(centre.xyz, step);
+}
+
+// The kernel's squared roughness: twice the variance of the normal over a pixel footprint of sigma^2 = 0.25 pixels^2,
+// at most kKernelLimit (the paper's kappa).
+float KernelRoughness2(int2 pixel, float depth, float4 surface)
+{
+    if (surface.w == 0.0 || g_frame.specularAntialiasing <= 0.0)
+        return 0.0;
+    float3 dx = SameSurfaceNormalStep(pixel, int2(1, 0), depth, surface);
+    float3 dy = SameSurfaceNormalStep(pixel, int2(0, 1), depth, surface);
+    return min(2.0 * kKernelVariance * (dot(dx, dx) + dot(dy, dy)), kKernelLimit);
+}
+
 // How far a hit point moved since last frame, in world space.
 float3 HitMotion(HitInfo hit)
 {
@@ -75,9 +107,10 @@ void main(uint3 id : SV_DispatchThreadID)
     if (surface.w > 0.0 && g_frame.traceMask != 0) {
         float3 view = normalize(position - g_frame.eyePosition);
         HitInfo hit;
-        // The eye is inside the local player's body. Glass a few units in front of a surface would otherwise give it
-        // the glass's material.
-        if (TraceHit(g_frame.eyePosition, view, surface.w + 8.0 + surface.w * 0.02, g_frame.traceMask & ~kLocalPlayerMask, hit, RAY_FLAG_NONE, true) &&
+        // The eye is inside the local player's body; the viewmodel's run finds its own triangles there. Glass a few units in
+        // front of a surface would otherwise give it the glass's material.
+        uint mask = g_frame.viewmodel != 0 ? g_frame.traceMask : g_frame.traceMask & ~kLocalPlayerMask;
+        if (TraceHit(g_frame.eyePosition, view, surface.w + 8.0 + surface.w * 0.02, mask, hit, RAY_FLAG_NONE, true) &&
             abs(hit.t - surface.w) <= 4.0 + surface.w * 0.02) {
             visible = uint4(hit.instance, hit.primitive, asuint(hit.barycentrics));
             // An unlit pixel shows its G-buffer albedo as it is, so the hit must be the surface the G-buffer shows: at a
@@ -102,5 +135,5 @@ void main(uint3 id : SV_DispatchThreadID)
     motion[pixel] = pixelMotion;
     previousDistance[pixel] = length(previous - g_frame.prevEyePosition);
     flags[pixel] = pixelFlags;
-    geometricNormal[pixel] = float4(faceNormal, 0.0);
+    geometricNormal[pixel] = float4(faceNormal, KernelRoughness2(pixel, depth, surface));
 }

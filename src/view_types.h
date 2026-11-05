@@ -147,6 +147,9 @@ struct SkyDraw {
     UINT cloudCubeView = kNoCloudView;
     std::array<std::array<float, 4>, 4> cloudViewProj = {};
     float cloudOverscan = 0.0f;
+    // Aerial perspective's change of the sky's light by the cloud shadows over the same widened view (Lighting::
+    // RecordAerial), or kNoCloudView.
+    UINT aerialSkyView = kNoCloudView;
 
     static constexpr UINT kNoCloudView = 0xFFFFFFFFu;
     // A disc whose radiance is not known yet shows through anything but opaque clouds.

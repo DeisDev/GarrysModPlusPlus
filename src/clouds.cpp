@@ -221,6 +221,20 @@ void CloudWeather::Write(const Settings& settings, CloudConstants& constants) co
     constants.octaves = kOctaves;
     constants.lightSteps = static_cast<uint32_t>(settings.cloudLightSteps);
     constants.shadowStrength = settings.cloudShadows ? settings.cloudShadowStrength : 0.0f;
+    // Atmospheric optics (shaders/clouds.hlsl, Optics): the share of the cirrus' single scattering in the 22 degree halo
+    // (6% for smooth crystals: Macke, Mueller and Raschke 1996; roughened ones wash it out, hence the setting), with the
+    // 46 degree halo and the circumzenithal arc, and in the sun dogs; and the corona of droplets of the droplet size,
+    // their size parameter 2 pi r / wavelength at 610, 550 and 465 nm.
+    constexpr float kHaloShare = 0.06f;
+    constexpr float kParheliaShare = 0.04f;
+    constexpr float kWavelengths[3] = {0.610f, 0.550f, 0.465f};
+    constants.haloShare = settings.halos ? kHaloShare * settings.haloStrength : 0.0f;
+    constants.wideHalos = settings.halos && settings.wideHalos ? 1.0f : 0.0f;
+    constants.parheliaShare = settings.halos ? kParheliaShare * settings.sunDogsStrength : 0.0f;
+    constants.coronaSpread = settings.coronaSpread;
+    for (size_t i = 0; i < 3; ++i)
+        constants.dropletX[i] = 2.0f * 3.14159265f * (0.5f * settings.cloudDropletSize) / kWavelengths[i];
+    constants.corona = settings.corona ? 1.0f : 0.0f;
 }
 
 }

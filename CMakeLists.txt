@@ -351,6 +351,7 @@ add_shader(shaders/sky.hlsl main cs_6_6 g_skyCS)
 # The procedural sky: its atmosphere and colours, and the pixel shaders of the game's 2D sky draws.
 add_shader(shaders/sky_atmosphere.hlsl main cs_6_6 g_skyAtmosphereCS)
 add_shader(shaders/clouds.hlsl main cs_6_6 g_cloudsCS)
+add_shader(shaders/particle_shadows.hlsl main cs_6_6 g_particleShadowsCS)
 add_shader(shaders/sky_draw.hlsl SkyMain ps_6_6 g_skyDrawPS)
 add_shader(shaders/sky_draw.hlsl DiscMain ps_6_6 g_sunDiscPS)
 add_shader(shaders/translucent_depth.hlsl main cs_6_6 g_translucentDepthCS)
@@ -364,6 +365,16 @@ add_shader(shaders/post/post.hlsl VSMain vs_6_6 g_postVS)
 foreach(entry Prepare Camera TileMax NeighborMax MotionBlur FrameMotion ExposureHistogram Exposure)
     add_shader(shaders/post/post.hlsl ${entry}Main cs_6_6 g_post${entry}CS)
 endforeach()
+add_shader(shaders/post/bloom.hlsl DownMain cs_6_6 g_bloomDownCS)
+add_shader(shaders/post/bloom.hlsl UpMain cs_6_6 g_bloomUpCS)
+add_shader(shaders/post/local_exposure.hlsl GridMain cs_6_6 g_localGridCS)
+add_shader(shaders/post/local_exposure.hlsl BlurGridMain cs_6_6 g_localBlurGridCS)
+add_shader(shaders/post/local_exposure.hlsl BlurMeanMain cs_6_6 g_localBlurMeanCS)
+foreach(entry Aperture FftRows FftColumns Starburst)
+    add_shader(shaders/post/flare.hlsl ${entry}Main cs_6_6 g_flare${entry}CS)
+endforeach()
+add_shader(shaders/post/flare.hlsl GhostVS vs_6_6 g_flareGhostVS)
+add_shader(shaders/post/flare.hlsl GhostPS ps_6_6 g_flareGhostPS)
 foreach(pass 0 1 2 3 4)
     add_shader(shaders/amd/dof.hlsl main cs_6_6 g_dof${pass}CS -D DOF_PASS=${pass} ${FFX_SHADER_OPTIONS})
 endforeach()
@@ -566,6 +577,7 @@ add_library(gmodpp SHARED
     src/shaderapi_meshes.cpp
     src/shaderapi_pipelines.cpp
     src/post_effects.cpp
+    src/lens_flare.cpp
     src/display_output.cpp
     src/exposure.cpp
     src/fsr.cpp
@@ -590,6 +602,8 @@ add_library(gmodpp SHARED
     src/studio_model.cpp
     src/opacity_micromaps.cpp
     src/skinned_casters.cpp
+    src/viewmodel_casters.cpp
+    src/particle_shadows.cpp
     src/swaying_props.cpp
     src/ropes.cpp
     src/settings.cpp

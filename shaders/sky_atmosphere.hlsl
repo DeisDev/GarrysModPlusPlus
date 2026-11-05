@@ -31,6 +31,13 @@
 //    of the clear sky's irradiance on a surface facing up (a), from both tables (input0, input1).
 // 6: the Milky Way's starlight in S10 units into a cube's faces (output0), in the stars' frame (MilkyWayStarlight in
 //    shaders/night_sky.hlsli).
+// 7: aerial perspective (Hillaire 2020, section 5.4: the camera volume with volumetric shadows), a thread per column of
+//    the view widened by the clouds' overscan (AerialConstants in input0): the light the air scatters toward the eye up
+//    to the end of each of kAerialSize slices, which lengthen with the square of their index out to rangeKm, in the
+//    procedural sky's units and colours (rgb), and the share of what lies beyond that reaches the eye (a), into output0
+//    (a 3D texture); the sunlight's single scattering is shadowed by the clouds (their shadow map's depth beyond each
+//    point, CloudShadowAt), the multiple scattering not, as Hillaire leaves it. output1: what the cloud shadows change
+//    of the whole column's light, which the sky's draws add to the procedural sky (that holds the unshadowed sky).
 
 static const uint kBands = 32;
 static const uint kLanesPerBand = 8;
@@ -50,6 +57,27 @@ static const uint kDaylightRings = 16;
 static const uint kDaylightAzimuths = 32;
 
 static const float kIsotropicPhase = 1.0 / (4.0 * 3.14159265);
+
+// Step 7: AerialConstants in src/lighting.cpp. The sky's light (the sun it shows, or the Moon at its share) and the
+// tables; the view's directions; the volume's reach, how strong it is drawn (1 is physical), whether the cloud shadows
+// darken it, their mean over the ground (beyond their shadow map) and the Sun glow setting.
+struct AerialConstants
+{
+    float4 clipToDirection[3];
+    float3 lightDirection;
+    float lightScale;
+    uint transmittanceView;
+    uint multipleScatteringView;
+    uint bandsView;
+    float rangeKm;
+    float strength;
+    uint crepuscular;
+    float shadowMean;
+    float glowScale;
+};
+
+static const uint kAerialSize = 32;
+static const uint kAerialStepsPerSlice = 2;
 
 groupshared float4 g_capturedSums[kBands * kLanesPerBand];
 groupshared float3 g_skySums[kBands * kLanesPerBand];
@@ -256,6 +284,107 @@ float3 Recoloured(float4 clear, float3 sun, float4 multiplier, Texture2D<float4>
     return (clear.rgb - glow) * multiplier.rgb + glow * multiplier.a * glowScale;
 }
 
+// The colour bands' multiplier toward a direction: a uniform cubic B-spline through the bands (straight lines between
+// their centres turned at each one, which showed as stripes of colour).
+float4 BandMultiplierToward(Texture2D<float4> bands, float3 direction)
+{
+    float band = (asin(clamp(direction.z, -1.0, 1.0)) / 3.14159265 + 0.5) * kBands - 0.5;
+    int first = int(floor(band)) - 1;
+    float t = band - floor(band);
+    float weights[4] = {pow(1.0 - t, 3.0) / 6.0, (3.0 * t * t * t - 6.0 * t * t + 4.0) / 6.0, (-3.0 * t * t * t + 3.0 * t * t + 3.0 * t + 1.0) / 6.0,
+        t * t * t / 6.0};
+    float4 multiplier = 0.0;
+    [unroll]
+    for (int k = 0; k < 4; ++k)
+        multiplier += weights[k] * bands.Load(int3(clamp(first + k, 0, int(kBands) - 1), 0, 0));
+    return multiplier;
+}
+
+// The clouds' shadow over a point of the air (the atmosphere's space): where their shadow map covers it, else their mean
+// over the ground.
+float AerialCloudShadow(float3 position, float mean)
+{
+    if (g_frame.cloudShadowView == kNoView)
+        return 1.0;
+    float3 world = float3(position.xy, position.z - (kGroundRadius + kEyeHeight)) / kKilometresPerUnit;
+    float2 plane = float2(dot(world, g_frame.cloudShadowU.xyz) + g_frame.cloudShadowU.w, dot(world, g_frame.cloudShadowV.xyz) + g_frame.cloudShadowV.w);
+    if (any(abs(plane * g_frame.cloudShadowCoarseScale) > 0.5 - g_frame.cloudShadowEdge))
+        return lerp(1.0, mean, g_frame.cloudShadowStrength);
+    return CloudShadowAt(world, false);
+}
+
+void Aerial(uint2 texel)
+{
+    if (any(texel >= kAerialSize))
+        return;
+    StructuredBuffer<AerialConstants> buffer = ResourceDescriptorHeap[g_pass.input0];
+    AerialConstants aerial = buffer[0];
+    Texture2D<float4> transmittance = ResourceDescriptorHeap[aerial.transmittanceView];
+    Texture2D<float4> multipleScattering = ResourceDescriptorHeap[aerial.multipleScatteringView];
+    Texture2D<float4> bands = ResourceDescriptorHeap[aerial.bandsView];
+    RWTexture3D<float4> volume = ResourceDescriptorHeap[g_pass.output0];
+    RWTexture2D<float4> skyChange = ResourceDescriptorHeap[g_pass.output1];
+    float2 uv = (float2(texel) + 0.5) / kAerialSize;
+    float3 clip = float3(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 1.0);
+    float3 direction = normalize(float3(dot(aerial.clipToDirection[0].xyz, clip), dot(aerial.clipToDirection[1].xyz, clip), dot(aerial.clipToDirection[2].xyz, clip)));
+    // The map's origin stands kEyeHeight above the ground (shaders/clouds.hlsl, CloudSpace); the eye stays above it.
+    float3 eye = float3(g_frame.eyePosition.xy * kKilometresPerUnit, kGroundRadius + kEyeHeight + g_frame.eyePosition.z * kKilometresPerUnit);
+    eye.z = max(eye.z, kGroundRadius + 0.002);
+    float3 sun = aerial.lightDirection;
+    float cosine = dot(direction, sun);
+    float rayleighPhase = RayleighPhase(cosine);
+    float miePhase = MiePhase(cosine);
+    float ground = SphereDistance(eye, direction, kGroundRadius);
+    float4 multiplier = BandMultiplierToward(bands, direction);
+    float3 throughput = 1.0;
+    float3 shadowed = 0.0;
+    float3 shadowedMie = 0.0;
+    float3 open = 0.0;
+    float3 openMie = 0.0;
+    float sliceStart = 0.0;
+    [loop]
+    for (uint slice = 0; slice < kAerialSize; ++slice) {
+        float sliceEnd = aerial.rangeKm * pow((slice + 1.0) / kAerialSize, 2.0);
+        [loop]
+        for (uint s = 0; s < kAerialStepsPerSlice; ++s) {
+            float start = lerp(sliceStart, sliceEnd, float(s) / kAerialStepsPerSlice);
+            float end = lerp(sliceStart, sliceEnd, float(s + 1) / kAerialStepsPerSlice);
+            if (ground >= 0.0)
+                end = min(end, ground);
+            float span = end - start;
+            if (span <= 0.0)
+                continue;
+            float3 position = eye + direction * (start + 0.5 * span);
+            float r = length(position);
+            float sunMu = dot(position, sun) / r;
+            Medium medium = MediumAt(r - kGroundRadius);
+            float3 sunlight = SphereDistance(position, sun, kGroundRadius) < 0.0 ? AtmosphereTransmittance(transmittance, g_linearClamp, r, sunMu) : 0.0;
+            float shadow = aerial.crepuscular != 0 ? AerialCloudShadow(position, aerial.shadowMean) : 1.0;
+            float3 mieIn = sunlight * (medium.mie * miePhase);
+            float3 single = sunlight * (medium.rayleigh * rayleighPhase) + mieIn;
+            float3 multipleIn = (medium.rayleigh + medium.mie) * multipleScattering.SampleLevel(g_linearClamp, MultipleScatteringUv(r, sunMu), 0.0).rgb;
+            float3 extinction = max(medium.extinction, 1e-9);
+            float3 stepTransmittance = exp(-extinction * span);
+            float3 weight = throughput * (1.0 - stepTransmittance) / extinction;
+            open += weight * (single + multipleIn);
+            openMie += weight * mieIn;
+            shadowed += weight * (single * shadow + multipleIn);
+            shadowedMie += weight * (mieIn * shadow);
+            throughput *= stepTransmittance;
+        }
+        sliceStart = sliceEnd;
+        float3 light = aerial.lightScale * aerial.strength *
+            Recoloured(float4(shadowed, Luminance(shadowedMie)), sun, multiplier, transmittance, aerial.glowScale);
+        volume[uint3(texel, slice)] = float4(min(max(light, 0.0), 65504.0), pow(saturate(Luminance(throughput)), aerial.strength));
+    }
+    float3 change = 0.0;
+    if (aerial.crepuscular != 0) {
+        change = aerial.lightScale * aerial.strength * (Recoloured(float4(shadowed, Luminance(shadowedMie)), sun, multiplier, transmittance, aerial.glowScale) -
+            Recoloured(float4(open, Luminance(openMie)), sun, multiplier, transmittance, aerial.glowScale));
+    }
+    skyChange[texel] = float4(min(change, 0.0), 1.0);
+}
+
 // Steps 3 and 5 run as groups of kBands x kLanesPerBand threads.
 [RootSignature(ROOT_SIGNATURE)]
 [numthreads(16, 16, 1)]
@@ -320,6 +449,10 @@ void main(uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint index :
         Daylight(group.x, index);
         return;
     }
+    if (g_pass.step == 7) {
+        Aerial(id.xy);
+        return;
+    }
     if (g_pass.step == 6) {
         RWTexture2DArray<float4> output = ResourceDescriptorHeap[g_pass.output0];
         uint width, height, faces;
@@ -336,17 +469,7 @@ void main(uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint index :
     uint width, height, faces;
     output.GetDimensions(width, height, faces);
     float3 direction = normalize(FaceDirection(id.z, (float2(id.xy) + 0.5) * (2.0 / width) - 1.0));
-    // A uniform cubic B-spline through the bands: straight lines between their centres turned at each one, which showed
-    // as stripes of colour.
-    float band = (asin(direction.z) / 3.14159265 + 0.5) * kBands - 0.5;
-    int first = int(floor(band)) - 1;
-    float t = band - floor(band);
-    float weights[4] = {pow(1.0 - t, 3.0) / 6.0, (3.0 * t * t * t - 6.0 * t * t + 4.0) / 6.0, (-3.0 * t * t * t + 3.0 * t * t + 3.0 * t + 1.0) / 6.0,
-        t * t * t / 6.0};
-    float4 multiplier = 0.0;
-    [unroll]
-    for (int k = 0; k < 4; ++k)
-        multiplier += weights[k] * bands.Load(int3(clamp(first + k, 0, int(kBands) - 1), 0, 0));
+    float4 multiplier = BandMultiplierToward(bands, direction);
     Texture2D<float4> transmittance = ResourceDescriptorHeap[night.transmittanceView];
     float glowScale = asfloat(g_pass.output1);
     float4 clear = sky.Load(int4(id, 0));

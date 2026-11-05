@@ -21,7 +21,9 @@ struct SkyDrawConstants
     uint cloudHistoryView;
     uint cloudCubeView;
     float cloudOverscan;
-    uint padding1;
+    // Aerial perspective's change of the sky's light by the cloud shadows (crepuscular rays) over the history's view, in
+    // the procedural sky's units, or kNoView.
+    uint aerialSkyView;
     NightSkyConstants night;
 };
 
@@ -93,6 +95,25 @@ float4 CloudsToward(float3 direction)
     return clouds;
 }
 
+// The cloud shadows' change of the sky's light toward a direction (shaders/sky_atmosphere.hlsl step 7), fading out over
+// the overscan of the view it covers; none outside it.
+float3 AerialSkyToward(float3 direction)
+{
+    if (g_sky.aerialSkyView == kNoView)
+        return 0.0;
+    float4 clip = float4(dot(g_sky.cloudViewProj[0].xyz, direction), dot(g_sky.cloudViewProj[1].xyz, direction), 0.0,
+        dot(g_sky.cloudViewProj[3].xyz, direction));
+    if (clip.w <= 0.0)
+        return 0.0;
+    float2 uv = clip.xy / clip.w * float2(0.5, -0.5) + 0.5;
+    float2 edge = min(uv, 1.0 - uv);
+    float inside = saturate(min(edge.x, edge.y) * (1.0 + 2.0 * g_sky.cloudOverscan) / max(g_sky.cloudOverscan, 1e-3));
+    if (inside <= 0.0)
+        return 0.0;
+    Texture2D<float4> aerial = ResourceDescriptorHeap[g_sky.aerialSkyView];
+    return aerial.SampleLevel(g_linearClamp, uv, 0.0).rgb * inside;
+}
+
 float4 SkyMain(Interpolants input) : SV_Target0
 {
     float3 direction = ViewDirection(input.position.xy);
@@ -105,7 +126,7 @@ float4 SkyMain(Interpolants input) : SV_Target0
     float logGain = LogGainThroughClouds(procedural.a, clouds.a);
     float moonCoverage;
     float3 moon = MoonDisc(g_sky.night, direction, pixelAngle, logGain, g_sky.tonemapScale, transmittance, g_linearClamp, moonCoverage);
-    float3 color = procedural.rgb * clouds.a + clouds.rgb;
+    float3 color = max(procedural.rgb + AerialSkyToward(direction), 0.0) * clouds.a + clouds.rgb;
     if (g_sky.night.parts != 0)
         color += NightSkyLight(g_sky.night, direction, logGain, kPointFootprint * pixelAngle, g_sky.tonemapScale, transmittance, g_linearClamp) *
             (1.0 - moonCoverage);

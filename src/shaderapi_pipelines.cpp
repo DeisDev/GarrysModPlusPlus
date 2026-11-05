@@ -5,6 +5,8 @@
 #include "display_output.h"
 #include "log.h"
 #include "night_sky.h"
+#include "particle_shadows.h"
+#include "post_effects.h"
 #include "settings.h"
 #include "shaderapi_capture.h"
 #include "shader_bytecode.h"
@@ -15,6 +17,7 @@
 #include "shaderapi.h"
 #include "shaderapi_textures.h"
 #include "vcs.h"
+#include "viewmodel_casters.h"
 
 #include <d3d9types.h>
 
@@ -66,7 +69,7 @@ constexpr unsigned kFileSystemRead = 0;
 constexpr unsigned kFileSystemOpen = 2;
 constexpr unsigned kFileSystemClose = 3;
 constexpr size_t kReadChunk = 1 << 20;
-constexpr UINT kStateBufferBytes = 576;
+constexpr UINT kStateBufferBytes = 672;
 constexpr UINT kConstantAlignment = D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT;
 constexpr UINT kZeroStream = 3;
 // Unbound samplers read a null descriptor of the shader's texture type.
@@ -651,6 +654,11 @@ struct StateBuffer {
     std::uint32_t samplers[16];
     float alpha[4];
     float clipPlanes[6][4];
+    // Vertex shaders with translator::Variant::writePositions: the inverse of the view-projection to points relative to
+    // the eye (ClipToEye), the eye, and where the positions go (viewmodel_casters::Positions: UAV, first and end vertex).
+    float clipToEye[4][4];
+    float eyePosition[4];
+    std::uint32_t positions[4];
 };
 static_assert(sizeof(StateBuffer) == kStateBufferBytes);
 
@@ -1154,7 +1162,7 @@ struct SkyConstants {
     std::uint32_t cloudHistoryView;
     std::uint32_t cloudCubeView;
     float cloudOverscan;
-    std::uint32_t padding1;
+    std::uint32_t aerialSkyView;
     NightSkyConstants night;
 };
 static_assert(sizeof(SkyConstants) == 576);
@@ -1165,7 +1173,7 @@ static_assert(sizeof(SkyConstants) == 576);
 // Far-plane points mapped to the world in single precision moved by up to a few hundredths of a degree from frame to
 // frame with the jittered matrix, which the stars and Moon showed when zoomed in; relative to the eye, a rounding of w
 // only scales a point along its direction.
-bool ClipToEye(const std::array<Float4, 4>& rows, std::array<Float4, 4>& clipToEye)
+bool ClipToEye(const std::array<Float4, 4>& rows, std::array<Float4, 4>& clipToEye, std::array<double, 3>* eyePosition = nullptr)
 {
     double m[4][8];
     for (int r = 0; r < 4; ++r) {
@@ -1201,7 +1209,39 @@ bool ClipToEye(const std::array<Float4, 4>& rows, std::array<Float4, 4>& clipToE
         const double eye = r < 3 ? m[r][6] / m[3][6] : 0.0;
         for (int c = 0; c < 4; ++c)
             clipToEye[static_cast<size_t>(r)].v[c] = static_cast<float>(m[r][c + 4] - eye * m[3][c + 4]);
+        if (eyePosition != nullptr && r < 3)
+            (*eyePosition)[static_cast<size_t>(r)] = eye;
     }
+    return true;
+}
+
+// The state a viewmodel draw's vertex shader needs to write its world positions (translator::Variant::writePositions):
+// the inverse of the view-projection it draws with (c8-c11 as the draw's patches leave them; the lighting places the
+// viewmodel's pixels by the same rows), kept while the rows stay the same.
+bool WritePositionsState(std::span<const capture::RegisterPatch> vertexPatches, StateBuffer& state)
+{
+    const DynamicState& dynamic = Dynamic();
+    std::array<Float4, 4> rows;
+    for (UINT r = 0; r < 4; ++r)
+        rows[r] = dynamic.vertexFloats[gbuffer::kViewProjection + r];
+    for (const capture::RegisterPatch& patch : vertexPatches) {
+        if (patch.reg >= gbuffer::kViewProjection && patch.reg < gbuffer::kViewProjection + 4)
+            std::copy(patch.value.begin(), patch.value.end(), rows[patch.reg - gbuffer::kViewProjection].v);
+    }
+    static std::array<Float4, 4> lastRows = {};
+    static std::array<Float4, 4> lastInverse = {};
+    static std::array<double, 3> lastEye = {};
+    static bool valid = false;
+    if (!valid || std::memcmp(rows.data(), lastRows.data(), sizeof(rows)) != 0) {
+        valid = ClipToEye(rows, lastInverse, &lastEye);
+        lastRows = rows;
+    }
+    if (!valid)
+        return false;
+    for (size_t r = 0; r < 4; ++r)
+        std::copy(std::begin(lastInverse[r].v), std::end(lastInverse[r].v), state.clipToEye[r]);
+    for (size_t i = 0; i < 3; ++i)
+        state.eyePosition[i] = static_cast<float>(lastEye[i]);
     return true;
 }
 
@@ -1228,6 +1268,7 @@ D3D12_GPU_VIRTUAL_ADDRESS SkyDrawConstants(const gbuffer::SkyDraw& sky, std::spa
     constants.cloudHistoryView = sky.cloudHistoryView;
     constants.cloudCubeView = sky.cloudCubeView;
     constants.cloudOverscan = sky.cloudOverscan;
+    constants.aerialSkyView = sky.aerialSkyView;
     constants.night = PackNightSky(sky);
     return UploadConstants(&constants, sizeof(constants));
 }
@@ -1580,6 +1621,69 @@ void MoveColorCorrection(std::span<const DWORD> pixelCode, std::vector<capture::
     patches.push_back({static_cast<UINT>(shader.weights), {0.0f, 0.0f, 0.0f, 0.0f}});
 }
 
+// The sprites of a SpriteCard draw in the main view's translucent pass, which shadow the sun's light next frame
+// (src/particle_shadows.h), read from its vertices by its vertex format's elements.
+void RecordParticles(const MeshDraw& mesh, float density)
+{
+    if (mesh.vertexData == nullptr || mesh.indexData == nullptr || mesh.topology != D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST)
+        return;
+    constexpr std::uint32_t kAbsent = ~0u;
+    particle_shadows::Layout layout = {mesh.streams[0].StrideInBytes, kAbsent, kAbsent, kAbsent};
+    for (const VertexElement& element : VertexElements(mesh.vertexFormat, false, 0)) {
+        if (element.stream != 0)
+            continue;
+        if (element.usage == D3DDECLUSAGE_POSITION && element.usageIndex == 0 && element.format == DXGI_FORMAT_R32G32B32_FLOAT)
+            layout.position = element.offset;
+        else if (element.usage == D3DDECLUSAGE_COLOR && element.usageIndex == 0)
+            layout.color = element.offset;
+        else if (element.usage == D3DDECLUSAGE_TEXCOORD && element.usageIndex == 2 && element.format == DXGI_FORMAT_R32G32B32A32_FLOAT)
+            layout.parameters = element.offset;
+    }
+    if (layout.position == kAbsent || layout.color == kAbsent || layout.parameters == kAbsent) {
+        static bool logged = false;
+        if (!std::exchange(logged, true))
+            log::Info("Native: a particle draw without SpriteCard's vertex layout casts no shadow");
+        return;
+    }
+    particle_shadows::Record(mesh.vertexData, static_cast<std::uint32_t>(std::max(mesh.vertexCount, 0)), layout, mesh.indexData, mesh.primitives, density);
+}
+
+// The game's bloom chain in DoEnginePostProcessing (client.dll's Generate8BitBloomTexture, 0x180303090, REA 2026-11-04):
+// dev/downsample_non_hdr into _rt_SmallFB0, dev/blurfilterx_nohdr into _rt_SmallFB1, then dev/blurfiltery_nohdr, whose
+// $bloomamount is the bloom scale (GetBloomAmount: mat_bloomscale or env_tonemap_controller's, smoothed by
+// mat_bloomamount_rate, times mat_bloom_scalefactor_scalar, 0 when bloom is off), back into _rt_SmallFB0; then
+// dev/bloomadd adds it, or dev/engine_post with the colour correction. stdshader_dx9.dll's BlurFilterY draw
+// (0x180018b70) sets pixel c3 to $bloomamount; BlurFilter_ps2x.fxc names it scale_factor.
+enum class BloomDraw { None, Chain, Scale, Composite };
+
+BloomDraw BloomDrawOf(std::string_view material)
+{
+    if (material == "dev/blurfiltery_nohdr")
+        return BloomDraw::Scale;
+    if (material == "dev/downsample_non_hdr" || material == "dev/blurfilterx_nohdr" || material == "dev/bloomadd")
+        return BloomDraw::Chain;
+    if (material == "dev/engine_post")
+        return BloomDraw::Composite;
+    return BloomDraw::None;
+}
+
+// The register of the blur's scale_factor in its constant table, or -1.
+int BloomScaleRegister(std::span<const DWORD> pixelCode)
+{
+    static std::unordered_map<const DWORD*, int> shaders;
+    auto found = shaders.find(pixelCode.data());
+    if (found != shaders.end())
+        return found->second;
+    int reg = -1;
+    for (const bytecode::Constant& constant : bytecode::ConstantTable(pixelCode)) {
+        if (constant.set == bytecode::RegisterSet::Float4 && constant.name == "scale_factor")
+            reg = static_cast<int>(constant.index);
+    }
+    if (reg < 0)
+        log::Info("Native: the bloom's blur has no scale_factor constant; the game's bloom scale cannot be read, so the bloom is off");
+    return shaders.emplace(pixelCode.data(), reg).first->second;
+}
+
 }
 
 void DrawPass(const ShadowState& shadow, const MeshDraw& mesh)
@@ -1613,6 +1717,16 @@ void DrawPass(const ShadowState& shadow, const MeshDraw& mesh)
                 depthOnly ? "none" : shadow.pixelShader->name, shadow.pixelStaticIndex);
         return;
     }
+    // Our bloom replaces the game's: its chain is not drawn, only the scale it was drawn with is kept.
+    const BloomDraw bloomDraw = ReplacingBloom() && !depthOnly ? BloomDrawOf(BoundMaterialName()) : BloomDraw::None;
+    if (bloomDraw == BloomDraw::Scale) {
+        const int reg = BloomScaleRegister(pixelCode);
+        if (reg >= 0)
+            RecordBloomScale(dynamic.pixelFloats[static_cast<size_t>(reg)].v[0]);
+        return;
+    }
+    if (bloomDraw == BloomDraw::Chain)
+        return;
     const DynamicState::BlendOverride& colorOverride = dynamic.blendOverride;
     const DynamicState::BlendOverride& alphaOverride = dynamic.alphaBlendOverride;
     const int source = colorOverride.active ? colorOverride.source : shadow.srcBlend;
@@ -1629,6 +1743,27 @@ void DrawPass(const ShadowState& shadow, const MeshDraw& mesh)
         return;
     if (pass.waterSurface)
         capture::RecordWaterMapping(mesh);
+    // Sprites that blend by their alpha shadow the sun's light next frame; added ones only give light.
+    if (pass.fogEpilogue && (pass.fogBlend == 1.0f || pass.fogBlend == 2.0f)) {
+        const Settings& settings = GetSettings();
+        if (settings.particleShadows && settings.realtimeLighting)
+            RecordParticles(mesh, settings.particleShadowDensity);
+    }
+    // The viewmodel's G-buffer draws write their world positions for its self-shadows (src/viewmodel_casters.h); their
+    // triangles are recorded once the draw is issued.
+    const bool viewmodelCaster = pass.route == capture::Pass::Route::GBuffer && viewmodel_casters::Recording();
+    viewmodel_casters::Mesh caster;
+    if (viewmodelCaster) {
+        caster.vertices = mesh.streams[0].BufferLocation;
+        caster.vertexBytes = mesh.streams[0].SizeInBytes;
+        caster.stride = mesh.streams[0].StrideInBytes;
+        caster.indexBuffer = mesh.indices.BufferLocation;
+        caster.indexData = mesh.indexData;
+        caster.primitives = mesh.primitives;
+        caster.triangleList = mesh.topology == D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST && mesh.indices.SizeInBytes != 0;
+        // Source's front faces are clockwise; MaterialCullMode_t 1 (D3DCULL_CW) draws mirrored models (0x180014c60).
+        caster.mirrored = shadow.culling && dynamic.cullMode == 1;
+    }
     const std::span<const DWORD> drawnPixelCode = pass.pixelCode.empty() ? pixelCode : pass.pixelCode;
     const char* pixelName = !pass.pixelCode.empty() ? pass.pixelName : depthOnly ? "none" : shadow.pixelShader->name.c_str();
 
@@ -1650,8 +1785,12 @@ void DrawPass(const ShadowState& shadow, const MeshDraw& mesh)
         capture::AddCoverageTarget(targets);
 
     std::vector<capture::RegisterPatch> pixelPatches = pass.pixelPatches;
-    if (pass.route == capture::Pass::Route::Game && targets.linear && !depthOnly && dynamic.colorTargets[0] == kDefaultTarget)
+    if (pass.route == capture::Pass::Route::Game && targets.linear && !depthOnly && dynamic.colorTargets[0] == kDefaultTarget) {
         MoveColorCorrection(drawnPixelCode, pixelPatches);
+        // With its colour correction moved, engine_post would only add the game's bloom: our bloom replaces it.
+        if (bloomDraw == BloomDraw::Composite)
+            return;
+    }
 
     StateBuffer pixelState = {};
     translator::Variant pixelVariant;
@@ -1728,6 +1867,8 @@ void DrawPass(const ShadowState& shadow, const MeshDraw& mesh)
         }
     }
     vertexVariant.clipPlanes = static_cast<std::uint8_t>(UserClipPlanes(vertexState.clipPlanes));
+    if (viewmodelCaster && caster.triangleList && caster.indexData != nullptr && WritePositionsState(pass.vertexPatches, vertexState))
+        vertexVariant.writePositions = 1;
     const CompiledShader* vertexShader = Compiled(vertexCode, vertexVariant, shadow.vertexShader->name.c_str());
     const CompiledShader* pixelShader = depthOnly ? nullptr : Compiled(drawnPixelCode, pixelVariant, pixelName);
     if (vertexShader == nullptr || (pixelShader == nullptr && !depthOnly))
@@ -1820,9 +1961,9 @@ void DrawPass(const ShadowState& shadow, const MeshDraw& mesh)
                 viewport.TopLeftX, viewport.TopLeftY, viewport.Width, viewport.Height, c(4), c(5), c(6), c(7), c(8), c(9), c(10), c(11), c(58), c(59), c(60),
                 t0 != nullptr ? t0->name : "none", t0 != nullptr ? t0->width : 0, t0 != nullptr ? t0->height : 0, dynamic.colorTargets[0],
                 vertexShader->info.firstFloatConstant, vertexShader->info.floatConstantCount);
-            log::Info("DIAG   srgb write {} read {:#x} linear target {} decode {} encoded {:#x} clipped {} blend {} encoded blend {}", shadow.srgbWrite, shadow.srgbRead,
-                targets.linear, static_cast<int>(pixelVariant.decodeOutput), pixelVariant.encodedSamplers, static_cast<int>(pixelVariant.saturateSamples),
-                blendEnabled, encoded);
+            log::Info("DIAG   material {} srgb write {} read {:#x} linear target {} decode {} encoded {:#x} clipped {} blend {} encoded blend {}", BoundMaterialName(),
+                shadow.srgbWrite, shadow.srgbRead, targets.linear, static_cast<int>(pixelVariant.decodeOutput), pixelVariant.encodedSamplers,
+                static_cast<int>(pixelVariant.saturateSamples), blendEnabled, encoded);
             if (mesh.vertexData != nullptr) {
                 const float* p = reinterpret_cast<const float*>(mesh.vertexData);
                 const int stride = mesh.streams[0].StrideInBytes / 4;
@@ -1874,6 +2015,14 @@ void DrawPass(const ShadowState& shadow, const MeshDraw& mesh)
     if (g_cache.boundPipeline != pipeline) {
         commands->SetPipelineState(pipeline);
         g_cache.boundPipeline = pipeline;
+    }
+    // The draw is issued: its triangles join the viewmodel's, and its vertices go where they were placed (none when full).
+    if (vertexVariant.writePositions != 0) {
+        if (const std::optional<viewmodel_casters::Positions> placed = viewmodel_casters::RecordDraw(caster)) {
+            vertexState.positions[0] = placed->uav;
+            vertexState.positions[1] = placed->firstVertex;
+            vertexState.positions[2] = placed->endVertex;
+        }
     }
     const D3D12_GPU_VIRTUAL_ADDRESS vertexStateAddress = UploadConstants(&vertexState, sizeof(vertexState));
     const D3D12_GPU_VIRTUAL_ADDRESS pixelStateAddress = UploadConstants(&pixelState, sizeof(pixelState));

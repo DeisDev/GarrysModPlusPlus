@@ -56,7 +56,12 @@ struct Variant {
     // Pixel shaders: samplers reading such a target with sRGB reads off, which see its colour encoded as the 8-bit
     // target's bytes were.
     std::uint16_t encodedSamplers = 0;
-    std::uint16_t reserved = 0;
+    // Vertex shaders of the viewmodel's G-buffer draws: each vertex's world position, from the position written through
+    // gmodpp_clipToEye and gmodpp_eyePosition, is stored as three floats at (gmodpp_positions.y + SV_VertexID) x 12 in
+    // the RWByteAddressBuffer gmodpp_positions.x, below vertex gmodpp_positions.z (src/viewmodel_casters.h).
+    std::uint8_t writePositions : 1 = 0;
+    std::uint8_t reserved : 7 = 0;
+    std::uint8_t reserved2 = 0;
 };
 
 // The target a translation compiles for.

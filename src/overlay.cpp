@@ -1163,6 +1163,7 @@ void DrawLightingPage(Settings& settings)
             ColorRow("lighting.sun_color", &Settings::sunColor, true, sun && settings.sunColorOverride,
                 Text(sun ? "lighting.sun_color_reason" : "lighting.sun_reason"));
             SliderRow("lighting.sun_shadow_softness", &Settings::sunShadowSoftness, sun, sunReason);
+            SwitchRow("lighting.viewmodel_self_shadows", &Settings::viewmodelSelfShadows);
             widgets::EndRows();
         }
         if (OnMap() && !statistics.mapHasSun)
@@ -1218,6 +1219,7 @@ void DrawLightingPage(Settings& settings)
         if (widgets::BeginRows("reflections")) {
             StrengthRow("lighting.reflections", &Settings::reflections, &Settings::reflectionIntensity);
             SwitchRow("lighting.glossy_reflections", &Settings::glossyReflections, settings.reflections, Text("lighting.glossy_reflections_reason"));
+            StrengthRow("lighting.specular_antialiasing", &Settings::specularAntialiasing, &Settings::specularAntialiasingStrength);
             widgets::EndRows();
         }
     }
@@ -1243,8 +1245,21 @@ void DrawLightingPage(Settings& settings)
             SliderRow("lighting.fog_start", &Settings::fogStart, fog, fogReason, 0);
             SliderRow("lighting.fog_end", &Settings::fogEnd, fog, fogReason, 0);
             SliderRow("lighting.fog_max_density", &Settings::fogMaxDensity, fog, fogReason);
+            SwitchRow("lighting.ground_mist", &Settings::groundMist);
+            const bool mist = settings.groundMist;
+            const char* mistReason = Text("lighting.ground_mist_reason");
+            SliderRow("lighting.mist_visibility", &Settings::mistVisibility, mist, mistReason, 0);
+            SliderRow("lighting.mist_height", &Settings::mistHeight, mist, mistReason, 0);
+            SliderRow("lighting.mist_falloff", &Settings::mistFalloff, mist, mistReason, 0);
+            ColorRow("lighting.mist_color", &Settings::mistColor, false, mist, mistReason);
+            SliderRow("lighting.mist_turbulence", &Settings::mistTurbulence, mist, mistReason);
+            SliderRow("lighting.mist_scale", &Settings::mistScale, mist, mistReason, 0);
+            SliderRow("lighting.mist_phase", &Settings::mistPhase, mist, mistReason);
+            StrengthRow("lighting.particle_shadows", &Settings::particleShadows, &Settings::particleShadowDensity);
             widgets::EndRows();
         }
+        if (settings.groundMist)
+            widgets::Note(Text("lighting.ground_mist_note"));
     }
     widgets::EndCard();
 
@@ -1272,6 +1287,7 @@ void DrawSkyPage(Settings& settings)
             SwitchRow("lighting.sun_disc", &Settings::sunDisc);
             SliderRow("lighting.sun_size", &Settings::sunSize, settings.sunDisc, Text("lighting.sun_size_reason"));
             SliderRow("lighting.sun_glow", &Settings::sunGlow, settings.physicalSky, physicalSkyReason);
+            StrengthRow("lighting.aerial_perspective", &Settings::aerialPerspective, &Settings::aerialStrength, settings.physicalSky, physicalSkyReason);
             widgets::EndRows();
         }
     }
@@ -1338,6 +1354,8 @@ void DrawSkyPage(Settings& settings)
             SliderRow("lighting.cloud_droplet_size", &Settings::cloudDropletSize, clouds, cloudsReason, 1);
             SliderRow("lighting.cloud_multiple_scattering", &Settings::cloudMultipleScattering, clouds, cloudsReason);
             StrengthRow("lighting.cloud_shadows", &Settings::cloudShadows, &Settings::cloudShadowStrength, clouds, cloudsReason);
+            const bool rays = clouds && settings.cloudShadows && settings.aerialPerspective;
+            SwitchRow("lighting.crepuscular_rays", &Settings::crepuscularRays, rays, clouds ? Text("lighting.crepuscular_rays_reason") : cloudsReason);
             widgets::EndRows();
         }
     }
@@ -1367,6 +1385,21 @@ void DrawSkyPage(Settings& settings)
             SliderRow("lighting.high_cloud_coverage", &Settings::highCloudCoverage, high && chosen, high ? chosenReason : highReason);
             SliderRow("lighting.high_cloud_altitude", &Settings::highCloudAltitude, high, highReason, 0);
             SliderRow("lighting.high_cloud_opacity", &Settings::highCloudOpacity, high && chosen, high ? chosenReason : highReason);
+            widgets::EndRows();
+        }
+    }
+    widgets::EndCard();
+
+    if (widgets::BeginCard("##optics", Text("lighting.section_optics"), Text("lighting.optics_note"))) {
+        if (widgets::BeginRows("optics")) {
+            SwitchRow("lighting.halos", &Settings::halos, clouds, cloudsReason);
+            const bool halos = clouds && settings.halos;
+            const char* const halosReason = clouds ? Text("lighting.halos_reason") : cloudsReason;
+            SliderRow("lighting.halo_strength", &Settings::haloStrength, halos, halosReason);
+            SliderRow("lighting.sun_dogs_strength", &Settings::sunDogsStrength, halos, halosReason);
+            SwitchRow("lighting.wide_halos", &Settings::wideHalos, halos, halosReason);
+            SwitchRow("lighting.corona", &Settings::corona, clouds, cloudsReason);
+            SliderRow("lighting.corona_spread", &Settings::coronaSpread, clouds && settings.corona, clouds ? Text("lighting.corona_reason") : cloudsReason);
             widgets::EndRows();
         }
     }
@@ -1614,6 +1647,22 @@ void DrawImagePage(Settings& settings)
     }
     widgets::EndCard();
 
+    if (widgets::BeginCard("##local_exposure", Text("image.section_local_exposure"), Text("image.local_exposure_note"))) {
+        if (widgets::BeginRows("local_exposure")) {
+            SwitchRow("image.local_exposure", &Settings::localExposure);
+            const bool local = settings.localExposure;
+            const char* reason = Text("image.local_exposure_reason");
+            SliderRow("image.local_exposure_highlights", &Settings::localExposureHighlights, local, reason);
+            SliderRow("image.local_exposure_shadows", &Settings::localExposureShadows, local, reason);
+            SliderRow("image.local_exposure_detail", &Settings::localExposureDetail, local, reason);
+            SliderRow("image.local_exposure_blend", &Settings::localExposureBlend, local, reason);
+            SliderRow("image.local_exposure_blur", &Settings::localExposureBlur, local, reason, 0);
+            SliderRow("image.local_exposure_middle_grey", &Settings::localExposureMiddleGrey, local, reason);
+            widgets::EndRows();
+        }
+    }
+    widgets::EndCard();
+
     if (widgets::BeginCard("##grading", Text("image.section_grading"), Text("image.grading_note"))) {
         if (widgets::BeginRows("grading")) {
             SwitchRow("image.grading", &Settings::grading);
@@ -1648,8 +1697,11 @@ void DrawCameraPage(Settings& settings)
             const bool manual = settings.dofFocus == DofFocus::Manual;
             SliderRow("camera.dof_focus_distance", &Settings::dofFocusDistance, dof && manual, dof ? Text("camera.dof_manual_reason") : reason, 0);
             SliderRow("camera.dof_focus_time", &Settings::dofFocusTime, dof && !manual, dof ? Text("camera.dof_auto_reason") : reason);
-            SliderRow("camera.dof_aperture", &Settings::dofAperture, dof, reason, 1);
-            SliderRow("camera.dof_sensor_size", &Settings::dofSensorSize, dof, reason);
+            // The lens flare's lens works at the same f-number and sensor size.
+            const bool lensUsed = lit && (settings.depthOfField || settings.lensFlare);
+            const char* lensReason = lit ? Text("camera.aperture_reason") : litReason;
+            SliderRow("camera.dof_aperture", &Settings::dofAperture, lensUsed, lensReason, 1);
+            SliderRow("camera.dof_sensor_size", &Settings::dofSensorSize, lensUsed, lensReason);
             SliderRow("camera.dof_max_blur", &Settings::dofMaxBlur, dof, reason, 3);
             SliderRow("camera.dof_rings", &Settings::dofRings, dof, reason);
             widgets::EndRows();
@@ -1673,10 +1725,25 @@ void DrawCameraPage(Settings& settings)
     if (widgets::BeginCard("##lens_flare", Text("camera.section_lens_flare"), Text("camera.lens_flare_note"))) {
         if (widgets::BeginRows("lens_flare")) {
             StrengthRow("camera.lens_flare", &Settings::lensFlare, &Settings::lensFlareIntensity, lit, litReason);
-            SliderRow("camera.lens_flare_starburst", &Settings::lensFlareStarburst, lit && settings.lensFlare,
-                lit ? Text("camera.lens_flare_reason") : litReason);
+            const bool flare = lit && settings.lensFlare;
+            const char* reason = lit ? Text("camera.lens_flare_reason") : litReason;
+            SliderRow("camera.lens_flare_blades", &Settings::lensFlareBlades, flare, reason);
+            SliderRow("camera.lens_flare_dispersion", &Settings::lensFlareDispersion, flare, reason);
+            SliderRow("camera.lens_flare_starburst", &Settings::lensFlareStarburst, flare, reason);
+            SliderRow("camera.lens_flare_starburst_size", &Settings::lensFlareStarburstSize, flare, reason);
             widgets::EndRows();
         }
+    }
+    widgets::EndCard();
+
+    if (widgets::BeginCard("##bloom", Text("camera.section_bloom"), Text("camera.bloom_note"))) {
+        if (widgets::BeginRows("bloom")) {
+            StrengthRow("camera.bloom", &Settings::bloom, &Settings::bloomStrength);
+            SliderRow("camera.bloom_spread", &Settings::bloomSpread, settings.bloom, Text("camera.bloom_reason"));
+            widgets::EndRows();
+        }
+        if (settings.bloom && GetStatistics().gameBloomScale == 0.0f)
+            widgets::Note(Text("camera.bloom_none"));
     }
     widgets::EndCard();
 
@@ -1824,6 +1891,49 @@ void DrawFrameRate(const Statistics& statistics)
 constexpr const char* kPasses[] = {"pass.scene_update", "pass.surface", "pass.radiance_cache", "pass.volume", "pass.direct_light", "pass.light_sampling",
     "pass.ambient_occlusion", "pass.indirect_trace", "pass.reflections", "pass.accumulation", "pass.denoiser", "pass.lighting", "pass.resolve"};
 static_assert(std::size(kPasses) == static_cast<size_t>(GpuPass::Count));
+constexpr const char* kPostPasses[] = {"pass.post_prepare", "pass.post_motion_blur", "pass.post_depth_of_field", "pass.post_bloom", "pass.post_flare",
+    "pass.post_lens", "pass.post_sharpening", "pass.post_local_exposure", "pass.post_final"};
+static_assert(std::size(kPostPasses) == static_cast<size_t>(PostGpuPass::Count));
+
+// A table of GPU times per pass with a bar each, longest full, and their total.
+void DrawPassTable(const char* id, std::span<const char* const> labels, std::span<const double> ms, const char* extraLabel, double extraMs, double total)
+{
+    if (!ImGui::BeginTable(id, 3, ImGuiTableFlags_SizingStretchProp))
+        return;
+    // Name, bar and time, from right to left for right-to-left languages.
+    const int nameColumn = widgets::RightToLeft() ? 2 : 0;
+    const int timeColumn = 2 - nameColumn;
+    for (int column = 0; column < 3; ++column) {
+        if (column == timeColumn)
+            ImGui::TableSetupColumn(nullptr, ImGuiTableColumnFlags_WidthFixed, ImGui::CalcTextSize(Milliseconds(100.0).c_str()).x);
+        else
+            ImGui::TableSetupColumn(nullptr, ImGuiTableColumnFlags_WidthStretch, column == nameColumn ? 0.45f : 0.55f);
+    }
+    double longest = extraMs;
+    for (double pass : ms)
+        longest = std::max(longest, pass);
+    auto passRow = [&](const char* label, double passMs) {
+        ImGui::TableNextRow();
+        ImGui::TableSetColumnIndex(nameColumn);
+        widgets::Text(Text(label));
+        ImGui::TableSetColumnIndex(1);
+        widgets::Meter(longest > 0.0 ? static_cast<float>(passMs / longest) : 0.0f);
+        ImGui::TableSetColumnIndex(timeColumn);
+        EndAligned(Milliseconds(passMs));
+    };
+    for (size_t i = 0; i < labels.size(); ++i)
+        passRow(labels[i], ms[i]);
+    if (extraLabel != nullptr)
+        passRow(extraLabel, extraMs);
+    ImGui::TableNextRow();
+    ImGui::PushFont(widgets::GetFonts().strong);
+    ImGui::TableSetColumnIndex(nameColumn);
+    widgets::Text(Text("performance.total"));
+    ImGui::TableSetColumnIndex(timeColumn);
+    EndAligned(Milliseconds(total));
+    ImGui::PopFont();
+    ImGui::EndTable();
+}
 
 void DrawPerformancePage(Settings& settings)
 {
@@ -1853,42 +1963,12 @@ void DrawPerformancePage(Settings& settings)
 
     DrawFrameRate(statistics);
 
-    if (widgets::BeginCard("##passes", Text("performance.section_gpu_passes"))) {
-        if (ImGui::BeginTable("passes", 3, ImGuiTableFlags_SizingStretchProp)) {
-            // Name, bar and time, from right to left for right-to-left languages.
-            const int nameColumn = widgets::RightToLeft() ? 2 : 0;
-            const int timeColumn = 2 - nameColumn;
-            for (int column = 0; column < 3; ++column) {
-                if (column == timeColumn)
-                    ImGui::TableSetupColumn(nullptr, ImGuiTableColumnFlags_WidthFixed, ImGui::CalcTextSize(Milliseconds(100.0).c_str()).x);
-                else
-                    ImGui::TableSetupColumn(nullptr, ImGuiTableColumnFlags_WidthStretch, column == nameColumn ? 0.45f : 0.55f);
-            }
-            double longest = statistics.otherViewsMs;
-            for (double ms : statistics.passMs)
-                longest = std::max(longest, ms);
-            auto passRow = [&](const char* label, double ms) {
-                ImGui::TableNextRow();
-                ImGui::TableSetColumnIndex(nameColumn);
-                widgets::Text(Text(label));
-                ImGui::TableSetColumnIndex(1);
-                widgets::Meter(longest > 0.0 ? static_cast<float>(ms / longest) : 0.0f);
-                ImGui::TableSetColumnIndex(timeColumn);
-                EndAligned(Milliseconds(ms));
-            };
-            for (size_t i = 0; i < std::size(kPasses); ++i)
-                passRow(kPasses[i], statistics.passMs[i]);
-            passRow("pass.other_views", statistics.otherViewsMs);
-            ImGui::TableNextRow();
-            ImGui::PushFont(widgets::GetFonts().strong);
-            ImGui::TableSetColumnIndex(nameColumn);
-            widgets::Text(Text("performance.total"));
-            ImGui::TableSetColumnIndex(timeColumn);
-            EndAligned(Milliseconds(statistics.lightingMs));
-            ImGui::PopFont();
-            ImGui::EndTable();
-        }
-    }
+    if (widgets::BeginCard("##passes", Text("performance.section_gpu_passes")))
+        DrawPassTable("passes", kPasses, statistics.passMs, "pass.other_views", statistics.otherViewsMs, statistics.lightingMs);
+    widgets::EndCard();
+
+    if (widgets::BeginCard("##post_passes", Text("performance.section_post_passes")))
+        DrawPassTable("post_passes", kPostPasses, statistics.postPassMs, nullptr, 0.0, statistics.postMs);
     widgets::EndCard();
 
     if (widgets::BeginCard("##statistics", Text("performance.section_statistics"))) {
@@ -2650,7 +2730,8 @@ void DrawAboutPage(Settings&)
     widgets::EndCard();
 
     if (widgets::BeginCard("##references", Text("about.section_references"))) {
-        for (const char* key : {"about.ref_sky", "about.ref_clouds", "about.ref_volumetrics", "about.ref_restir", "about.ref_skin", "about.ref_motion_blur",
+        for (const char* key : {"about.ref_sky", "about.ref_clouds", "about.ref_halos", "about.ref_volumetrics", "about.ref_mist", "about.ref_restir",
+                 "about.ref_skin", "about.ref_specular_aa", "about.ref_motion_blur", "about.ref_bloom", "about.ref_local_exposure", "about.ref_lens_flare",
                  "about.ref_moon", "about.ref_stars"})
             widgets::Note(Text(key));
     }
@@ -2839,6 +2920,7 @@ float DrawPerformanceOverlay(const Settings& settings)
                 ImGui::PlotLines("##frametimes", figures.frameTimes.data(), static_cast<int>(figures.frameTimes.size()), 0, nullptr, 0.0f, figures.longestFrame,
                     ImVec2(ImGui::GetFontSize() * 13.0f, ImGui::GetFontSize() * 2.2f));
             Line(ui::Format("overlay.gpu_lighting", {{"value", ui::Number(statistics.lightingMs, 2)}}));
+            Line(ui::Format("overlay.gpu_post", {{"value", ui::Number(statistics.postMs, 2)}}));
             const ImVec2 output = ImGui::GetIO().DisplaySize;
             Line(ui::Format("overlay.output", {{"width", ui::Number(output.x, 0)}, {"height", ui::Number(output.y, 0)}}));
             if (statistics.renderWidth != 0)
@@ -2871,6 +2953,8 @@ float DrawPerformanceOverlay(const Settings& settings)
                 for (size_t i = 0; i < std::size(kPasses); ++i)
                     passRow(kPasses[i], statistics.passMs[i]);
                 passRow("pass.other_views", statistics.otherViewsMs);
+                for (size_t i = 0; i < std::size(kPostPasses); ++i)
+                    passRow(kPostPasses[i], statistics.postPassMs[i]);
                 ImGui::EndTable();
             }
         }
