@@ -2128,8 +2128,14 @@ bool Lighting::EnsureTargets(UINT width, UINT height)
         ok = ok && CreateTarget(texture, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT);
     for (Texture& texture : m_viewmodelIndirect)
         ok = ok && CreateTarget(texture, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT);
-    ok = ok && CreateTarget(m_viewmodelHistory, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT);
-    ok = ok && CreateTarget(m_viewmodelRecord, width, height, DXGI_FORMAT_R32G32B32A32_FLOAT);
+    for (Texture& texture : m_viewmodelHistory)
+        ok = ok && CreateTarget(texture, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT);
+    for (Texture& texture : m_viewmodelRecord)
+        ok = ok && CreateTarget(texture, width, height, DXGI_FORMAT_R32G32B32A32_FLOAT);
+    for (Texture& texture : m_viewmodelNormal)
+        ok = ok && CreateTarget(texture, width, height, DXGI_FORMAT_R8G8B8A8_SNORM);
+    for (Texture& texture : m_viewmodelReflection)
+        ok = ok && CreateTarget(texture, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT);
     ok = ok && CreateTarget(m_resolved, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT);
     for (Texture& texture : m_skyGeometry)
         ok = ok && CreateTarget(texture, width, height, DXGI_FORMAT_R8_UINT);
@@ -2780,6 +2786,14 @@ bool Lighting::FillConstants(FrameConstants& constants, const Scene& scene, cons
     }
     constants.lightScale = settings.lightIntensity;
     constants.indirectScale = settings.indirectLight ? settings.indirectIntensity : 0.0f;
+    if (inputs.kind == gbuffer::ViewKind::Main) {
+        for (int i = 0; i < 3; ++i) {
+            const float sunlight = constants.sunEnabled != 0.0f ? constants.sunColor[i] : 0.0f;
+            const float skylight = constants.skyColor[i] * constants.indirectScale;
+            m_openAirLight[i] = {0.25f * sunlight + 0.5f * skylight, 0.5f * sunlight * constants.sunDirection[0], 0.5f * sunlight * constants.sunDirection[1],
+                0.5f * sunlight * constants.sunDirection[2] + 0.5f * skylight};
+        }
+    }
     constants.taaHistoryWeight = settings.taaHistoryWeight;
     constants.sharpening = settings.sharpening;
     constants.tonemapScale = inputs.tonemapScale;
@@ -3148,7 +3162,8 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
                 m_skyboxMsTotal = 0.0;
                 m_passMsTotal = {};
                 m_gpuSamples = 0;
-                if (++m_timingReports % (GetOptions().devMode ? 1 : 10) == 0) {
+                // Every tenth average (1200 main views): the Performance page and the overlay show them live.
+                if (++m_timingReports % 10 == 0) {
                     constexpr size_t kRecentFrames = 240;
                     const size_t frames = std::min(statistics.frameCount, kRecentFrames);
                     double frameMs = 0.0;
@@ -3425,16 +3440,21 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
         UpdateSway(scene, slot, inputs.sway, constants.eyePosition, slotConstantsGpu);
     m_sway.Append(m_frameInstances);
     // The viewmodel, drawn after the main view of its frame, traces that view's scene: characters included, it keeps the
-    // main view's slot from being rebuilt until it is done (m_slotFenceValues below). Without its own triangles it reuses
-    // the main view's acceleration structure and records with its own mask (kViewmodelTraceMask); with them
-    // (viewmodel_casters) it records its own: the main view's instances without the local player's, and the viewmodel's,
-    // which then shadows itself.
-    const bool followsMain =
-        inputs.kind == gbuffer::ViewKind::Viewmodel && m_mainScene.tlas != 0 && m_mainSceneFrame == inputs.frame && m_mainSceneRun + 1 == m_run;
+    // main view's slot from being rebuilt until it is done (m_slotFenceValues below), which holds while fewer runs than
+    // the slots follow it (a viewmodel captured in parts is lit once per part). Without its own triangles it reuses the
+    // main view's acceleration structure and records with its own mask (kViewmodelTraceMask); with them
+    // (viewmodel_casters) it records its own: the main view's instances without the local player's, and the viewmodel's
+    // (its other parts too), whose pixels then find their own triangles and their motion, and which shadows itself with
+    // viewmodel_self_shadows.
+    const bool followsMain = inputs.kind == gbuffer::ViewKind::Viewmodel && m_mainScene.tlas != 0 && m_mainSceneFrame == inputs.frame &&
+        m_run > m_mainSceneRun && m_run - m_mainSceneRun < kSlots;
     D3D12_GPU_VIRTUAL_ADDRESS viewmodelBlas = 0;
     if (followsMain && inputs.viewmodelGeometry)
-        viewmodelBlas = viewmodel_casters::RecordBlas(m_list.Get(), *inputs.viewmodelGeometry);
+        viewmodelBlas = viewmodel_casters::RecordGeometry(m_list.Get(), *inputs.viewmodelGeometry, inputs.frame);
     const bool viewmodelScene = viewmodelBlas != 0;
+    const std::vector<viewmodel_casters::Part> viewmodelParts =
+        viewmodelScene ? viewmodel_casters::OtherParts(*inputs.viewmodelGeometry, inputs.frame) : std::vector<viewmodel_casters::Part>();
+    const bool viewmodelShadows = viewmodelScene && GetSettings().viewmodelSelfShadows;
     const bool reuseScene = followsMain && !viewmodelScene;
     if (viewmodelScene) {
         m_frameInstances.clear();
@@ -3446,14 +3466,52 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
         SceneInstance viewmodel;
         viewmodel.blas = viewmodelBlas;
         viewmodel.positionsView = geometry.positionsView;
+        viewmodel.previousPositionsView = geometry.previousView;
         viewmodel.indicesView = geometry.indicesView;
         viewmodel.albedoView = geometry.albedoView;
         viewmodel.triangleCount = geometry.triangleCount;
         viewmodel.mask = kLocalPlayerMask;
         viewmodel.transform[0][0] = viewmodel.transform[1][1] = viewmodel.transform[2][2] = 1.0f;
         m_frameInstances.push_back(viewmodel);
+        for (const viewmodel_casters::Part& part : viewmodelParts) {
+            SceneInstance other;
+            other.blas = part.blas;
+            other.positionsView = part.positionsView;
+            other.indicesView = part.indicesView;
+            other.albedoView = part.albedoView;
+            other.triangleCount = part.triangleCount;
+            other.mask = kLocalPlayerMask;
+            other.transform[0][0] = other.transform[1][1] = other.transform[2][2] = 1.0f;
+            m_frameInstances.push_back(other);
+        }
         constants.viewmodel = 2;
-        constants.normalBias = kViewmodelNormalBias;
+        if (viewmodelShadows)
+            constants.normalBias = kViewmodelNormalBias;
+    }
+    // The viewmodel's motion (shaders/primary.hlsl) and light history (shaders/gi_temporal.hlsl) take its runs of the
+    // frame before, which saw its triangles too, and their camera.
+    if (inputs.kind == gbuffer::ViewKind::Viewmodel) {
+        if (viewmodelScene && inputs.frame != m_viewmodelFrame) {
+            m_viewmodelPreviousFrame = m_viewmodelFrame;
+            std::memcpy(m_viewmodelPrevViewProj, m_viewmodelViewProj, sizeof(m_viewmodelPrevViewProj));
+            std::memcpy(m_viewmodelPrevEye, m_viewmodelEye, sizeof(m_viewmodelPrevEye));
+            m_viewmodelFrame = inputs.frame;
+            std::memcpy(m_viewmodelViewProj, constants.viewProj, sizeof(m_viewmodelViewProj));
+            std::memcpy(m_viewmodelEye, constants.eyePosition, sizeof(m_viewmodelEye));
+        }
+        const bool viewmodelHistory =
+            viewmodelScene && m_viewmodelHistoryValid && m_viewmodelFrame == inputs.frame && m_viewmodelPreviousFrame + 1 == inputs.frame;
+        constants.historyValid = viewmodelHistory ? 1u : 0u;
+        constexpr uint32_t kViewmodelStateLogs = 32;
+        const std::array<uint64_t, 4> state = {followsMain ? 1u : 0u, viewmodelScene ? 1u : 0u, viewmodelParts.size(), viewmodelHistory ? 1u : 0u};
+        if (GetOptions().devMode && state != m_viewmodelLoggedState && m_viewmodelStateLogs < kViewmodelStateLogs) {
+            m_viewmodelLoggedState = state;
+            ++m_viewmodelStateLogs;
+            log::Info("Viewmodel: run {} after the main view's, follows it {}, own scene {}, {} other parts, light history {}", m_run - m_mainSceneRun,
+                followsMain, viewmodelScene, viewmodelParts.size(), viewmodelHistory);
+        }
+        std::memcpy(constants.prevViewProj, m_viewmodelPrevViewProj, sizeof(constants.prevViewProj));
+        std::memcpy(constants.prevEyePosition, m_viewmodelPrevEye, sizeof(constants.prevEyePosition));
     }
     const SceneFrame frame = reuseScene ? m_mainScene : scene.RecordFrame(m_list.Get(), slot, m_frameInstances, m_useMicromaps);
     if (main) {
@@ -3486,12 +3544,12 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     else if (inputs.kind == gbuffer::ViewKind::Skybox)
         constants.traceMask = kSkyboxMask;
     else
-        constants.traceMask = inputs.kind == gbuffer::ViewKind::Viewmodel && !viewmodelScene ? kViewmodelTraceMask : kTraceMask;
+        constants.traceMask = inputs.kind == gbuffer::ViewKind::Viewmodel && !viewmodelShadows ? kViewmodelTraceMask : kTraceMask;
     const FoliageShadows foliage = GetSettings().foliageShadows;
     const auto withFoliage = [&](UINT mask, FoliageShadows from) { return foliage >= from ? mask : mask & ~kShadowlessPropMask; };
     constants.sunShadowMask = withFoliage(constants.traceMask, FoliageShadows::Sun);
     // The hands and the weapon hide each other's indirect light; elsewhere the local player is left out.
-    const UINT indirectMask = viewmodelScene ? constants.traceMask : constants.traceMask & ~kLocalPlayerMask;
+    const UINT indirectMask = viewmodelShadows ? constants.traceMask : constants.traceMask & ~kLocalPlayerMask;
     constants.indirectMask = withFoliage(indirectMask, FoliageShadows::SunAndIndirect);
     constants.bounceMask = withFoliage(indirectMask, FoliageShadows::All);
     constants.lightShadowMask = withFoliage(constants.traceMask, FoliageShadows::All);
@@ -3860,6 +3918,19 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
                 .output0 = m_reflectionHistory[current].uav, .step = m_reflectionHistoryValid ? 1u : 0u});
             Use(m_reflectionHistory[current], read);
             reflections = m_reflectionHistory[current].srv;
+        } else if (!main && inputs.kind == gbuffer::ViewKind::Viewmodel) {
+            // The viewmodel's glossy reflections (a weapon's Phong and env_cubemap) are accumulated along its motion in
+            // textures of its own, checked against last frame's light history records; nothing else denoises them.
+            const UINT now = static_cast<UINT>(inputs.frame % 2);
+            const UINT before = 1 - now;
+            for (Texture* texture : {&m_viewmodelReflection[before], &m_viewmodelRecord[before], &m_viewmodelNormal[before]})
+                Use(*texture, read);
+            Use(m_viewmodelReflection[now], write);
+            Dispatch(Pass::ReflectionTemporal, {.input0 = m_reflections.srv, .input1 = m_viewmodelReflection[before].srv,
+                .input2 = m_viewmodelRecord[before].srv, .input3 = m_viewmodelNormal[before].srv, .output0 = m_viewmodelReflection[now].uav,
+                .step = static_cast<UINT>(inputs.frame % kViewmodelTags + 1)});
+            Use(m_viewmodelReflection[now], read);
+            reflections = m_viewmodelReflection[now].srv;
         }
     }
     if (main)
@@ -3878,18 +3949,24 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     mark();
     Texture* indirect = nullptr;
     if (traced && !main) {
-        Use(m_viewmodelHistory, write);
-        Use(m_viewmodelRecord, write);
-        Dispatch(Pass::GiTemporal, {.input0 = m_giRaw.srv, .input2 = m_viewmodelHistoryValid ? 0u : 1u, .output0 = m_viewmodelHistory.uav,
-            .output1 = m_viewmodelRecord.uav, .step = static_cast<UINT>(inputs.frame % kViewmodelTags + 1)});
-        m_viewmodelHistoryValid = true;
-        Use(m_viewmodelRecord, read);
-        Texture* source = &m_viewmodelHistory;
+        // A frame's parts write the same textures, each its own pixels.
+        const UINT now = static_cast<UINT>(inputs.frame % 2);
+        const UINT before = 1 - now;
+        for (Texture* texture : {&m_viewmodelHistory[before], &m_viewmodelRecord[before], &m_viewmodelNormal[before]})
+            Use(*texture, read);
+        for (Texture* texture : {&m_viewmodelHistory[now], &m_viewmodelRecord[now], &m_viewmodelNormal[now]})
+            Use(*texture, write);
+        Dispatch(Pass::GiTemporal, {.input0 = m_giRaw.srv, .input1 = m_viewmodelHistory[before].srv, .input2 = m_viewmodelRecord[before].srv,
+            .input3 = m_viewmodelNormal[before].srv, .output0 = m_viewmodelHistory[now].uav, .output1 = m_viewmodelRecord[now].uav,
+            .output2 = m_viewmodelNormal[now].uav, .step = static_cast<UINT>(inputs.frame % kViewmodelTags + 1)});
+        m_viewmodelHistoryValid = m_viewmodelHistoryValid || viewmodelScene;
+        Use(m_viewmodelRecord[now], read);
+        Texture* source = &m_viewmodelHistory[now];
         for (size_t i = 0; i < std::size(kFilterSteps) && GetSettings().denoiser; ++i) {
             Texture* target = &m_viewmodelIndirect[i % 2];
             Use(*source, read);
             Use(*target, write);
-            Dispatch(Pass::GiFilter, {.input0 = source->srv, .input1 = i == 0 ? m_viewmodelRecord.srv : kInvalidView, .input2 = i == 0 ? 1u : 0u,
+            Dispatch(Pass::GiFilter, {.input0 = source->srv, .input1 = i == 0 ? m_viewmodelRecord[now].srv : kInvalidView, .input2 = i == 0 ? 1u : 0u,
                 .output0 = target->uav, .step = kFilterSteps[i]});
             source = target;
         }
@@ -4349,6 +4426,8 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
         m_slotFenceValues[m_mainSceneSlot] = m_fenceValue;
     if (viewmodelScene)
         viewmodel_casters::MarkUsed(inputs.viewmodelGeometry->entry, m_fence.Get(), m_fenceValue);
+    for (const viewmodel_casters::Part& part : viewmodelParts)
+        viewmodel_casters::MarkUsed(part.entry, m_fence.Get(), m_fenceValue);
     if (std::exchange(m_bakeLogPending, false))
         FinishBake(scene);
     if (probe) {

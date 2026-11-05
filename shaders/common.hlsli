@@ -67,8 +67,9 @@ struct FrameConstants
     uint bspNodesView;
     uint leafClustersView;
     uint clusterCount;
-    // 1 for the first-person viewmodel's run, 2 when it traces its own scene with its own triangles (kLocalPlayerMask),
-    // so it shadows itself (src/viewmodel_casters.h).
+    // 1 for the first-person viewmodel's run, 2 when it traces its own scene with its own triangles (kLocalPlayerMask):
+    // its pixels find them, with their motion, and with viewmodel_self_shadows the masks keep them, so it shadows itself
+    // (src/viewmodel_casters.h).
     uint viewmodel;
     // Written by shaders/primary.hlsl.
     uint visibilityView;

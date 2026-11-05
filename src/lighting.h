@@ -451,6 +451,10 @@ public:
     // How the light that shows the map's fog compares with the map's own in the last main view, by colour (FogDaylight
     // in shaders/common.hlsli).
     std::array<float, 3> FogDaylight() const { return m_fogDaylight; }
+    // The last main view's light in open air in the irradiance volume's form (shaders/forward_light.hlsli: per colour
+    // a and b of a + b.n): the sun's clamped cosine and the sky's upper hemisphere, each by its constant and linear
+    // terms (a quarter and a half of the sun's irradiance, a half and a half of the sky's, as LitFogScale takes them).
+    std::array<std::array<float, 4>, 3> OpenAirLight() const { return m_openAirLight; }
     // The last main view's frame constants and scene for forward twins (shaders/forward_twin.hlsli); 0 before one ran
     // with its irradiance volume.
     D3D12_GPU_VIRTUAL_ADDRESS ForwardFrame() const { return m_volumeReady ? m_forwardFrame : 0; }
@@ -992,6 +996,7 @@ private:
     float m_prevFroxelRange = 0.0f;
     // The last main view's FogDaylight.
     std::array<float, 3> m_fogDaylight = {1.0f, 1.0f, 1.0f};
+    std::array<std::array<float, 4>, 3> m_openAirLight = {};
     // Irradiance volume (shaders/probes.hlsl): red, green and blue coefficients and cells of the last two frames,
     // and the filled volume copied to the game's textures.
     std::array<std::array<Texture, 4>, 2> m_probeHistory;
@@ -1015,12 +1020,26 @@ private:
     std::array<Texture, 2> m_taaHistory;
     // Indirect light of the viewmodel, filtered in buffers of its own so the main view's stay intact.
     std::array<Texture, 2> m_viewmodelIndirect;
-    // The viewmodel's accumulated indirect light (rgb, sample count) and its record (luminance moments, distance and the
-    // tag of the frame that wrote it), updated in place (shaders/gi_temporal.hlsl).
-    Texture m_viewmodelHistory;
-    Texture m_viewmodelRecord;
-    // False until the record is written after its creation: a new texture's contents are undefined.
+    // The viewmodel's accumulated indirect light (rgb, sample count), its record (luminance moments, distance and the
+    // tag of the frame that wrote it) and its face normals, this frame's and last frame's in turn, carried along its
+    // motion (shaders/gi_temporal.hlsl), and its accumulated reflections checked against the records
+    // (shaders/reflection_temporal.hlsl).
+    std::array<Texture, 2> m_viewmodelHistory;
+    std::array<Texture, 2> m_viewmodelRecord;
+    std::array<Texture, 2> m_viewmodelNormal;
+    std::array<Texture, 2> m_viewmodelReflection;
+    // Whether a viewmodel run with its own triangles wrote the history since the textures were made (a new texture's
+    // contents are undefined); the last two frames with such runs and their cameras.
     bool m_viewmodelHistoryValid = false;
+    uint64_t m_viewmodelFrame = 0;
+    uint64_t m_viewmodelPreviousFrame = 0;
+    float m_viewmodelViewProj[4][4] = {};
+    float m_viewmodelEye[3] = {};
+    float m_viewmodelPrevViewProj[4][4] = {};
+    float m_viewmodelPrevEye[3] = {};
+    // Developer log of the viewmodel runs' state, as it changes.
+    std::array<uint64_t, 4> m_viewmodelLoggedState = {~0ull, ~0ull, ~0ull, ~0ull};
+    uint32_t m_viewmodelStateLogs = 0;
     Texture m_resolved;
     // The frames since the upscalers' resolve last saw geometry near an output pixel (shaders/dlss_resolve.hlsl), and
     // whether last frame's may be used.

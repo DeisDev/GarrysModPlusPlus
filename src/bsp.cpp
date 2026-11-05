@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cfloat>
 #include <cmath>
 #include <cstdio>
@@ -10,6 +11,8 @@
 #include <format>
 #include <functional>
 #include <optional>
+#include <string>
+#include <string_view>
 
 #include <LzmaDec.h>
 
@@ -818,6 +821,35 @@ std::optional<SkyCamera> ReadSkyCamera(std::span<const std::byte> file, const He
     return camera;
 }
 
+// worldspawn's detailmaterial, lower case with forward slashes, or nothing.
+std::optional<std::string> ReadDetailMaterial(std::span<const std::byte> file, const Header& header)
+{
+    const Lump& lump = header.lumps[kLumpEntities];
+    if (lump.offset < 0 || lump.length <= 0 || static_cast<size_t>(lump.offset) + lump.length > file.size())
+        return std::nullopt;
+    std::string_view entities(reinterpret_cast<const char*>(file.data() + lump.offset), lump.length);
+    const size_t classPos = entities.find("\"worldspawn\"");
+    if (classPos == std::string_view::npos)
+        return std::nullopt;
+    const size_t blockStart = entities.rfind('{', classPos);
+    const size_t blockEnd = entities.find('}', classPos);
+    if (blockStart == std::string_view::npos || blockEnd == std::string_view::npos)
+        return std::nullopt;
+    const std::string_view block = entities.substr(blockStart, blockEnd - blockStart);
+    constexpr std::string_view kKey = "\"detailmaterial\"";
+    const size_t keyPos = block.find(kKey);
+    if (keyPos == std::string_view::npos)
+        return std::nullopt;
+    const size_t valueStart = block.find('"', keyPos + kKey.size());
+    const size_t valueEnd = valueStart == std::string_view::npos ? valueStart : block.find('"', valueStart + 1);
+    if (valueEnd == std::string_view::npos || valueEnd == valueStart + 1)
+        return std::nullopt;
+    std::string name(block.substr(valueStart + 1, valueEnd - valueStart - 1));
+    for (char& c : name)
+        c = c == '\\' ? '/' : static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return name;
+}
+
 struct AreaLocator {
     std::span<const Plane> planes;
     std::span<const Node> nodes;
@@ -1353,6 +1385,8 @@ bool LoadWorld(std::span<const std::byte> file, WorldGeometry& world, std::strin
     // occlude the main view's rays, so faces and props in the sky camera's area are kept apart.
     const std::optional<AreaLocator> areas = MakeAreaLocator(file, header);
     const std::optional<SkyCamera> skyCamera = ReadSkyCamera(file, header);
+    if (std::optional<std::string> detailMaterial = ReadDetailMaterial(file, header))
+        world.detailMaterial = std::move(*detailMaterial);
     int skyArea = areas && skyCamera ? areas->AreaAt(skyCamera->origin) : -1;
     // ProcessSkyCameras in src/utils/vrad/vrad.cpp keeps only cameras with a positive scale.
     if (skyCamera && skyCamera->scale > 0.0f) {

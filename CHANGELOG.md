@@ -2,56 +2,36 @@
 
 All notable changes to this project are documented in this file.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The first release will be 0.9.0-alpha.
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.9.0-alpha] - 2026-11-05
+
+First public release. This is an early alpha: expect bugs, crashes and addons that don't work with it.
+
 ### Added
 
-- The mod's version is shown at the bottom of the menu's page list and on the About page, and written at the top of the log.
-- HDR10 output on HDR displays, with paper white, peak brightness, black level, saturation and HUD and menu brightness on the Display page. Paper white and peak follow Windows and the display unless set by hand.
-- DLSS and FSR Frame Generation work with HDR output.
-- 10-bit SDR output where the display takes it.
-- In HDR, the HUD and menu show at paper white or a fixed brightness, and a brightness boost (off by default) can lift the game toward middle grey by up to one stop.
-- Debug views showing the image's brightness in nits and the pixels brighter than the display can show.
-- The Performance page and the overlay show the camera effects' GPU time per pass.
-- The held weapon and hands shadow each other, from the sun, lamps, the flashlight and muzzle flashes (Lighting page, on by default). Each weapon's vertex shaders compile once more the first time it is held.
-- Specular anti-aliasing: bumpy and shiny surfaces far away no longer sparkle in motion (Lighting page, on by default).
-- Ground mist (Lighting page, off by default): a layer of mist over the ground that drifts with the wind, lit by the sun, sky and lamps, with light shafts through it.
-- Distant air (aerial perspective): far-off land in the 3D skybox turns hazy and blue by day and red at sunset, and cloud shadows show as dark rays across the sky.
-- Ice halos, sun dogs, the 46° halo, the circumzenithal arc and coloured coronas around the sun and Moon, from the clouds (Sky page).
-- Smoke and other particles that blend cast soft shadows from the sun on the ground, in the haze and mist, and on the particles born under them (Lighting page, on by default).
-- Local exposure on the Image page (off by default): brightens dark areas and darkens bright ones while keeping their detail.
-- Glowing parts of moving models light their surroundings: Combine eyes, the AR2's core and other glowing models, including the weapon in first person, following colours set by the game such as the physics gun's.
-- Light from effects (Lighting page, on by default): muzzle flashes, explosions, fire, sparks, glowing sprites such as the manhack's eye, the combine ball and other glowing effects light the scene.
-- A "Skip glows at map lights" option leaves out the glow of lamp halos, whose light the map already has.
-- Addons can read the `gmodpp_lights` console variable to know the mod lights effects itself and turn their own lights off.
+- A Direct3D 12 renderer that replaces the game's Direct3D 9 one and runs the game's own shaders. It loads only when the game is started with `-insecure`.
+- Ray-traced lighting in place of the maps' baked lighting: sun and lamp shadows, bounce light and sky light.
+- Ray-traced reflections on shiny surfaces, water and glass, in place of the maps' cubemaps.
+- Ray-traced flashlights and projected lights.
+- Glowing surfaces and models, muzzle flashes, explosions, fire and other effects light their surroundings.
+- Coloured light through stained and tinted glass, light through leaves, and soft light on skin.
+- Water with traced reflections and refraction, caustics and light shafts under the surface.
+- Volumetric light: lit map fog, haze with light shafts, optional ground mist, and shadows from smoke.
+- A physical sky with a sun disc, sunsets and dark nights, stars, the Milky Way, a Moon with phases, and volumetric clouds with changing weather and cloud shadows.
+- The sun, sky and shadows follow the sandbox Sun Editor, and the menu can set the sun, sky light and fog by hand.
+- NVIDIA DLSS Ray Reconstruction, AMD FSR upscaling and FSR Ray Regeneration, alongside the mod's own anti-aliasing and denoisers.
+- DLSS and FSR Frame Generation, NVIDIA Reflex and AMD Anti-Lag 2, off by default.
+- HDR10 output on HDR displays, and 10-bit output on SDR displays that take it.
+- A tone curve that keeps bright light from clipping, colour grading and local exposure.
+- A bloom that spreads bright light without adding any, in place of the game's.
+- Camera effects, off by default: depth of field, motion blur, lens flare, vignette, sharpening, film grain, chromatic aberration and lens distortion.
+- Quality presets from Low to Ultra; Low bakes bounce light when a map loads, for slower GPUs.
+- A settings menu (Insert) with per-map settings, your own presets, a performance overlay and a log viewer.
+- A check at launch that warns about GPUs that can't run the mod and offers to play without it.
+- Addons can read the `gmodpp_lights` console variable to turn off their own dynamic lights while the mod lights effects itself.
 
-### Changed
-
-- The game draws into a high dynamic range image, so nothing is clipped at white until the image is shown. The tone curve now covers the whole 3D view: particles, sprites, glass and the sky roll off with the rest of the image. The HUD and menus keep their colours.
-- The Brightness slider in the video options works again, in every display mode.
-- Maps' colour correction is applied after the tone curve, so it no longer clips bright light.
-- The sun and Moon are drawn at their real brightness, so on an HDR display they reach its peak instead of stopping at white.
-- The Filmic tone curve is Gran Turismo's in SDR as in HDR and keeps hues; it replaces AgX.
-- The menu blends over the game in linear light in SDR as in HDR.
-- The lens flare is now the reflections inside a real double Gauss lens: coloured aperture shapes along the line through the sun that grow, shrink and brighten with the f-number, with coating colours, colour fringes and a diffraction starburst. New settings for aperture blades, colour fringes and starburst size.
-- Cloud shadows depend on height: places above or inside the clouds are shadowed only by the cloud above them.
-- A new bloom replaces the game's: bright light such as the sun now glows by how bright it really is, and the bloom spreads light without adding any. It still follows the game's bloom scale and has strength and spread settings on the Camera page.
-
-### Fixed
-
-- Clouds no longer repeat in a pattern toward the horizon.
-- Dynamic lights from Lua set to light only models or only the world (`noworld`, `nomodel`) now do so.
-- Models whose glow the game turns off no longer glow.
-- Fixed the game crashing when ARC9 weapons draw their icons, such as when opening the weapon selector.
-- Images that addons read back from render targets keep their transparency, so ARC9's weapon icons no longer have a black background.
-- Less noise in the indirect light on the held weapon and hands.
-- Heat distortion from explosions no longer shows a box with part of the map in it.
-- ARC9's customization menu shows the game behind it again instead of a white screen.
-- Fixed dark streaks along the edges of hands and other models.
-- Distant power lines and ropes against the sky no longer break into dashes with DLSS Ray Reconstruction or FSR.
-- Lamps in fog and water are much less noisy in the distance.
-- The HUD no longer smears in generated frames with DLSS Frame Generation.
-- Light shafts in haze no longer stop at the edges of things against the sky with DLSS Ray Reconstruction or FSR.
-- Under water with DLSS Ray Reconstruction or FSR, the far water no longer shows the unlit view above the surface.
+[Unreleased]: https://github.com/DeisDev/GarrysModPlusPlus/compare/v0.9.0-alpha...HEAD
+[0.9.0-alpha]: https://github.com/DeisDev/GarrysModPlusPlus/releases/tag/v0.9.0-alpha

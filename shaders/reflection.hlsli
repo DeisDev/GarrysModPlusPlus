@@ -35,9 +35,11 @@ float3 SkyBeyond(float3 direction, float coneSpread, bool night, bool disc)
     if (night && beyond.parts != 0)
         radiance += NightSkyLight(beyond, direction, logGain, kPointFootprint * coneSpread, g_frame.tonemapScale, transmittance, g_linearClamp) *
             (1.0 - moonCoverage * narrow);
-    if (disc && beyond.disc != 0)
-        radiance += SunDisc(beyond, direction, coneSpread, transmittance, g_linearClamp) *
+    if (disc && beyond.disc != 0) {
+        float coverage;
+        radiance += SunDisc(beyond, direction, coneSpread, transmittance, g_linearClamp, coverage) *
             (narrow * DiscThroughClouds(beyond, clouds, g_frame.tonemapScale) / g_frame.tonemapScale);
+    }
     return radiance;
 }
 

@@ -21,11 +21,8 @@
 #include <g_bloomUpCS.h>
 #include <g_casCS.h>
 #include <g_flareApertureCS.h>
-#include <g_flareFftColumnsCS.h>
-#include <g_flareFftRowsCS.h>
 #include <g_flareGhostPS.h>
 #include <g_flareGhostVS.h>
-#include <g_flareStarburstCS.h>
 #include <g_dof0CS.h>
 #include <g_dof0ReverseCS.h>
 #include <g_dof1CS.h>
@@ -154,7 +151,7 @@ struct PostConstants {
     std::uint32_t flareGhosts;
     std::uint32_t flareGhostCount;
     std::uint32_t flareAperture;
-    std::uint32_t flareStarburstView;
+    std::uint32_t flareBlades;
     float flareStarburstSize;
     std::uint32_t padding8[2];
 };
@@ -174,13 +171,11 @@ struct PostPass {
 static_assert(sizeof(PostPass) == 8 * sizeof(UINT));
 
 enum class Compute { Prepare, Camera, TileMax, NeighborMax, MotionBlur, DofTiles, DofTilesReverse, DofColor, DofDilate, DofBlur, DofComposite, Cas, Lens,
-    FrameMotion, ExposureHistogram, Exposure, BloomDown, BloomUp, LocalGrid, LocalBlurGrid, LocalBlurMean, FlareAperture, FlareFftRows, FlareFftColumns,
-    FlareStarburst, Count };
+    FrameMotion, ExposureHistogram, Exposure, BloomDown, BloomUp, LocalGrid, LocalBlurGrid, LocalBlurMean, FlareAperture, Count };
 
 constexpr std::span<const unsigned char> kComputeShaders[] = {g_postPrepareCS, g_postCameraCS, g_postTileMaxCS, g_postNeighborMaxCS, g_postMotionBlurCS,
     g_dof0CS, g_dof0ReverseCS, g_dof1CS, g_dof2CS, g_dof3CS, g_dof4CS, g_casCS, g_lensCS, g_postFrameMotionCS, g_postExposureHistogramCS, g_postExposureCS,
-    g_bloomDownCS, g_bloomUpCS, g_localGridCS, g_localBlurGridCS, g_localBlurMeanCS, g_flareApertureCS, g_flareFftRowsCS, g_flareFftColumnsCS,
-    g_flareStarburstCS};
+    g_bloomDownCS, g_bloomUpCS, g_localGridCS, g_localBlurGridCS, g_localBlurMeanCS, g_flareApertureCS};
 static_assert(std::size(kComputeShaders) == static_cast<size_t>(Compute::Count));
 
 // The HDR exposure's luminance bins (kExposureBins in shaders/post/post.hlsl), and how often (in frames) Source's auto
@@ -256,14 +251,9 @@ struct State {
     bool bloomReplaced = false;
     bool bloomRecorded = false;
     float bloomScale = 0.0f;
-    // The lens flare: the aperture with lensFlareBlades blades and its diffraction (each row's transform, the power
-    // spectrum, the energies and the starburst), made again when the blade count changes; the ghosts uploaded each frame;
-    // the flare drawn at half the view's size with its pipeline.
+    // The lens flare: the aperture with lensFlareBlades blades, made again when the blade count changes; the ghosts
+    // uploaded each frame; the flare drawn at half the view's size with its pipeline.
     Target aperture;
-    Target fftRows;
-    Target fftPower;
-    Target fftEnergy;
-    Target starburst;
     int apertureBlades = 0;
     Target ghosts;
     Target flare;
@@ -351,6 +341,27 @@ std::array<float, 3> GradeGain(const Settings& settings)
     for (float& gain : balance)
         gain *= scale;
     return balance;
+}
+
+// The diffraction spikes' strength (Spikes in shaders/post/flare.hlsl): their light per pixel along them one pixel from
+// the light, as a share of the light. The Fraunhofer pattern is the aperture's Fourier transform (Goodman, "Introduction
+// to Fourier Optics"); far from its centre each straight edge of length L of an aperture of area A sends
+// L lambda / (4 pi^2 A) of the light's power per unit of angle to each side along its normal, falling with the square
+// of the angle (a step's transform falls with its frequency). N blades on a circle of radius R give
+// L / A = 2 / (N R cos(pi / N)); R is the focal length over twice the depth of field's f-number, the focal length the
+// view's in pixels times the sensor's pixel pitch. The light's power on the sensor is pi times what a white surface
+// facing it shows times the focal length in pixels squared.
+float SpikeStrength(float focalPixels, float heightPixels, const Settings& settings)
+{
+    constexpr double kWavelength = 550e-9;
+    constexpr double kPiDouble = 3.14159265358979323846;
+    const double sensor = kFullFrameHeight * 1e-3 * settings.dofSensorSize;
+    const double focal = focalPixels * sensor / heightPixels;
+    const double radius = focal / (2.0 * std::max(static_cast<double>(settings.dofAperture), 0.1));
+    const double blades = std::max(settings.lensFlareBlades, 3);
+    const double perAngle = kWavelength * 2.0 / (blades * radius * std::cos(kPiDouble / blades)) / (4.0 * kPiDouble * kPiDouble);
+    // At d pixels from the light the angle is d / f, and a pixel along the spike is 1 / f of it.
+    return static_cast<float>(kPiDouble * focalPixels * focalPixels * perAngle * focalPixels);
 }
 
 bool GradingChanges(const Settings& settings)
@@ -690,18 +701,9 @@ bool EnsureGhostBuffer()
 }
 
 // The aperture's textures and the diffraction's working textures, which do not depend on the view's size.
-bool EnsureApertureTextures()
+bool EnsureApertureTexture()
 {
-    if (g_state.aperture.texture.resource)
-        return true;
-    if (CreateTexture(g_state.aperture, kApertureSize, kApertureSize, DXGI_FORMAT_R8_UNORM) &&
-        CreateTexture(g_state.fftRows, kApertureSize, kApertureSize, DXGI_FORMAT_R32G32_FLOAT) &&
-        CreateTexture(g_state.fftPower, kApertureSize, kApertureSize, DXGI_FORMAT_R32_FLOAT) && CreateBuffer(g_state.fftEnergy, 4, kApertureSize + 1) &&
-        CreateTexture(g_state.starburst, kApertureSize, kApertureSize, DXGI_FORMAT_R16G16B16A16_FLOAT))
-        return true;
-    for (Target* target : {&g_state.aperture, &g_state.fftRows, &g_state.fftPower, &g_state.fftEnergy, &g_state.starburst})
-        Release(*target);
-    return false;
+    return g_state.aperture.texture.resource || CreateTexture(g_state.aperture, kApertureSize, kApertureSize, DXGI_FORMAT_R8_UNORM);
 }
 
 // Frame generation's view without the HUD, in the swap chain's format, made again when the frame's size or the format
@@ -1214,11 +1216,9 @@ void PostProcessView(D3D12_RECT rect, bool postVgui)
     // The wide blur is localExposureBlur percent of the height across: a Gaussian of half that.
     c.localBlurSigma = settings.localExposureBlur * 0.01f * 0.5f * static_cast<float>(height) / static_cast<float>(kLocalCell);
     // The lens flare: the double Gauss lens's ghosts at the depth of field's f-number (src/lens_flare.cpp) and its
-    // aperture's diffraction, drawn lensFlareStarburstSize of the height across (the real pattern is smaller than a pixel)
-    // with the light's whole power in the view (pi x a white surface facing it x the focal length in pixels squared,
-    // the image of a light of that irradiance) spread over it, times lensFlareStarburst.
+    // aperture's diffraction spikes (shaders/post/flare.hlsl), out to lensFlareStarburstSize of the height.
     std::vector<lens_flare::Ghost> ghosts;
-    const bool flareDrawn = c.flareInFront != 0.0f && EnsureApertureTextures() && EnsureGhostBuffer() && EnsureFlareTarget();
+    const bool flareDrawn = c.flareInFront != 0.0f && EnsureApertureTexture() && EnsureGhostBuffer() && EnsureFlareTarget();
     if (flareDrawn) {
         if (GetOptions().devMode && !std::exchange(g_state.loggedLens, true))
             lens_flare::LogPrescription();
@@ -1227,14 +1227,13 @@ void PostProcessView(D3D12_RECT rect, bool postVgui)
         if (ghosts.size() > kMaxGhosts)
             ghosts.resize(kMaxGhosts);
     }
-    const float starburstHalf = 0.5f * settings.lensFlareStarburstSize * static_cast<float>(height);
     c.flareView = flareDrawn ? g_state.flare.srv : kInvalid;
     c.flareGhosts = flareDrawn ? g_state.ghosts.srv : kInvalid;
     c.flareGhostCount = static_cast<std::uint32_t>(ghosts.size());
     c.flareAperture = flareDrawn ? g_state.aperture.srv : kInvalid;
-    c.flareStarburstView = flareDrawn ? g_state.starburst.srv : kInvalid;
-    c.flareStarburstSize = starburstHalf;
-    c.flareStarburst = settings.lensFlareStarburst * kPi * c.focalPixels * c.focalPixels / (4.0f * starburstHalf * starburstHalf);
+    c.flareBlades = static_cast<std::uint32_t>(settings.lensFlareBlades);
+    c.flareStarburstSize = 0.5f * settings.lensFlareStarburstSize * static_cast<float>(height);
+    c.flareStarburst = settings.lensFlareStarburst * SpikeStrength(c.focalPixels, static_cast<float>(height), settings);
     c.gradeExposure = settings.grading ? std::exp2(settings.exposure) : 1.0f;
     c.gradeEnabled = grade ? 1u : 0u;
     if (grade) {
@@ -1412,34 +1411,16 @@ void PostProcessView(D3D12_RECT rect, bool postVgui)
     }
     markAfter(PostGpuPass::Bloom);
     if (flareDrawn) {
-        // The aperture and its diffraction, once per blade count.
+        // The aperture, once per blade count.
         if (g_state.apertureBlades != settings.lensFlareBlades) {
             const UINT groups = kApertureSize / 8;
             Use(g_state.aperture, write);
             if (!Dispatch(Compute::FlareAperture, {.output0 = g_state.aperture.uav, .step = static_cast<UINT>(settings.lensFlareBlades)}, groups, groups))
                 return;
-            Use(g_state.aperture, read);
-            Use(g_state.fftRows, write);
-            Use(g_state.fftEnergy, write);
-            if (!Dispatch(Compute::FlareFftRows, {.input0 = g_state.aperture.srv, .output0 = g_state.fftRows.uav, .output1 = g_state.fftEnergy.uav}, kApertureSize, 1))
-                return;
-            Use(g_state.fftRows, read);
-            UavBarrier(g_state.fftEnergy);
-            Use(g_state.fftPower, write);
-            if (!Dispatch(Compute::FlareFftColumns, {.input0 = g_state.fftRows.srv, .output0 = g_state.fftPower.uav, .output1 = g_state.fftEnergy.uav},
-                    kApertureSize, 1))
-                return;
-            Use(g_state.fftPower, read);
-            UavBarrier(g_state.fftEnergy);
-            Use(g_state.starburst, write);
-            if (!Dispatch(Compute::FlareStarburst, {.input0 = g_state.fftPower.srv, .input1 = g_state.fftEnergy.uav, .output0 = g_state.starburst.uav}, groups,
-                    groups))
-                return;
             g_state.apertureBlades = settings.lensFlareBlades;
         }
         constexpr D3D12_RESOURCE_STATES shaders = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
         Use(g_state.aperture, shaders);
-        Use(g_state.starburst, shaders);
         if (!ghosts.empty()) {
             const UINT64 bytes = sizeof(lens_flare::Ghost) * ghosts.size();
             const Backend::Upload upload = backend.AllocateUpload(bytes, 256);

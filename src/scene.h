@@ -218,11 +218,11 @@ struct SceneInstance {
     // triangle.
     static constexpr uint32_t kNoWaterBody = 0xFFFFFFFFu;
     uint32_t waterBody = kNoWaterBody;
-    float transform[3][4];
+    float transform[3][4] = {};
     // Where the instance was last frame, for motion vectors: its transform when `previousKnown`, and a skinned
     // model's vertex positions when the view is valid.
     bool previousKnown = false;
-    float previousTransform[3][4];
+    float previousTransform[3][4] = {};
     UINT previousPositionsView = DescriptorHeap::kInvalid;
 };
 
@@ -419,6 +419,8 @@ public:
     bool Ready() const { return m_worldModel >= 0; }
     const std::string& Name() const { return m_name; }
     const bsp::SunLight& Sun() const { return m_sun; }
+    // bsp::WorldGeometry::detailMaterial.
+    const std::string& DetailMaterial() const { return m_detailMaterial; }
     UINT LightsView() const { return m_lightsView; }
     UINT LightCount() const { return m_lightCount; }
 
@@ -612,6 +614,7 @@ private:
     std::array<FrameTlas, kFrameSlots> m_frames;
     int m_worldModel = -1;
     std::string m_name;
+    std::string m_detailMaterial;
     bsp::SunLight m_sun;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_lights;
     UINT m_lightsView = DescriptorHeap::kInvalid;

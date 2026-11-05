@@ -1216,7 +1216,7 @@ float VisibleIrradiance() { return (1.0 / 1024.0) / max(g_frame.tonemapScale, 1e
 // Dynamic and projected lights are often attached to a player or weapon (flashlights, muzzle flashes) whose
 // model surrounds the light, so occluders right next to them are ignored.
 static const float kAttachedLightClearance = 48.0;
-// The muzzle flash sits just past the barrel, so with the viewmodel's own triangles its shadow rays start closer.
+// The muzzle flash sits just past the barrel, so where the viewmodel's own triangles shadow it its shadow rays start closer.
 static const float kViewmodelAttachedClearance = 4.0;
 
 // kLocalPlayerMask and kLampShellMask in src/scene.h.
@@ -1656,7 +1656,7 @@ float3 LightTransmittance(LightSet set, uint i, float3 origin, float3 lightPosit
         float size = asfloat(shape.y);
         sealed = !attached && (shape.x & kLightSealed) != 0;
         if (attached && size <= 0.0)
-            clearance = g_frame.viewmodel == 2 ? kViewmodelAttachedClearance : kAttachedLightClearance;
+            clearance = g_frame.viewmodel == 2 && (g_frame.lightShadowMask & kLocalPlayerMask) != 0 ? kViewmodelAttachedClearance : kAttachedLightClearance;
         else if (attached)
             skipsPlayer = (shape.x & kLightOnLocalPlayer) != 0;
         if (size > 0.0 && jitter.x >= 0.0)

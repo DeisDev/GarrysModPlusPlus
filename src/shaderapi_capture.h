@@ -41,6 +41,10 @@ void SkipView(bool skip);
 
 // INT_RENDERPARM_ENABLE_FIXED_LIGHTING while capturing or lighting translucent surfaces, or -1 to keep the game's.
 int FixedLighting();
+// The map's detail sprite material (world::DetailSpriteMaterial). Its UnlitGeneric sprites carry their light in their
+// vertex colour, baked by VRAD (CDetailModel::GetColorModulation in the SDK), so forward passes light them like lit
+// surfaces: the preview combos leave that colour out and keep its alpha, the sprites' fade.
+void SetDetailSprites(std::string_view material);
 
 // A constant register replaced in one draw's upload.
 struct RegisterPatch {

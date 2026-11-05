@@ -3,8 +3,10 @@
 // The lens flare (src/post_effects.cpp, src/lens_flare.cpp), as Hullin, Eisemann, Seidel and Lee's "Physically-Based
 // Real-Time Lens Flare Rendering" (SIGGRAPH 2011) builds it, with Lee and Eisemann's paraxial ghosts ("Practical
 // Real-Time Lens-Flare Rendering", EGSR 2013): each ghost is the aperture's image, drawn where the lens's matrices put
-// it, clipped by the front element and tinted by its coatings; the starburst is the aperture's Fraunhofer diffraction,
-// the squared magnitude of its Fourier transform, summed over wavelengths.
+// it, clipped by the front element and tinted by its coatings. The starburst is the far field of the aperture's
+// Fraunhofer diffraction, the part of it a camera shows: each blade's straight edge sends a spike out perpendicular
+// to it on both sides, whose light along it falls with the square of the angle. Its finer pattern (the rings and the
+// fringes along the spikes) is far smaller than a pixel and averages out over the pixel and the spectrum.
 
 static const float kPi = 3.14159265;
 static const uint kApertureSize = 256;
@@ -13,9 +15,12 @@ static const float kApertureRotation = 0.26;
 // corners lie at kApertureFill of the texture's half-size, so its 2-texel soft edge stays inside.
 static const float kBladeCurvature = 0.15;
 static const float kApertureFill = 0.97;
-// For the diffraction pattern, the aperture's circumscribed circle is kDiffractionRadius texels of the transform's 256.
-static const float kDiffractionRadius = 32.0;
-static const uint kWavelengthSamples = 8;
+// A spike is narrower than a pixel; it is drawn as a Gaussian this many pixels across (sigma), which the half-size
+// flare target still resolves.
+static const float kSpikeWidth = 1.5;
+// The spikes' light per colour relative to 550 nm: an edge diffracts in proportion to the wavelength, weighed over the
+// visible spectrum by linear sRGB's colour matching (Wyman, Sloan and Shirley 2013's fits of the CIE 1931 functions).
+static const float3 kSpikeTint = float3(1.093, 0.983, 0.822);
 
 // output0: the aperture (R8, 256 square): a polygon of `step` blades whose corners lie on the circle of radius
 // kApertureFill around the centre.
@@ -32,142 +37,6 @@ void ApertureMain(uint2 texel : SV_DispatchThreadID)
     float polygon = cos(0.5 * sector) / cos(fromMiddle);
     float edge = lerp(polygon, 1.0, kBladeCurvature) * kApertureFill;
     aperture[texel] = saturate((edge - radius) * 0.25 * float(kApertureSize)).xxxx;
-}
-
-groupshared float2 g_fft[kApertureSize];
-groupshared float g_energy[kApertureSize / 2];
-
-float2 ComplexMultiply(float2 a, float2 b)
-{
-    return float2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
-}
-
-// A 256-point discrete Fourier transform of g_fft, loaded in bit-reversed order, by radix-2 butterflies; 128 threads.
-void Fft(uint thread)
-{
-    [unroll]
-    for (uint stage = 0; stage < 8; ++stage) {
-        uint span = 1u << stage;
-        uint k = thread & (span - 1);
-        uint i0 = ((thread >> stage) << (stage + 1)) + k;
-        uint i1 = i0 + span;
-        float angle = -kPi * float(k) / float(span);
-        float2 a = g_fft[i0];
-        float2 b = ComplexMultiply(g_fft[i1], float2(cos(angle), sin(angle)));
-        g_fft[i0] = a + b;
-        g_fft[i1] = a - b;
-        GroupMemoryBarrierWithGroupSync();
-    }
-}
-
-uint BitReversed(uint index)
-{
-    return reversebits(index) >> 24;
-}
-
-// input0: the aperture; output0: each row's transform (RG32F, 256 square) of the aperture scaled so its circumscribed
-// circle is kDiffractionRadius texels across the middle, times (-1)^(x+y) so the transform's zero frequency lands in the
-// middle; output1: per row, the sum of the squared values (step: none). One group per row.
-[RootSignature(POST_ROOT_SIGNATURE)]
-[numthreads(128, 1, 1)]
-void FftRowsMain(uint3 group : SV_GroupID, uint thread : SV_GroupThreadID)
-{
-    Texture2D<float4> aperture = ResourceDescriptorHeap[g_postPass.input0];
-    uint row = group.x;
-    float energy = 0.0;
-    [unroll]
-    for (uint i = 0; i < 2; ++i) {
-        uint x = thread + i * 128;
-        float2 q = (float2(x, row) + 0.5 - 0.5 * float(kApertureSize)) / kDiffractionRadius * kApertureFill;
-        float value = all(abs(q) < 1.0) ? aperture.SampleLevel(g_postLinear, q * 0.5 + 0.5, 0).r : 0.0;
-        energy += value * value;
-        g_fft[BitReversed(x)] = float2(((x + row) & 1) != 0 ? -value : value, 0.0);
-    }
-    g_energy[thread] = energy;
-    GroupMemoryBarrierWithGroupSync();
-    Fft(thread);
-    RWTexture2D<float4> output = ResourceDescriptorHeap[g_postPass.output0];
-    output[uint2(thread, row)] = float4(g_fft[thread], 0.0, 0.0);
-    output[uint2(thread + 128, row)] = float4(g_fft[thread + 128], 0.0, 0.0);
-    if (thread == 0) {
-        float sum = 0.0;
-        for (uint t = 0; t < kApertureSize / 2; ++t)
-            sum += g_energy[t];
-        RWStructuredBuffer<float> energies = ResourceDescriptorHeap[g_postPass.output1];
-        energies[row] = sum;
-    }
-}
-
-// input0: the rows' transforms; input1: the rows' energies; output0: the power spectrum (R32F, 256 square), the squared
-// magnitude of each column's transform; output1: the energies, whose element 256 gets their sum. One group per column.
-[RootSignature(POST_ROOT_SIGNATURE)]
-[numthreads(128, 1, 1)]
-void FftColumnsMain(uint3 group : SV_GroupID, uint thread : SV_GroupThreadID)
-{
-    Texture2D<float4> rows = ResourceDescriptorHeap[g_postPass.input0];
-    uint column = group.x;
-    [unroll]
-    for (uint i = 0; i < 2; ++i) {
-        uint y = thread + i * 128;
-        g_fft[BitReversed(y)] = rows.Load(int3(column, y, 0)).xy;
-    }
-    GroupMemoryBarrierWithGroupSync();
-    Fft(thread);
-    RWTexture2D<float4> power = ResourceDescriptorHeap[g_postPass.output0];
-    power[uint2(column, thread)] = dot(g_fft[thread], g_fft[thread]).xxxx;
-    power[uint2(column, thread + 128)] = dot(g_fft[thread + 128], g_fft[thread + 128]).xxxx;
-    if (column == 0 && thread == 0) {
-        RWStructuredBuffer<float> energies = ResourceDescriptorHeap[g_postPass.output1];
-        float sum = 0.0;
-        for (uint r = 0; r < kApertureSize; ++r)
-            sum += energies[r];
-        energies[kApertureSize] = sum;
-    }
-}
-
-// The CIE 1931 colour matching functions by Wyman, Sloan and Shirley's multi-lobe fits ("Simple Analytic Approximations
-// to the CIE XYZ Color Matching Functions", JCGT 2013), in linear sRGB, negative parts left out.
-float FitLobe(float wavelength, float centre, float below, float above)
-{
-    float t = (wavelength - centre) / (wavelength < centre ? below : above);
-    return exp(-0.5 * t * t);
-}
-
-float3 WavelengthRgb(float wavelength)
-{
-    float x = 1.056 * FitLobe(wavelength, 599.8, 37.9, 31.0) + 0.362 * FitLobe(wavelength, 442.0, 16.0, 26.7) - 0.065 * FitLobe(wavelength, 501.1, 20.4, 26.2);
-    float y = 0.821 * FitLobe(wavelength, 568.8, 46.9, 40.5) + 0.286 * FitLobe(wavelength, 530.9, 16.3, 31.1);
-    float z = 1.217 * FitLobe(wavelength, 437.0, 11.8, 36.0) + 0.681 * FitLobe(wavelength, 459.0, 26.0, 13.8);
-    float3 rgb = float3(3.2406 * x - 1.5372 * y - 0.4986 * z, -0.9689 * x + 1.8758 * y + 0.0415 * z, 0.0557 * x - 0.2040 * y + 1.0570 * z);
-    return max(rgb, 0.0);
-}
-
-// input0: the power spectrum at 550 nm; input1: the energies; output0: the starburst (RGBA16F, 256 square): the power
-// spectrum at kWavelengthSamples wavelengths from 400 to 700 nm, each scaled about the middle by wavelength / 550 (a
-// longer wavelength diffracts wider) and weighted by its colour, each channel summing to 65536 over the texture (by
-// Parseval's theorem the spectrum sums to 65536 x the aperture's energy).
-[RootSignature(POST_ROOT_SIGNATURE)]
-[numthreads(8, 8, 1)]
-void StarburstMain(uint2 texel : SV_DispatchThreadID)
-{
-    Texture2D<float4> power = ResourceDescriptorHeap[g_postPass.input0];
-    RWStructuredBuffer<float> energies = ResourceDescriptorHeap[g_postPass.input1];
-    float energy = max(energies[kApertureSize], 1e-6);
-    float2 fromMiddle = float2(texel) + 0.5 - 0.5 * float(kApertureSize);
-    float3 sum = 0.0;
-    float3 weights = 0.0;
-    [loop]
-    for (uint i = 0; i < kWavelengthSamples; ++i) {
-        float wavelength = 400.0 + 300.0 * (float(i) + 0.5) / float(kWavelengthSamples);
-        float3 weight = WavelengthRgb(wavelength);
-        float shrink = 550.0 / wavelength;
-        float2 uv = (0.5 * float(kApertureSize) + fromMiddle * shrink) / float(kApertureSize);
-        float value = all(uv >= 0.0) && all(uv <= 1.0) ? power.SampleLevel(g_postLinear, uv, 0).r : 0.0;
-        sum += weight * (value * shrink * shrink);
-        weights += weight;
-    }
-    RWTexture2D<float4> output = ResourceDescriptorHeap[g_postPass.output0];
-    output[texel] = float4(sum / (max(weights, 1e-6) * energy), 1.0);
 }
 
 // Mirrors lens_flare::Ghost in src/lens_flare.h.
@@ -190,7 +59,7 @@ struct GhostVertex
     nointerpolation uint instance : INSTANCE;
 };
 
-// A quad around ghost `instance` of flareGhosts, or for instance flareGhostCount around the starburst, in the view's
+// A quad around ghost `instance` of flareGhosts, or for instance flareGhostCount around the spikes, in the view's
 // pixels; drawn into the half-size flare target.
 [RootSignature(POST_ROOT_SIGNATURE)]
 GhostVertex GhostVS(uint vertex : SV_VertexID, uint instance : SV_InstanceID)
@@ -218,22 +87,44 @@ float GhostChannel(Texture2D<float4> aperture, float2 pixel, float2 centre, floa
     return all(abs(q) < 1.0) ? aperture.SampleLevel(g_postLinear, q * 0.5 + 0.5, 0).r : 0.0;
 }
 
-// Each ghost: the aperture's image per colour, within the front element's circle, times its tint and the light; the
-// starburst: its image times flareStarburst (the light's power in the view spread over the texture) and the light.
+// The diffraction spikes at `offset` pixels from the light, per unit of its light: for each blade's edge a line through
+// the light along the edge's normal (ApertureMain's polygon), its light along it flareStarburst / d^2 at d pixels from
+// the light, spread across it by a Gaussian of unit area. They start at the light's disc and fade out by
+// flareStarburstSize.
+float3 Spikes(float2 offset)
+{
+    float distance = length(offset);
+    float reach = g_post.flareStarburstSize;
+    if (distance >= reach)
+        return 0.0;
+    float sector = 2.0 * kPi / float(max(g_post.flareBlades, 3u));
+    float across = 0.0;
+    [loop]
+    for (uint k = 0; k < max(g_post.flareBlades, 3u); ++k) {
+        float angle = kApertureRotation + (float(k) + 0.5) * sector;
+        float side = dot(offset, float2(-sin(angle), cos(angle)));
+        across += exp(-0.5 * side * side / (kSpikeWidth * kSpikeWidth));
+    }
+    across /= kSpikeWidth * 2.5066283;
+    float near = max(distance, max(g_post.flareRadius, 2.0 * kSpikeWidth));
+    float fade = 1.0 - (distance / reach) * (distance / reach);
+    return kSpikeTint * (g_post.flareStarburst * across * fade * fade / (near * near));
+}
+
+// Each ghost: the aperture's image per colour, within the front element's circle (its edge a little soft, as the ghost
+// is out of focus), times its tint and the light; the starburst: the spikes times the light.
 [RootSignature(POST_ROOT_SIGNATURE)]
 float4 GhostPS(GhostVertex input) : SV_Target
 {
     float3 light = FlareLight();
-    if (input.instance >= g_post.flareGhostCount) {
-        Texture2D<float4> starburst = ResourceDescriptorHeap[g_post.flareStarburstView];
-        float2 uv = (input.pixel - g_post.flarePosition) / (2.0 * g_post.flareStarburstSize) + 0.5;
-        return float4(starburst.SampleLevel(g_postLinear, uv, 0).rgb * g_post.flareStarburst * light, 0.0);
-    }
+    if (input.instance >= g_post.flareGhostCount)
+        return float4(Spikes(input.pixel - g_post.flarePosition) * light, 0.0);
     StructuredBuffer<FlareGhost> ghosts = ResourceDescriptorHeap[g_post.flareGhosts];
     FlareGhost ghost = ghosts[input.instance];
     Texture2D<float4> aperture = ResourceDescriptorHeap[g_post.flareAperture];
     float3 shape = float3(GhostChannel(aperture, input.pixel, ghost.centreRed, ghost.radius.x), GhostChannel(aperture, input.pixel, ghost.centreGreen, ghost.radius.y),
         GhostChannel(aperture, input.pixel, ghost.centreBlue, ghost.radius.z));
-    float entrance = saturate(ghost.circleRadius - length(input.pixel - ghost.circleCentre));
+    float edge = max(0.015 * ghost.circleRadius, 1.0);
+    float entrance = saturate((ghost.circleRadius - length(input.pixel - ghost.circleCentre)) / edge + 0.5);
     return float4(shape * entrance * ghost.tint * light, 0.0);
 }

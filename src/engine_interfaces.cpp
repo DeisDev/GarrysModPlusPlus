@@ -256,6 +256,12 @@ std::optional<std::array<float, 3>> MaterialVector(const std::string& material, 
 
 void ForgetMaterials() { g_materialVars.clear(); }
 
+std::string MaterialName(void* material)
+{
+    const char* name = Slot<const char*(__fastcall*)(void*)>(material, kGetMaterialNameSlot)(material);
+    return name != nullptr ? name : "";
+}
+
 bool IsTranslucentMaterial(void* material)
 {
     return Slot<bool(__fastcall*)(void*)>(material, kIsTranslucentSlot)(material);

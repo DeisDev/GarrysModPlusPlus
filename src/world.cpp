@@ -2243,6 +2243,8 @@ bool LevelHasWater() { return Ready() && !g_state.scene.WaterBodies().empty(); }
 
 float SkyboxScale() { return Ready() ? g_state.scene.Sun().skyCameraScale : 0.0f; }
 
+std::string_view DetailSpriteMaterial() { return Ready() ? std::string_view(g_state.scene.DetailMaterial()) : std::string_view(); }
+
 void WaitForGpu()
 {
     if (g_state.lighting)
@@ -2420,7 +2422,11 @@ std::optional<gbuffer::SkyDraw> SkyDraw()
 
 std::optional<gbuffer::ForwardConstants> ForwardLighting(const ViewInputs& inputs)
 {
-    if (inputs.kind != gbuffer::ViewKind::Main || !g_state.lighting->VolumeReady())
+    const bool skybox = inputs.kind == gbuffer::ViewKind::Skybox;
+    if ((inputs.kind != gbuffer::ViewKind::Main && !skybox) || !g_state.lighting->VolumeReady())
+        return std::nullopt;
+    const bsp::SunLight& sun = g_state.scene.Sun();
+    if (skybox && sun.skyCameraScale <= 0.0f)
         return std::nullopt;
     gbuffer::ForwardConstants forward = {};
     if (const std::optional<std::array<float, 3>> eye = EyePosition(inputs.viewProj))
@@ -2433,6 +2439,15 @@ std::optional<gbuffer::ForwardConstants> ForwardLighting(const ViewInputs& input
         forward.litFogScale = g_state.lighting->LitFogScale();
     }
     forward.lightOnly = IsLightingDebugView(GetSettings().debugView);
+    // The 3D skybox's translucent draws (props fading out at their distance, cards, detail sprites) take the light of
+    // open air, as its own surfaces are lit by the sun and the sky, with its own fog lit as the map's; its scene is not
+    // the forward twins' and its froxels are not the main view's.
+    if (skybox) {
+        forward.openAir = true;
+        forward.openAirLight = g_state.lighting->OpenAirLight();
+        forward.jittered = true;
+        return forward;
+    }
     forward.twinFrame = g_state.lighting->ForwardFrame();
     forward.twinScene = g_state.lighting->ForwardScene();
     forward.fogFrame = g_state.lighting->ForwardFrame();

@@ -321,8 +321,8 @@ struct Settings {
     float motionBlurShutter = 60.0f;
     // Lens flare from the sun or the Moon (src/lens_flare.h): the ghosts of a double Gauss lens at the depth of field's
     // f-number and sensor size, with lensFlareBlades aperture blades, colour fringes lensFlareDispersion times the
-    // glass's, and the aperture's diffraction starburst lensFlareStarburst times as bright, lensFlareStarburstSize of the
-    // screen's height across.
+    // glass's, and the diffraction spikes of the blades' edges lensFlareStarburst times as bright as they make them,
+    // fading out lensFlareStarburstSize of the screen's height across.
     bool lensFlare = false;
     float lensFlareIntensity = 1.0f;
     float lensFlareStarburst = 1.0f;
