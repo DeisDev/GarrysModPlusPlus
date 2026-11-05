@@ -30,7 +30,8 @@ struct PostConstants
     // The held weapon is drawn with DepthRange(0, 0.1): depths below viewmodelDepth (above it with reversed depth).
     float viewmodelDepth;
     uint reverseDepth;
-    uint padding4;
+    // The bloom (shaders/post/bloom.hlsl): its sum at half the view's size, or kNoView without it.
+    uint bloomView;
     float frameSeconds;
     // The camera's state (CameraMain in shaders/post/post.hlsl): the focus distance and the flare's visibility. Depth of
     // field (FidelityFX DoF): the circle of confusion's radius in half-resolution pixels is
@@ -60,7 +61,7 @@ struct PostConstants
     // Motion blur: the share of a frame's motion the shutter sees, and the tiles' size in pixels and count.
     float shutterShare;
     uint blurTile;
-    uint padding0;
+    uint flareView;
     uint2 tileCount;
     // Lens flare: the light's position on screen (pixels), its brightness on screen per colour, whether it lies in front
     // of the eye, the starburst's strength, the visibility the lighting traced (a 1x1 texture, or kNoView without a
@@ -112,7 +113,36 @@ struct PostConstants
     float paperWhite;
     float uiWhite;
     float exposureLimit;
-    uint padding6;
+    // Grading's exposure (2 to the power of its stops; 1 without grading), applied before local exposure.
+    float gradeExposure;
+    // The bloom's level weights (they add up to 1) and the share of each pixel's light it scatters.
+    float4 bloomWeights;
+    float2 bloomWeightsHigh;
+    float bloomScatter;
+    // Local exposure (shaders/post/local_exposure.hlsl): the bilateral grid (sums of log2 luminance and counts per cell and
+    // luminance bin) blurred, and the cells' mean log2 luminance blurred wide, or kNoView without it; the contrast scales
+    // above and below middle grey (log2 of it plus the bias), the detail's, the share of the wide blur in the base; the
+    // grid's luminance axis from gridMinLog over 1 / gridInvRangeLog stops.
+    uint localGrid;
+    uint localBlurred;
+    float localHighlights;
+    float localShadows;
+    float localDetail;
+    float localBlend;
+    float localMiddleGreyLog;
+    float localGridMinLog;
+    float localGridInvRangeLog;
+    // The wide blur's Gaussian in cells.
+    float localBlurSigma;
+    // The lens flare's ghosts (src/lens_flare.cpp: FlareGhost records, flareGhostCount of them), the aperture's image
+    // and its diffraction starburst (shaders/post/flare.hlsl), the flare drawn at half the view's size, or kNoView
+    // without it; the starburst's half-size in pixels.
+    uint flareGhosts;
+    uint flareGhostCount;
+    uint flareAperture;
+    uint flareStarburstView;
+    float flareStarburstSize;
+    uint2 padding8;
 };
 
 // Per pass: descriptor indices and a parameter.

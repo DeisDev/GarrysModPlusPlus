@@ -906,8 +906,12 @@ std::string Translator::Assemble()
     text += std::format("#define GMODPP_FIRST {}\n", first);
     if (m_out.floatConstantCount > 0)
         text += std::format("cbuffer gmodpp_floats : register(b0) {{ float4 gmodpp_c[{}]; }};\n", m_out.floatConstantCount);
+    const bool writePositions = m_stage == Stage::Vertex && m_variant.writePositions != 0;
     text += "cbuffer gmodpp_state : register(b1) {\n    int4 gmodpp_i[16];\n    uint4 gmodpp_b[4];\n    float4 gmodpp_halfPixel;\n"
-            "    uint4 gmodpp_textures[4];\n    uint4 gmodpp_samplers[4];\n    float4 gmodpp_alpha;\n    float4 gmodpp_clipPlanes[6];\n};\n";
+            "    uint4 gmodpp_textures[4];\n    uint4 gmodpp_samplers[4];\n    float4 gmodpp_alpha;\n    float4 gmodpp_clipPlanes[6];\n";
+    if (writePositions)
+        text += "    float4 gmodpp_clipToEye[4];\n    float4 gmodpp_eyePosition;\n    uint4 gmodpp_positions;\n";
+    text += "};\n";
     text += kHelpers;
 
     for (const auto& [sampler, kind] : m_sampleHelpers) {
@@ -982,7 +986,7 @@ std::string Translator::Assemble()
             text += std::format("    {} v{} : {}{};\n", integer ? (signedInteger ? "int4" : "uint4") : "float4", input.reg, semantic, input.usageIndex);
             m_out.inputs.push_back({ static_cast<BYTE>(input.usage), static_cast<BYTE>(input.usageIndex), static_cast<BYTE>(input.reg) });
         }
-        if (m_inputs.empty())
+        if (m_inputs.empty() || writePositions)
             text += "    uint gmodpp_vertex : SV_VertexID;\n";
         const UINT clipPlanes = std::min<UINT>(m_variant.clipPlanes, 6);
         if (clipPlanes > 0) {
@@ -1018,6 +1022,15 @@ std::string Translator::Assemble()
                 else if (global.starts_with("oD"))
                     text += std::format("    output.color{} = saturate({});\n", global.substr(2), global);
             }
+        }
+        if (writePositions) {
+            // The world position of what the vertex shader drew, by the inverse of the view-projection it drew with.
+            text += "    if (gmodpp_positions.y + input.gmodpp_vertex < gmodpp_positions.z) {\n"
+                    "        float4 gmodpp_eye = float4(dot(gmodpp_clipToEye[0], output.position), dot(gmodpp_clipToEye[1], output.position), "
+                    "dot(gmodpp_clipToEye[2], output.position), dot(gmodpp_clipToEye[3], output.position));\n"
+                    "        RWByteAddressBuffer gmodpp_out = ResourceDescriptorHeap[gmodpp_positions.x];\n"
+                    "        gmodpp_out.Store3((gmodpp_positions.y + input.gmodpp_vertex) * 12, asuint(gmodpp_eyePosition.xyz + gmodpp_eye.xyz / gmodpp_eye.w));\n"
+                    "    }\n";
         }
         if (clipPlanes > 0) {
             // D3D9 clips against the position the shader wrote, before the half-pixel offset; unused planes pass.

@@ -14,6 +14,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - 10-bit SDR output where the display takes it.
 - In HDR, the HUD and menu show at paper white or a fixed brightness, and a brightness boost (off by default) can lift the game toward middle grey by up to one stop.
 - Debug views showing the image's brightness in nits and the pixels brighter than the display can show.
+- The Performance page and the overlay show the camera effects' GPU time per pass.
+- The held weapon and hands shadow each other, from the sun, lamps, the flashlight and muzzle flashes (Lighting page, on by default). Each weapon's vertex shaders compile once more the first time it is held.
+- Specular anti-aliasing: bumpy and shiny surfaces far away no longer sparkle in motion (Lighting page, on by default).
+- Ground mist (Lighting page, off by default): a layer of mist over the ground that drifts with the wind, lit by the sun, sky and lamps, with light shafts through it.
+- Distant air (aerial perspective): far-off land in the 3D skybox turns hazy and blue by day and red at sunset, and cloud shadows show as dark rays across the sky.
+- Ice halos, sun dogs, the 46° halo, the circumzenithal arc and coloured coronas around the sun and Moon, from the clouds (Sky page).
+- Smoke and other particles that blend cast soft shadows from the sun on the ground, in the haze and mist, and on the particles born under them (Lighting page, on by default).
+- Local exposure on the Image page (off by default): brightens dark areas and darkens bright ones while keeping their detail.
 
 ### Changed
 
@@ -23,6 +31,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - The sun and Moon are drawn at their real brightness, so on an HDR display they reach its peak instead of stopping at white.
 - The Filmic tone curve is Gran Turismo's in SDR as in HDR and keeps hues; it replaces AgX.
 - The menu blends over the game in linear light in SDR as in HDR.
+- The lens flare is now the reflections inside a real double Gauss lens: coloured aperture shapes along the line through the sun that grow, shrink and brighten with the f-number, with coating colours, colour fringes and a diffraction starburst. New settings for aperture blades, colour fringes and starburst size.
+- Cloud shadows depend on height: places above or inside the clouds are shadowed only by the cloud above them.
+- A new bloom replaces the game's: bright light such as the sun now glows by how bright it really is, and the bloom spreads light without adding any. It still follows the game's bloom scale and has strength and spread settings on the Camera page.
 
 ### Fixed
 

@@ -164,6 +164,11 @@ struct SceneInstance {
     // Geometry the scene does not own (skinned models): their BLAS and positions view replace the model's.
     D3D12_GPU_VIRTUAL_ADDRESS blas = 0;
     UINT positionsView = DescriptorHeap::kInvalid;
+    // Without a model (the viewmodel's triangles, src/viewmodel_casters.h): its indices, albedo and opaque triangles,
+    // with `blas` and `positionsView`.
+    UINT indicesView = DescriptorHeap::kInvalid;
+    UINT albedoView = DescriptorHeap::kInvalid;
+    UINT triangleCount = 0;
     UINT mask = 0;
     // kInstanceIgnoreNormals.
     uint32_t flags = 0;

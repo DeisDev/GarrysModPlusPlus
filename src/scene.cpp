@@ -1415,9 +1415,13 @@ SceneFrame Scene::RecordFrame(ID3D12GraphicsCommandList4* list, UINT slot, std::
     m_recorded.clear();
     // `staticIndex`: 0 for the world, i + 1 for static instance i, none for dynamic ones.
     auto write = [&](const SceneInstance& source, const float (*transform)[4], UINT mask, std::optional<size_t> staticIndex) {
-        if (source.model < 0 || static_cast<size_t>(source.model) >= m_models.size())
+        // Geometry without a model brings all it is traced and shaded with.
+        const bool modelless = source.model < 0 && source.blas != 0 && source.positionsView != DescriptorHeap::kInvalid &&
+            source.indicesView != DescriptorHeap::kInvalid && source.albedoView != DescriptorHeap::kInvalid;
+        if (!modelless && (source.model < 0 || static_cast<size_t>(source.model) >= m_models.size()))
             return;
-        const Model& model = m_models[source.model];
+        static const Model kNoModel;
+        const Model& model = modelless ? kNoModel : m_models[source.model];
         D3D12_GPU_VIRTUAL_ADDRESS blas = source.blas != 0 ? source.blas : model.blas->GetGPUVirtualAddress();
         D3D12_RAYTRACING_INSTANCE_DESC& instance = frame.mapped[written];
         instance = {};
@@ -1433,8 +1437,9 @@ SceneFrame Scene::RecordFrame(ID3D12GraphicsCommandList4* list, UINT slot, std::
             instance.Flags |= D3D12_RAYTRACING_INSTANCE_FLAG_DISABLE_OMMS;
         instance.AccelerationStructure = blas;
         InstanceRecord& record = frame.mappedRecords[written];
-        record = {source.positionsView != DescriptorHeap::kInvalid ? source.positionsView : model.positionsView, model.indicesView, model.albedoView,
-            model.uvsView, model.alphaView, model.opaqueTriangles, model.materialsView, source.previousPositionsView, {},
+        record = {source.positionsView != DescriptorHeap::kInvalid ? source.positionsView : model.positionsView,
+            modelless ? source.indicesView : model.indicesView, modelless ? source.albedoView : model.albedoView, model.uvsView, model.alphaView,
+            modelless ? source.triangleCount : model.opaqueTriangles, model.materialsView, source.previousPositionsView, {},
             source.flags | (model.selfIllum ? kInstanceSelfIllum : 0u) | (dynamicModel ? kInstanceModel : 0u) | (model.character ? kInstanceCharacter : 0u),
             staticIndex && *staticIndex < m_emitterLightViews.size() ? m_emitterLightViews[*staticIndex] : DescriptorHeap::kInvalid, source.waterBody,
             model.blendsView};

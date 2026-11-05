@@ -13,6 +13,14 @@ namespace gmodpp::native {
 // shaders/post and shaders/amd.
 void PostProcessView(D3D12_RECT rect, bool postVgui);
 
+// Around the game's DoEnginePostProcessing for a view drawn into the frame: with Settings::bloom our bloom replaces the
+// game's, so DrawPass skips its bloom chain while ReplacingBloom() holds and records the bloom scale its Y blur was drawn
+// with (RecordBloomScale), which the PostProcessView that follows takes.
+void BeginEnginePost(bool postVgui);
+void EndEnginePost();
+bool ReplacingBloom();
+void RecordBloomScale(float scale);
+
 // DLSS Frame Generation's UI alpha at the present (Streamline's kBufferTypeUIAlpha): when this frame's view without the
 // HUD was tagged and is the back buffer's size and format, points `mapping` at it and at the UI alpha's target, so the
 // display mapping draws the mask as it maps the frame (UiAlphaMain in shaders/post/display_output.hlsl), and returns true;

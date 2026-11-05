@@ -312,6 +312,9 @@ bool TraceHit(float3 origin, float3 direction, float tMax, uint mask, out HitInf
     return true;
 }
 
+// The local player's body and what it holds (kLocalPlayerMask in src/scene.h); in the viewmodel's own scene, the viewmodel.
+static const uint kLocalPlayerMask = 0x08;
+
 // Where lighting of a G-buffer position is evaluated. The viewmodel is drawn with its own projection and depth
 // range, so next to a wall its surface lies inside or behind world geometry; it is lit from the last point
 // the eye can see on the way to it instead.
@@ -323,7 +326,8 @@ float3 LitPosition(float3 position)
     float distance = length(toPosition);
     float3 direction = toPosition / max(distance, 1e-4);
     HitInfo hit;
-    if (!TraceHit(g_frame.eyePosition, direction, distance, g_frame.traceMask, hit))
+    // What lies in front of the weapon, never the weapon itself.
+    if (!TraceHit(g_frame.eyePosition, direction, distance, g_frame.traceMask & ~kLocalPlayerMask, hit))
         return position;
     return g_frame.eyePosition + direction * max(hit.t - 2.0, 0.0);
 }
@@ -753,26 +757,11 @@ float3 Transmittance(float3 origin, float3 direction, float tMax, uint mask, uin
     return query.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? 0.0 : transmittance;
 }
 
-// The share of the sun's light the clouds let through to a point (shaders/clouds.hlsl's shadow map), in the 3D skybox's
-// space when `mask` holds kSkyboxMask: the fine cascade where it covers the point, else the coarse one.
-float CloudShadowAt(float3 origin, uint mask)
+// The share of the sun's light the clouds and smoke let through to a point (SunOcclusionAt in shaders/common.hlsli), in
+// the 3D skybox's space when `mask` holds kSkyboxMask.
+float SunOcclusionAt(float3 origin, uint mask)
 {
-    if (g_frame.cloudShadowView == kNoView)
-        return 1.0;
-    float3 position = origin;
-    if ((mask & kSkyboxMask) != 0 && g_frame.worldToSky > 0.0)
-        position = (origin - float3(g_frame.skyCameraX, g_frame.skyCameraY, g_frame.skyCameraZ)) / g_frame.worldToSky;
-    float2 plane = float2(dot(position, g_frame.cloudShadowU.xyz) + g_frame.cloudShadowU.w, dot(position, g_frame.cloudShadowV.xyz) + g_frame.cloudShadowV.w);
-    Texture2D<float> shadow = ResourceDescriptorHeap[g_frame.cloudShadowView];
-    float edge = g_frame.cloudShadowEdge;
-    float2 uv = plane * g_frame.cloudShadowFineScale + 0.5;
-    float cascade = 0.0;
-    if (any(abs(uv - 0.5) > 0.5 - edge)) {
-        uv = plane * g_frame.cloudShadowCoarseScale + 0.5;
-        cascade = 1.0;
-    }
-    uv = clamp(uv, edge, 1.0 - edge);
-    return shadow.SampleLevel(g_linearClamp, float2((uv.x + cascade) * 0.5, uv.y), 0.0);
+    return SunOcclusionAt(origin, (mask & kSkyboxMask) != 0);
 }
 
 // `mask` is g_frame.sunShadowMask, or g_frame.bounceMask for the light of indirect bounces. As VRAD did
@@ -780,7 +769,7 @@ float CloudShadowAt(float3 origin, uint mask)
 // skybox, whose buildings and terrain shadow the map. The clouds take their share.
 float3 SunVisibilityAlong(float3 origin, float3 direction, uint mask, uint rayFlags)
 {
-    float3 visibility = Transmittance(origin, direction, 65536.0, mask, rayFlags) * CloudShadowAt(origin, mask);
+    float3 visibility = Transmittance(origin, direction, 65536.0, mask, rayFlags) * SunOcclusionAt(origin, mask);
     if (any(visibility > 0.0) && g_frame.worldToSky > 0.0 && (mask & kSkyboxMask) == 0) {
         float3 camera = float3(g_frame.skyCameraX, g_frame.skyCameraY, g_frame.skyCameraZ);
         visibility *= Transmittance(camera + origin * g_frame.worldToSky, direction, 65536.0, kSkyboxMask);
@@ -912,7 +901,7 @@ float3 SunVisibilityToNearest(float3 origin, float3 direction, uint mask, uint r
         occluder = occluder < length ? occluder : 65536.0;
         return any(under > 0.0) ? UnderwaterSunVisibility(origin, water, direction, mask, rayFlags) : 0.0;
     }
-    float3 visibility = TransmittanceToNearest(origin, direction, 65536.0, mask, rayFlags, occluder) * CloudShadowAt(origin, mask);
+    float3 visibility = TransmittanceToNearest(origin, direction, 65536.0, mask, rayFlags, occluder) * SunOcclusionAt(origin, mask);
     if (any(visibility > 0.0) && g_frame.worldToSky > 0.0 && (mask & kSkyboxMask) == 0) {
         float3 camera = float3(g_frame.skyCameraX, g_frame.skyCameraY, g_frame.skyCameraZ);
         float skyOccluder;
@@ -1204,9 +1193,10 @@ float VisibleIrradiance() { return (1.0 / 1024.0) / max(g_frame.tonemapScale, 1e
 // Dynamic and projected lights are often attached to a player or weapon (flashlights, muzzle flashes) whose
 // model surrounds the light, so occluders right next to them are ignored.
 static const float kAttachedLightClearance = 48.0;
+// The muzzle flash sits just past the barrel, so with the viewmodel's own triangles its shadow rays start closer.
+static const float kViewmodelAttachedClearance = 4.0;
 
 // kLocalPlayerMask and kLampShellMask in src/scene.h.
-static const uint kLocalPlayerMask = 0x08;
 static const uint kLampShellMask = 0x80;
 
 // Other lights' shadow rays stop this far short of them.
@@ -1219,7 +1209,8 @@ float ShadowRayLength(float clearance, float distance) { return distance - min(c
 uint ShadowMask(bool attachedLight, bool sealed = false)
 {
     uint mask = sealed ? g_frame.lightShadowMask & ~kLampShellMask : g_frame.lightShadowMask;
-    return attachedLight ? mask & ~kLocalPlayerMask : mask;
+    // The viewmodel's own triangles do shadow its pixels from the flashlight and muzzle flashes.
+    return attachedLight && g_frame.viewmodel == 0 ? mask & ~kLocalPlayerMask : mask;
 }
 
 // Set by a pass for a pixel of a prop that ignores normals, whose normal it turns towards the eye: light reaches it from
@@ -1606,7 +1597,8 @@ float3 SetLightIrradiance(LightSet set, uint i, float3 position, float3 normal, 
 float3 LightTransmittance(LightSet set, uint i, float3 origin, float3 lightPosition, float2 jitter, uint rayFlags = RAY_FLAG_NONE)
 {
     bool attached = IsAttachedLight(set, i);
-    float clearance = !attached ? kLightClearance : i >= set.pointLights ? ProjectorClearance(LoadProjector(i - set.pointLights)) : kAttachedLightClearance;
+    float clearance = !attached ? kLightClearance : i >= set.pointLights ? ProjectorClearance(LoadProjector(i - set.pointLights))
+        : g_frame.viewmodel == 2 ? kViewmodelAttachedClearance : kAttachedLightClearance;
     bool sealed = false;
     if (!attached) {
         uint2 shape = MapLightShape(SetMapLight(set, i));

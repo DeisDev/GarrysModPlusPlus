@@ -157,7 +157,7 @@ float3 BakedIrradiance(int2 pixel, float3 position, float3 normal)
     ByteAddressBuffer light = ResourceDescriptorHeap[g_frame.bakedLightView];
     uint part = BakedPartSamples(light);
     float3 weights = face.bumped != 0 ? BumpWeights(face, normal) : 0.0;
-    float clouds = CloudShadowAt(position, g_frame.traceMask);
+    float clouds = SunOcclusionAt(position, g_frame.traceMask);
     float3 a = LuxelLight(light, part, face, low.y * face.width + low.x, weights, clouds);
     float3 b = LuxelLight(light, part, face, low.y * face.width + high.x, weights, clouds);
     float3 c = LuxelLight(light, part, face, high.y * face.width + low.x, weights, clouds);
@@ -182,7 +182,7 @@ bool LeafAmbientCube(float3 position, out float3 cube[6])
     uint bytes;
     samples.GetDimensions(bytes);
     uint part = bytes / (112 * kBakedParts);
-    float clouds = CloudShadowAt(position, g_frame.traceMask);
+    float clouds = SunOcclusionAt(position, g_frame.traceMask);
     float weights = 0.0;
     for (uint i = 0; i < range.y; ++i) {
         AmbientSample sun = samples.Load<AmbientSample>((range.x + i) * 112);

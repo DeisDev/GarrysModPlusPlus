@@ -3,6 +3,8 @@
 #include "color.h"
 #include "display_output.h"
 #include "engine_interfaces.h"
+#include "lens_flare.h"
+#include "options.h"
 #include "log.h"
 #include "overlay.h"
 #include "settings.h"
@@ -15,7 +17,15 @@
 
 #include <wrl/client.h>
 
+#include <g_bloomDownCS.h>
+#include <g_bloomUpCS.h>
 #include <g_casCS.h>
+#include <g_flareApertureCS.h>
+#include <g_flareFftColumnsCS.h>
+#include <g_flareFftRowsCS.h>
+#include <g_flareGhostPS.h>
+#include <g_flareGhostVS.h>
+#include <g_flareStarburstCS.h>
 #include <g_dof0CS.h>
 #include <g_dof0ReverseCS.h>
 #include <g_dof1CS.h>
@@ -23,6 +33,9 @@
 #include <g_dof3CS.h>
 #include <g_dof4CS.h>
 #include <g_lensCS.h>
+#include <g_localBlurGridCS.h>
+#include <g_localBlurMeanCS.h>
+#include <g_localGridCS.h>
 #include <g_postCameraCS.h>
 #include <g_postExposureCS.h>
 #include <g_postExposureHistogramCS.h>
@@ -45,6 +58,7 @@
 #include <span>
 #include <string>
 #include <utility>
+#include <vector>
 
 using Microsoft::WRL::ComPtr;
 
@@ -66,7 +80,7 @@ struct PostConstants {
     float depthBias;
     float viewmodelDepth;
     std::uint32_t reverseDepth;
-    std::uint32_t padding4;
+    std::uint32_t bloomView;
     float frameSeconds;
     std::uint32_t cameraView;
     float cocScale;
@@ -88,7 +102,7 @@ struct PostConstants {
     std::uint32_t dofGlobals;
     float shutterShare;
     std::uint32_t blurTile;
-    std::uint32_t padding0;
+    std::uint32_t flareView;
     std::uint32_t tileCount[2];
     float flarePosition[2];
     float flareColor[3];
@@ -123,9 +137,28 @@ struct PostConstants {
     float paperWhite;
     float uiWhite;
     float exposureLimit;
-    std::uint32_t padding6;
+    float gradeExposure;
+    float bloomWeights[4];
+    float bloomWeightsHigh[2];
+    float bloomScatter;
+    std::uint32_t localGrid;
+    std::uint32_t localBlurred;
+    float localHighlights;
+    float localShadows;
+    float localDetail;
+    float localBlend;
+    float localMiddleGreyLog;
+    float localGridMinLog;
+    float localGridInvRangeLog;
+    float localBlurSigma;
+    std::uint32_t flareGhosts;
+    std::uint32_t flareGhostCount;
+    std::uint32_t flareAperture;
+    std::uint32_t flareStarburstView;
+    float flareStarburstSize;
+    std::uint32_t padding8[2];
 };
-static_assert(sizeof(PostConstants) == 22 * 16);
+static_assert(sizeof(PostConstants) == 28 * 16);
 
 // Mirrors PostPass in shaders/post/post.hlsli.
 struct PostPass {
@@ -141,10 +174,13 @@ struct PostPass {
 static_assert(sizeof(PostPass) == 8 * sizeof(UINT));
 
 enum class Compute { Prepare, Camera, TileMax, NeighborMax, MotionBlur, DofTiles, DofTilesReverse, DofColor, DofDilate, DofBlur, DofComposite, Cas, Lens,
-    FrameMotion, ExposureHistogram, Exposure, Count };
+    FrameMotion, ExposureHistogram, Exposure, BloomDown, BloomUp, LocalGrid, LocalBlurGrid, LocalBlurMean, FlareAperture, FlareFftRows, FlareFftColumns,
+    FlareStarburst, Count };
 
 constexpr std::span<const unsigned char> kComputeShaders[] = {g_postPrepareCS, g_postCameraCS, g_postTileMaxCS, g_postNeighborMaxCS, g_postMotionBlurCS,
-    g_dof0CS, g_dof0ReverseCS, g_dof1CS, g_dof2CS, g_dof3CS, g_dof4CS, g_casCS, g_lensCS, g_postFrameMotionCS, g_postExposureHistogramCS, g_postExposureCS};
+    g_dof0CS, g_dof0ReverseCS, g_dof1CS, g_dof2CS, g_dof3CS, g_dof4CS, g_casCS, g_lensCS, g_postFrameMotionCS, g_postExposureHistogramCS, g_postExposureCS,
+    g_bloomDownCS, g_bloomUpCS, g_localGridCS, g_localBlurGridCS, g_localBlurMeanCS, g_flareApertureCS, g_flareFftRowsCS, g_flareFftColumnsCS,
+    g_flareStarburstCS};
 static_assert(std::size(kComputeShaders) == static_cast<size_t>(Compute::Count));
 
 // The HDR exposure's luminance bins (kExposureBins in shaders/post/post.hlsl), and how often (in frames) Source's auto
@@ -161,6 +197,30 @@ constexpr float kFullFrameHeight = 24.0f;
 constexpr float kUnitMillimetres = 25.4f;
 // Film runs at 24 frames a second; its grain changes with each frame.
 constexpr double kGrainRate = 24.0;
+// GPU timestamps: one before the passes and one after each (PostGpuPass), in a ring of slots each read back once its
+// frame has completed, averaged over kTimingSamples frames as the lighting's are.
+constexpr UINT kPostPasses = static_cast<UINT>(PostGpuPass::Count);
+constexpr UINT kTimingMarkers = kPostPasses + 1;
+constexpr UINT kTimingSlots = Backend::kFrames + 2;
+constexpr UINT kTimingSamples = 120;
+// The bloom's levels below the view, each half the size of the one above (shaders/post/bloom.hlsl), the share of the
+// light it scatters per unit of the game's bloom scale (veiling glare is a few percent of the light) and the most it
+// may take.
+constexpr size_t kBloomLevels = 6;
+constexpr float kBloomScatterPerScale = 0.05f;
+constexpr float kBloomScatterLimit = 0.5f;
+// Local exposure's cells in pixels and luminance bins (shaders/post/local_exposure.hlsl), and its grid's range around
+// middle grey in stops.
+constexpr UINT kLocalCell = 32;
+constexpr UINT kLocalBins = 32;
+constexpr float kLocalStopsBelow = 12.0f;
+constexpr float kLocalStopsAbove = 8.0f;
+constexpr float kMiddleGrey = 0.18f;
+// The lens flare's aperture and diffraction textures' size (shaders/post/flare.hlsl, a 256-point transform) and the
+// most ghosts it draws (every pair of the lens's 10 surfaces is 45).
+constexpr UINT kApertureSize = 256;
+constexpr UINT kMaxGhosts = 64;
+constexpr float kPi = 3.14159265f;
 // The lens effects' field of view without the lighting's camera: GMod's default (fov_desired 75, horizontal at 4:3).
 constexpr float kDefaultTanHalfHeight = 0.5754f;
 // FidelityFX Lens's dispersion strength per unit of the chromatic aberration setting: red is magnified 0.25% less than
@@ -185,6 +245,37 @@ struct State {
     std::array<Target, 2> scene;
     Target bilateral;
     std::array<UINT, kDofMips> bilateralMips = {kInvalid, kInvalid, kInvalid, kInvalid};
+    // The bloom's down and up chains, made when it first runs at this size, in smallHdrFormat (R11G11B10_FLOAT, or
+    // RGBA16F where the device cannot store or draw it).
+    std::array<Target, kBloomLevels> bloomDown;
+    std::array<Target, kBloomLevels> bloomUp;
+    DXGI_FORMAT smallHdrFormat = DXGI_FORMAT_UNKNOWN;
+    // Around DoEnginePostProcessing (BeginEnginePost): whether our bloom replaces the game's in this view, and the bloom
+    // scale the game drew its blur with, if it drew it.
+    bool replacingBloom = false;
+    bool bloomReplaced = false;
+    bool bloomRecorded = false;
+    float bloomScale = 0.0f;
+    // The lens flare: the aperture with lensFlareBlades blades and its diffraction (each row's transform, the power
+    // spectrum, the energies and the starburst), made again when the blade count changes; the ghosts uploaded each frame;
+    // the flare drawn at half the view's size with its pipeline.
+    Target aperture;
+    Target fftRows;
+    Target fftPower;
+    Target fftEnergy;
+    Target starburst;
+    int apertureBlades = 0;
+    Target ghosts;
+    Target flare;
+    D3D12_CPU_DESCRIPTOR_HANDLE flareTarget = {};
+    ComPtr<ID3D12PipelineState> ghostPipeline;
+    bool loggedLens = false;
+    // Local exposure: the bilateral grid and its blur, the cells' mean luminance, blurred along x, then y.
+    Target localGrid;
+    Target localGridBlurred;
+    Target localMean;
+    Target localMeanTemp;
+    Target localMeanBlurred;
     Target tileRadius;
     Target dilated;
     Target nearField;
@@ -224,15 +315,25 @@ struct State {
     UINT depthView = kInvalid;
     std::chrono::steady_clock::time_point last;
     double seconds = 0.0;
+    // GPU timing: the timestamps, their mapped read-back, each slot's fence (0 while it holds nothing to read), the
+    // next slot, and the sums of the frames read since the last average.
+    bool timersFailed = false;
+    ComPtr<ID3D12QueryHeap> timestamps;
+    ComPtr<ID3D12Resource> timestampReadback;
+    const std::uint64_t* timestampValues = nullptr;
+    double timestampPeriodMs = 0.0;
+    std::array<std::uint64_t, kTimingSlots> slotFence = {};
+    UINT timingSlot = 0;
+    std::array<double, kPostPasses> passMsTotal = {};
+    UINT timingSamples = 0;
 };
 
 State g_state;
 
 float Luminance(const std::array<float, 3>& color) { return 0.2126f * color[0] + 0.7152f * color[1] + 0.0722f * color[2]; }
 
-// The per-channel gain of exposure and white balance: warmth recolours the view as if lit by a black body of
-// 6500 K x 2^-warmth rather than 6500 K (the sRGB white), tint shifts it between green and magenta; neither changes
-// its luminance.
+// The per-channel gain of white balance: warmth recolours the view as if lit by a black body of 6500 K x 2^-warmth
+// rather than 6500 K (the sRGB white), tint shifts it between green and magenta; neither changes its luminance.
 std::array<float, 3> GradeGain(const Settings& settings)
 {
     constexpr float kNeutralKelvin = 6500.0f;
@@ -246,7 +347,7 @@ std::array<float, 3> GradeGain(const Settings& settings)
     const std::array<float, 3> shift = {1.0f + tint, 1.0f - tint, 1.0f + tint};
     for (size_t i = 0; i < 3; ++i)
         balance[i] *= shift[i];
-    const float scale = std::exp2(settings.exposure) / std::max(Luminance(balance), 1e-6f);
+    const float scale = 1.0f / std::max(Luminance(balance), 1e-6f);
     for (float& gain : balance)
         gain *= scale;
     return balance;
@@ -307,6 +408,61 @@ bool CreateTexture(Target& target, UINT width, UINT height, DXGI_FORMAT format, 
     return true;
 }
 
+// A 3D texture with an unordered access view and a shader resource view.
+bool CreateVolume(Target& target, UINT width, UINT height, UINT depth, DXGI_FORMAT format)
+{
+    Backend& backend = GetBackend();
+    D3D12_RESOURCE_DESC desc = {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    desc.Width = std::max(width, 1u);
+    desc.Height = std::max(height, 1u);
+    desc.DepthOrArraySize = static_cast<UINT16>(std::max(depth, 1u));
+    desc.MipLevels = 1;
+    desc.Format = format;
+    desc.SampleDesc.Count = 1;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    const D3D12_HEAP_PROPERTIES heap = {D3D12_HEAP_TYPE_DEFAULT};
+    const HRESULT hr = backend.Device()->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+        IID_PPV_ARGS(&target.texture.resource));
+    if (FAILED(hr)) {
+        log::Info("Post effects: creating a {}x{}x{} volume failed: {:#010x}", width, height, depth, static_cast<unsigned>(hr));
+        return false;
+    }
+    target.texture.state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    target.srv = backend.Descriptors().Allocate();
+    target.uav = backend.Descriptors().Allocate();
+    if (target.srv == kInvalid || target.uav == kInvalid)
+        return false;
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+    srv.Format = format;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Texture3D.MipLevels = 1;
+    backend.Device()->CreateShaderResourceView(target.texture.resource.Get(), &srv, backend.Descriptors().Cpu(target.srv));
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
+    uav.Format = format;
+    uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+    uav.Texture3D.WSize = static_cast<UINT>(-1);
+    backend.Device()->CreateUnorderedAccessView(target.texture.resource.Get(), nullptr, &uav, backend.Descriptors().Cpu(target.uav));
+    return true;
+}
+
+// The format of the bloom's and the flare's light: R11G11B10_FLOAT (positive, up to 65000, which the sun's disc at 1024
+// paper whites fits) where the device can store it from compute shaders, draw into and sample it, else RGBA16F.
+DXGI_FORMAT SmallHdrFormat()
+{
+    if (g_state.smallHdrFormat == DXGI_FORMAT_UNKNOWN) {
+        D3D12_FEATURE_DATA_FORMAT_SUPPORT support = {DXGI_FORMAT_R11G11B10_FLOAT};
+        const bool supported = SUCCEEDED(GetBackend().Device()->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support))) &&
+            (support.Support1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET) != 0 && (support.Support1 & D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE) != 0 &&
+            (support.Support1 & D3D12_FORMAT_SUPPORT1_BLENDABLE) != 0 && (support.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE) != 0;
+        g_state.smallHdrFormat = supported ? DXGI_FORMAT_R11G11B10_FLOAT : DXGI_FORMAT_R16G16B16A16_FLOAT;
+        if (!supported)
+            log::Info("Post effects: R11G11B10_FLOAT cannot be stored or drawn into; the bloom and the lens flare use RGBA16F");
+    }
+    return g_state.smallHdrFormat;
+}
+
 // A structured buffer of `count` elements of `stride` bytes, zeroed as committed resources are, with an unordered
 // access view.
 bool CreateBuffer(Target& target, UINT stride, UINT count)
@@ -345,6 +501,12 @@ void ReleaseTargets()
 {
     for (Target& target : g_state.scene)
         Release(target);
+    for (Target& target : g_state.bloomDown)
+        Release(target);
+    for (Target& target : g_state.bloomUp)
+        Release(target);
+    for (Target* target : {&g_state.localGrid, &g_state.localGridBlurred, &g_state.localMean, &g_state.localMeanTemp, &g_state.localMeanBlurred, &g_state.flare})
+        Release(*target);
     for (Target* target : {&g_state.bilateral, &g_state.tileRadius, &g_state.dilated, &g_state.nearField, &g_state.farField, &g_state.globals,
              &g_state.tileMax, &g_state.neighborMax, &g_state.frameMotion, &g_state.frameDepth})
         Release(*target);
@@ -401,6 +563,145 @@ bool EnsureTargets(UINT width, UINT height)
     g_state.width = width;
     g_state.height = height;
     return true;
+}
+
+// The size of the bloom's level `level` for a view `size` across.
+UINT BloomSize(UINT size, size_t level) { return std::max(1u, (size + (2u << level) - 1) >> (level + 1)); }
+
+// The bloom's chains, made when it first runs at the targets' size (EnsureTargets drops them with the others).
+bool EnsureBloomTargets()
+{
+    if (g_state.bloomDown[0].texture.resource)
+        return true;
+    const DXGI_FORMAT format = SmallHdrFormat();
+    for (size_t level = 0; level < kBloomLevels; ++level) {
+        const UINT width = BloomSize(g_state.width, level);
+        const UINT height = BloomSize(g_state.height, level);
+        if (!CreateTexture(g_state.bloomDown[level], width, height, format) || !CreateTexture(g_state.bloomUp[level], width, height, format)) {
+            for (size_t i = 0; i < kBloomLevels; ++i) {
+                Release(g_state.bloomDown[i]);
+                Release(g_state.bloomUp[i]);
+            }
+            return false;
+        }
+    }
+    return true;
+}
+
+// The bloom's level weights: falling off by e every lerp(0.8, 3, spread) levels, so a wider spread gives the large
+// levels more, and adding up to 1.
+std::array<float, kBloomLevels> BloomWeights(float spread)
+{
+    const float levels = std::lerp(0.8f, 3.0f, std::clamp(spread, 0.0f, 1.0f));
+    std::array<float, kBloomLevels> weights;
+    float sum = 0.0f;
+    for (size_t level = 0; level < kBloomLevels; ++level) {
+        weights[level] = std::exp(-static_cast<float>(level) / levels);
+        sum += weights[level];
+    }
+    for (float& weight : weights)
+        weight /= sum;
+    return weights;
+}
+
+// Local exposure's grid and blurs for the targets' size.
+bool EnsureLocalTargets()
+{
+    if (g_state.localGrid.texture.resource)
+        return true;
+    const UINT cellsX = (g_state.width + kLocalCell - 1) / kLocalCell;
+    const UINT cellsY = (g_state.height + kLocalCell - 1) / kLocalCell;
+    if (CreateVolume(g_state.localGrid, cellsX, cellsY, kLocalBins, DXGI_FORMAT_R16G16_FLOAT) &&
+        CreateVolume(g_state.localGridBlurred, cellsX, cellsY, kLocalBins, DXGI_FORMAT_R16G16_FLOAT) &&
+        CreateTexture(g_state.localMean, cellsX, cellsY, DXGI_FORMAT_R16_FLOAT) && CreateTexture(g_state.localMeanTemp, cellsX, cellsY, DXGI_FORMAT_R16_FLOAT) &&
+        CreateTexture(g_state.localMeanBlurred, cellsX, cellsY, DXGI_FORMAT_R16_FLOAT))
+        return true;
+    for (Target* target : {&g_state.localGrid, &g_state.localGridBlurred, &g_state.localMean, &g_state.localMeanTemp, &g_state.localMeanBlurred})
+        Release(*target);
+    return false;
+}
+
+// The flare's target at half the view's size, which the ghosts are drawn into, with a render target view.
+bool EnsureFlareTarget()
+{
+    if (g_state.flare.texture.resource)
+        return true;
+    Backend& backend = GetBackend();
+    D3D12_RESOURCE_DESC desc = {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = BloomSize(g_state.width, 0);
+    desc.Height = BloomSize(g_state.height, 0);
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = SmallHdrFormat();
+    desc.SampleDesc.Count = 1;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    const D3D12_HEAP_PROPERTIES heap = {D3D12_HEAP_TYPE_DEFAULT};
+    const HRESULT hr = backend.Device()->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+        IID_PPV_ARGS(&g_state.flare.texture.resource));
+    if (FAILED(hr)) {
+        log::Info("Post effects: creating the lens flare's target failed: {:#010x}", static_cast<unsigned>(hr));
+        return false;
+    }
+    g_state.flare.texture.state = D3D12_RESOURCE_STATE_COMMON;
+    if (g_state.flareTarget.ptr == 0)
+        g_state.flareTarget = backend.RenderTargetViews().Allocate();
+    backend.Device()->CreateRenderTargetView(g_state.flare.texture.resource.Get(), nullptr, g_state.flareTarget);
+    g_state.flare.srv = backend.Descriptors().Allocate();
+    if (g_state.flare.srv == kInvalid)
+        return false;
+    backend.Device()->CreateShaderResourceView(g_state.flare.texture.resource.Get(), nullptr, backend.Descriptors().Cpu(g_state.flare.srv));
+    return true;
+}
+
+// The ghosts' buffer: kMaxGhosts records the CPU uploads each frame, read through a structured shader resource view.
+bool EnsureGhostBuffer()
+{
+    if (g_state.ghosts.texture.resource)
+        return true;
+    Backend& backend = GetBackend();
+    D3D12_RESOURCE_DESC desc = {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = sizeof(lens_flare::Ghost) * kMaxGhosts;
+    desc.Height = 1;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    const D3D12_HEAP_PROPERTIES heap = {D3D12_HEAP_TYPE_DEFAULT};
+    const HRESULT hr = backend.Device()->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+        IID_PPV_ARGS(&g_state.ghosts.texture.resource));
+    if (FAILED(hr)) {
+        log::Info("Post effects: creating the lens flare's ghost buffer failed: {:#010x}", static_cast<unsigned>(hr));
+        return false;
+    }
+    g_state.ghosts.texture.state = D3D12_RESOURCE_STATE_COMMON;
+    g_state.ghosts.srv = backend.Descriptors().Allocate();
+    if (g_state.ghosts.srv == kInvalid)
+        return false;
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+    srv.Format = DXGI_FORMAT_UNKNOWN;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Buffer.NumElements = kMaxGhosts;
+    srv.Buffer.StructureByteStride = sizeof(lens_flare::Ghost);
+    backend.Device()->CreateShaderResourceView(g_state.ghosts.texture.resource.Get(), &srv, backend.Descriptors().Cpu(g_state.ghosts.srv));
+    return true;
+}
+
+// The aperture's textures and the diffraction's working textures, which do not depend on the view's size.
+bool EnsureApertureTextures()
+{
+    if (g_state.aperture.texture.resource)
+        return true;
+    if (CreateTexture(g_state.aperture, kApertureSize, kApertureSize, DXGI_FORMAT_R8_UNORM) &&
+        CreateTexture(g_state.fftRows, kApertureSize, kApertureSize, DXGI_FORMAT_R32G32_FLOAT) &&
+        CreateTexture(g_state.fftPower, kApertureSize, kApertureSize, DXGI_FORMAT_R32_FLOAT) && CreateBuffer(g_state.fftEnergy, 4, kApertureSize + 1) &&
+        CreateTexture(g_state.starburst, kApertureSize, kApertureSize, DXGI_FORMAT_R16G16B16A16_FLOAT))
+        return true;
+    for (Target* target : {&g_state.aperture, &g_state.fftRows, &g_state.fftPower, &g_state.fftEnergy, &g_state.starburst})
+        Release(*target);
+    return false;
 }
 
 // Frame generation's view without the HUD, in the swap chain's format, made again when the frame's size or the format
@@ -478,6 +779,71 @@ bool EnsureRoot()
     return GetBackend().Device() != nullptr && (g_state.camera.texture.resource || CreateBuffer(g_state.camera, 16, 2)) &&
         (g_state.exposureBins.texture.resource || CreateBuffer(g_state.exposureBins, 4, kExposureBins)) &&
         (g_state.exposure.texture.resource || CreateBuffer(g_state.exposure, 16, 1));
+}
+
+bool EnsureTimers()
+{
+    if (g_state.timestampValues != nullptr)
+        return true;
+    if (g_state.timersFailed)
+        return false;
+    g_state.timersFailed = true;
+    Backend& backend = GetBackend();
+    const D3D12_QUERY_HEAP_DESC heapDesc = {D3D12_QUERY_HEAP_TYPE_TIMESTAMP, kTimingSlots * kTimingMarkers};
+    HRESULT hr = backend.Device()->CreateQueryHeap(&heapDesc, IID_PPV_ARGS(&g_state.timestamps));
+    if (SUCCEEDED(hr)) {
+        D3D12_RESOURCE_DESC desc = {};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        desc.Width = sizeof(std::uint64_t) * kTimingSlots * kTimingMarkers;
+        desc.Height = 1;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = 1;
+        desc.SampleDesc.Count = 1;
+        desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        const D3D12_HEAP_PROPERTIES heap = {D3D12_HEAP_TYPE_READBACK};
+        hr = backend.Device()->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+            IID_PPV_ARGS(&g_state.timestampReadback));
+    }
+    void* mapped = nullptr;
+    if (SUCCEEDED(hr))
+        hr = g_state.timestampReadback->Map(0, nullptr, &mapped);
+    UINT64 frequency = 0;
+    if (SUCCEEDED(hr))
+        hr = backend.Queue()->GetTimestampFrequency(&frequency);
+    if (FAILED(hr) || frequency == 0) {
+        log::Info("Post effects: GPU timing is unavailable: {:#010x}", static_cast<unsigned>(hr));
+        return false;
+    }
+    g_state.timestampPeriodMs = 1000.0 / static_cast<double>(frequency);
+    g_state.timestampValues = static_cast<const std::uint64_t*>(mapped);
+    g_state.timersFailed = false;
+    return true;
+}
+
+// Adds the times of every slot whose frame has completed, and every kTimingSamples frames publishes their average.
+void ReadTimings()
+{
+    const std::uint64_t completed = GetBackend().CompletedFence();
+    for (UINT slot = 0; slot < kTimingSlots; ++slot) {
+        if (g_state.slotFence[slot] == 0 || completed < g_state.slotFence[slot])
+            continue;
+        g_state.slotFence[slot] = 0;
+        const std::uint64_t* markers = g_state.timestampValues + slot * kTimingMarkers;
+        if (markers[kPostPasses] <= markers[0])
+            continue;
+        for (UINT pass = 0; pass < kPostPasses; ++pass)
+            g_state.passMsTotal[pass] += static_cast<double>(markers[pass + 1] - markers[pass]) * g_state.timestampPeriodMs;
+        if (++g_state.timingSamples < kTimingSamples)
+            continue;
+        Statistics& statistics = GetStatistics();
+        statistics.postMs = 0.0;
+        for (UINT pass = 0; pass < kPostPasses; ++pass) {
+            statistics.postPassMs[pass] = g_state.passMsTotal[pass] / g_state.timingSamples;
+            statistics.postMs += statistics.postPassMs[pass];
+        }
+        g_state.passMsTotal = {};
+        g_state.timingSamples = 0;
+    }
 }
 
 std::optional<float> ConVarShare(const char* name)
@@ -558,6 +924,42 @@ ID3D12PipelineState* FinalPipeline()
     return g_state.final.Get();
 }
 
+// The ghosts' and starburst's pipeline: quads added into the flare's target.
+ID3D12PipelineState* GhostPipeline()
+{
+    if (!g_state.ghostPipeline) {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = {};
+        desc.pRootSignature = g_state.root.Get();
+        desc.VS = {g_flareGhostVS, sizeof(g_flareGhostVS)};
+        desc.PS = {g_flareGhostPS, sizeof(g_flareGhostPS)};
+        D3D12_RENDER_TARGET_BLEND_DESC& blend = desc.BlendState.RenderTarget[0];
+        blend.BlendEnable = TRUE;
+        blend.SrcBlend = D3D12_BLEND_ONE;
+        blend.DestBlend = D3D12_BLEND_ONE;
+        blend.BlendOp = D3D12_BLEND_OP_ADD;
+        blend.SrcBlendAlpha = D3D12_BLEND_ONE;
+        blend.DestBlendAlpha = D3D12_BLEND_ONE;
+        blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+        blend.LogicOp = D3D12_LOGIC_OP_NOOP;
+        blend.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        desc.SampleMask = UINT_MAX;
+        desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        desc.RasterizerState.DepthClipEnable = TRUE;
+        desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        desc.NumRenderTargets = 1;
+        desc.RTVFormats[0] = SmallHdrFormat();
+        desc.SampleDesc.Count = 1;
+        const HRESULT hr = GetBackend().Device()->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&g_state.ghostPipeline));
+        if (FAILED(hr)) {
+            log::Info("Post effects: creating the lens flare's pipeline failed: {:#010x}", static_cast<unsigned>(hr));
+            g_state.failed = true;
+            return nullptr;
+        }
+    }
+    return g_state.ghostPipeline.Get();
+}
+
 void Use(Target& target, D3D12_RESOURCE_STATES state) { GetBackend().Transition(target.texture, state); }
 
 void UavBarrier(Target& target)
@@ -566,8 +968,8 @@ void UavBarrier(Target& target)
     GetBackend().Commands()->ResourceBarrier(1, &barrier);
 }
 
-// Records a compute pass over `x` x `y` x 1 groups; false when its pipeline cannot be made.
-bool Dispatch(Compute pass, const PostPass& args, UINT x, UINT y)
+// Records a compute pass over `x` x `y` x `z` groups; false when its pipeline cannot be made.
+bool Dispatch(Compute pass, const PostPass& args, UINT x, UINT y, UINT z = 1)
 {
     ID3D12PipelineState* pipeline = Pipeline(pass);
     if (pipeline == nullptr)
@@ -575,7 +977,7 @@ bool Dispatch(Compute pass, const PostPass& args, UINT x, UINT y)
     ID3D12GraphicsCommandList* commands = GetBackend().Commands();
     commands->SetPipelineState(pipeline);
     commands->SetComputeRoot32BitConstants(1, sizeof(PostPass) / sizeof(UINT), &args, 0);
-    commands->Dispatch(x, y, 1);
+    commands->Dispatch(x, y, z);
     return true;
 }
 
@@ -614,9 +1016,33 @@ std::optional<Camera> CameraOf(const gbuffer::Matrix4& viewProj)
 
 }
 
+void BeginEnginePost(bool postVgui)
+{
+    g_state.bloomRecorded = false;
+    g_state.bloomScale = 0.0f;
+    g_state.replacingBloom = GetSettings().bloom && !postVgui && !g_state.failed && GetBackend().HasDevice() && Dynamic().colorTargets[0] == kDefaultTarget;
+    g_state.bloomReplaced = g_state.replacingBloom;
+}
+
+void EndEnginePost() { g_state.replacingBloom = false; }
+
+bool ReplacingBloom() { return g_state.replacingBloom; }
+
+void RecordBloomScale(float scale)
+{
+    g_state.bloomScale = std::isfinite(scale) ? std::max(scale, 0.0f) : 0.0f;
+    g_state.bloomRecorded = true;
+}
+
 void PostProcessView(D3D12_RECT rect, bool postVgui)
 {
     const Settings& settings = GetSettings();
+    // Our bloom scatters the share of light the game's bloom scale asks for; without the game's chain (bloom off, a map
+    // without HDR) there is none.
+    const bool bloomReplaced = std::exchange(g_state.bloomReplaced, false);
+    const float gameBloomScale = std::exchange(g_state.bloomRecorded, false) ? g_state.bloomScale : 0.0f;
+    if (bloomReplaced)
+        GetStatistics().gameBloomScale = gameBloomScale;
     // The second pass some games run over the menus (the SDK's bPostVGui) sees a view that is tone mapped already.
     if (g_state.failed || postVgui)
         return;
@@ -630,7 +1056,10 @@ void PostProcessView(D3D12_RECT rect, bool postVgui)
     const float aberration = settings.chromaticAberration ? settings.chromaticAberrationStrength : 0.0f;
     const float distortion = settings.lensDistortion ? settings.lensDistortionAmount : 0.0f;
     const float vignette = settings.vignette ? settings.vignetteAmount : 0.0f;
-    const bool lens = aberration > 0.0f || distortion != 0.0f || vignette > 0.0f || flare;
+    const float bloomScatter = bloomReplaced ? std::clamp(kBloomScatterPerScale * gameBloomScale * settings.bloomStrength, 0.0f, kBloomScatterLimit) : 0.0f;
+    // Local exposure with every scale at 1 leaves the view as it is.
+    const bool localExposure = settings.localExposure &&
+        (settings.localExposureHighlights != 1.0f || settings.localExposureShadows != 1.0f || settings.localExposureDetail != 1.0f);
     const bool grain = settings.filmGrain && settings.grainAmount > 0.0f;
     const bool grade = GradingChanges(settings);
     // Frame generation takes the main view's depth, motion and the view without the HUD from here.
@@ -656,6 +1085,9 @@ void PostProcessView(D3D12_RECT rect, bool postVgui)
     const UINT height = static_cast<UINT>(rect.bottom - rect.top);
     if (!EnsureRoot() || !EnsureTargets(width, height) || !EnsureDepthView())
         return;
+    const bool bloom = bloomScatter > 0.0f && EnsureBloomTargets();
+    const bool local = localExposure && EnsureLocalTargets();
+    const bool lens = aberration > 0.0f || distortion != 0.0f || vignette > 0.0f || flare || bloom;
 
     const auto now = std::chrono::steady_clock::now();
     const double frameSeconds = g_state.last.time_since_epoch().count() != 0 ? std::chrono::duration<double>(now - g_state.last).count() : 1.0 / 60.0;
@@ -728,7 +1160,6 @@ void PostProcessView(D3D12_RECT rect, bool postVgui)
             c.flareRadius = std::tan(post->lightRadius) / camera->tanHalfHeight * 0.5f * static_cast<float>(height);
             for (size_t i = 0; i < 3; ++i)
                 c.flareColor[i] = post->lightColor[i] * settings.lensFlareIntensity;
-            c.flareStarburst = settings.lensFlareStarburst;
             c.flareVisibilityView = post->flareVisibilityView;
         }
     }
@@ -764,6 +1195,47 @@ void PostProcessView(D3D12_RECT rect, bool postVgui)
         std::copy(views.begin(), views.end(), c.ccViews);
         std::copy(weights.begin(), weights.end(), c.ccWeights);
     }
+    c.bloomView = bloom ? g_state.bloomUp[0].srv : kInvalid;
+    c.bloomScatter = bloomScatter;
+    {
+        const std::array<float, kBloomLevels> weights = BloomWeights(settings.bloomSpread);
+        std::copy(weights.begin(), weights.begin() + 4, c.bloomWeights);
+        std::copy(weights.begin() + 4, weights.end(), c.bloomWeightsHigh);
+    }
+    c.localGrid = local ? g_state.localGridBlurred.srv : kInvalid;
+    c.localBlurred = local ? g_state.localMeanBlurred.srv : kInvalid;
+    c.localHighlights = settings.localExposureHighlights;
+    c.localShadows = settings.localExposureShadows;
+    c.localDetail = settings.localExposureDetail;
+    c.localBlend = settings.localExposureBlend;
+    c.localMiddleGreyLog = std::log2(kMiddleGrey) + settings.localExposureMiddleGrey;
+    c.localGridMinLog = std::log2(kMiddleGrey) - kLocalStopsBelow;
+    c.localGridInvRangeLog = 1.0f / (kLocalStopsBelow + kLocalStopsAbove);
+    // The wide blur is localExposureBlur percent of the height across: a Gaussian of half that.
+    c.localBlurSigma = settings.localExposureBlur * 0.01f * 0.5f * static_cast<float>(height) / static_cast<float>(kLocalCell);
+    // The lens flare: the double Gauss lens's ghosts at the depth of field's f-number (src/lens_flare.cpp) and its
+    // aperture's diffraction, drawn lensFlareStarburstSize of the height across (the real pattern is smaller than a pixel)
+    // with the light's whole power in the view (pi x a white surface facing it x the focal length in pixels squared,
+    // the image of a light of that irradiance) spread over it, times lensFlareStarburst.
+    std::vector<lens_flare::Ghost> ghosts;
+    const bool flareDrawn = c.flareInFront != 0.0f && EnsureApertureTextures() && EnsureGhostBuffer() && EnsureFlareTarget();
+    if (flareDrawn) {
+        if (GetOptions().devMode && !std::exchange(g_state.loggedLens, true))
+            lens_flare::LogPrescription();
+        ghosts = lens_flare::Ghosts({static_cast<float>(width), static_cast<float>(height), c.focalPixels, c.flarePosition[0], c.flarePosition[1],
+            settings.dofAperture, settings.lensFlareDispersion, 1.0f});
+        if (ghosts.size() > kMaxGhosts)
+            ghosts.resize(kMaxGhosts);
+    }
+    const float starburstHalf = 0.5f * settings.lensFlareStarburstSize * static_cast<float>(height);
+    c.flareView = flareDrawn ? g_state.flare.srv : kInvalid;
+    c.flareGhosts = flareDrawn ? g_state.ghosts.srv : kInvalid;
+    c.flareGhostCount = static_cast<std::uint32_t>(ghosts.size());
+    c.flareAperture = flareDrawn ? g_state.aperture.srv : kInvalid;
+    c.flareStarburstView = flareDrawn ? g_state.starburst.srv : kInvalid;
+    c.flareStarburstSize = starburstHalf;
+    c.flareStarburst = settings.lensFlareStarburst * kPi * c.focalPixels * c.focalPixels / (4.0f * starburstHalf * starburstHalf);
+    c.gradeExposure = settings.grading ? std::exp2(settings.exposure) : 1.0f;
     c.gradeEnabled = grade ? 1u : 0u;
     if (grade) {
         const std::array<float, 3> gain = GradeGain(settings);
@@ -786,6 +1258,21 @@ void PostProcessView(D3D12_RECT rect, bool postVgui)
     struct Rebind {
         ~Rebind() { ForgetBindings(); }
     } rebind;
+
+    // Timestamps up to the end of each pass; a pass that does not run takes no time.
+    const bool timed = EnsureTimers() && g_state.slotFence[g_state.timingSlot] == 0;
+    if (g_state.timestampValues != nullptr)
+        ReadTimings();
+    const UINT timingSlot = g_state.timingSlot;
+    UINT marker = 0;
+    const auto markTo = [&](UINT count) {
+        if (!timed)
+            return;
+        for (; marker < count; ++marker)
+            commands->EndQuery(g_state.timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, timingSlot * kTimingMarkers + marker);
+    };
+    const auto markAfter = [&](PostGpuPass pass) { markTo(static_cast<UINT>(pass) + 2); };
+    markTo(1);
 
     backend.Transition(backend.DepthBuffer(), D3D12_RESOURCE_STATE_DEPTH_READ | read);
     if (frameGeneration) {
@@ -839,6 +1326,7 @@ void PostProcessView(D3D12_RECT rect, bool postVgui)
             return;
         UavBarrier(g_state.exposure);
     }
+    markAfter(PostGpuPass::Prepare);
     const auto next = [&](Compute pass, UINT x, UINT y, PostPass args) {
         Use(g_state.scene[current], read);
         Use(g_state.scene[current ^ 1], write);
@@ -867,6 +1355,7 @@ void PostProcessView(D3D12_RECT rect, bool postVgui)
         if (!next(Compute::MotionBlur, Groups(width, 8), Groups(height, 8), {.input1 = g_state.neighborMax.srv}))
             return;
     }
+    markAfter(PostGpuPass::MotionBlur);
     if (depthOfField) {
         // The passes and their dispatch sizes of the SDK's dofDispatch (ffx_dof.cpp).
         const UINT fullTilesX = Groups(width, 8);
@@ -898,10 +1387,126 @@ void PostProcessView(D3D12_RECT rect, bool postVgui)
         if (!next(Compute::DofComposite, Groups(halfWidth, 8), Groups(halfHeight, 8), {}))
             return;
     }
+    markAfter(PostGpuPass::DepthOfField);
+    if (bloom) {
+        Use(g_state.scene[current], read);
+        UINT source = g_state.scene[current].srv;
+        for (size_t level = 0; level < kBloomLevels; ++level) {
+            Target& down = g_state.bloomDown[level];
+            Use(down, write);
+            if (!Dispatch(Compute::BloomDown, {.input0 = source, .output0 = down.uav, .step = static_cast<UINT>(level)}, Groups(BloomSize(width, level), 8),
+                    Groups(BloomSize(height, level), 8)))
+                return;
+            Use(down, read);
+            source = down.srv;
+        }
+        for (size_t level = kBloomLevels; level-- > 0;) {
+            Target& up = g_state.bloomUp[level];
+            Use(up, write);
+            const UINT below = level + 1 < kBloomLevels ? g_state.bloomUp[level + 1].srv : kInvalid;
+            if (!Dispatch(Compute::BloomUp, {.input0 = g_state.bloomDown[level].srv, .input1 = below, .output0 = up.uav, .step = static_cast<UINT>(level)},
+                    Groups(BloomSize(width, level), 8), Groups(BloomSize(height, level), 8)))
+                return;
+            Use(up, read);
+        }
+    }
+    markAfter(PostGpuPass::Bloom);
+    if (flareDrawn) {
+        // The aperture and its diffraction, once per blade count.
+        if (g_state.apertureBlades != settings.lensFlareBlades) {
+            const UINT groups = kApertureSize / 8;
+            Use(g_state.aperture, write);
+            if (!Dispatch(Compute::FlareAperture, {.output0 = g_state.aperture.uav, .step = static_cast<UINT>(settings.lensFlareBlades)}, groups, groups))
+                return;
+            Use(g_state.aperture, read);
+            Use(g_state.fftRows, write);
+            Use(g_state.fftEnergy, write);
+            if (!Dispatch(Compute::FlareFftRows, {.input0 = g_state.aperture.srv, .output0 = g_state.fftRows.uav, .output1 = g_state.fftEnergy.uav}, kApertureSize, 1))
+                return;
+            Use(g_state.fftRows, read);
+            UavBarrier(g_state.fftEnergy);
+            Use(g_state.fftPower, write);
+            if (!Dispatch(Compute::FlareFftColumns, {.input0 = g_state.fftRows.srv, .output0 = g_state.fftPower.uav, .output1 = g_state.fftEnergy.uav},
+                    kApertureSize, 1))
+                return;
+            Use(g_state.fftPower, read);
+            UavBarrier(g_state.fftEnergy);
+            Use(g_state.starburst, write);
+            if (!Dispatch(Compute::FlareStarburst, {.input0 = g_state.fftPower.srv, .input1 = g_state.fftEnergy.uav, .output0 = g_state.starburst.uav}, groups,
+                    groups))
+                return;
+            g_state.apertureBlades = settings.lensFlareBlades;
+        }
+        constexpr D3D12_RESOURCE_STATES shaders = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        Use(g_state.aperture, shaders);
+        Use(g_state.starburst, shaders);
+        if (!ghosts.empty()) {
+            const UINT64 bytes = sizeof(lens_flare::Ghost) * ghosts.size();
+            const Backend::Upload upload = backend.AllocateUpload(bytes, 256);
+            if (upload.data == nullptr)
+                return;
+            std::memcpy(upload.data, ghosts.data(), bytes);
+            Use(g_state.ghosts, D3D12_RESOURCE_STATE_COPY_DEST);
+            commands->CopyBufferRegion(g_state.ghosts.texture.resource.Get(), 0, upload.buffer, upload.offset, bytes);
+        }
+        Use(g_state.ghosts, shaders);
+        ID3D12PipelineState* ghostPipeline = GhostPipeline();
+        if (ghostPipeline == nullptr)
+            return;
+        Use(g_state.flare, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        constexpr float kClear[4] = {};
+        commands->ClearRenderTargetView(g_state.flareTarget, kClear, 0, nullptr);
+        commands->SetGraphicsRootSignature(g_state.root.Get());
+        commands->SetPipelineState(ghostPipeline);
+        commands->SetGraphicsRootConstantBufferView(0, constants);
+        const PostPass ghostArgs = {};
+        commands->SetGraphicsRoot32BitConstants(1, sizeof(PostPass) / sizeof(UINT), &ghostArgs, 0);
+        commands->OMSetRenderTargets(1, &g_state.flareTarget, FALSE, nullptr);
+        const UINT flareWidth = BloomSize(width, 0);
+        const UINT flareHeight = BloomSize(height, 0);
+        const D3D12_VIEWPORT flareViewport = {0.0f, 0.0f, static_cast<float>(flareWidth), static_cast<float>(flareHeight), 0.0f, 1.0f};
+        const D3D12_RECT flareScissor = {0, 0, static_cast<LONG>(flareWidth), static_cast<LONG>(flareHeight)};
+        commands->RSSetViewports(1, &flareViewport);
+        commands->RSSetScissorRects(1, &flareScissor);
+        commands->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        commands->DrawInstanced(6, static_cast<UINT>(ghosts.size()) + 1, 0, 0);
+        Use(g_state.flare, read);
+    }
+    markAfter(PostGpuPass::Flare);
     if (lens && !next(Compute::Lens, Groups(width, 8), Groups(height, 8), {}))
         return;
+    markAfter(PostGpuPass::Lens);
     if (settings.contrastSharpening && !next(Compute::Cas, Groups(width, 8), Groups(height, 8), {}))
         return;
+    markAfter(PostGpuPass::Sharpening);
+    if (local) {
+        const UINT cellsX = Groups(width, kLocalCell);
+        const UINT cellsY = Groups(height, kLocalCell);
+        Use(g_state.scene[current], read);
+        Use(g_state.localGrid, write);
+        Use(g_state.localMean, write);
+        if (!Dispatch(Compute::LocalGrid, {.input0 = g_state.scene[current].srv, .output0 = g_state.localGrid.uav, .output1 = g_state.localMean.uav}, cellsX,
+                cellsY))
+            return;
+        Use(g_state.localGrid, read);
+        Use(g_state.localMean, read);
+        Use(g_state.localGridBlurred, write);
+        if (!Dispatch(Compute::LocalBlurGrid, {.input0 = g_state.localGrid.srv, .output0 = g_state.localGridBlurred.uav}, Groups(cellsX, 4), Groups(cellsY, 4),
+                kLocalBins / 4))
+            return;
+        Use(g_state.localMeanTemp, write);
+        if (!Dispatch(Compute::LocalBlurMean, {.input0 = g_state.localMean.srv, .output0 = g_state.localMeanTemp.uav, .step = 1}, Groups(cellsX, 8),
+                Groups(cellsY, 8)))
+            return;
+        Use(g_state.localMeanTemp, read);
+        Use(g_state.localMeanBlurred, write);
+        if (!Dispatch(Compute::LocalBlurMean, {.input0 = g_state.localMeanTemp.srv, .output0 = g_state.localMeanBlurred.uav, .step = 2}, Groups(cellsX, 8),
+                Groups(cellsY, 8)))
+            return;
+        Use(g_state.localGridBlurred, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        Use(g_state.localMeanBlurred, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    }
+    markAfter(PostGpuPass::LocalExposure);
 
     ID3D12PipelineState* final = FinalPipeline();
     if (final == nullptr)
@@ -920,6 +1525,13 @@ void PostProcessView(D3D12_RECT rect, bool postVgui)
     commands->RSSetScissorRects(1, &rect);
     commands->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     commands->DrawInstanced(3, 1, 0, 0);
+    markAfter(PostGpuPass::Final);
+    if (timed) {
+        commands->ResolveQueryData(g_state.timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, timingSlot * kTimingMarkers, kTimingMarkers,
+            g_state.timestampReadback.Get(), sizeof(std::uint64_t) * timingSlot * kTimingMarkers);
+        g_state.slotFence[timingSlot] = backend.PendingFence();
+        g_state.timingSlot = (timingSlot + 1) % kTimingSlots;
+    }
     tagFrame();
 }
 

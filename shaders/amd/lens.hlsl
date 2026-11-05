@@ -2,7 +2,7 @@
 // SDK 1.1.4, MIT): its chromatic aberration's dispersion and film grain. FfxLens itself is not used: it samples blue at
 // pixel corners, half a pixel off red and green, and its effects do not follow the field of view.
 
-#include "../post/flare.hlsli"
+#include "../post/post.hlsli"
 #include "../tone_curve.hlsli"
 #include "ffx_core.h"
 
@@ -65,8 +65,8 @@ FfxUInt32 GrainSeed()
 
 // input0: the view (linear); output0: the view through the lens, by each pixel's field angle (its tangent from the
 // centre over the focal length): radially distorted, each colour magnified by its refraction relative to blue (lateral
-// chromatic aberration, which grows with the angle like the distortion), with the lens flare and the cos^4 law's
-// vignetting.
+// chromatic aberration, which grows with the angle like the distortion), with the bloom, the lens flare and the cos^4
+// law's vignetting.
 [RootSignature(POST_ROOT_SIGNATURE)]
 [numthreads(8, 8, 1)]
 void LensMain(uint2 pixel : SV_DispatchThreadID)
@@ -88,9 +88,18 @@ void LensMain(uint2 pixel : SV_DispatchThreadID)
         color.r = source.SampleLevel(g_postLinear, (centre + (seen - centre) * magnification.x) * g_post.invSize, 0).r;
         color.g = source.SampleLevel(g_postLinear, (centre + (seen - centre) * magnification.y) * g_post.invSize, 0).g;
     }
-    float3 light = FlareLight();
-    if (any(light > 0.0))
-        color += LensFlare(position, light);
+    // The bloom takes bloomScatter of each pixel's light and spreads it by a kernel that integrates to 1
+    // (shaders/post/bloom.hlsl), so the view's light is moved, not added to.
+    if (g_post.bloomView != kNoView) {
+        Texture2D<float4> bloom = ResourceDescriptorHeap[g_post.bloomView];
+        color = lerp(color, bloom.SampleLevel(g_postLinear, seen * g_post.invSize, 0).rgb, g_post.bloomScatter);
+    }
+    // The lens flare, drawn at half size (shaders/post/flare.hlsl): the lens's own reflections, which its distortion
+    // does not bend.
+    if (g_post.flareView != kNoView) {
+        Texture2D<float4> flare = ResourceDescriptorHeap[g_post.flareView];
+        color += flare.SampleLevel(g_postLinear, position * g_post.invSize, 0).rgb;
+    }
     // cos^4 of the field angle is (1 / (1 + tan^2))^2.
     if (g_post.vignette > 0.0)
         color *= pow(1.0 / (1.0 + fieldSquared), 2.0 * g_post.vignette);
@@ -113,6 +122,7 @@ float3 ColorCorrected(float3 encoded)
     return result;
 }
 
+// White balance (luminance kept), contrast around middle grey and saturation; grading's exposure is applied before.
 float3 Grade(float3 color)
 {
     float3 graded = color * g_post.gradeGain;
@@ -120,7 +130,29 @@ float3 Grade(float3 color)
     return max(lerp(Luminance(graded), graded, g_post.gradeSaturation), 0.0);
 }
 
-// input0: the view. In HDR the brightness boost's gain (ExposureMain in shaders/post/post.hlsl), then the colour grading,
+// Local exposure (shaders/post/local_exposure.hlsl) for a pixel of log2 luminance `stops`: the factor that scales the
+// contrast of its base (the bilateral grid's mean around it, blended toward the wide blur) around middle grey by the
+// highlights' or the shadows' scale and its detail (what it differs from the base by) by the detail's. All three at 1
+// leave it as it is.
+float LocalExposure(int2 pixel, float stops)
+{
+    Texture3D<float4> grid = ResourceDescriptorHeap[g_post.localGrid];
+    Texture2D<float4> blurred = ResourceDescriptorHeap[g_post.localBlurred];
+    uint3 cells;
+    grid.GetDimensions(cells.x, cells.y, cells.z);
+    float2 uv = (float2(pixel) + 0.5) / (32.0 * float2(cells.xy));
+    float bin = saturate((stops - g_post.localGridMinLog) * g_post.localGridInvRangeLog);
+    float2 slice = grid.SampleLevel(g_postLinear, float3(uv, bin), 0).xy;
+    float base = slice.y > 1e-6 ? g_post.localGridMinLog + slice.x / slice.y : stops;
+    base = lerp(base, blurred.SampleLevel(g_postLinear, uv, 0).x, g_post.localBlend);
+    float detail = stops - base;
+    float contrast = base > g_post.localMiddleGreyLog ? g_post.localHighlights : g_post.localShadows;
+    float mapped = (base - g_post.localMiddleGreyLog) * contrast + g_post.localMiddleGreyLog + detail * g_post.localDetail;
+    return exp2(mapped - stops);
+}
+
+// input0: the view. In HDR the brightness boost's gain (ExposureMain in shaders/post/post.hlsl), grading's exposure,
+// local exposure, then the rest of the colour grading,
 // the tone curve up to the display's peak, the engine's colour correction below white under Source's exposure and film
 // grain, back into the frame as display-referred linear light in units of the HUD's white (UiWhite; paper white in SDR),
 // which the HUD drawn next writes at 1. The grain is added to the sRGB-encoded values up to paper white, as FidelityFX
@@ -138,14 +170,20 @@ float4 FinalMain(float4 position : SV_Position) : SV_Target
         gain = state.y != 0.0 ? state.x : 1.0;
     }
     float toFrame = g_post.paperWhite > 0.0 ? g_post.paperWhite / UiWhite(g_post.paperWhite, g_post.uiWhite) : 1.0;
-    float3 exposed = max(color.rgb, 0.0) * gain;
+    float3 exposed = max(color.rgb, 0.0) * (gain * g_post.gradeExposure);
+    float local = 1.0;
+    if (g_post.localGrid != kNoView) {
+        local = LocalExposure(pixel, log2(max(Luminance(exposed), 1e-6)));
+        exposed *= local;
+    }
     float3 graded = max(g_post.gradeEnabled != 0 ? Grade(exposed) : exposed, 0.0);
     graded = ToneCurve(graded, g_post.toneCurve, g_post.highlightRolloff, g_post.tonePeak);
     if (g_post.ccCount != 0) {
         // Below white under Source's exposure, as the game corrected its 8-bit image; above it unchanged.
-        float3 sourceExposed = graded / gain;
+        float scale = gain * local;
+        float3 sourceExposed = graded / scale;
         float3 low = saturate(sourceExposed);
-        graded = (SrgbToLinear(ColorCorrected(LinearToSrgb(low))) + (sourceExposed - low)) * gain;
+        graded = (SrgbToLinear(ColorCorrected(LinearToSrgb(low))) + (sourceExposed - low)) * scale;
     }
     if (g_post.grainAmount > 0.0) {
         float3 encoded = LinearToSrgb(graded);

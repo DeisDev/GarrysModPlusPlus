@@ -140,6 +140,26 @@ struct Settings {
     bool reflections = true;
     // Reflections follow a GGX lobe where the material has a Phong exponent; mirrors everywhere without.
     bool glossyReflections = true;
+    // Highlights and reflections widen by the spread of the normals a pixel covers (Tokuyoshi and Kaplanyan 2021),
+    // specularAntialiasingStrength times as much, so bumpy surfaces far away do not sparkle.
+    bool specularAntialiasing = true;
+    float specularAntialiasingStrength = 1.0f;
+    // The held weapon and hands shadow each other (src/viewmodel_casters.h).
+    bool viewmodelSelfShadows = true;
+    // Smoke and other particles that blend shade the sun's light, particleShadowDensity times a smoke sprite's opacity.
+    bool particleShadows = true;
+    float particleShadowDensity = 0.35f;
+    // Mist lying over the ground in the open air: an exponential height fog, mistVisibility units of visibility at
+    // mistHeight, thinning by e every mistFalloff units above it, of mistColor's albedo, broken up by noise mistScale
+    // units across by mistTurbulence and carried by the clouds' wind; mistPhase is its Henyey-Greenstein asymmetry.
+    bool groundMist = false;
+    float mistVisibility = 8000.0f;
+    float mistHeight = 0.0f;
+    float mistFalloff = 400.0f;
+    Color mistColor = {1.0f, 1.0f, 1.0f};
+    float mistTurbulence = 0.6f;
+    float mistScale = 1500.0f;
+    float mistPhase = 0.6f;
     // Translucent surfaces lit from the ray-traced irradiance volume instead of baked light.
     bool translucentLighting = true;
     // Views drawn into textures (cameras, mirrors, scopes) lit like translucent surfaces.
@@ -224,6 +244,20 @@ struct Settings {
     float highCloudCoverage = 0.15f;
     float highCloudAltitude = 9000.0f;
     float highCloudOpacity = 0.2f;
+    // The air between the eye and distant land and the sky (aerial perspective), aerialStrength times its physical
+    // amount, with the clouds' shadows in it (crepuscular rays across the sky).
+    bool aerialPerspective = true;
+    bool crepuscularRays = true;
+    float aerialStrength = 1.0f;
+    // Ice crystals in the cirrus make halos: the 22 degree halo (haloStrength), sun dogs (sunDogsStrength) and, with
+    // wideHalos, the 46 degree halo and the circumzenithal arc. Droplets in the middle layer make a corona around the sun
+    // and the Moon, its rings washed out by coronaSpread (droplets of uneven size).
+    bool halos = true;
+    float haloStrength = 1.0f;
+    float sunDogsStrength = 1.0f;
+    bool wideHalos = true;
+    bool corona = true;
+    float coronaSpread = 0.3f;
     float sunIntensity = 1.0f;
     float skyIntensity = 1.0f;
     float lightIntensity = 1.0f;
@@ -252,6 +286,17 @@ struct Settings {
     float saturation = 1.0f;
     float warmth = 0.0f;
     float tint = 0.0f;
+    // Local exposure (a bilateral grid, as Unreal Engine 5's): the contrast of large areas above and below middle grey
+    // (plus localExposureMiddleGrey stops) is scaled by localExposureHighlights and localExposureShadows, the detail
+    // within them by localExposureDetail; localExposureBlend mixes in a blur localExposureBlur percent of the screen's
+    // height across.
+    bool localExposure = false;
+    float localExposureHighlights = 0.8f;
+    float localExposureShadows = 0.8f;
+    float localExposureDetail = 1.0f;
+    float localExposureBlend = 0.6f;
+    float localExposureBlur = 50.0f;
+    float localExposureMiddleGrey = 0.0f;
     // Camera effects on the 3D view after the game's post-processing, before the HUD (post_effects.cpp). Depth of field
     // (AMD FidelityFX DoF) follows a thin lens: focused on what the crosshair points at, settling over dofFocusTime
     // seconds, or at dofFocusDistance units; at f-number dofAperture on a sensor dofSensorSize times as tall as a
@@ -268,10 +313,21 @@ struct Settings {
     // Motion blur of a shutter open 1 / motionBlurShutter seconds.
     bool motionBlur = false;
     float motionBlurShutter = 60.0f;
-    // Lens flare from the sun or the Moon, and the starburst of glare around it.
+    // Lens flare from the sun or the Moon (src/lens_flare.h): the ghosts of a double Gauss lens at the depth of field's
+    // f-number and sensor size, with lensFlareBlades aperture blades, colour fringes lensFlareDispersion times the
+    // glass's, and the aperture's diffraction starburst lensFlareStarburst times as bright, lensFlareStarburstSize of the
+    // screen's height across.
     bool lensFlare = false;
     float lensFlareIntensity = 1.0f;
     float lensFlareStarburst = 1.0f;
+    int lensFlareBlades = 6;
+    float lensFlareStarburstSize = 0.6f;
+    float lensFlareDispersion = 1.0f;
+    // Bloom: light scattered in the lens and eye, bloomStrength times the game's bloom scale, spreading wider with
+    // bloomSpread; it moves light without adding any.
+    bool bloom = true;
+    float bloomStrength = 1.0f;
+    float bloomSpread = 0.5f;
     // Lens effects, by the field angle the view's field of view gives each pixel: radial distortion (lensDistortionAmount
     // is the coefficient of tan^2 of the angle, negative for barrel), lateral chromatic aberration (each colour
     // magnified differently by FidelityFX Lens's dispersion, growing with the angle like the distortion), vignetting
@@ -516,6 +572,9 @@ enum class GpuPass : uint32_t {
     Count
 };
 
+// The camera effects' passes (post_effects.cpp), in the order they run.
+enum class PostGpuPass : uint32_t { Prepare, MotionBlur, DepthOfField, Bloom, Flare, Lens, Sharpening, LocalExposure, Final, Count };
+
 // Why real-time lighting is not drawing, if it is on.
 enum class RealtimeBlock : uint8_t { None, Unsupported, OtherThread };
 
@@ -533,6 +592,11 @@ struct Statistics {
     double lightingMs = 0.0;
     std::array<double, static_cast<size_t>(GpuPass::Count)> passMs = {};
     double otherViewsMs = 0.0;
+    // The camera effects' GPU time per pass and in all (post_effects.cpp).
+    std::array<double, static_cast<size_t>(PostGpuPass::Count)> postPassMs = {};
+    double postMs = 0.0;
+    // The bloom scale the game drew its bloom with in the last view our bloom replaced it in (0: none), or -1 before any.
+    float gameBloomScale = -1.0f;
     uint32_t mapLights = 0;
     uint32_t dynamicLights = 0;
     uint32_t projectedLights = 0;

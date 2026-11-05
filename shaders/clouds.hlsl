@@ -128,6 +128,15 @@ struct CloudConstants
     // The clouds' shapes (steps 10 to 12), and the side of the history's blocks a texel of which is traced each frame.
     uint shapesView;
     uint traceBlock;
+    // Atmospheric optics (Optics): the cirrus' share in the 22 degree halo (0 without halos), whether the 46 degree halo
+    // and the circumzenithal arc show, its share in the sun dogs; the corona's ring softness, the droplets' size parameter
+    // per colour, and whether it shows.
+    float haloShare;
+    float wideHalos;
+    float parheliaShare;
+    float coronaSpread;
+    float3 dropletX;
+    float corona;
 };
 
 static const uint kLayerLow = 1;
@@ -157,7 +166,6 @@ static const uint kLightGround = 2;
 static const uint kSkyBands = 32;
 
 // Source's units are inches (Valve Developer Community, "Dimensions"): kilometres per unit.
-static const float kKilometresPerUnit = 2.54e-5;
 
 // Depth markers of the trace (step 6).
 static const float kNoCloud = -1.0;
@@ -744,15 +752,158 @@ float CloudPhase(float cosine, float4 phase, float eccentricity)
     return lerp(1.0 / (4.0 * 3.14159265), droplets, eccentricity);
 }
 
+// ---- Atmospheric optics: ice halos in the cirrus (Greenler 1980, "Rainbows, Halos, and Glories"; Tape 1994,
+// "Atmospheric Halos") and the droplets' corona (van de Hulst 1957, section 8; Lock and Yang 1991), in the phase
+// functions of the cirrus and of the first octave, so they show where those layers are met, in the history, the cube
+// and the reflections alike.
+
+static const float kDegree = 0.01745329;
+// Ice's refractive index at 650, 550 and 450 nm (Warren and Brandt 2008, "Optical constants of ice"), as red, green and
+// blue.
+static const float3 kIceIndex = float3(1.3078, 1.3110, 1.3157);
+
+// The deviation of minimum deviation through a prism of apex `apex` (radians) of index `n`.
+float3 MinimumDeviation(float3 n, float apex)
+{
+    return 2.0 * asin(saturate(n * sin(0.5 * apex))) - apex;
+}
+
+// A halo's shape `offset` radians outside its inner edge: sharp inside (a Gaussian `inner` wide), a tail outside (falling
+// by e every `outer`), as halos look (Tape 1994).
+float3 HaloShape(float3 offset, float inner, float outer)
+{
+    return select(offset < 0.0, exp(-(offset / inner) * (offset / inner)), exp(-offset / outer));
+}
+
+// The integral of HaloShape across the ring.
+float HaloWidth(float inner, float outer)
+{
+    return inner * 0.8862269 + outer;
+}
+
+// A ring halo of minimum deviation `edge` at angle `theta` from the light, normalised over the sphere.
+float3 RingHalo(float theta, float3 edge, float inner, float outer)
+{
+    return HaloShape(theta - edge, inner, outer) / (2.0 * 3.14159265 * sin(edge) * HaloWidth(inner, outer));
+}
+
+// The sun dogs (horizontal plates): at the light's elevation h, an azimuth D(h) from it, the 22 degree halo's deviation
+// for Bravais' index sqrt(n^2 - sin^2 h) / cos h (Tape 1994, section 2), fading out as the light climbs past 50 degrees;
+// normalised over both.
+float3 SunDogs(float3 direction, float3 light)
+{
+    float h = asin(clamp(light.z, -1.0, 1.0));
+    float fade = 1.0 - smoothstep(50.0 * kDegree, 65.0 * kDegree, h);
+    float lightAcross = length(light.xy);
+    float viewAcross = length(direction.xy);
+    if (fade <= 0.0 || lightAcross < 1e-4 || viewAcross < 1e-4)
+        return 0.0;
+    float azimuth = acos(clamp(dot(direction.xy / viewAcross, light.xy / lightAcross), -1.0, 1.0));
+    float3 bravais = sqrt(max(kIceIndex * kIceIndex - light.z * light.z, 0.0)) / max(lightAcross, 1e-4);
+    float3 deviation = MinimumDeviation(bravais, 60.0 * kDegree);
+    const float spread = 1.2 * kDegree;
+    float elevation = asin(clamp(direction.z, -1.0, 1.0)) - h;
+    float across = exp(-0.5 * elevation * elevation / (spread * spread));
+    float area = 2.0 * spread * 2.5066283 * HaloWidth(0.3 * kDegree, 1.5 * kDegree) * cos(h);
+    return fade * across * HaloShape(azimuth - deviation, 0.3 * kDegree, 1.5 * kDegree) / area;
+}
+
+// The circumzenithal arc (horizontal plates, in through the top face, out through a side): at zenith distance
+// 90 degrees - asin(n cos(asin(cos h / n))) toward the light's side, within 45 degrees of its azimuth, while the light is
+// below 32.2 degrees; normalised over the arc.
+float3 CircumzenithalArc(float3 direction, float3 light)
+{
+    float lightAcross = length(light.xy);
+    float viewAcross = length(direction.xy);
+    if (lightAcross < 1e-4 || viewAcross < 1e-4)
+        return 0.0;
+    float azimuth = acos(clamp(dot(direction.xy / viewAcross, light.xy / lightAcross), -1.0, 1.0));
+    if (azimuth >= 45.0 * kDegree)
+        return 0.0;
+    float3 refracted = lightAcross / kIceIndex;
+    float3 exitSine = kIceIndex * sqrt(saturate(1.0 - refracted * refracted));
+    float3 zenith = 0.5 * 3.14159265 - asin(saturate(exitSine));
+    float taper = cos(2.0 * azimuth);
+    const float spread = 0.4 * kDegree;
+    float3 offset = acos(clamp(direction.z, -1.0, 1.0)) - zenith;
+    float3 arc = exp(-0.5 * offset * offset / (spread * spread)) * taper * taper / (max(sin(zenith), 1e-3) * 0.7853982 * spread * 2.5066283);
+    return select(exitSine < 1.0, arc, 0.0);
+}
+
+// The Bessel function J1 (Abramowitz and Stegun 9.4.4 and 9.4.6).
+float BesselJ1(float x)
+{
+    if (x <= 3.0) {
+        float y = (x / 3.0) * (x / 3.0);
+        return x * (0.5 + y * (-0.56249985 + y * (0.21093573 + y * (-0.03954289 + y * (0.00443319 + y * (-0.00031761 + y * 0.00001109))))));
+    }
+    float y = 3.0 / x;
+    float f = 0.79788456 + y * (0.00000156 + y * (0.01659667 + y * (0.00017105 + y * (-0.00249511 + y * (0.00113653 - y * 0.00020033)))));
+    float t = x - 2.35619449 + y * (0.12499612 + y * (0.00005650 + y * (-0.00637879 + y * (0.00074348 + y * (0.00079824 - y * 0.00029166)))));
+    return f * cos(t) / sqrt(x);
+}
+
+// The corona: Fraunhofer diffraction by droplets of size parameter x per colour, (x^2 / 4 pi) (2 J1(u) / u)^2 with
+// u = x sin(theta), normalised over the sphere; droplets of uneven size wash the outer rings toward their mean,
+// 4 / (pi u^3), by coronaSpread.
+float3 CoronaPhase(CloudConstants clouds, float theta)
+{
+    float3 u = max(clouds.dropletX * sin(theta), 1e-3);
+    float3 bessel = float3(BesselJ1(u.x), BesselJ1(u.y), BesselJ1(u.z));
+    float3 airy = 4.0 * bessel * bessel / (u * u);
+    airy = lerp(airy, 4.0 / (3.14159265 * u * u * u), clouds.coronaSpread * saturate(u / 10.0));
+    return clouds.dropletX * clouds.dropletX / (4.0 * 3.14159265) * airy;
+}
+
+// Per ray: the cirrus' phase function per colour, its ice crystals' halos added to the bulk (HG, kIceAsymmetry); and
+// the droplets' forward peak per colour, the corona in place of Jendersie and d'Eon's Henyey-Greenstein peak within
+// 8 degrees of the light (the peak stands for the diffraction, and its envelope meets the rings' mean there).
+struct Optics
+{
+    float3 cirrusPhase;
+    float3 dropletForward;
+};
+
+Optics OpticsToward(CloudConstants clouds, float3 direction, float cosine)
+{
+    Optics optics;
+    float theta = acos(clamp(cosine, -1.0, 1.0));
+    float3 light = clouds.lightDirection;
+    float bulk = HenyeyGreenstein(cosine, kIceAsymmetry);
+    float3 halos = 0.0;
+    float share = 0.0;
+    if (clouds.haloShare > 0.0) {
+        halos += clouds.haloShare * RingHalo(theta, MinimumDeviation(kIceIndex, 60.0 * kDegree), 0.3 * kDegree, 1.5 * kDegree);
+        share += clouds.haloShare;
+        if (clouds.wideHalos != 0.0) {
+            float wide = 0.15 * clouds.haloShare;
+            halos += wide * RingHalo(theta, MinimumDeviation(kIceIndex, 90.0 * kDegree), 0.5 * kDegree, 2.5 * kDegree);
+            halos += 0.03 * CircumzenithalArc(direction, light);
+            share += wide + 0.03;
+        }
+    }
+    if (clouds.parheliaShare > 0.0) {
+        halos += clouds.parheliaShare * SunDogs(direction, light);
+        share += clouds.parheliaShare;
+    }
+    optics.cirrusPhase = (1.0 - share) * bulk + halos;
+    float peak = HenyeyGreenstein(cosine, clouds.phase.x);
+    optics.dropletForward = peak;
+    if (clouds.corona != 0.0 && theta < 8.0 * kDegree)
+        optics.dropletForward = lerp(CoronaPhase(clouds, theta), peak, smoothstep(6.0 * kDegree, 8.0 * kDegree, theta));
+    return optics;
+}
+
 // The octaves' phase functions toward the eye times their scattering, and their extinctions, at most eight (the first
-// four in [0]).
+// four in [0]); the first's per colour too (firstPhase), with the corona in it.
 struct Octaves
 {
     float4 phases[2];
     float4 extinctions[2];
+    float3 firstPhase;
 };
 
-Octaves OctavesToward(CloudConstants clouds, float cosine)
+Octaves OctavesToward(CloudConstants clouds, float cosine, float3 dropletForward)
 {
     Octaves octaves = (Octaves)0;
     float scatter = 1.0;
@@ -766,17 +917,19 @@ Octaves OctavesToward(CloudConstants clouds, float cosine)
         scatter *= clouds.octaveScatter;
         eccentricity *= clouds.octaveEccentricity;
     }
+    octaves.firstPhase = lerp(dropletForward, DrainePhase(cosine, clouds.phase.y, clouds.phase.z), clouds.phase.w);
     return octaves;
 }
 
 // The light the octaves scatter toward the eye from light that crossed `depth` toward the point, per unit of irradiance,
 // the octaves past the first times `multiple`: an optically thin medium scatters light about once, and the octaves would
 // add light to thin wisps regardless.
-float OctaveLight(Octaves octaves, float depth, float multiple)
+float3 OctaveLight(Octaves octaves, float depth, float multiple)
 {
     float total = dot(octaves.phases[0], exp(-octaves.extinctions[0] * depth)) + dot(octaves.phases[1], exp(-octaves.extinctions[1] * depth));
-    float single = octaves.phases[0].x * exp(-octaves.extinctions[0].x * depth);
-    return single + (total - single) * multiple;
+    float first = exp(-octaves.extinctions[0].x * depth);
+    float single = octaves.phases[0].x * first;
+    return octaves.firstPhase * first + (total - single) * multiple;
 }
 
 // The light's irradiance at `p` through the air above, none where the planet hides it.
@@ -897,7 +1050,7 @@ void MarchLayer(CloudConstants clouds, CloudLayer layer, CloudLight light, float
 
 // The cirrus sheet along a ray `pixelAngle` radians across: single scattering of the light it takes in, which it is too
 // thin to dim much, and of the sky's.
-void AddCirrus(CloudConstants clouds, CloudLight light, float3 eye, float3 direction, float cosine, float pixelAngle, Texture2D<float4> transmittance,
+void AddCirrus(CloudConstants clouds, CloudLight light, float3 eye, float3 direction, float3 phase, float pixelAngle, Texture2D<float4> transmittance,
     inout CloudTrace trace)
 {
     float nearest, farthest;
@@ -915,7 +1068,7 @@ void AddCirrus(CloudConstants clouds, CloudLight light, float3 eye, float3 direc
     if (depth <= 0.0)
         return;
     float opacity = 1.0 - exp(-depth / slant);
-    float3 radiance = LightAt(clouds, light, p, transmittance) * HenyeyGreenstein(cosine, kIceAsymmetry) + 0.5 * (light.sky + light.ground);
+    float3 radiance = LightAt(clouds, light, p, transmittance) * phase + 0.5 * (light.sky + light.ground);
     trace.light += trace.transmittance * radiance * opacity;
     trace.depthSum += trace.transmittance * t;
     trace.depthWeight += trace.transmittance;
@@ -929,7 +1082,8 @@ CloudTrace TraceClouds(CloudConstants clouds, CloudLight light, float3 eye, floa
     CloudTrace trace = (CloudTrace)0;
     trace.transmittance = 1.0;
     float cosine = dot(direction, clouds.lightDirection);
-    Octaves octaves = OctavesToward(clouds, cosine);
+    Optics optics = OpticsToward(clouds, direction, cosine);
+    Octaves octaves = OctavesToward(clouds, cosine, optics.dropletForward);
     float starts[2] = {0.0, 0.0};
     float ends[2] = {0.0, 0.0};
     bool crosses[2];
@@ -948,7 +1102,7 @@ CloudTrace TraceClouds(CloudConstants clouds, CloudLight light, float3 eye, floa
     if (trace.transmittance <= kOpaque)
         trace.transmittance = 0.0;
     else if ((clouds.layerMask & kLayerCirrus) != 0)
-        AddCirrus(clouds, light, eye, direction, cosine, pixelAngle, transmittance, trace);
+        AddCirrus(clouds, light, eye, direction, optics.cirrusPhase, pixelAngle, transmittance, trace);
     return trace;
 }
 
@@ -1092,10 +1246,12 @@ void WriteLight(CloudConstants clouds, uint index)
         clearSum += float4(clear * z, z);
         cloudySum += cloudy * z;
         if (g_pass.input2 != kNoView) {
-            Texture2D<float> shadow = ResourceDescriptorHeap[g_pass.input2];
+            // The ground lies under every cloud: their whole depth shades it.
+            Texture2D<float4> shadow = ResourceDescriptorHeap[g_pass.input2];
             uint width, height;
             shadow.GetDimensions(width, height);
-            shadowSum += shadow.Load(int3(height + (k % 16 + 0.5) * height / 16, (k / 16 + 0.5) * height / 16, 0));
+            float depth = shadow.Load(int3(height + (k % 16 + 0.5) * height / 16, (k / 16 + 0.5) * height / 16, 0)).x;
+            shadowSum += lerp(1.0, exp(-depth), g_frame.cloudShadowStrength);
         } else {
             shadowSum += 1.0;
         }
@@ -1136,8 +1292,9 @@ void WriteLight(CloudConstants clouds, uint index)
 }
 
 // The shadow map's texel `id`: the line toward the sun through its place on the plane across the sun, from where it
-// leaves the ground through every layer.
-float ShadowTransmittance(CloudConstants clouds, uint2 id, uint size)
+// leaves the ground through every layer: its optical depth, and where along the sun that depth lies, as the mean and
+// spread of the position along the sun (kilometres from the plane, CloudShadowAt), weighted by optical depth.
+float4 ShadowTransmittance(CloudConstants clouds, uint2 id, uint size)
 {
     uint cascade = id.x / size;
     float scale = cascade == 0 ? g_frame.cloudShadowFineScale : g_frame.cloudShadowCoarseScale;
@@ -1147,7 +1304,11 @@ float ShadowTransmittance(CloudConstants clouds, uint2 id, uint size)
     float3 sun = g_frame.sunDirection;
     float nearest, farthest;
     float3 origin = SphereRoots(point0, sun, kGroundRadius, nearest, farthest) ? point0 + sun * farthest : point0 - sun * dot(point0, sun);
+    // A point's place along the sun: 0 on the plane, which passes through the map's origin.
+    float planeOffset = (kGroundRadius + kEyeHeight) * sun.z;
     float depth = 0.0;
+    float along = 0.0;
+    float alongSquared = 0.0;
     [unroll]
     for (uint k = 0; k < 2; ++k) {
         CloudLayer layer = clouds.layers[k];
@@ -1157,20 +1318,31 @@ float ShadowTransmittance(CloudConstants clouds, uint2 id, uint size)
         // Steps for the low layer, half as many for the middle one, through what may be tens of kilometres at low sun.
         uint steps = k == 0 ? 32 : 16;
         float stride = (end - start) / steps;
-        float sum = 0.0;
         [loop]
-        for (uint i = 0; i < steps; ++i)
-            sum += DensityAt(clouds, layer, origin + sun * (start + (i + 0.5) * stride), cascade == 0);
-        depth += sum * stride * layer.extinction;
+        for (uint i = 0; i < steps; ++i) {
+            float3 p = origin + sun * (start + (i + 0.5) * stride);
+            float weight = DensityAt(clouds, layer, p, cascade == 0) * stride * layer.extinction;
+            float s = dot(p, sun) - planeOffset;
+            depth += weight;
+            along += weight * s;
+            alongSquared += weight * s * s;
+        }
     }
     if ((clouds.layerMask & kLayerCirrus) != 0) {
         if (SphereRoots(origin, sun, clouds.cirrusRadius, nearest, farthest) && farthest > 0.0) {
             float3 p = origin + sun * farthest;
             float slant = max(dot(p / length(p), sun), 0.02);
-            depth += CirrusDepth(clouds, p, kKilometresPerUnit / (scale * size * slant)) / slant;
+            float weight = CirrusDepth(clouds, p, kKilometresPerUnit / (scale * size * slant)) / slant;
+            float s = dot(p, sun) - planeOffset;
+            depth += weight;
+            along += weight * s;
+            alongSquared += weight * s * s;
         }
     }
-    return lerp(1.0, exp(-depth), clouds.shadowStrength);
+    if (depth <= 0.0)
+        return float4(0.0, 0.0, kCloudShadowMinSpread, 0.0);
+    float mean = along / depth;
+    return float4(depth, mean, max(sqrt(max(alongSquared / depth - mean * mean, 0.0)), kCloudShadowMinSpread), 0.0);
 }
 
 [RootSignature(ROOT_SIGNATURE)]
@@ -1243,7 +1415,7 @@ void main(uint3 id : SV_DispatchThreadID, uint index : SV_GroupIndex)
     }
     CloudConstants clouds = LoadClouds();
     if (g_pass.step == 3) {
-        RWTexture2D<float> output = ResourceDescriptorHeap[g_pass.output0];
+        RWTexture2D<float4> output = ResourceDescriptorHeap[g_pass.output0];
         uint width, height;
         output.GetDimensions(width, height);
         uint2 texel = g_pass.input1 == 0 ? id.xy : uint2(id.x, id.y * 2 + g_pass.input1 - 1);

@@ -37,6 +37,11 @@ GamePixel GamePixelAt(float4 position, float2 viewportSize)
 // depth: x the factor's negative, z 1, w 0. Fog under water, which Source blends by height, stays.
 float4 gmodpp_FogParams(float4 original, float4 position, float2 viewportSize)
 {
+    // Ground mist: the game's fog blend takes its opacity at the pixel, and gmodpp_LitFogColor its light.
+    if (g_frame.mistEnabled != 0.0 && g_frame.volumetricView != kNoView) {
+        GamePixel pixel = GamePixelAt(position, viewportSize);
+        return float4(-(1.0 - FroxelLight(pixel.uv, pixel.viewDepth).a), original.y, 1.0, 0.0);
+    }
     if (g_frame.fogEnabled == 0 || g_frame.fogParams.y > 0.0)
         return original;
     GamePixel pixel = GamePixelAt(position, viewportSize);
@@ -51,6 +56,11 @@ float4 gmodpp_FogParams(float4 original, float4 position, float2 viewportSize)
 float4 gmodpp_LitFogColor(float4 original, float4 position, float2 viewportSize)
 {
     float3 flat = original.rgb * FogDaylight();
+    if (g_frame.mistEnabled != 0.0 && g_frame.volumetricView != kNoView) {
+        GamePixel pixel = GamePixelAt(position, viewportSize);
+        float4 medium = FroxelLight(pixel.uv, pixel.viewDepth);
+        return float4(medium.a < 0.999 ? medium.rgb * g_frame.tonemapScale / (1.0 - medium.a) : 0.0, original.w);
+    }
     if (g_frame.volumetricView == kNoView || g_frame.volumetricFog == 0)
         return float4(flat, original.w);
     GamePixel pixel = GamePixelAt(position, viewportSize);
