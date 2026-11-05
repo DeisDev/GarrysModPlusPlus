@@ -10,7 +10,8 @@
 // last frame did not write, starts again.
 // input0: raw estimate; input1: last frame's history (rgb, sample count); input2: last frame's moments;
 // output0: new history; output1: new moments.
-// Viewmodel: input0: raw estimate; output0: history (rgb, sample count); output1: record (moments, distance, tag).
+// Viewmodel: input0: raw estimate; input2: 1 when the history and record were just made (their contents are undefined);
+// output0: history (rgb, sample count); output1: record (moments, distance, tag).
 
 static const float kMaxSamples = 32.0;
 // The viewmodel's light turns with the eye, so its history is shorter.
@@ -51,7 +52,7 @@ void main(uint3 id : SV_DispatchThreadID)
     if (viewmodel) {
         float4 previous = record[pixel];
         float previousTag = float(g_pass.step > 1 ? g_pass.step - 1 : kViewmodelTags);
-        if (previous.w == previousTag && abs(previous.z - surface.w) <= 0.5 + surface.w * 0.01) {
+        if (g_pass.input2 == 0 && previous.w == previousTag && abs(previous.z - surface.w) <= 0.5 + surface.w * 0.01) {
             accumulated = output[pixel];
             moments = previous.xy;
             weightSum = 1.0;

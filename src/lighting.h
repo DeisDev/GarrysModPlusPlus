@@ -920,6 +920,8 @@ private:
     // tag of the frame that wrote it), updated in place (shaders/gi_temporal.hlsl).
     Texture m_viewmodelHistory;
     Texture m_viewmodelRecord;
+    // False until the record is written after its creation: a new texture's contents are undefined.
+    bool m_viewmodelHistoryValid = false;
     Texture m_resolved;
     // The frames since the upscalers' resolve last saw geometry near an output pixel (shaders/dlss_resolve.hlsl), and
     // whether last frame's may be used.

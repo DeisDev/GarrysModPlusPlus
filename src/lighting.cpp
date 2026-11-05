@@ -1910,6 +1910,7 @@ bool Lighting::EnsureTargets(UINT width, UINT height)
     m_width = width;
     m_height = height;
     m_historyValid = false;
+    m_viewmodelHistoryValid = false;
     m_volumetricHistoryValid = false;
     m_lastDenoised = nullptr;
     return ok;
@@ -3594,8 +3595,9 @@ void Lighting::Run(const ViewInputs& inputs, Scene& scene, std::span<const Scene
     if (traced && !main) {
         Use(m_viewmodelHistory, write);
         Use(m_viewmodelRecord, write);
-        Dispatch(Pass::GiTemporal, {.input0 = m_giRaw.srv, .output0 = m_viewmodelHistory.uav, .output1 = m_viewmodelRecord.uav,
-            .step = static_cast<UINT>(inputs.frame % kViewmodelTags + 1)});
+        Dispatch(Pass::GiTemporal, {.input0 = m_giRaw.srv, .input2 = m_viewmodelHistoryValid ? 0u : 1u, .output0 = m_viewmodelHistory.uav,
+            .output1 = m_viewmodelRecord.uav, .step = static_cast<UINT>(inputs.frame % kViewmodelTags + 1)});
+        m_viewmodelHistoryValid = true;
         Use(m_viewmodelRecord, read);
         Texture* source = &m_viewmodelHistory;
         for (size_t i = 0; i < std::size(kFilterSteps) && GetSettings().denoiser; ++i) {
