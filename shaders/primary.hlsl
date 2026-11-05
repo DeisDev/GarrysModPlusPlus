@@ -8,6 +8,8 @@
 // output1: motion in pixels towards last frame's position; output2: last frame's distance from the eye;
 // output3: kPixelHit, kPixelUnlit and kPixelIgnoreNormals flags; output4: the triangle's face normal facing the eye, or the
 // G-buffer normal without a triangle (the normal map's normal can point into the surface, which rays must not).
+// Viewmodel vertices that have no position last frame (kNoPrevious in src/viewmodel_casters.h) leave the pixel no motion
+// and a last distance of 0, so nothing takes its history.
 // input0: with step 1 (the 3D skybox view), a UAV for each pixel's distance from the eye in the map's space (0 for
 // none), its surfaces being 1 / worldToSky times nearer in the skybox's; otherwise (the main view) that distance, for
 // the pixels the main view leaves empty, or none.
@@ -50,6 +52,9 @@ float KernelRoughness2(int2 pixel, float depth, float4 surface)
     float3 dy = SameSurfaceNormalStep(pixel, int2(0, 1), depth, surface);
     return min(2.0 * kKernelVariance * (dot(dx, dx) + dot(dy, dy)), kKernelLimit);
 }
+
+// Coordinates beyond this are viewmodel_casters::kNoPrevious: the vertex was not drawn last frame.
+static const float kNoPrevious = 1e8;
 
 // How far a hit point moved since last frame, in world space.
 float3 HitMotion(HitInfo hit)
@@ -103,13 +108,14 @@ void main(uint3 id : SV_DispatchThreadID)
         previous = g_frame.eyePosition + float3(dot(g_frame.skyMotion[0].xyz, toSky), dot(g_frame.skyMotion[1].xyz, toSky), dot(g_frame.skyMotion[2].xyz, toSky));
     uint4 visible = uint4(kNoView, 0, 0, 0);
     uint pixelFlags = 0;
+    bool known = true;
     float3 faceNormal = surface.xyz;
     if (surface.w > 0.0 && g_frame.traceMask != 0) {
         float3 view = normalize(position - g_frame.eyePosition);
         HitInfo hit;
-        // The eye is inside the local player's body; the viewmodel's run finds its own triangles there. Glass a few units in
-        // front of a surface would otherwise give it the glass's material.
-        uint mask = g_frame.viewmodel != 0 ? g_frame.traceMask : g_frame.traceMask & ~kLocalPlayerMask;
+        // The eye is inside the local player's body; the viewmodel's run with its own triangles finds them there. Glass a
+        // few units in front of a surface would otherwise give it the glass's material.
+        uint mask = g_frame.viewmodel == 2 ? g_frame.traceMask | kLocalPlayerMask : g_frame.traceMask & ~kLocalPlayerMask;
         if (TraceHit(g_frame.eyePosition, view, surface.w + 8.0 + surface.w * 0.02, mask, hit, RAY_FLAG_NONE, true) &&
             abs(hit.t - surface.w) <= 4.0 + surface.w * 0.02) {
             visible = uint4(hit.instance, hit.primitive, asuint(hit.barycentrics));
@@ -119,21 +125,23 @@ void main(uint3 id : SV_DispatchThreadID)
             bool exact = abs(hit.t - surface.w) <= 0.5 + surface.w * 0.004;
             pixelFlags = kPixelHit | (exact && (MaterialFlags(hit) & kMaterialUnlit) != 0 ? kPixelUnlit : 0u) |
                 ((LoadInstance(hit.instance).flags & kInstanceIgnoreNormals) != 0 ? kPixelIgnoreNormals : 0u);
-            previous = position + HitMotion(hit);
+            float3 moved = HitMotion(hit);
+            known = all(abs(moved) < kNoPrevious);
+            previous = known ? position + moved : position;
             faceNormal = SurfaceOf(hit, g_frame.eyePosition, view).normal;
         }
     }
     float2 pixelMotion = 0.0;
     float4 currentClip = mul(g_frame.viewProj, float4(position, 1.0));
     float4 previousClip = mul(g_frame.prevViewProj, float4(previous, 1.0));
-    if (g_frame.historyValid != 0 && currentClip.w > 0.0 && previousClip.w > 0.0) {
+    if (g_frame.historyValid != 0 && known && currentClip.w > 0.0 && previousClip.w > 0.0) {
         float2 currentUv = float2(currentClip.x / currentClip.w * 0.5 + 0.5, 0.5 - currentClip.y / currentClip.w * 0.5);
         float2 previousUv = float2(previousClip.x / previousClip.w * 0.5 + 0.5, 0.5 - previousClip.y / previousClip.w * 0.5);
         pixelMotion = (previousUv - currentUv) * float2(g_frame.size);
     }
     visibility[pixel] = visible;
     motion[pixel] = pixelMotion;
-    previousDistance[pixel] = length(previous - g_frame.prevEyePosition);
+    previousDistance[pixel] = known ? length(previous - g_frame.prevEyePosition) : 0.0;
     flags[pixel] = pixelFlags;
     geometricNormal[pixel] = float4(faceNormal, KernelRoughness2(pixel, depth, surface));
 }

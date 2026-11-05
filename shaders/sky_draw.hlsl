@@ -130,9 +130,12 @@ float4 SkyMain(Interpolants input) : SV_Target0
     if (g_sky.night.parts != 0)
         color += NightSkyLight(g_sky.night, direction, logGain, kPointFootprint * pixelAngle, g_sky.tonemapScale, transmittance, g_linearClamp) *
             (1.0 - moonCoverage);
-    color = color * g_sky.tonemapScale + moon;
-    if (g_sky.night.disc != 0)
-        color += SunDisc(g_sky.night, direction, pixelAngle, transmittance, g_linearClamp) * DiscThroughClouds(g_sky.night, clouds.a, g_sky.tonemapScale);
+    color = OverDisc(max(color, 0.0) * g_sky.tonemapScale, moon / max(moonCoverage, 1e-6), moonCoverage);
+    if (g_sky.night.disc != 0) {
+        float discCoverage;
+        float3 disc = SunDisc(g_sky.night, direction, pixelAngle, transmittance, g_linearClamp, discCoverage) * DiscThroughClouds(g_sky.night, clouds.a, g_sky.tonemapScale);
+        color = OverDisc(color, disc / max(discCoverage, 1e-6), discCoverage);
+    }
     return float4(max(color, 0.0), 1.0);
 }
 
@@ -140,5 +143,6 @@ float4 DiscMain(Interpolants input) : SV_Target0
 {
     float3 direction = ViewDirection(input.position.xy);
     Texture2D<float4> transmittance = ResourceDescriptorHeap[g_sky.night.transmittanceView];
-    return float4(SunDisc(g_sky.night, direction, PixelAngle(input.position.xy, direction), transmittance, g_linearClamp), 0.0);
+    float coverage;
+    return float4(SunDisc(g_sky.night, direction, PixelAngle(input.position.xy, direction), transmittance, g_linearClamp, coverage), 0.0);
 }

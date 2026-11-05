@@ -64,6 +64,8 @@ ComputeLightingFn ComputeLightingFunction();
 // Whether a material draws unlit (UnlitGeneric, UnlitTwoTexture, MonitorScreen), whose preview combos leave out vertex
 // colour.
 bool IsUnlitMaterial(void* material);
+// An IMaterial's name ("detail/detailsprites"), or nothing.
+std::string MaterialName(void* material);
 // IMaterial::IsTranslucent: whether the material blends as it is drawn now (its render state or alpha modulation).
 bool IsTranslucentMaterial(void* material);
 

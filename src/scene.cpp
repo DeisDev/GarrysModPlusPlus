@@ -836,6 +836,7 @@ void Scene::Clear()
     m_hasSkybox = false;
     m_worldModel = -1;
     m_name.clear();
+    m_detailMaterial.clear();
     m_sun = {};
     m_descriptors->Free(m_lightsView);
     m_lightsView = DescriptorHeap::kInvalid;
@@ -1001,6 +1002,7 @@ bool Scene::LoadMap(const std::string& name, const bsp::WorldGeometry& world, st
     }
     m_name = name;
     m_sun = world.sun;
+    m_detailMaterial = world.detailMaterial;
     return true;
 }
 

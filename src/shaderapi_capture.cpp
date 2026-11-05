@@ -94,6 +94,17 @@ struct State {
     SkyCube sky;
     bool active = false;
     bool forwardActive = false;
+    // G-buffer draws since Begin: a viewmodel capture without any is not lit (End).
+    uint32_t gbufferDraws = 0;
+    // The forward pass's draws take the last capture's jitter (the 3D skybox's translucent ones).
+    bool forwardJitter = false;
+    // The forward pass's draws read openAirProbes, one texel each that holds the light of open air (BeginForward).
+    bool forwardOpenAir = false;
+    std::array<TrackedResource, 3> openAirProbes;
+    std::array<UINT, 3> openAirViews = {DescriptorHeap::kInvalid, DescriptorHeap::kInvalid, DescriptorHeap::kInvalid};
+    // SetDetailSprites: the material's name and whether each material drawn since it was set is it.
+    std::string detailSprites;
+    std::unordered_map<void*, bool> detailSpriteMaterials;
     bool skipView = false;
     std::array<float, 2> jitter = {};
     gbuffer::Matrix4 viewProj = {};
@@ -247,6 +258,48 @@ void CreateProbeTextures()
     }
 }
 
+// One texel per colour channel in the probe textures' form, read alike wherever the forward snippet looks
+// (ForwardConstants::openAirLight), copied in on the game's command list before the draws that read it.
+bool UploadOpenAirLight(const std::array<std::array<float, 4>, 3>& light)
+{
+    Backend& backend = GetBackend();
+    for (size_t i = 0; i < g_state.openAirProbes.size(); ++i) {
+        if (!g_state.openAirProbes[i].resource) {
+            const D3D12_HEAP_PROPERTIES heap = {D3D12_HEAP_TYPE_DEFAULT};
+            D3D12_RESOURCE_DESC desc = {};
+            desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+            desc.Width = 1;
+            desc.Height = 1;
+            desc.DepthOrArraySize = 1;
+            desc.MipLevels = 1;
+            desc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+            desc.SampleDesc.Count = 1;
+            if (FAILED(backend.Device()->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                    IID_PPV_ARGS(&g_state.openAirProbes[i].resource))))
+                return false;
+            g_state.openAirProbes[i].state = D3D12_RESOURCE_STATE_COMMON;
+            g_state.openAirViews[i] = backend.Descriptors().Allocate();
+            D3D12_SHADER_RESOURCE_VIEW_DESC view = {};
+            view.Format = desc.Format;
+            view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+            view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            view.Texture3D.MipLevels = 1;
+            backend.Device()->CreateShaderResourceView(g_state.openAirProbes[i].resource.Get(), &view, backend.Descriptors().Cpu(g_state.openAirViews[i]));
+        }
+        const Backend::Upload upload = backend.AllocateUpload(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
+        if (upload.data == nullptr)
+            return false;
+        std::memcpy(upload.data, light[i].data(), sizeof(light[i]));
+        backend.Transition(g_state.openAirProbes[i], D3D12_RESOURCE_STATE_COPY_DEST);
+        D3D12_TEXTURE_COPY_LOCATION to = {g_state.openAirProbes[i].resource.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+        to.SubresourceIndex = 0;
+        D3D12_TEXTURE_COPY_LOCATION from = {upload.buffer, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+        from.PlacedFootprint = {upload.offset, {DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 1, 1, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT}};
+        backend.Commands()->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+    }
+    return true;
+}
+
 bool CreateSkyCube()
 {
     SkyCube& sky = g_state.sky;
@@ -392,6 +445,7 @@ bool Begin(std::array<float, 2> jitter)
     g_state.litFogSeen = false;
     g_state.projected.clear();
     g_state.active = true;
+    g_state.gbufferDraws = 0;
     ++g_state.sections;
     if (!g_state.loggedCounts) {
         g_state.loggedCounts = true;
@@ -408,6 +462,13 @@ bool End(ViewKind kind, ViewInputs& inputs)
     if (!g_state.active)
         return false;
     g_state.active = false;
+    // ARC9 copies the screen and changes the depth range in its viewmodel hooks, which end captures with nothing in
+    // them; lit, each took a run, and the viewmodel's own no longer followed the main view's (Lighting::Run).
+    if (kind == ViewKind::Viewmodel && g_state.gbufferDraws == 0) {
+        g_state.flashlightDraws = 0;
+        g_state.projected.clear();
+        return false;
+    }
     if (kind != ViewKind::Viewmodel) {
         // Every lit shader's vertex fog constant holds the view's range fog (cFogParams: end / range, 1,
         // 1 - max density, 1 / range) and pixel c29 its colour; Source writes that constant only when fog is on, so
@@ -516,6 +577,8 @@ void BeginForward(const gbuffer::ForwardConstants& constants, bool mainView)
     g_state.twinFrame = constants.twinFrame;
     g_state.twinScene = constants.twinScene;
     g_state.fogFrame = mainView ? constants.fogFrame : 0;
+    g_state.forwardJitter = constants.jittered;
+    g_state.forwardOpenAir = constants.openAir && UploadOpenAirLight(constants.openAirLight);
     g_state.forwardActive = true;
     g_state.forwardDraws = 0;
     g_state.forwardTwinDraws = 0;
@@ -531,11 +594,33 @@ void EndForward()
     if (!g_state.forwardActive)
         return;
     g_state.forwardActive = false;
+    g_state.forwardOpenAir = false;
     if (g_state.forwardLogged < 3) {
         ++g_state.forwardLogged;
         log::Info("G-buffer: {} forward-lit draws, {} of them by forward twins ({} preview shaders have a forward variant, {} could not take one)",
             g_state.forwardDraws, g_state.forwardTwinDraws, gbuffer::ShaderStatistics().forward, gbuffer::ShaderStatistics().forwardFailures);
     }
+}
+
+bool IsDetailSprites(void* material)
+{
+    if (g_state.detailSprites.empty())
+        return false;
+    auto [entry, added] = g_state.detailSpriteMaterials.try_emplace(material, false);
+    if (added) {
+        std::string name = engine::MaterialName(material);
+        std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return c == '\\' ? '/' : static_cast<char>(std::tolower(c)); });
+        entry->second = name == g_state.detailSprites;
+    }
+    return entry->second;
+}
+
+void SetDetailSprites(std::string_view material)
+{
+    if (material == g_state.detailSprites)
+        return;
+    g_state.detailSprites = material;
+    g_state.detailSpriteMaterials.clear();
 }
 
 int FixedLighting()
@@ -549,7 +634,7 @@ int FixedLighting()
     }
     if (g_state.forwardActive) {
         void* material = BoundMaterial();
-        return material != nullptr && engine::IsUnlitMaterial(material) ? 0 : 2;
+        return material != nullptr && engine::IsUnlitMaterial(material) && !IsDetailSprites(material) ? 0 : 2;
     }
     return -1;
 }
@@ -653,6 +738,8 @@ Pass Prepare(std::span<const DWORD> vertexCode, std::span<const DWORD> pixelCode
             Count(pixelFile, Path::ForwardUnlit);
             return pass;
         }
+        if (g_state.forwardJitter)
+            AddJitter(pass.vertexPatches);
         pass.fogFrame = g_state.fogFrame;
         if (pixelFile != nullptr && twins::IsParticleShader(pixelFile)) {
             pass.fogEpilogue = true;
@@ -797,6 +884,7 @@ Pass Prepare(std::span<const DWORD> vertexCode, std::span<const DWORD> pixelCode
     pass.pixelName = pixel->name.c_str();
     for (UINT r = 0; r < 4; ++r)
         std::copy_n(VertexRegister(gbuffer::kViewProjection + r).v, 4, g_state.viewProj[r].begin());
+    ++g_state.gbufferDraws;
     return pass;
 }
 
@@ -858,8 +946,9 @@ float LightWarpSlot(UINT view)
 
 UINT ProbeView(size_t index)
 {
-    GetBackend().Transition(g_state.probes[index], D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
-    return g_state.probeViews[index];
+    TrackedResource& probes = g_state.forwardOpenAir ? g_state.openAirProbes[index] : g_state.probes[index];
+    GetBackend().Transition(probes, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
+    return g_state.forwardOpenAir ? g_state.openAirViews[index] : g_state.probeViews[index];
 }
 
 // The engine loads the 2D skybox's faces as the materials "skybox/<sv_skyname><side>" (engine.dll 0x180102020, with

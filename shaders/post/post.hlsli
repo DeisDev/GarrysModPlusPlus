@@ -64,8 +64,9 @@ struct PostConstants
     uint flareView;
     uint2 tileCount;
     // Lens flare: the light's position on screen (pixels), its brightness on screen per colour, whether it lies in front
-    // of the eye, the starburst's strength, the visibility the lighting traced (a 1x1 texture, or kNoView without a
-    // light) and the disc's radius in pixels.
+    // of the eye, the starburst's strength (its spikes' light per pixel along them at a pixel from the light, as a share
+    // of the light), the visibility the lighting traced (a 1x1 texture, or kNoView without a light) and the disc's radius
+    // in pixels.
     float2 flarePosition;
     float3 flareColor;
     float flareInFront;
@@ -134,13 +135,13 @@ struct PostConstants
     float localGridInvRangeLog;
     // The wide blur's Gaussian in cells.
     float localBlurSigma;
-    // The lens flare's ghosts (src/lens_flare.cpp: FlareGhost records, flareGhostCount of them), the aperture's image
-    // and its diffraction starburst (shaders/post/flare.hlsl), the flare drawn at half the view's size, or kNoView
-    // without it; the starburst's half-size in pixels.
+    // The lens flare's ghosts (src/lens_flare.cpp: FlareGhost records, flareGhostCount of them) and the aperture's image
+    // (shaders/post/flare.hlsl), or kNoView without it; the aperture's blades, which its diffraction spikes follow, and
+    // how far from the light in pixels they fade out.
     uint flareGhosts;
     uint flareGhostCount;
     uint flareAperture;
-    uint flareStarburstView;
+    uint flareBlades;
     float flareStarburstSize;
     uint2 padding8;
 };

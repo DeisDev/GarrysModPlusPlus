@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <functional>
 #include <optional>
+#include <string_view>
 
 // The ray-traced scene of the loaded map and its entities, and the lighting that uses it.
 namespace gmodpp::world {
@@ -27,6 +28,8 @@ std::optional<std::pair<size_t, size_t>> LightingPipelineProgress();
 bool LevelHasWater();
 // The loaded map's 3D skybox scale (its sky_camera's), or 0 without one or before the map's scene has loaded.
 float SkyboxScale();
+// The current map's detail sprite material (bsp::WorldGeometry::detailMaterial), or nothing before its scene is ready.
+std::string_view DetailSpriteMaterial();
 void WaitForGpu();
 
 // Once per presented frame, with the size of the main view: installs the engine hooks, follows the settings file,
@@ -53,7 +56,7 @@ std::array<float, 2> ViewJitter(UINT width, UINT height);
 // entities and dynamic lights the view is lit with.
 void LightView(ViewInputs& inputs);
 
-// What the forward-lit translucent surfaces of the main view read, once its irradiance volume is ready.
+// What the forward-lit translucent surfaces of the main view or the 3D skybox read, once the irradiance volume is ready.
 std::optional<gbuffer::ForwardConstants> ForwardLighting(const ViewInputs& inputs);
 
 // The main view's camera, light and motion vectors for the camera effects, when it was lit this frame.

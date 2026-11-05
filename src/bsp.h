@@ -206,6 +206,9 @@ struct WorldGeometry {
     std::vector<BrushWater> brushWater;
     // Material name of each texdata entry, as in "materials/<name>.vmt".
     std::vector<std::string> materials;
+    // The material the client draws detail sprites with (worldspawn's detailmaterial, else detail/detailsprites:
+    // CDetailObjectSystem::LevelInitPostEntity in the SDK's detailobjectsystem.cpp), lower case with forward slashes.
+    std::string detailMaterial = "detail/detailsprites";
     // The texdata entries VRAD made emit_surface lights of (a texinfo with SURF_LIGHT uses them).
     std::vector<bool> lightMaterials;
     SunLight sun;

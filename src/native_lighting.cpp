@@ -141,10 +141,13 @@ void Finish(gbuffer::ViewKind kind)
         capture::SetSky(world::SkyDraw());
         g_state.mainLit = true;
     }
+    capture::SetDetailSprites(world::DetailSpriteMaterial());
     if (const std::optional<gbuffer::ForwardConstants> forward = world::ForwardLighting(inputs)) {
-        g_state.forward = forward;
-        g_state.forwardLevel = engine::LevelName();
-        capture::BeginForward(*forward, true);
+        if (kind == gbuffer::ViewKind::Main) {
+            g_state.forward = forward;
+            g_state.forwardLevel = engine::LevelName();
+        }
+        capture::BeginForward(*forward, kind == gbuffer::ViewKind::Main);
     }
 }
 

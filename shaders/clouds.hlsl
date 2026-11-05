@@ -754,8 +754,9 @@ float CloudPhase(float cosine, float4 phase, float eccentricity)
 
 // ---- Atmospheric optics: ice halos in the cirrus (Greenler 1980, "Rainbows, Halos, and Glories"; Tape 1994,
 // "Atmospheric Halos") and the droplets' corona (van de Hulst 1957, section 8; Lock and Yang 1991), in the phase
-// functions of the cirrus and of the first octave, so they show where those layers are met, in the history, the cube
-// and the reflections alike.
+// functions of the cirrus and of the middle layer's first octave, so they show where those layers are met, in the
+// history, the cube and the reflections alike. Coronas are seen through thin altocumulus and altostratus, whose droplets
+// are of even size; the low layer's cumulus and stratus, of widely spread sizes, show none.
 
 static const float kDegree = 0.01745329;
 // Ice's refractive index at 650, 550 and 450 nm (Warren and Brandt 2008, "Optical constants of ice"), as red, green and
@@ -844,24 +845,40 @@ float BesselJ1(float x)
 }
 
 // The corona: Fraunhofer diffraction by droplets of size parameter x per colour, (x^2 / 4 pi) (2 J1(u) / u)^2 with
-// u = x sin(theta), normalised over the sphere; droplets of uneven size wash the outer rings toward their mean,
-// 4 / (pi u^3), by coronaSpread.
+// u = x sin(theta), normalised over the sphere, averaged over droplet sizes spread normally around the mean by
+// kCoronaSizeSpread x coronaSpread of it, each weighed by its cross-section (5-point Gauss-Hermite quadrature,
+// Abramowitz and Stegun 25.4.46): the outer rings, which differ most between sizes, wash out first.
+static const float kCoronaSizeSpread = 0.25;
+static const float kHermiteNodes[3] = {0.0, 1.3556262, 2.8569700};
+static const float kHermiteWeights[3] = {0.5333333, 0.2220759, 0.0112574};
+
 float3 CoronaPhase(CloudConstants clouds, float theta)
 {
-    float3 u = max(clouds.dropletX * sin(theta), 1e-3);
-    float3 bessel = float3(BesselJ1(u.x), BesselJ1(u.y), BesselJ1(u.z));
-    float3 airy = 4.0 * bessel * bessel / (u * u);
-    airy = lerp(airy, 4.0 / (3.14159265 * u * u * u), clouds.coronaSpread * saturate(u / 10.0));
-    return clouds.dropletX * clouds.dropletX / (4.0 * 3.14159265) * airy;
+    float spread = kCoronaSizeSpread * clouds.coronaSpread;
+    float3 sum = 0.0;
+    float weights = 0.0;
+    [unroll]
+    for (int k = -2; k <= 2; ++k) {
+        float size = max(1.0 + spread * (k < 0 ? -kHermiteNodes[-k] : kHermiteNodes[k]), 0.05);
+        float weight = kHermiteWeights[abs(k)] * size * size;
+        float3 x = clouds.dropletX * size;
+        float3 u = max(x * sin(theta), 1e-3);
+        float3 bessel = float3(BesselJ1(u.x), BesselJ1(u.y), BesselJ1(u.z));
+        sum += weight * (x * x / (4.0 * 3.14159265)) * (4.0 * bessel * bessel / (u * u));
+        weights += weight;
+    }
+    return sum / weights;
 }
 
 // Per ray: the cirrus' phase function per colour, its ice crystals' halos added to the bulk (HG, kIceAsymmetry); and
-// the droplets' forward peak per colour, the corona in place of Jendersie and d'Eon's Henyey-Greenstein peak within
-// 8 degrees of the light (the peak stands for the diffraction, and its envelope meets the rings' mean there).
+// the droplets' forward peak (Jendersie and d'Eon's Henyey-Greenstein peak), and for the middle layer per colour with
+// the corona in its place within 8 degrees of the light (the peak stands for the diffraction, and its envelope meets the
+// rings' mean there).
 struct Optics
 {
     float3 cirrusPhase;
     float3 dropletForward;
+    float3 coronaForward;
 };
 
 Optics OpticsToward(CloudConstants clouds, float3 direction, float cosine)
@@ -889,19 +906,27 @@ Optics OpticsToward(CloudConstants clouds, float3 direction, float cosine)
     optics.cirrusPhase = (1.0 - share) * bulk + halos;
     float peak = HenyeyGreenstein(cosine, clouds.phase.x);
     optics.dropletForward = peak;
+    optics.coronaForward = peak;
     if (clouds.corona != 0.0 && theta < 8.0 * kDegree)
-        optics.dropletForward = lerp(CoronaPhase(clouds, theta), peak, smoothstep(6.0 * kDegree, 8.0 * kDegree, theta));
+        optics.coronaForward = lerp(CoronaPhase(clouds, theta), peak, smoothstep(6.0 * kDegree, 8.0 * kDegree, theta));
     return optics;
 }
 
 // The octaves' phase functions toward the eye times their scattering, and their extinctions, at most eight (the first
-// four in [0]); the first's per colour too (firstPhase), with the corona in it.
+// four in [0]); the first's per colour too (firstPhase), from `dropletForward` (the middle layer's with the corona in
+// it, FirstPhase).
 struct Octaves
 {
     float4 phases[2];
     float4 extinctions[2];
     float3 firstPhase;
 };
+
+// The first octave's phase function: Jendersie and d'Eon's blend of the forward peak and Draine's.
+float3 FirstPhase(CloudConstants clouds, float cosine, float3 dropletForward)
+{
+    return lerp(dropletForward, DrainePhase(cosine, clouds.phase.y, clouds.phase.z), clouds.phase.w);
+}
 
 Octaves OctavesToward(CloudConstants clouds, float cosine, float3 dropletForward)
 {
@@ -917,7 +942,7 @@ Octaves OctavesToward(CloudConstants clouds, float cosine, float3 dropletForward
         scatter *= clouds.octaveScatter;
         eccentricity *= clouds.octaveEccentricity;
     }
-    octaves.firstPhase = lerp(dropletForward, DrainePhase(cosine, clouds.phase.y, clouds.phase.z), clouds.phase.w);
+    octaves.firstPhase = FirstPhase(clouds, cosine, dropletForward);
     return octaves;
 }
 
@@ -1084,6 +1109,8 @@ CloudTrace TraceClouds(CloudConstants clouds, CloudLight light, float3 eye, floa
     float cosine = dot(direction, clouds.lightDirection);
     Optics optics = OpticsToward(clouds, direction, cosine);
     Octaves octaves = OctavesToward(clouds, cosine, optics.dropletForward);
+    float3 lowFirst = octaves.firstPhase;
+    float3 middleFirst = FirstPhase(clouds, cosine, optics.coronaForward);
     float starts[2] = {0.0, 0.0};
     float ends[2] = {0.0, 0.0};
     bool crosses[2];
@@ -1094,6 +1121,7 @@ CloudTrace TraceClouds(CloudConstants clouds, CloudLight light, float3 eye, floa
     [loop]
     for (uint n = 0; n < 2; ++n) {
         uint index = n == 0 ? first : 1 - first;
+        octaves.firstPhase = index == 1 ? middleFirst : lowFirst;
         if (crosses[index])
             MarchLayer(clouds, clouds.layers[index], light, eye, direction, starts[index], ends[index], jitter, stepScale, octaves, transmittance, trace);
     }

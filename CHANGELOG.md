@@ -19,7 +19,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Specular anti-aliasing: bumpy and shiny surfaces far away no longer sparkle in motion (Lighting page, on by default).
 - Ground mist (Lighting page, off by default): a layer of mist over the ground that drifts with the wind, lit by the sun, sky and lamps, with light shafts through it.
 - Distant air (aerial perspective): far-off land in the 3D skybox turns hazy and blue by day and red at sunset, and cloud shadows show as dark rays across the sky.
-- Ice halos, sun dogs, the 46° halo, the circumzenithal arc and coloured coronas around the sun and Moon, from the clouds (Sky page).
+- Ice halos, sun dogs, the 46° halo and the circumzenithal arc in high cirrus, and coloured coronas around the sun and Moon in thin middle clouds (Sky page).
 - Smoke and other particles that blend cast soft shadows from the sun on the ground, in the haze and mist, and on the particles born under them (Lighting page, on by default).
 - Local exposure on the Image page (off by default): brightens dark areas and darkens bright ones while keeping their detail.
 
@@ -29,18 +29,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - The Brightness slider in the video options works again, in every display mode.
 - Maps' colour correction is applied after the tone curve, so it no longer clips bright light.
 - The sun and Moon are drawn at their real brightness, so on an HDR display they reach its peak instead of stopping at white.
+- Shiny surfaces show the sun or Moon as a steady highlight instead of a reflected disc.
 - The Filmic tone curve is Gran Turismo's in SDR as in HDR and keeps hues; it replaces AgX.
 - The menu blends over the game in linear light in SDR as in HDR.
-- The lens flare is now the reflections inside a real double Gauss lens: coloured aperture shapes along the line through the sun that grow, shrink and brighten with the f-number, with coating colours, colour fringes and a diffraction starburst. New settings for aperture blades, colour fringes and starburst size.
+- The lens flare is now the reflections inside a real double Gauss lens: coloured aperture shapes along the line through the sun that grow, shrink and brighten with the f-number, with coating colours, colour fringes and thin diffraction spikes from the aperture's blades. New settings for aperture blades, colour fringes and starburst size.
 - Cloud shadows depend on height: places above or inside the clouds are shadowed only by the cloud above them.
 - A new bloom replaces the game's: bright light such as the sun now glows by how bright it really is, and the bloom spreads light without adding any. It still follows the game's bloom scale and has strength and spread settings on the Camera page.
 
 ### Fixed
 
 - Clouds no longer repeat in a pattern toward the horizon.
+- Detail sprites (sprite grass and sprite trees on hills) are lit by the real-time lighting instead of glowing with daytime light at night.
+- See-through props, cards and decals in the 3D skybox are lit by the real-time lighting and no longer shake with DLSS or TAA.
+- The edges of the Moon and sun discs no longer flicker.
+- The held weapon and hands shadow each other with ARC9 weapons too, and their light is no longer noisy.
+- The held weapon's shiny parts no longer sparkle: their reflections are accumulated over frames, and its light keeps its history on bumpy surfaces and along fine edges.
+- Reflective surfaces with reflection contrast no longer blow out and change colour where they reflect bright light.
+- Less log spam: lighting timings are logged less often, and each held weapon's size once.
 - Fixed the game crashing when ARC9 weapons draw their icons, such as when opening the weapon selector.
 - Images that addons read back from render targets keep their transparency, so ARC9's weapon icons no longer have a black background.
-- Less noise in the indirect light on the held weapon and hands.
+- Less noise in the indirect light on the held weapon and hands, which no longer smears as the weapon moves.
 - Heat distortion from explosions no longer shows a box with part of the map in it.
 - ARC9's customization menu shows the game behind it again instead of a white screen.
 - Fixed dark streaks along the edges of hands and other models.

@@ -407,12 +407,13 @@ float3 MoonDisc(NightSkyConstants night, float3 direction, float edge, float log
 // The sun's disc toward a direction, in the colour the atmosphere leaves it (env_sun's tint times the transmittance
 // toward it) with its brightest channel at 1, with Allen's limb darkening at 550 nm (I / I0 = 0.3 + 0.93 mu - 0.23 mu^2;
 // Cox, Allen's Astrophysical Quantities, 2000), or as the Moon (MoonAlbedo); DiscThroughClouds gives its brightness. Its
-// edge covers the share of a footprint `edge` radians wide inside it, and the ground hides it below the horizon.
-float3 SunDisc(NightSkyConstants night, float3 direction, float edge, Texture2D<float4> transmittance, SamplerState linearClamp)
+// edge covers `coverage`, the share of a footprint `edge` radians wide inside it, and the ground hides it below the
+// horizon.
+float3 SunDisc(NightSkyConstants night, float3 direction, float edge, Texture2D<float4> transmittance, SamplerState linearClamp, out float coverage)
 {
     float3 sun = night.sunDirection;
     float angle = atan2(length(cross(direction, sun)), dot(direction, sun));
-    float coverage = saturate((night.sunRadius - angle) / max(edge, 1e-7) + 0.5);
+    coverage = saturate((night.sunRadius - angle) / max(edge, 1e-7) + 0.5);
     float3 eye = float3(0.0, 0.0, kGroundRadius + kEyeHeight);
     if (coverage <= 0.0 || SphereDistance(eye, direction, kGroundRadius) >= 0.0)
         return 0.0;
@@ -426,6 +427,21 @@ float3 SunDisc(NightSkyConstants night, float3 direction, float edge, Texture2D<
     float r = saturate(angle / night.sunRadius);
     float mu = sqrt(1.0 - r * r);
     return color * ((0.3 + 0.93 * mu - 0.23 * mu * mu) * coverage);
+}
+
+// A disc of `disc` (as bright as where it covers the whole pixel) over `background`, covering `coverage` of the pixel,
+// both after the tonemap scale: blended as the display shows them, through x / (1 + x) by luminance (as Karis 2014
+// resolves bright edges in TAA). Blended linearly, the disc, hundreds of times brighter than white, turned every pixel its
+// edge touched white, and the edge stepped anew with each jittered frame.
+float3 OverDisc(float3 background, float3 disc, float coverage)
+{
+    if (coverage <= 0.0)
+        return background;
+    const float3 luminance = float3(0.2126, 0.7152, 0.0722);
+    float3 under = background / (1.0 + dot(background, luminance));
+    float3 over = (background + disc) / (1.0 + dot(background + disc, luminance));
+    float3 shown = lerp(under, over, coverage);
+    return shown / max(1.0 - dot(shown, luminance), 1e-6);
 }
 
 // The brightness of the disc (SunDisc) through clouds that let `transmittance` of it through, after the tonemap scale:

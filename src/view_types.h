@@ -183,6 +183,12 @@ struct ForwardConstants {
     // The main view's frame constants (Lighting::ForwardFrame) with its froxel volume, which the game's shaders read
     // their fog from (shaders/game_fog.hlsli), or 0.
     std::uint64_t fogFrame;
+    // For the 3D skybox's draws: the light of open air, the same everywhere, in the probes' form (per colour a and b, the
+    // irradiance a + b.n), in place of the irradiance volume, which holds the map's light around the eye and none of the
+    // distant land the skybox stands for. They lie under the main view's jittered image, so they take its jitter.
+    bool openAir = false;
+    std::array<std::array<float, 4>, 3> openAirLight = {};
+    bool jittered = false;
 };
 
 }
